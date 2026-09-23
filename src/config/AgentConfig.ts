@@ -1,3 +1,6 @@
+// [CUSTOM-BEGIN] CUSTOM-20260923-001 - 全局命名空间重命名 acp.* → acpc.*：本文件内的命令 id / 视图 id / 配置键 / 输出通道名已改名。
+// 上游合并后，若本文件出现新的 acp.* 引用，需按 CUSTOMIZATIONS/docs/pitfalls.md 重新应用重命名。
+// [CUSTOM-END] CUSTOM-20260923-001
 import * as vscode from 'vscode';
 
 /**
@@ -19,7 +22,7 @@ export interface AgentConfigEntry {
  * Returns a map of agent name → config.
  */
 export function getAgentConfigs(): Record<string, AgentConfigEntry> {
-  const config = vscode.workspace.getConfiguration('acp');
+  const config = vscode.workspace.getConfiguration('acpc');
   const agents = config.get<Record<string, AgentConfigEntry>>('agents', {});
   return agents;
 }

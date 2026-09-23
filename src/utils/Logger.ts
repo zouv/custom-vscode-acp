@@ -1,3 +1,6 @@
+// [CUSTOM-BEGIN] CUSTOM-20260923-001 - 全局命名空间重命名 acp.* → acpc.*：本文件内的命令 id / 视图 id / 配置键 / 输出通道名已改名。
+// 上游合并后，若本文件出现新的 acp.* 引用，需按 CUSTOMIZATIONS/docs/pitfalls.md 重新应用重命名。
+// [CUSTOM-END] CUSTOM-20260923-001
 import * as vscode from 'vscode';
 
 let _outputChannel: vscode.OutputChannel | undefined;
@@ -5,14 +8,14 @@ let _trafficChannel: vscode.OutputChannel | undefined;
 
 export function getOutputChannel(): vscode.OutputChannel {
   if (!_outputChannel) {
-    _outputChannel = vscode.window.createOutputChannel('ACP Client');
+    _outputChannel = vscode.window.createOutputChannel('ACP Client (Custom)');
   }
   return _outputChannel;
 }
 
 export function getTrafficChannel(): vscode.OutputChannel {
   if (!_trafficChannel) {
-    _trafficChannel = vscode.window.createOutputChannel('ACP Traffic');
+    _trafficChannel = vscode.window.createOutputChannel('ACP Traffic (Custom)');
   }
   return _trafficChannel;
 }
@@ -35,7 +38,7 @@ export function logError(message: string, error?: unknown): void {
 }
 
 export function logTraffic(direction: 'send' | 'recv', data: unknown): void {
-  const config = vscode.workspace.getConfiguration('acp');
+  const config = vscode.workspace.getConfiguration('acpc');
   if (!config.get<boolean>('logTraffic', true)) {
     return;
   }

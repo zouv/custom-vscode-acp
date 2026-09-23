@@ -1,9 +1,15 @@
 name: Publish
 
+# [CUSTOM-BEGIN] CUSTOM-20260923-004 - 只打包并作为 Release 资产上传，不发布到插件市场
+# 上游原版在 release created 时会尝试发布到 VS Code Marketplace 与 Open VSX
+# （依赖 secrets.VSCE_PAT / secrets.OVSX_PAT）。本仓库是自用 fork，不发市场，
+# 缺少这两个 secret 会导致 workflow 失败，故移除这两步。
+# 上游文件：.github/workflows/publish.yml
 on:
   release:
     types: [created]
   workflow_dispatch:
+# [CUSTOM-END] CUSTOM-20260923-004
 
 jobs:
   test:
@@ -24,7 +30,7 @@ jobs:
       - run: npm test
         if: runner.os != 'Linux'
 
-  publish:
+  package:
     needs: test
     runs-on: ubuntu-latest
     steps:
@@ -36,24 +42,12 @@ jobs:
       - run: npm ci
 
       - name: Package VSIX
-        run: npx vsce package -o extension.vsix
+        run: npx @vscode/vsce package -o extension.vsix
 
-      - name: Publish to Visual Studio Marketplace
-        uses: HaaLeo/publish-vscode-extension@v2
-        with:
-          pat: ${{ secrets.VSCE_PAT }}
-          registryUrl: https://marketplace.visualstudio.com
-          extensionFile: extension.vsix
-
-      - name: Publish to Open VSX Registry
-        uses: HaaLeo/publish-vscode-extension@v2
-        with:
-          pat: ${{ secrets.OVSX_PAT }}
-          registryUrl: https://open-vsx.org
-          extensionFile: extension.vsix
-
+      # [CUSTOM-BEGIN] CUSTOM-20260923-004 - 仅上传 Release 资产（移除 Marketplace / Open VSX 发布）
       - name: Upload VSIX as release asset
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
           files: extension.vsix
+      # [CUSTOM-END] CUSTOM-20260923-004

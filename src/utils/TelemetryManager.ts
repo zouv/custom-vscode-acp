@@ -1,64 +1,32 @@
 import * as vscode from 'vscode';
-import { TelemetryReporter } from '@vscode/extension-telemetry';
 
-const CONNECTION_STRING = 'InstrumentationKey=c4d676c8-3b21-4047-8f57-804f20ccb62d';
-
-let reporter: TelemetryReporter | undefined;
-
-/** Common properties attached to every telemetry event. */
-function getCommonProperties(): Record<string, string> {
-  return {
-    ideName: vscode.env.appName,
-    ideUriScheme: vscode.env.uriScheme,
-    ideAppHost: vscode.env.appHost,
-  };
-}
+// [CUSTOM-BEGIN] CUSTOM-20260923-002 - 遥测已移除：上游硬编码了作者自己的 Application Insights
+// 连接串并向其上报使用数据。本 fork 改为 no-op，保留同名 API 以免调用点扩散。
+// 若将来需要重新启用，请换成自己的连接串，不要在 fork 中复用上游 key。
+// [CUSTOM-END] CUSTOM-20260923-002
 
 /**
- * Initialise the telemetry reporter.  Must be called once during
- * `activate()`.  Returns the reporter so it can be pushed into
- * `context.subscriptions` for automatic disposal.
+ * No-op telemetry stub.  Kept API-compatible with the upstream
+ * TelemetryManager so that call sites stay unchanged; every function
+ * below deliberately does nothing.
  */
-export function initTelemetry(): TelemetryReporter {
-  if (reporter) {
-    return reporter;
-  }
-  reporter = new TelemetryReporter(CONNECTION_STRING);
-  return reporter;
+export function initTelemetry(): vscode.Disposable {
+  return { dispose() {} };
 }
 
-/**
- * Send a named telemetry event with optional string properties and
- * numeric measurements.
- */
+/** No-op. */
 export function sendEvent(
-  eventName: string,
-  properties?: Record<string, string>,
-  measurements?: Record<string, number>,
-): void {
-  reporter?.sendTelemetryEvent(eventName, { ...getCommonProperties(), ...properties }, measurements);
-}
+  _eventName: string,
+  _properties?: Record<string, string>,
+  _measurements?: Record<string, number>,
+): void {}
 
-/**
- * Send an error event (non-exception).  Properties describe the error
- * context; the data is still sent through the normal event pipeline.
- */
+/** No-op. */
 export function sendError(
-  eventName: string,
-  properties?: Record<string, string>,
-  measurements?: Record<string, number>,
-): void {
-  reporter?.sendTelemetryErrorEvent(eventName, { ...getCommonProperties(), ...properties }, measurements);
-}
+  _eventName: string,
+  _properties?: Record<string, string>,
+  _measurements?: Record<string, number>,
+): void {}
 
-/**
- * Report an exception / caught error as an error event.
- */
-export function sendException(error: Error, properties?: Record<string, string>): void {
-  reporter?.sendTelemetryErrorEvent('unhandledException', {
-    ...getCommonProperties(),
-    ...properties,
-    errorName: error.name,
-    errorMessage: error.message,
-  });
-}
+/** No-op. */
+export function sendException(_error: Error, _properties?: Record<string, string>): void {}
