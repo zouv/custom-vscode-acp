@@ -1,15 +1,20 @@
-name: Publish
+name: Package (Manual)
 
-# [CUSTOM-BEGIN] CUSTOM-20260923-004 - 只打包并作为 Release 资产上传，不发布到插件市场
-# 上游原版在 release created 时会尝试发布到 VS Code Marketplace 与 Open VSX
+# [CUSTOM-BEGIN] CUSTOM-20260923-004/006 - 只打包，不发布插件市场，且不由 release 自动触发
+# 上游原版在 release created 时自动触发，并发布到 VS Code Marketplace 与 Open VSX
 # （依赖 secrets.VSCE_PAT / secrets.OVSX_PAT）。本仓库是自用 fork，不发市场，
-# 缺少这两个 secret 会导致 workflow 失败，故移除这两步。
-# 上游文件：.github/workflows/publish.yml
+# 缺少这两个 secret 会导致 workflow 失败，故移除这两步（004）。
+#
+# 006：进一步改为**纯手动触发**。本仓库的发布主路径是本地 `gh release create`
+# （见 acp-release skill）——若保留 `release: created` 自动触发，workflow 会在
+# 手动发布后再往同一个 Release 挂一个冗余的 extension.vsix 资产。
+# 现在本 workflow 只产出 workflow artifact，完全不接触 GitHub Release。
+#
+# 刻意保留文件名 publish.yml（虽然它现在只做 package）：这是上游也有的文件，
+# 改名会在后续合并上游时产生 delete/modify 冲突，得不偿失。
 on:
-  release:
-    types: [created]
   workflow_dispatch:
-# [CUSTOM-END] CUSTOM-20260923-004
+# [CUSTOM-END] CUSTOM-20260923-004/006
 
 jobs:
   test:
@@ -44,10 +49,12 @@ jobs:
       - name: Package VSIX
         run: npx @vscode/vsce package -o extension.vsix
 
-      # [CUSTOM-BEGIN] CUSTOM-20260923-004 - 仅上传 Release 资产（移除 Marketplace / Open VSX 发布）
-      - name: Upload VSIX as release asset
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+      # [CUSTOM-BEGIN] CUSTOM-20260923-004/006 - 只产出 workflow artifact，不触碰 GitHub Release
+      # （移除 Marketplace / Open VSX 发布，也移除 release 资产上传）
+      - name: Upload VSIX as workflow artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: extension.vsix
-      # [CUSTOM-END] CUSTOM-20260923-004
+          name: vsix
+          path: extension.vsix
+          if-no-files-found: error
+      # [CUSTOM-END] CUSTOM-20260923-004/006
