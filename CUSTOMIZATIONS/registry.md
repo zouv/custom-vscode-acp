@@ -67,7 +67,7 @@ upstream_remote: "https://github.com/formulahendry/vscode-acp.git"
 | .gitattributes | 20260923-005 | 20260923-005 | **新增**。写 `* -text` 关闭 git 的换行转换。上游 blob 以 CRLF 入库且本机 `core.autocrlf=true`，不固定的话编辑工具一转 LF 就产生整文件伪差异、并毁掉三方合并能力（见 pitfalls #7） | keep-ours | active |
 | .agents/skills/（acp-record-change、acp-merge-upstream、acp-release） | （纯自定义目录） | 20260923-000 | 3 个 AI Agent 工作流 skill：改动登记、上游合并（适配无 tag 的 vendor/main）、打包发布（.vsix + GitHub Release） | keep-ours | active |
 | AGENTS.md | （纯自定义文件） | 20260923-000 | AI Agent 会话级硬约束摘要：必读文件、工作流、技术栈（npm/webpack）、构建命令、分支规则、自定义代码规范、skills 触发表、文档更新职责；含会话礼仪约定（回复开头称"啊唯"） | keep-ours | active |
-| .github/workflows/publish.yml | 20260923-004 | 20260923-004 | **改造为"只打包 + 上传 Release 资产"**：移除 Publish to Visual Studio Marketplace 与 Publish to Open VSX Registry 两步（上游依赖 `secrets.VSCE_PAT`/`secrets.OVSX_PAT`，本仓库无这些 secret，触发即失败）；保留 test 矩阵作为打包前门禁，job 由 `publish` 改名 `package`，`vsce` 调用改为 `npx @vscode/vsce package` | merge-manual | active |
+| .github/workflows/publish.yml | 20260923-004/006 | 20260923-004→006 | ①移除 `Publish to Visual Studio Marketplace` 与 `Publish to Open VSX Registry` 两步（上游依赖 `secrets.VSCE_PAT`/`secrets.OVSX_PAT`，本仓库无这些 secret）；②去掉 `release: created` 自动触发，改为**仅 `workflow_dispatch`**——发布主路径是本地 `gh release create`（acp-release skill），保留自动触发会在手动发布后再挂一个冗余的 `extension.vsix`；③workflow 名 `Publish` → `Package (Manual)`，job `publish` → `package`，产出改为 workflow artifact（`actions/upload-artifact`），**完全不接触 GitHub Release**；④`npx vsce` → `npx @vscode/vsce`。**文件名刻意保留 publish.yml**（上游也有此文件，改名会产生 delete/modify 冲突） | merge-manual | active |
 | .github/workflows/ci.yml | （**未改动**，上游原样保留） | — | 上游 CI 原样保留：push/PR 触发，三平台矩阵跑 `npm ci` + `npm test` 并上传 `.vsix` 构建产物。无需改动 | keep-theirs | active |
 
 ---
@@ -75,6 +75,13 @@ upstream_remote: "https://github.com/formulahendry/vscode-acp.git"
 ## 变更日志
 
 > 按时间倒序 append-only，只增不改。
+
+### 2026-09-23 - CUSTOM-20260923-006
+- **功能**：`publish.yml` 改为纯手动打包，去掉与手动发布重复的自动触发
+- **改动文件**：`.github/workflows/publish.yml`
+- **详细说明**：v0.2.0-custom.1 发布后暴露的一个设计冗余——`publish.yml` 原以 `release: created` 自动触发并挂 `.vsix` 到 Release，而本仓库的发布主路径是本地 `gh release create`（acp-release skill）。两者并存会让每次发布都多挂一个名为 `extension.vsix` 的冗余名资产。现改为：**仅 `workflow_dispatch` 手动触发**，产出 workflow artifact，**完全不接触 GitHub Release**；workflow 名 `Publish` → `Package (Manual)`，job `publish` → `package`，上传步骤从 `softprops/action-gh-release` 换成 `actions/upload-artifact@v4`。**文件名刻意保留 `publish.yml`**：它是上游也有的文件，改名会让后续合并上游产生 delete/modify 冲突。
+- **验证方式**：js-yaml 解析确认 `triggers = {workflow_dispatch}`、无 release/marketplace/softprops 残留（排除注释行）；换行符仍为 CRLF（用 Edit 工具而非 Write，避免踩 pitfalls #7）
+- **基于上游版本**：0.2.0（commit e7371659）
 
 ### 2026-09-23 - CUSTOM-20260923-005
 - **功能**：固定换行符处理，修复整文件伪差异（首次提交前发现，属阻断性问题）
