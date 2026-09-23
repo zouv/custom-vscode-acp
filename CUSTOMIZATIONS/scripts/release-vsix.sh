@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # release-vsix.sh — 把源码打成 .vsix（终点：release/zouv.acp-client-custom-<版本>.vsix）
-# 用法（Git Bash）：sh CUSTOMIZATIONS/scripts/release-vsix.sh 0.2.0-custom.1
+# 用法（Git Bash）：bash CUSTOMIZATIONS/scripts/release-vsix.sh 0.2.0-custom.1
 #
 # 只负责「源码 → 产物」。发布到 GitHub Release 用 acp-release skill 的后半段（gh release create）。
 # =============================================================================
@@ -12,8 +12,8 @@ cd "$PROJECT_ROOT"
 
 VERSION="${1:-}"
 if [[ -z "$VERSION" ]]; then
-  echo "用法: sh CUSTOMIZATIONS/scripts/release-vsix.sh <版本号>"
-  echo "示例: sh CUSTOMIZATIONS/scripts/release-vsix.sh 0.2.0-custom.1"
+  echo "用法: bash CUSTOMIZATIONS/scripts/release-vsix.sh <版本号>"
+  echo "示例: bash CUSTOMIZATIONS/scripts/release-vsix.sh 0.2.0-custom.1"
   echo ""
   echo "已有 tag："
   git tag -l "v*-custom.*" --sort=-v:refname | head -5 || echo "  (还没有)"

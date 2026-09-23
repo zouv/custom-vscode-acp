@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # check-registry.sh — 代码 CUSTOM 标记 ↔ registry.md 改动总览 一致性自检
-# 用法（Git Bash）：sh CUSTOMIZATIONS/scripts/check-registry.sh
+# 用法（Git Bash）：bash CUSTOMIZATIONS/scripts/check-registry.sh
 # 退出码：0 一致；1 有差异（按提示修文档或补标记）
 #
 # 注意：本文件自身含 "CUSTOM-BEGIN" 字面量，会被扫描到；它由总览里的

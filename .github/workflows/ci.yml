@@ -1,10 +1,15 @@
+# [CUSTOM-BEGIN] CUSTOM-20260923-007 - 触发分支改为 custom/main；新增机制自检
+# 上游盯的是 main，但本仓库是 fork，默认与开发分支是 custom/main，根本没有 main
+# 分支 —— 原配置导致 CI 从未触发过。vendor/main 是上游只读镜像，由 sync-vendor.ps1
+# 推进，不需要跑 CI。
 name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [custom/main]
   pull_request:
-    branches: [main]
+    branches: [custom/main]
+# [CUSTOM-END] CUSTOM-20260923-007
 
 jobs:
   build:
@@ -23,6 +28,14 @@ jobs:
 
       - run: npm ci
 
+      # [CUSTOM-BEGIN] CUSTOM-20260923-007 - 机制自检（代码标记↔账本 / 命名空间 / 换行符）
+      # 必须用 bash 而非 sh：脚本用了 declare -A / [[ ]] / pipefail 等 bash 专有特性，
+      # Ubuntu runner 的 sh 是 dash，会直接报错。
+      # 放在三平台矩阵里是有意的 —— 顺带验证换行符规则在 Linux/macOS 上也成立。
+      - name: Check custom-development invariants
+        run: bash CUSTOMIZATIONS/scripts/check-registry.sh
+      # [CUSTOM-END] CUSTOM-20260923-007
+
       - run: xvfb-run -a npm test
         if: runner.os == 'Linux'
 
@@ -30,7 +43,7 @@ jobs:
         if: runner.os != 'Linux'
 
       - name: Package VSIX
-        run: npx vsce package
+        run: npx @vscode/vsce package
 
       - name: Upload VSIX
         uses: actions/upload-artifact@v4

@@ -42,7 +42,7 @@ CUSTOMIZATIONS/
 | **改动总览** | 按文件（一文件一节，多轮演进合并） | "这个文件现在改了什么？冲突策略？" | 已有该文件就更新该节，演进链追加 id |
 | **变更日志** | 按次（时间倒序 append-only） | "何时/为何/怎么验证" | 顶部追加，永不改写历史 |
 
-总览与代码 `[CUSTOM-BEGIN]` 标记一一对应（同一文件的"当前状态"镜像），`sh CUSTOMIZATIONS/scripts/check-registry.sh` 做双向一致性自检——**每次登记后必须跑到全绿**。
+总览与代码 `[CUSTOM-BEGIN]` 标记一一对应（同一文件的"当前状态"镜像），`bash CUSTOMIZATIONS/scripts/check-registry.sh` 做双向一致性自检——**每次登记后必须跑到全绿**。
 
 ## 必须遵守的铁律
 
@@ -135,8 +135,8 @@ pwsh ./CUSTOMIZATIONS/scripts/list-custom.ps1
 pwsh ./CUSTOMIZATIONS/scripts/sync-vendor.ps1 -Ref upstream/main -Push
 
 # 打包 .vsix（编译 + lint + 测试 + vsce package）
-sh ./CUSTOMIZATIONS/scripts/release-vsix.sh 0.2.0-custom.0
+bash ./CUSTOMIZATIONS/scripts/release-vsix.sh 0.2.0-custom.0
 
 # 登记一致性自检（代码标记 ↔ 改动总览，必须全绿）
-sh ./CUSTOMIZATIONS/scripts/check-registry.sh
+bash ./CUSTOMIZATIONS/scripts/check-registry.sh
 ```
