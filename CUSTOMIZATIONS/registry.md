@@ -1,10 +1,10 @@
 ---
 current_upstream_version: "0.2.0"
 current_upstream_commit: "e7371659e3ac100db842b419b1361205a193032e"
-custom_version: ""
+custom_version: "0.2.0-custom.1"
 last_merge_date: "2026-09-23"
-last_release_version: ""
-last_release_date: ""
+last_release_version: "v0.2.0-custom.1"
+last_release_date: "2026-09-23"
 vendor_branch: "vendor/main"
 upstream_remote: "https://github.com/formulahendry/vscode-acp.git"
 ---
@@ -33,7 +33,7 @@ upstream_remote: "https://github.com/formulahendry/vscode-acp.git"
 - **当前基于上游 Commit**：e7371659e3ac100db842b419b1361205a193032e（**唯一定位依据**）
 - **当前 Vendor 分支**：vendor/main
 - **最近一次上游合并**：2026-09-23
-- **最近一次发布版本**：（尚未发布）
+- **最近一次发布版本**：v0.2.0-custom.1（2026-09-23）
 
 ---
 
