@@ -28,13 +28,15 @@ jobs:
 
       - run: npm ci
 
-      # [CUSTOM-BEGIN] CUSTOM-20260923-007 - 机制自检（代码标记↔账本 / 命名空间 / 换行符）
-      # 必须用 bash 而非 sh：脚本用了 declare -A / [[ ]] / pipefail 等 bash 专有特性，
-      # Ubuntu runner 的 sh 是 dash，会直接报错。
+      # [CUSTOM-BEGIN] CUSTOM-20260923-007/008 - 机制自检（代码标记↔账本 / 命名空间 / 换行符）
+      # 用 node 调用：自检脚本从 bash 移植到了 Node（008）。原因见下 ——
+      # bash 版用了关联数组 declare -A，而 **macOS 自带 bash 3.2** 不支持，
+      # 在 macos-latest 上直接 `declare: -A: invalid option` 失败。
+      # Node 在本项目是硬依赖（npm install 是前置），三平台行为一致。
       # 放在三平台矩阵里是有意的 —— 顺带验证换行符规则在 Linux/macOS 上也成立。
       - name: Check custom-development invariants
-        run: bash CUSTOMIZATIONS/scripts/check-registry.sh
-      # [CUSTOM-END] CUSTOM-20260923-007
+        run: node CUSTOMIZATIONS/scripts/check-registry.mjs
+      # [CUSTOM-END] CUSTOM-20260923-007/008
 
       - run: xvfb-run -a npm test
         if: runner.os == 'Linux'

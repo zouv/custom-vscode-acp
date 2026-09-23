@@ -22,7 +22,7 @@ upstream_remote: "https://github.com/formulahendry/vscode-acp.git"
 > 2. 完成改动后调用 `acp-record-change` skill：**总览里已有该文件就更新那一节**（合并描述、追加演进链 id），没有就新增一节；变更日志追加一轮记录
 > 3. 合并上游时按总览的冲突策略列处理；**合并后必须重新执行 `acp.*` → `acpc.*` 命名空间扫描**（见 README 冲突策略节）
 > 4. 不要删除历史（总览条目整体废弃时标 deprecated，变更日志永不删改）
-> 5. 一致性自检：`bash CUSTOMIZATIONS/scripts/check-registry.sh`（代码标记 ↔ 总览表双向比对；CI 上也会跑）
+> 5. 一致性自检：`node CUSTOMIZATIONS/scripts/check-registry.mjs`（代码标记 ↔ 总览表双向比对；CI 上也会跑）
 
 ---
 
@@ -63,18 +63,39 @@ upstream_remote: "https://github.com/formulahendry/vscode-acp.git"
 | src/core/SessionHistoryStore.ts | （**故意保留 `acp.sessionHistory.v1`，非改动文件**） | — | 未改动。`STATE_KEY` 是 `workspaceState` 的 Memento key，扩展内作用域，不与上游冲突；改名会导致既有会话历史丢失。见 `architecture.md §4` 与 pitfalls #4 | keep-ours | active |
 | src/core/ConnectionManager.ts | （**故意保留 `vscode-acp-client`，非改动文件**） | — | 未改动。`clientInfo.name` 是 ACP `initialize` 上报给 agent 的客户端名，协议元数据，非全局命名空间。见 pitfalls #4 | keep-ours | active |
 | CUSTOMIZATIONS/（README.md、registry.md、architecture.md、docs/pitfalls.md、release-notes/、src/、patches/） | （纯自定义目录） | 20260923-000 | 自定义开发机制：规则唯一源 + 改动账本 + 代码地图 + 坑点库。移植自 zouv/custom-chatbox 并按 VS Code 扩展语境适配（npm / webpack / .vsix / 上游无 tag） | keep-ours | active |
-| CUSTOMIZATIONS/scripts/（init-repo.ps1、sync-vendor.ps1、list-custom.ps1、check-registry.sh、release-vsix.sh、normalize-eol.mjs） | （纯自定义目录，逐文件标记非必需） | 20260923-000→005 | 仓库基线初始化、vendor 同步（`-Ref` 代替 `-Version`）、改动清单查询、标记↔账本一致性自检（含命名空间卫生与换行符两项）、.vsix 打包封装、换行符归一化工具 | keep-ours | active |
+| CUSTOMIZATIONS/scripts/（init-repo.ps1、sync-vendor.ps1、list-custom.ps1、check-registry.mjs、release-vsix.sh、normalize-eol.mjs） | （纯自定义目录，逐文件标记非必需） | 20260923-000→005→008 | 仓库基线初始化、vendor 同步（`-Ref` 代替 `-Version`）、改动清单查询、标记↔账本一致性自检（含命名空间卫生与换行符两项，**Node 实现**）、.vsix 打包封装、换行符归一化工具 | keep-ours | active |
 | .gitattributes | 20260923-005 | 20260923-005 | **新增**。写 `* -text` 关闭 git 的换行转换。上游 blob 以 CRLF 入库且本机 `core.autocrlf=true`，不固定的话编辑工具一转 LF 就产生整文件伪差异、并毁掉三方合并能力（见 pitfalls #7） | keep-ours | active |
 | .agents/skills/（acp-record-change、acp-merge-upstream、acp-release） | （纯自定义目录） | 20260923-000 | 3 个 AI Agent 工作流 skill：改动登记、上游合并（适配无 tag 的 vendor/main）、打包发布（.vsix + GitHub Release） | keep-ours | active |
 | AGENTS.md | （纯自定义文件） | 20260923-000 | AI Agent 会话级硬约束摘要：必读文件、工作流、技术栈（npm/webpack）、构建命令、分支规则、自定义代码规范、skills 触发表、文档更新职责；含会话礼仪约定（回复开头称"啊唯"） | keep-ours | active |
 | .github/workflows/publish.yml | 20260923-004/006 | 20260923-004→006 | ①移除 `Publish to Visual Studio Marketplace` 与 `Publish to Open VSX Registry` 两步（上游依赖 `secrets.VSCE_PAT`/`secrets.OVSX_PAT`，本仓库无这些 secret）；②去掉 `release: created` 自动触发，改为**仅 `workflow_dispatch`**——发布主路径是本地 `gh release create`（acp-release skill），保留自动触发会在手动发布后再挂一个冗余的 `extension.vsix`；③workflow 名 `Publish` → `Package (Manual)`，job `publish` → `package`，产出改为 workflow artifact（`actions/upload-artifact`），**完全不接触 GitHub Release**；④`npx vsce` → `npx @vscode/vsce`。**文件名刻意保留 publish.yml**（上游也有此文件，改名会产生 delete/modify 冲突） | merge-manual | active |
-| .github/workflows/ci.yml | 20260923-007 | 20260923-007 | ①**修 CI 完全失效的问题**：上游触发分支是 `[main]`，但本仓库（fork）没有 `main` 分支（默认与开发分支是 `custom/main`），导致 CI 从未触发过——改为 `[custom/main]`；②新增「Check custom-development invariants」步骤跑 `check-registry.sh`（代码标记↔账本 / 命名空间卫生 / 换行符卫生），把机制约束从口头约定变成 CI 强制；③`npx vsce package` → `npx @vscode/vsce package`。**必须用 `bash` 而非 `sh` 调用脚本**（脚本含 `declare -A` / `[[ ]]` / `pipefail`，Ubuntu runner 的 `sh` 是 dash 会报错） | merge-manual | active |
+| .github/workflows/ci.yml | 20260923-007/008 | 20260923-007→008 | ①**修 CI 完全失效的问题**：上游触发分支是 `[main]`，但本仓库（fork）没有 `main` 分支（默认与开发分支是 `custom/main`），导致 CI 从未触发过——改为 `[custom/main]`；②新增「Check custom-development invariants」步骤，用 **`node CUSTOMIZATIONS/scripts/check-registry.mjs`** 跑机制自检（代码标记↔账本 / 命名空间卫生 / 换行符卫生），把约束从口头约定变成 CI 强制；③`npx vsce package` → `npx @vscode/vsce package`。放在三平台矩阵里是有意的——**正是它在 macos-latest 上暴露了自检脚本的 bash 3.2 不兼容**（见 008） | merge-manual | active |
 
 ---
 
 ## 变更日志
 
 > 按时间倒序 append-only，只增不改。
+
+### 2026-09-23 - CUSTOM-20260923-008
+- **功能**：自检脚本从 bash 移植到 Node —— 修 macOS 兼容性（007 的 CI 直接抓出来的）
+- **改动文件**：`CUSTOMIZATIONS/scripts/check-registry.mjs`（新增，取代 .sh）、`CUSTOMIZATIONS/scripts/check-registry.sh`（删除）、`.github/workflows/ci.yml`、`CUSTOMIZATIONS/README.md`、`CUSTOMIZATIONS/docs/pitfalls.md`、`.agents/skills/（acp-record-change、acp-merge-upstream、acp-release）`、`CUSTOMIZATIONS/scripts/list-custom.ps1`
+- **详细说明**：
+  - **问题**：007 把机制自检接进 CI 的三平台矩阵后，**macos-latest 立刻失败**：
+    `check-registry.sh: line 17: declare: -A: invalid option`。
+    根因是 **macOS 自带 bash 3.2**（2007 年版，苹果因 GPLv3 一直未升级），不支持关联数组 `declare -A`；
+    本地 Git Bash 是 bash 5，所以在本机永远发现不了。
+  - **解法**：整个自检脚本移植为 **Node**（`check-registry.mjs`），删除 bash 版。
+    理由：①Node 在本项目是硬依赖（`npm install` 是前置步骤）；②`normalize-eol.mjs` 已有先例；
+    ③彻底消除 Windows/Linux/macOS 的 shell 方言差异——而 CI 恰恰是三平台跑的。
+    逻辑完全保留四节（标记↔账本 / 反向校验 / 命名空间卫生 / 换行符卫生），
+    输出格式与退出码不变。
+  - **移植中的一个自伤**：初版 `walk()` 只返回文件列表却没把结果传给 `collect()`，
+    导致含标记文件数从 12 误报成 2。**靠与 bash 版对照计数**才发现——
+    这条验证手段值得保留。
+  - **验证手段**：用**反向测试**确认检测有效（临时删掉 `src/extension.ts` 那一行 →
+    脚本报 `[MISSING-IN-DOC]` 并退出 1 → 还原后全绿）。
+- **验证方式**：Node 版与 bash 版输出一致（均为 12 个含标记文件）；反向测试能正确检出遗漏并返回 1；还原后 `git diff` 无残留；`grep -rn "check-registry.sh"` 仅剩历史变更日志条目
+- **基于上游版本**：0.2.0（commit e7371659）
 
 ### 2026-09-23 - CUSTOM-20260923-007
 - **功能**：修复 CI 完全失效的问题；把机制自检接入 CI；脚本调用从 `sh` 改为 `bash`
