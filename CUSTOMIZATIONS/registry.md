@@ -82,7 +82,7 @@ upstream_remote: "https://github.com/formulahendry/vscode-acp.git"
 - **详细说明**：
   - **问题**：上游 `formulahendry/vscode-acp` 的 blob **以 CRLF 入库**（仓库无 `.gitattributes`），本机 `core.autocrlf=true`。`sed -i`、`Write` 工具、`npm install` 均产出 LF，把 12 个已跟踪文件转成了 LF，导致 `git diff --stat` 出现 14339 插入 / 12788 删除的伪差异（`ChatWebviewProvider.ts` 显示 5121 行变更，实际只改了 4 行）。**真正的危害是后续每次合并上游都会变成全文件冲突**，三方合并能力彻底丧失。
   - **修复**：①新增 `.gitattributes` 写 `* -text`（关闭 EOL 转换、按字节原样存取，`-text` 不影响 diff/merge）；②新增 `normalize-eol.mjs` 做批量归一化与 `--check` 自检；③把 12 个被翻转的文件转回 CRLF。
-  - **防复发**：`check-registry.sh` 新增 §4 换行符卫生检查；`release-vsix.sh` 在 `npm install` 后自动把 `package-lock.json` 转回 CRLF；`acp-merge-upstream` skill 的验证步骤前置归一化。
+  - **防复发**：`check-registry.sh` 新增 §4 换行符卫生检查；`release-vsix.sh` 在 `npm install` 后自动把 `package.json` 与 `package-lock.json` 转回 CRLF（写版本号的 node 脚本与 npm install 都产出 LF）；`acp-merge-upstream` skill 的验证步骤前置归一化。
   - **判据分两类**（修的过程中踩到的第二个坑）：**上游共有文件**（`src/`、`package*.json`、`.github/`、`.gitignore`、`.vscodeignore` …）必须 CRLF；**纯自定义路径**（`CUSTOMIZATIONS/`、`.agents/`、`AGENTS.md`、`.gitattributes`）必须 LF——带 CRLF 的 `.sh` 在 Linux/macOS 上会执行失败。第一版 `normalize-eol.mjs` 一刀切成 CRLF，提交后自检立刻抓到 `sync-vendor.ps1` 被误判，已补 `CUSTOM_ONLY` 判据。
   - **测量教训**：Git Bash 的 `grep -U $'\r'` 仍可能走文本模式，读数不可靠（本次被误导过一次），须用 node 直接读字节。
 - **验证方式**：`node CUSTOMIZATIONS/scripts/normalize-eol.mjs --check` → 40 个文件全部 CRLF；`git diff --numstat src/extension.ts` 从 `544/544` 降至 `35/30`；`git diff --stat` 全仓从 14339/12788 降至 228/378

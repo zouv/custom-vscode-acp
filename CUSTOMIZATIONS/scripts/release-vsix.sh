@@ -58,9 +58,9 @@ echo ""
 echo "[3/6] npm install（确保依赖与锁文件一致）"
 npm install --silent
 
-# npm 会把 package-lock.json 重写成 LF，与上游的 CRLF blob 不一致，
-# 会产生整文件伪差异。这里立刻归一化回来（见 pitfalls #7）。
-node CUSTOMIZATIONS/scripts/normalize-eol.mjs package-lock.json
+# 本步骤的 node 写版本号、以及 npm install 都会产出 LF，与上游的 CRLF blob 不一致，
+# 会造成整文件伪差异（见 pitfalls #7）。立刻归一化回来。
+node CUSTOMIZATIONS/scripts/normalize-eol.mjs package.json package-lock.json
 
 echo ""
 echo "[4/6] lint + 编译 + 测试"
