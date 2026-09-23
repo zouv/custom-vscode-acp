@@ -135,7 +135,7 @@
   1. 加 `.gitattributes` 写 `* -text`：关闭 git 的换行转换，按字节原样存取，
      保证本地 blob 与上游 blob 逐字节可比对（`-text` 只关 EOL 转换，不影响 diff/merge）；
   2. `CUSTOMIZATIONS/scripts/normalize-eol.mjs` 做批量归一化 + `--check` 只读自检；
-  3. 自检接入 `check-registry.sh` §4；`release-vsix.sh` 在 `npm install` 之后自动把 `package-lock.json` 转回 CRLF。
+  3. 自检接入 `check-registry.mjs` §4；`release-vsix.sh` 在 `npm install` 之后自动把 `package-lock.json` 转回 CRLF。
 - **判据（两类文件，别一刀切）**——修的过程中踩到的第二个坑：
 
   | 类别 | 路径 | 换行 | 理由 |
@@ -156,3 +156,31 @@
      才补上 CUSTOM_ONLY 判据。好在自检脚本在提交后立刻暴露了它。
 - **验证**：`node CUSTOMIZATIONS/scripts/normalize-eol.mjs --check` 报"全部 36 个上游共有文件一致（CRLF）"；
   `git diff --numstat src/extension.ts` 从 `544/544` 降到真实改动量。
+
+## 8. macOS 自带 bash 3.2 → `declare -A` 报 "invalid option"（本地永远复现不了）
+
+- **日期**：2026-09-23（把自检接进 CI 三平台矩阵后立刻被 macos-latest 抓出，CUSTOM-20260923-008）
+- **现象**：CI 里 ubuntu 与 windows 都过，**macos-latest 挂在自检步骤**：
+  ```
+  check-registry.sh: line 17: declare: -A: invalid option
+  declare: usage: declare [-afFirtx] [-p] [name[=value] ...]
+  ##[error]Process completed with exit code 2.
+  ```
+- **根因**：**macOS 自带的 `/bin/bash` 是 3.2 版（2007 年）**——苹果因 GPLv3 授权问题一直没升级它。
+  关联数组 `declare -A` 需要 bash 4.0+，所以直接不可用。
+  而开发机上的 Git Bash 是 bash 5.x，**本地怎么跑都是绿的**，问题只会在 CI（或别人的 Mac）上出现。
+- **解法**：把自检脚本整体**移植到 Node**（`check-registry.mjs`），删掉 bash 版。
+  选 Node 而不是"绕开关联数组改写 bash"的理由：
+  1. Node 在本项目是**硬依赖**（`npm install` 是前置步骤，不可能没有）；
+  2. 项目里 `normalize-eol.mjs` 已有先例，语言统一；
+  3. 一次性消除 Windows / Linux / macOS 的 **shell 方言**差异——而 CI 恰恰是三平台跑的。
+- **教训**：
+  1. **shell 脚本的可移植性比想象中差得多**：关联数组、`mapfile`、`sed -i` 语义、`grep -P`……
+     在 macOS(BSD) 与 Linux(GNU) 上差异一堆，而 macOS 还锁在 bash 3.2。
+     **凡是 CI 要在多平台跑的脚本，优先用 Node/Python，别用 bash**；
+  2. **"本地能跑"不等于"能跑"**——本地 Git Bash 是 bash 5，掩盖了 macOS 的问题。
+     把检查放进多平台 CI 的价值就在这里：**这次是 CI 替我们发现的，不是用户**；
+  3. 移植脚本时要**对照原实现验证等价性**（本次移植初版有 bug，含标记文件数从 12 误报成 2，
+     靠与 bash 版对照计数才发现），并用**反向测试**（故意破坏 → 确认能报错 → 还原）证明检测真的有效。
+- **验证**：`node CUSTOMIZATIONS/scripts/check-registry.mjs` 输出与 bash 版一致（12 个含标记文件）；
+  CI 三平台全绿。

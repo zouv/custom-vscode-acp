@@ -36,7 +36,7 @@ git status --porcelain       # 必须干净（release-vsix.sh 会拦）
 
 工作区不干净 → 先让用户提交或 stash。**不要在脏工作区上打包**。
 
-同时确认 registry.md 里的自定义改动都已登记（`bash CUSTOMIZATIONS/scripts/check-registry.sh` 全绿）。
+同时确认 registry.md 里的自定义改动都已登记（`node CUSTOMIZATIONS/scripts/check-registry.mjs` 全绿）。
 
 ---
 

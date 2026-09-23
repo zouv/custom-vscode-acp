@@ -33,7 +33,7 @@ description: "记录自定义改动到 CUSTOMIZATIONS/registry.md。Invoke when 
 | 文件格式不支持注释 | `package.json`、`package-lock.json` | `（JSON 不支持注释，已知无标记缺口）` |
 | 测试文件 | `src/test/*.test.ts` | `（测试文件，无标记）` |
 | 全局性重命名（散落全文） | `acp.*` → `acpc.*` | 填 change-id；标记加在**文件头**而不是逐处包裹 |
-| **未改动的"故意保留"说明行** | `SessionHistoryStore.ts`（Memento key 保留） | 该行必须含 **`未改动`** 或 **`非改动`** 字样，否则 `check-registry.sh` 会报 NO-MARKER |
+| **未改动的"故意保留"说明行** | `SessionHistoryStore.ts`（Memento key 保留） | 该行必须含 **`未改动`** 或 **`非改动`** 字样，否则 `check-registry.mjs` 会报 NO-MARKER |
 
 ## 执行流程
 
@@ -90,7 +90,7 @@ git ls-files --others --exclude-standard
 ### 第五步：一致性自检（必须执行）
 
 ```bash
-bash CUSTOMIZATIONS/scripts/check-registry.sh
+node CUSTOMIZATIONS/scripts/check-registry.mjs
 ```
 
 脚本做三件事，**退出码非 0 必须修到全绿才算登记完成**：
@@ -125,5 +125,5 @@ git commit -m "feat(custom): <简要描述> (CUSTOM-YYYYMMDD-NNN)"
 向用户报告：
 - 本轮 change-id、涉及的文件
 - 总览更新了哪些既有节 / 新增了哪些节（体现"合并而非堆叠"）
-- check-registry.sh 校验结果（全绿）
+- check-registry.mjs 校验结果（全绿）
 - 变更日志当前条目数
