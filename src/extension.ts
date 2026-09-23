@@ -1,3 +1,6 @@
+// [CUSTOM-BEGIN] CUSTOM-20260923-001 - 全局命名空间重命名 acp.* → acpc.*：本文件内的命令 id / 视图 id / 配置键 / 输出通道名已改名。
+// 上游合并后，若本文件出现新的 acp.* 引用，需按 CUSTOMIZATIONS/docs/pitfalls.md 重新应用重命名。
+// [CUSTOM-END] CUSTOM-20260923-001
 import * as vscode from 'vscode';
 
 import { AgentManager } from './core/AgentManager';
@@ -40,7 +43,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // --- UI ---
   const workspaceCwd = () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   const sessionTreeProvider = new SessionTreeProvider(sessionManager, historyStore, workspaceCwd);
-  const treeView = vscode.window.createTreeView('acp-sessions', {
+  const treeView = vscode.window.createTreeView('acpc-sessions', {
     treeDataProvider: sessionTreeProvider,
   });
 
@@ -106,7 +109,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // --- Commands ---
 
   // Connect to Agent (primary action — inline icon in tree or pick from list)
-  const connectAgentCmd = vscode.commands.registerCommand('acp.connectAgent', async (agentNameOrItem?: string | any) => {
+  const connectAgentCmd = vscode.commands.registerCommand('acpc.connectAgent', async (agentNameOrItem?: string | any) => {
     // Handle tree item object or string
     let agentName: string | undefined;
     if (typeof agentNameOrItem === 'string') {
@@ -160,11 +163,11 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   // New Conversation (disconnect + clear chat + reconnect same agent)
-  const newConversationCmd = vscode.commands.registerCommand('acp.newConversation', async () => {
+  const newConversationCmd = vscode.commands.registerCommand('acpc.newConversation', async () => {
     const activeSession = sessionManager.getActiveSession();
     if (!activeSession) {
       // No active agent — fall back to connect
-      await vscode.commands.executeCommand('acp.connectAgent');
+      await vscode.commands.executeCommand('acpc.connectAgent');
       return;
     }
 
@@ -196,7 +199,7 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   // Disconnect Agent
-  const disconnectAgentCmd = vscode.commands.registerCommand('acp.disconnectAgent', async (item?: any) => {
+  const disconnectAgentCmd = vscode.commands.registerCommand('acpc.disconnectAgent', async (item?: any) => {
     const agentName = item?.agentName || sessionManager.getActiveAgentName();
     if (!agentName) {
       vscode.window.showInformationMessage('No agent connected.');
@@ -207,17 +210,17 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   // Open Chat
-  const openChatCmd = vscode.commands.registerCommand('acp.openChat', () => {
-    vscode.commands.executeCommand('acp-chat.focus');
+  const openChatCmd = vscode.commands.registerCommand('acpc.openChat', () => {
+    vscode.commands.executeCommand('acpc-chat.focus');
   });
 
   // Send Prompt (from keybinding — just focus chat)
-  const sendPromptCmd = vscode.commands.registerCommand('acp.sendPrompt', async () => {
-    vscode.commands.executeCommand('acp-chat.focus');
+  const sendPromptCmd = vscode.commands.registerCommand('acpc.sendPrompt', async () => {
+    vscode.commands.executeCommand('acpc-chat.focus');
   });
 
   // Cancel Turn
-  const cancelTurnCmd = vscode.commands.registerCommand('acp.cancelTurn', async () => {
+  const cancelTurnCmd = vscode.commands.registerCommand('acpc.cancelTurn', async () => {
     const activeId = sessionManager.getActiveSessionId();
     if (activeId) {
       try {
@@ -229,7 +232,7 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   // Restart Agent
-  const restartAgentCmd = vscode.commands.registerCommand('acp.restartAgent', async () => {
+  const restartAgentCmd = vscode.commands.registerCommand('acpc.restartAgent', async () => {
     const activeSession = sessionManager.getActiveSession();
     if (!activeSession) { return; }
 
@@ -253,19 +256,19 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   // Show Log
-  const showLogCmd = vscode.commands.registerCommand('acp.showLog', () => {
+  const showLogCmd = vscode.commands.registerCommand('acpc.showLog', () => {
     sendEvent('command/showLog');
     getOutputChannel().show();
   });
 
   // Show Traffic
-  const showTrafficCmd = vscode.commands.registerCommand('acp.showTraffic', () => {
+  const showTrafficCmd = vscode.commands.registerCommand('acpc.showTraffic', () => {
     sendEvent('command/showTraffic');
     getTrafficChannel().show();
   });
 
   // Set Mode
-  const setModeCmd = vscode.commands.registerCommand('acp.setMode', async (modeId?: string) => {
+  const setModeCmd = vscode.commands.registerCommand('acpc.setMode', async (modeId?: string) => {
     const activeId = sessionManager.getActiveSessionId();
     if (!activeId) { return; }
 
@@ -285,7 +288,7 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   // Set Model
-  const setModelCmd = vscode.commands.registerCommand('acp.setModel', async (modelId?: string) => {
+  const setModelCmd = vscode.commands.registerCommand('acpc.setModel', async (modelId?: string) => {
     const activeId = sessionManager.getActiveSessionId();
     if (!activeId) { return; }
 
@@ -305,19 +308,19 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   // Refresh Agents tree
-  const refreshAgentsCmd = vscode.commands.registerCommand('acp.refreshAgents', () => {
+  const refreshAgentsCmd = vscode.commands.registerCommand('acpc.refreshAgents', () => {
     sessionTreeProvider.refresh();
   });
 
   // Refresh sessions for an agent (or all agents). Invalidates the cached
   // session-list state so the next expansion re-runs `session/list`.
-  const refreshSessionsCmd = vscode.commands.registerCommand('acp.refreshSessions', (arg?: any) => {
+  const refreshSessionsCmd = vscode.commands.registerCommand('acpc.refreshSessions', (arg?: any) => {
     const agentName = typeof arg === 'string' ? arg : arg?.agentName;
     sessionTreeProvider.invalidate(agentName);
   });
 
   // Open (load or resume) a previously-existing session.
-  const openSessionCmd = vscode.commands.registerCommand('acp.openSession', async (arg?: any) => {
+  const openSessionCmd = vscode.commands.registerCommand('acpc.openSession', async (arg?: any) => {
     const agentName: string | undefined = arg?.agentName;
     const sessionId: string | undefined = arg?.sessionId;
     if (!agentName || !sessionId) {
@@ -327,7 +330,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
     // No-op if it is already the active session.
     if (sessionManager.getActiveSessionId() === sessionId) {
-      vscode.commands.executeCommand('acp-chat.focus');
+      vscode.commands.executeCommand('acpc-chat.focus');
       return;
     }
 
@@ -342,7 +345,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }
 
     try {
-      await vscode.commands.executeCommand('acp-chat.focus');
+      await vscode.commands.executeCommand('acpc-chat.focus');
       // Decide load vs resume based on capabilities. Prefer load (replays
       // history) for the richer experience.
       const caps = sessionManager.getCachedCapabilities(agentName);
@@ -372,13 +375,13 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   // Pagination cursor: append the next page to the agent-sourced list.
-  const loadMoreSessionsCmd = vscode.commands.registerCommand('acp.loadMoreSessions', async (agentName?: string) => {
+  const loadMoreSessionsCmd = vscode.commands.registerCommand('acpc.loadMoreSessions', async (agentName?: string) => {
     if (!agentName) { return; }
     await sessionTreeProvider.loadMore(agentName);
   });
 
   // Copy session ID to clipboard (right-click on a session tree item).
-  const copySessionIdCmd = vscode.commands.registerCommand('acp.copySessionId', async (arg?: any) => {
+  const copySessionIdCmd = vscode.commands.registerCommand('acpc.copySessionId', async (arg?: any) => {
     const sessionId = arg?.sessionId;
     if (!sessionId) { return; }
     await vscode.env.clipboard.writeText(sessionId);
@@ -386,7 +389,7 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   // Forget a single locally-cached session (right-click on a local session).
-  const forgetSessionCmd = vscode.commands.registerCommand('acp.forgetSession', async (arg?: any) => {
+  const forgetSessionCmd = vscode.commands.registerCommand('acpc.forgetSession', async (arg?: any) => {
     const agentName = arg?.agentName;
     const sessionId = arg?.sessionId;
     if (!agentName || !sessionId) { return; }
@@ -394,7 +397,7 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   // Add Agent Configuration
-  const addAgentCmd = vscode.commands.registerCommand('acp.addAgent', async () => {
+  const addAgentCmd = vscode.commands.registerCommand('acpc.addAgent', async () => {
     const name = await vscode.window.showInputBox({
       prompt: 'Agent name',
       placeHolder: 'my-agent',
@@ -416,7 +419,7 @@ export function activate(context: vscode.ExtensionContext): void {
     });
     const args = argsStr ? argsStr.split(/\s+/) : [];
 
-    const config = vscode.workspace.getConfiguration('acp');
+    const config = vscode.workspace.getConfiguration('acpc');
     const agents: Record<string, any> = { ...(config.get<Record<string, any>>('agents') || {}) };
     agents[name] = { command, args };
     await config.update('agents', agents, vscode.ConfigurationTarget.Global);
@@ -426,8 +429,8 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   // Remove Agent
-  const removeAgentCmd = vscode.commands.registerCommand('acp.removeAgent', async (item?: any) => {
-    const config = vscode.workspace.getConfiguration('acp');
+  const removeAgentCmd = vscode.commands.registerCommand('acpc.removeAgent', async (item?: any) => {
+    const config = vscode.workspace.getConfiguration('acpc');
     const agents: Record<string, any> = { ...(config.get<Record<string, any>>('agents') || {}) };
     const agentNames = Object.keys(agents);
     if (agentNames.length === 0) {
@@ -459,7 +462,7 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   // Attach File
-  const attachFileCmd = vscode.commands.registerCommand('acp.attachFile', async () => {
+  const attachFileCmd = vscode.commands.registerCommand('acpc.attachFile', async () => {
     const uris = await vscode.window.showOpenDialog({
       canSelectMany: false,
       openLabel: 'Attach',
@@ -471,7 +474,7 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   // Browse Registry
-  const browseRegistryCmd = vscode.commands.registerCommand('acp.browseRegistry', async () => {
+  const browseRegistryCmd = vscode.commands.registerCommand('acpc.browseRegistry', async () => {
     sendEvent('registry/browse');
     try {
       const agents = await fetchRegistry();
@@ -530,7 +533,9 @@ export function activate(context: vscode.ExtensionContext): void {
     },
   );
 
-  sendEvent('extension/activated', { version: vscode.extensions.getExtension('formulahendry.acp-client')?.packageJSON?.version ?? 'unknown' });
+  // [CUSTOM-BEGIN] CUSTOM-20260923-001/002 - 移除 extension/activated 遥测上报
+  // （原上游实现会读取 'formulahendry.acp-client' 的版本号上报，fork 后该 id 已不存在）
+  // [CUSTOM-END] CUSTOM-20260923-001/002
   log('ACP Client extension activated.');
 }
 

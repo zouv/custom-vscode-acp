@@ -1,19 +1,18 @@
 {
-  "name": "acp-client",
-  "displayName": "ACP Client",
-  "description": "Agent Client Protocol client for VS Code — connect to GitHub Copilot, Claude Code, Gemini CLI, Qwen Code, Codex CLI, OpenCode, OpenClaw, Kiro CLI, Hermes Agent, and any ACP-compatible AI coding agent",
+  "name": "acp-client-custom",
+  "displayName": "ACP Client (Custom)",
+  "description": "Agent Client Protocol client for VS Code — connect to GitHub Copilot, Claude Code, Gemini CLI, Qwen Code, Codex CLI, OpenCode, OpenClaw, Kiro CLI, Hermes Agent, and any ACP-compatible AI coding agent. Custom fork of formulahendry/vscode-acp.",
   "version": "0.2.0",
-  "publisher": "formulahendry",
+  "publisher": "zouv",
   "license": "MIT",
   "icon": "resources/icon.png",
   "bugs": {
-    "url": "https://github.com/formulahendry/vscode-acp/issues",
-    "email": "formulahendry@gmail.com"
+    "url": "https://github.com/zouv/custom-vscode-acp/issues"
   },
-  "homepage": "https://github.com/formulahendry/vscode-acp/blob/main/README.md",
+  "homepage": "https://github.com/zouv/custom-vscode-acp/blob/custom/main/README.md",
   "repository": {
     "type": "git",
-    "url": "https://github.com/formulahendry/vscode-acp.git"
+    "url": "https://github.com/zouv/custom-vscode-acp.git"
   },
   "engines": {
     "vscode": "^1.85.0"
@@ -35,21 +34,21 @@
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "acp-client",
-          "title": "ACP Client",
+          "id": "acp-client-custom",
+          "title": "ACP Client (Custom)",
           "icon": "resources/icon.svg"
         }
       ]
     },
     "views": {
-      "acp-client": [
+      "acp-client-custom": [
         {
-          "id": "acp-sessions",
+          "id": "acpc-sessions",
           "name": "Agents",
           "type": "tree"
         },
         {
-          "id": "acp-chat",
+          "id": "acpc-chat",
           "name": "Chat",
           "type": "webview"
         }
@@ -57,227 +56,227 @@
     },
     "viewsWelcome": [
       {
-        "view": "acp-sessions",
-        "contents": "No agents configured.\n[Add Agent](command:acp.addAgent)\nConfigure agents in settings or browse the [Agent Registry](command:acp.browseRegistry)."
+        "view": "acpc-sessions",
+        "contents": "No agents configured.\n[Add Agent](command:acpc.addAgent)\nConfigure agents in settings or browse the [Agent Registry](command:acpc.browseRegistry)."
       },
       {
-        "view": "acp-chat",
-        "contents": "Start chatting with an AI coding agent.\n[Connect to Agent](command:acp.connectAgent)\nSelect an agent from the list above to begin."
+        "view": "acpc-chat",
+        "contents": "Start chatting with an AI coding agent.\n[Connect to Agent](command:acpc.connectAgent)\nSelect an agent from the list above to begin."
       }
     ],
     "commands": [
       {
-        "command": "acp.connectAgent",
-        "title": "ACP: Connect to Agent",
+        "command": "acpc.connectAgent",
+        "title": "ACP (Custom): Connect to Agent",
         "icon": "$(plug)"
       },
       {
-        "command": "acp.newConversation",
-        "title": "ACP: New Conversation",
+        "command": "acpc.newConversation",
+        "title": "ACP (Custom): New Conversation",
         "icon": "$(add)"
       },
       {
-        "command": "acp.sendPrompt",
-        "title": "ACP: Send Prompt"
+        "command": "acpc.sendPrompt",
+        "title": "ACP (Custom): Send Prompt"
       },
       {
-        "command": "acp.cancelTurn",
-        "title": "ACP: Cancel Current Turn",
+        "command": "acpc.cancelTurn",
+        "title": "ACP (Custom): Cancel Current Turn",
         "icon": "$(debug-stop)"
       },
       {
-        "command": "acp.disconnectAgent",
-        "title": "ACP: Disconnect Agent",
+        "command": "acpc.disconnectAgent",
+        "title": "ACP (Custom): Disconnect Agent",
         "icon": "$(debug-disconnect)"
       },
       {
-        "command": "acp.openChat",
-        "title": "ACP: Open Chat Panel"
+        "command": "acpc.openChat",
+        "title": "ACP (Custom): Open Chat Panel"
       },
       {
-        "command": "acp.addAgent",
-        "title": "ACP: Add Agent Configuration",
+        "command": "acpc.addAgent",
+        "title": "ACP (Custom): Add Agent Configuration",
         "icon": "$(add)"
       },
       {
-        "command": "acp.removeAgent",
-        "title": "ACP: Remove Agent"
+        "command": "acpc.removeAgent",
+        "title": "ACP (Custom): Remove Agent"
       },
       {
-        "command": "acp.showLog",
-        "title": "ACP: Show Log"
+        "command": "acpc.showLog",
+        "title": "ACP (Custom): Show Log"
       },
       {
-        "command": "acp.showTraffic",
-        "title": "ACP: Show Protocol Traffic"
+        "command": "acpc.showTraffic",
+        "title": "ACP (Custom): Show Protocol Traffic"
       },
       {
-        "command": "acp.browseRegistry",
-        "title": "ACP: Browse Agent Registry"
+        "command": "acpc.browseRegistry",
+        "title": "ACP (Custom): Browse Agent Registry"
       },
       {
-        "command": "acp.setMode",
-        "title": "ACP: Set Agent Mode"
+        "command": "acpc.setMode",
+        "title": "ACP (Custom): Set Agent Mode"
       },
       {
-        "command": "acp.setModel",
-        "title": "ACP: Set Agent Model"
+        "command": "acpc.setModel",
+        "title": "ACP (Custom): Set Agent Model"
       },
       {
-        "command": "acp.attachFile",
-        "title": "ACP: Attach File to Prompt",
+        "command": "acpc.attachFile",
+        "title": "ACP (Custom): Attach File to Prompt",
         "icon": "$(attach)"
       },
       {
-        "command": "acp.refreshAgents",
-        "title": "Refresh",
+        "command": "acpc.refreshAgents",
+        "title": "ACP (Custom): Refresh",
         "icon": "$(refresh)"
       },
       {
-        "command": "acp.refreshSessions",
-        "title": "ACP: Refresh Sessions"
+        "command": "acpc.refreshSessions",
+        "title": "ACP (Custom): Refresh Sessions"
       },
       {
-        "command": "acp.openSession",
-        "title": "ACP: Open Session"
+        "command": "acpc.openSession",
+        "title": "ACP (Custom): Open Session"
       },
       {
-        "command": "acp.loadMoreSessions",
-        "title": "ACP: Load More Sessions"
+        "command": "acpc.loadMoreSessions",
+        "title": "ACP (Custom): Load More Sessions"
       },
       {
-        "command": "acp.copySessionId",
-        "title": "Copy Session ID"
+        "command": "acpc.copySessionId",
+        "title": "ACP (Custom): Copy Session ID"
       },
       {
-        "command": "acp.forgetSession",
-        "title": "Forget Session"
+        "command": "acpc.forgetSession",
+        "title": "ACP (Custom): Forget Session"
       },
       {
-        "command": "acp.restartAgent",
-        "title": "ACP: Restart Agent",
+        "command": "acpc.restartAgent",
+        "title": "ACP (Custom): Restart Agent",
         "icon": "$(debug-restart)"
       }
     ],
     "menus": {
       "commandPalette": [
         {
-          "command": "acp.openSession",
+          "command": "acpc.openSession",
           "when": "false"
         },
         {
-          "command": "acp.loadMoreSessions",
+          "command": "acpc.loadMoreSessions",
           "when": "false"
         },
         {
-          "command": "acp.copySessionId",
+          "command": "acpc.copySessionId",
           "when": "false"
         },
         {
-          "command": "acp.forgetSession",
+          "command": "acpc.forgetSession",
           "when": "false"
         }
       ],
       "view/title": [
         {
-          "command": "acp.addAgent",
-          "when": "view == acp-sessions",
+          "command": "acpc.addAgent",
+          "when": "view == acpc-sessions",
           "group": "navigation@1"
         },
         {
-          "command": "acp.refreshAgents",
-          "when": "view == acp-sessions",
+          "command": "acpc.refreshAgents",
+          "when": "view == acpc-sessions",
           "group": "navigation@2"
         },
         {
-          "command": "acp.browseRegistry",
-          "when": "view == acp-sessions"
+          "command": "acpc.browseRegistry",
+          "when": "view == acpc-sessions"
         },
         {
-          "command": "acp.newConversation",
-          "when": "view == acp-chat",
+          "command": "acpc.newConversation",
+          "when": "view == acpc-chat",
           "group": "navigation@1"
         },
         {
-          "command": "acp.attachFile",
-          "when": "view == acp-chat",
+          "command": "acpc.attachFile",
+          "when": "view == acpc-chat",
           "group": "navigation@2"
         },
         {
-          "command": "acp.cancelTurn",
-          "when": "view == acp-chat && acp.turnInProgress",
+          "command": "acpc.cancelTurn",
+          "when": "view == acpc-chat && acpc.turnInProgress",
           "group": "navigation@3"
         },
         {
-          "command": "acp.disconnectAgent",
-          "when": "view == acp-chat",
+          "command": "acpc.disconnectAgent",
+          "when": "view == acpc-chat",
           "group": "navigation@4"
         },
         {
-          "command": "acp.showLog",
-          "when": "view == acp-chat"
+          "command": "acpc.showLog",
+          "when": "view == acpc-chat"
         },
         {
-          "command": "acp.showTraffic",
-          "when": "view == acp-chat"
+          "command": "acpc.showTraffic",
+          "when": "view == acpc-chat"
         },
         {
-          "command": "acp.restartAgent",
-          "when": "view == acp-chat"
+          "command": "acpc.restartAgent",
+          "when": "view == acpc-chat"
         }
       ],
       "view/item/context": [
         {
-          "command": "acp.connectAgent",
-          "when": "view == acp-sessions && viewItem == agent-disconnected",
+          "command": "acpc.connectAgent",
+          "when": "view == acpc-sessions && viewItem == agent-disconnected",
           "group": "inline"
         },
         {
-          "command": "acp.disconnectAgent",
-          "when": "view == acp-sessions && viewItem == agent-connected",
+          "command": "acpc.disconnectAgent",
+          "when": "view == acpc-sessions && viewItem == agent-connected",
           "group": "inline"
         },
         {
-          "command": "acp.removeAgent",
-          "when": "view == acp-sessions && viewItem =~ /^agent/"
+          "command": "acpc.removeAgent",
+          "when": "view == acpc-sessions && viewItem =~ /^agent/"
         },
         {
-          "command": "acp.restartAgent",
-          "when": "view == acp-sessions && viewItem == agent-connected"
+          "command": "acpc.restartAgent",
+          "when": "view == acpc-sessions && viewItem == agent-connected"
         },
         {
-          "command": "acp.refreshSessions",
-          "when": "view == acp-sessions && viewItem =~ /^agent/",
+          "command": "acpc.refreshSessions",
+          "when": "view == acpc-sessions && viewItem =~ /^agent/",
           "group": "session@1"
         },
         {
-          "command": "acp.copySessionId",
-          "when": "view == acp-sessions && viewItem =~ /^session/",
+          "command": "acpc.copySessionId",
+          "when": "view == acpc-sessions && viewItem =~ /^session/",
           "group": "session@1"
         },
         {
-          "command": "acp.forgetSession",
-          "when": "view == acp-sessions && viewItem == session-local",
+          "command": "acpc.forgetSession",
+          "when": "view == acpc-sessions && viewItem == session-local",
           "group": "session@2"
         }
       ]
     },
     "keybindings": [
       {
-        "command": "acp.openChat",
+        "command": "acpc.openChat",
         "key": "ctrl+shift+a",
         "mac": "cmd+shift+a"
       },
       {
-        "command": "acp.cancelTurn",
+        "command": "acpc.cancelTurn",
         "key": "escape",
-        "when": "acp.turnInProgress"
+        "when": "acpc.turnInProgress"
       }
     ],
     "configuration": {
-      "title": "ACP Client",
+      "title": "ACP Client (Custom)",
       "properties": {
-        "acp.agents": {
+        "acpc.agents": {
           "type": "object",
           "description": "Agent configurations. Each key is the agent name, value has command, args, and env.",
           "default": {
@@ -370,7 +369,7 @@
             }
           }
         },
-        "acp.autoApprovePermissions": {
+        "acpc.autoApprovePermissions": {
           "type": "string",
           "enum": [
             "ask",
@@ -379,12 +378,12 @@
           "default": "ask",
           "description": "Automatically approve agent permission requests. 'ask' always prompts, 'allowAll' approves everything."
         },
-        "acp.defaultWorkingDirectory": {
+        "acpc.defaultWorkingDirectory": {
           "type": "string",
           "default": "",
           "description": "Default working directory for agent sessions. Leave empty to use the current workspace folder."
         },
-        "acp.logTraffic": {
+        "acpc.logTraffic": {
           "type": "boolean",
           "default": true,
           "description": "Log all ACP protocol traffic to the output channel."
@@ -405,7 +404,6 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.21.1",
-    "@vscode/extension-telemetry": "^1.5.0",
     "marked": "^15.0.0"
   },
   "devDependencies": {

@@ -1,0 +1,14 @@
+# [CUSTOM-BEGIN] CUSTOM-20260923-005 - 固定换行符处理，防止整文件伪差异
+#
+# 背景：上游 formulahendry/vscode-acp 的 blob **以 CRLF 入库**（仓库无 .gitattributes），
+# 而本机 git 配置里有 core.autocrlf=true。若不显式固定：
+#   - sed / Write 类编辑会产出 LF，与上游 CRLF blob 逐行不等 → 整文件伪差异；
+#   - 后续每次合并上游都会变成"全文件冲突"，彻底丧失三方合并能力。
+#
+# 用 -text 关闭 git 的换行转换，按字节原样存取，保证本地 blob 与上游 blob 逐字节可比对。
+# 注意：-text 只关闭 EOL 转换，不影响 diff / merge 的文本处理（那不是 binary）。
+#
+# 新增文件用 LF 或 CRLF 均可（它们不与上游同名，不存在冲突风险）；
+# 已跟踪的上游文件必须保持 CRLF —— 详见 CUSTOMIZATIONS/docs/pitfalls.md #7。
+* -text
+# [CUSTOM-END] CUSTOM-20260923-005

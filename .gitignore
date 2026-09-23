@@ -5,3 +5,9 @@ out/
 *.map
 .vscode-test/
 .DS_Store
+
+# [CUSTOM-BEGIN] CUSTOM-20260923-003 - 忽略本地发布产物与 AI 会话临时文件
+release/
+.zcode/plans/
+.claude/explore-results/
+# [CUSTOM-END] CUSTOM-20260923-003

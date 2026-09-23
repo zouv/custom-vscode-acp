@@ -1,3 +1,6 @@
+// [CUSTOM-BEGIN] CUSTOM-20260923-001 - 全局命名空间重命名 acp.* → acpc.*：本文件内的命令 id / 视图 id / 配置键 / 输出通道名已改名。
+// 上游合并后，若本文件出现新的 acp.* 引用，需按 CUSTOMIZATIONS/docs/pitfalls.md 重新应用重命名。
+// [CUSTOM-END] CUSTOM-20260923-001
 import * as vscode from 'vscode';
 import { marked } from 'marked';
 import { SessionManager } from '../core/SessionManager';
@@ -11,7 +14,7 @@ import { sendEvent } from '../utils/TelemetryManager';
  * Renders chat messages, tool calls, plans, and handles user input.
  */
 export class ChatWebviewProvider implements vscode.WebviewViewProvider {
-  public static readonly viewType = 'acp-chat';
+  public static readonly viewType = 'acpc-chat';
 
   private view?: vscode.WebviewView;
   private updateListener: SessionUpdateListener;
@@ -1440,8 +1443,8 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
 
     const welcomeConnectAgent = document.getElementById('welcomeConnectAgent');
     const welcomeAddAgent = document.getElementById('welcomeAddAgent');
-    if (welcomeConnectAgent) welcomeConnectAgent.addEventListener('click', () => execCmd('acp.connectAgent'));
-    if (welcomeAddAgent) welcomeAddAgent.addEventListener('click', () => execCmd('acp.addAgent'));
+    if (welcomeConnectAgent) welcomeConnectAgent.addEventListener('click', () => execCmd('acpc.connectAgent'));
+    if (welcomeAddAgent) welcomeAddAgent.addEventListener('click', () => execCmd('acpc.addAgent'));
 
     // --- Send/Stop toggle ---
     function setProcessing(processing) {

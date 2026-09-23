@@ -1,3 +1,6 @@
+// [CUSTOM-BEGIN] CUSTOM-20260923-001 - 全局命名空间重命名 acp.* → acpc.*：本文件内的命令 id / 视图 id / 配置键 / 输出通道名已改名。
+// 上游合并后，若本文件出现新的 acp.* 引用，需按 CUSTOMIZATIONS/docs/pitfalls.md 重新应用重命名。
+// [CUSTOM-END] CUSTOM-20260923-001
 import * as vscode from 'vscode';
 import type { SessionInfo as ProtocolSessionInfo } from '@agentclientprotocol/sdk';
 import { SessionManager, AgentCapabilitySummary } from '../core/SessionManager';
@@ -25,7 +28,7 @@ export class AgentTreeItem extends vscode.TreeItem {
         new vscode.ThemeColor('testing.iconPassed'),
       );
       this.description = 'connected';
-      this.command = { command: 'acp.openChat', title: 'Open Chat' };
+      this.command = { command: 'acpc.openChat', title: 'Open Chat' };
     } else {
       this.contextValue = 'agent-disconnected';
       this.iconPath = new vscode.ThemeIcon('circle-outline');
@@ -40,7 +43,7 @@ export class AgentTreeItem extends vscode.TreeItem {
 
 /**
  * Tier-2 — a session belonging to an agent. Clicking it routes to
- * `acp.openSession` which calls `session/load` or `session/resume`.
+ * `acpc.openSession` which calls `session/load` or `session/resume`.
  */
 export class SessionTreeItem extends vscode.TreeItem {
   constructor(
@@ -65,7 +68,7 @@ export class SessionTreeItem extends vscode.TreeItem {
       this.iconPath = new vscode.ThemeIcon('comment-discussion');
     }
     this.command = {
-      command: 'acp.openSession',
+      command: 'acpc.openSession',
       title: 'Open Session',
       arguments: [{ agentName, sessionId }],
     };
@@ -299,7 +302,7 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<AgentNode | 
         'Load more…',
         undefined,
         {
-          command: 'acp.loadMoreSessions',
+          command: 'acpc.loadMoreSessions',
           title: 'Load more sessions',
           arguments: [agentName],
         },
@@ -474,7 +477,7 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<AgentNode | 
       'Authentication required',
       'Click to retry authentication.',
       {
-        command: 'acp.connectAgent',
+        command: 'acpc.connectAgent',
         title: 'Retry connect',
         arguments: [agentName],
       },
@@ -488,7 +491,7 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<AgentNode | 
       'Failed to load sessions',
       message,
       {
-        command: 'acp.refreshSessions',
+        command: 'acpc.refreshSessions',
         title: 'Retry',
         arguments: [agentName],
       },
