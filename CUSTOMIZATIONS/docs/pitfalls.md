@@ -183,4 +183,35 @@
   3. 移植脚本时要**对照原实现验证等价性**（本次移植初版有 bug，含标记文件数从 12 误报成 2，
      靠与 bash 版对照计数才发现），并用**反向测试**（故意破坏 → 确认能报错 → 还原）证明检测真的有效。
 - **验证**：`node CUSTOMIZATIONS/scripts/check-registry.mjs` 输出与 bash 版一致（12 个含标记文件）；
-  CI 三平台全绿。
+  CI 三平台的 job 全部通过（macOS 的测试步骤另见 #9）。
+
+## 9. macOS runner 上 `npm test` 必失败 → 上游既有问题，别去修
+
+- **日期**：2026-09-23（修完 #8 后 CI 仍红，追查到是另一回事，CUSTOM-20260923-009）
+- **现象**：macos-latest 的 `npm test` 报
+  ```
+  - Downloading (299.02 MB)
+  ✔ Downloaded VS Code into .../.vscode-test/vscode-darwin-arm64-1.139.0
+  Test error: Error: spawn .../Visual Studio Code.app/Contents/MacOS/Electron ENOENT
+  ```
+- **根因**：**299 MB 不可能 12 秒下完**——"Downloaded" 是假的，**解压静默失败**，
+  所以 Electron 二进制根本不存在。属 `@vscode/test-electron` 在 macOS arm64 runner 上的工具链问题。
+- **关键证据（决定了"不该自己修"）**：查上游仓库的 CI 历史——
+  `gh run list -R formulahendry/vscode-acp` 里**没有一次成功**，全是 `failure` / `action_required`。
+  说明这是上游既有的问题，不是本仓库引入的，也不该由本仓库去修。
+- **解法**：**不修**。macOS 上仍然跑机制自检与打包（跨平台自检覆盖必须保留——
+  正是它在 macOS 上抓出了 #8 的 bash 3.2 问题），只跳过启动 VS Code 的测试步骤：
+  ```yaml
+  - run: npm test
+    if: runner.os == 'Windows'     # Linux 走 xvfb-run，macOS 跳过
+  ```
+  等上游/工具链修好后再放开。
+- **教训**：
+  1. **CI 红了先分清"谁的问题"**——查上游仓库的 CI 历史（`gh run list -R <upstream>`）是一分钟的事，
+     能立刻区分"我引入的"与"上游既有的"，避免一头扎进去修不属于自己的坑；
+  2. **不要用 `continue-on-error` 掩盖**——那会让 build 显示绿、实际有失败，掩盖真问题。
+     要用显式的 `if` 跳过 + 注释写清楚原因与证据；
+  3. 判断"跨平台检查要不要保留"时看**它有没有真的抓到过东西**：
+     自检在 macOS 上抓到过 #8，所以留下；测试在 macOS 上从没成功过，所以跳过。
+- **验证**：CI 在 ubuntu / windows / macos 三个 job 全部通过；macOS 的日志里能看到
+  `Check custom-development invariants` 是 ✓ 而测试步骤被跳过。

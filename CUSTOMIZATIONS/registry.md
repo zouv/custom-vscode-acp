@@ -68,13 +68,32 @@ upstream_remote: "https://github.com/formulahendry/vscode-acp.git"
 | .agents/skills/（acp-record-change、acp-merge-upstream、acp-release） | （纯自定义目录） | 20260923-000 | 3 个 AI Agent 工作流 skill：改动登记、上游合并（适配无 tag 的 vendor/main）、打包发布（.vsix + GitHub Release） | keep-ours | active |
 | AGENTS.md | （纯自定义文件） | 20260923-000 | AI Agent 会话级硬约束摘要：必读文件、工作流、技术栈（npm/webpack）、构建命令、分支规则、自定义代码规范、skills 触发表、文档更新职责；含会话礼仪约定（回复开头称"啊唯"） | keep-ours | active |
 | .github/workflows/publish.yml | 20260923-004/006 | 20260923-004→006 | ①移除 `Publish to Visual Studio Marketplace` 与 `Publish to Open VSX Registry` 两步（上游依赖 `secrets.VSCE_PAT`/`secrets.OVSX_PAT`，本仓库无这些 secret）；②去掉 `release: created` 自动触发，改为**仅 `workflow_dispatch`**——发布主路径是本地 `gh release create`（acp-release skill），保留自动触发会在手动发布后再挂一个冗余的 `extension.vsix`；③workflow 名 `Publish` → `Package (Manual)`，job `publish` → `package`，产出改为 workflow artifact（`actions/upload-artifact`），**完全不接触 GitHub Release**；④`npx vsce` → `npx @vscode/vsce`。**文件名刻意保留 publish.yml**（上游也有此文件，改名会产生 delete/modify 冲突） | merge-manual | active |
-| .github/workflows/ci.yml | 20260923-007/008 | 20260923-007→008 | ①**修 CI 完全失效的问题**：上游触发分支是 `[main]`，但本仓库（fork）没有 `main` 分支（默认与开发分支是 `custom/main`），导致 CI 从未触发过——改为 `[custom/main]`；②新增「Check custom-development invariants」步骤，用 **`node CUSTOMIZATIONS/scripts/check-registry.mjs`** 跑机制自检（代码标记↔账本 / 命名空间卫生 / 换行符卫生），把约束从口头约定变成 CI 强制；③`npx vsce package` → `npx @vscode/vsce package`。放在三平台矩阵里是有意的——**正是它在 macos-latest 上暴露了自检脚本的 bash 3.2 不兼容**（见 008） | merge-manual | active |
+| .github/workflows/ci.yml | 20260923-007/008/009 | 20260923-007→008→009 | ①**修 CI 完全失效的问题**：上游触发分支是 `[main]`，但本仓库（fork）没有 `main` 分支（默认与开发分支是 `custom/main`），导致 CI 从未触发过——改为 `[custom/main]`；②新增「Check custom-development invariants」步骤，用 `node CUSTOMIZATIONS/scripts/check-registry.mjs` 跑机制自检（代码标记↔账本 / 命名空间卫生 / 换行符卫生），把约束从口头约定变成 CI 强制；③`npx vsce package` → `npx @vscode/vsce package`；④**macOS 上跳过 `npm test`**——`@vscode/test-electron` 在 macos-latest 上解压静默失败（299MB 报 12 秒下完，随后 Electron ENOENT），属上游既有问题（上游 CI 历史上从未成功过）；macOS 仍保留机制自检与打包，**跨平台自检覆盖必须留着**（见 pitfalls #9） | merge-manual | active |
 
 ---
 
 ## 变更日志
 
 > 按时间倒序 append-only，只增不改。
+
+### 2026-09-23 - CUSTOM-20260923-009
+- **功能**：macOS 上跳过 `npm test`（上游既有工具链问题），让 CI 恢复绿色信号
+- **改动文件**：`.github/workflows/ci.yml`、`CUSTOMIZATIONS/docs/pitfalls.md`
+- **详细说明**：
+  - **现象**：008 之后 macOS 的自检已通过，但同一 job 的 `npm test` 仍失败：
+    `spawn .../vscode-darwin-arm64-1.139.0/Visual Studio Code.app/Contents/MacOS/Electron ENOENT`。
+  - **诊断**：日志显示 "Downloading (299.02 MB)" 后 **12 秒**就报 "Downloaded"——
+    299MB 不可能 12 秒下完，是**解压静默失败**，Electron 二进制压根不存在。
+  - **判定为上游既有问题**：`gh run list -R formulahendry/vscode-acp` 显示上游 CI
+    **历史上没有任何一次成功**（全是 failure / action_required）。不是本仓库引入的。
+  - **处理（不修，只隔离）**：macOS 上仍跑机制自检与打包，仅把启动 VS Code 的测试步骤
+    限制为 `if: runner.os == 'Windows'`（Linux 走 `xvfb-run`）。
+    **刻意不用 `continue-on-error`**——那会让 build 显示绿但实际有失败，掩盖真问题。
+  - **为什么保留 macOS 的 job**：机制自检的跨平台覆盖有价值且已被证明——
+    正是它在 macos-latest 上抓出了 #8 的 bash 3.2 不兼容。
+- **验证方式**：js-yaml 解析确认步骤与 `if` 条件正确；CI 三平台 job 全绿；macOS 日志中
+  `Check custom-development invariants` 为 ✓ 而测试步骤被跳过
+- **基于上游版本**：0.2.0（commit e7371659）
 
 ### 2026-09-23 - CUSTOM-20260923-008
 - **功能**：自检脚本从 bash 移植到 Node —— 修 macOS 兼容性（007 的 CI 直接抓出来的）
