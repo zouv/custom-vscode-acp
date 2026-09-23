@@ -22,7 +22,7 @@ upstream_remote: "https://github.com/formulahendry/vscode-acp.git"
 > 2. 完成改动后调用 `acp-record-change` skill：**总览里已有该文件就更新那一节**（合并描述、追加演进链 id），没有就新增一节；变更日志追加一轮记录
 > 3. 合并上游时按总览的冲突策略列处理；**合并后必须重新执行 `acp.*` → `acpc.*` 命名空间扫描**（见 README 冲突策略节）
 > 4. 不要删除历史（总览条目整体废弃时标 deprecated，变更日志永不删改）
-> 5. 一致性自检：`sh CUSTOMIZATIONS/scripts/check-registry.sh`（代码标记 ↔ 总览表双向比对）
+> 5. 一致性自检：`bash CUSTOMIZATIONS/scripts/check-registry.sh`（代码标记 ↔ 总览表双向比对；CI 上也会跑）
 
 ---
 
@@ -68,13 +68,24 @@ upstream_remote: "https://github.com/formulahendry/vscode-acp.git"
 | .agents/skills/（acp-record-change、acp-merge-upstream、acp-release） | （纯自定义目录） | 20260923-000 | 3 个 AI Agent 工作流 skill：改动登记、上游合并（适配无 tag 的 vendor/main）、打包发布（.vsix + GitHub Release） | keep-ours | active |
 | AGENTS.md | （纯自定义文件） | 20260923-000 | AI Agent 会话级硬约束摘要：必读文件、工作流、技术栈（npm/webpack）、构建命令、分支规则、自定义代码规范、skills 触发表、文档更新职责；含会话礼仪约定（回复开头称"啊唯"） | keep-ours | active |
 | .github/workflows/publish.yml | 20260923-004/006 | 20260923-004→006 | ①移除 `Publish to Visual Studio Marketplace` 与 `Publish to Open VSX Registry` 两步（上游依赖 `secrets.VSCE_PAT`/`secrets.OVSX_PAT`，本仓库无这些 secret）；②去掉 `release: created` 自动触发，改为**仅 `workflow_dispatch`**——发布主路径是本地 `gh release create`（acp-release skill），保留自动触发会在手动发布后再挂一个冗余的 `extension.vsix`；③workflow 名 `Publish` → `Package (Manual)`，job `publish` → `package`，产出改为 workflow artifact（`actions/upload-artifact`），**完全不接触 GitHub Release**；④`npx vsce` → `npx @vscode/vsce`。**文件名刻意保留 publish.yml**（上游也有此文件，改名会产生 delete/modify 冲突） | merge-manual | active |
-| .github/workflows/ci.yml | （**未改动**，上游原样保留） | — | 上游 CI 原样保留：push/PR 触发，三平台矩阵跑 `npm ci` + `npm test` 并上传 `.vsix` 构建产物。无需改动 | keep-theirs | active |
+| .github/workflows/ci.yml | 20260923-007 | 20260923-007 | ①**修 CI 完全失效的问题**：上游触发分支是 `[main]`，但本仓库（fork）没有 `main` 分支（默认与开发分支是 `custom/main`），导致 CI 从未触发过——改为 `[custom/main]`；②新增「Check custom-development invariants」步骤跑 `check-registry.sh`（代码标记↔账本 / 命名空间卫生 / 换行符卫生），把机制约束从口头约定变成 CI 强制；③`npx vsce package` → `npx @vscode/vsce package`。**必须用 `bash` 而非 `sh` 调用脚本**（脚本含 `declare -A` / `[[ ]]` / `pipefail`，Ubuntu runner 的 `sh` 是 dash 会报错） | merge-manual | active |
 
 ---
 
 ## 变更日志
 
 > 按时间倒序 append-only，只增不改。
+
+### 2026-09-23 - CUSTOM-20260923-007
+- **功能**：修复 CI 完全失效的问题；把机制自检接入 CI；脚本调用从 `sh` 改为 `bash`
+- **改动文件**：`.github/workflows/ci.yml`、`CUSTOMIZATIONS/README.md`、`CUSTOMIZATIONS/scripts/（check-registry.sh、release-vsix.sh、list-custom.ps1）`、`.agents/skills/（acp-record-change、acp-merge-upstream、acp-release）`、`CUSTOMIZATIONS/docs/pitfalls.md`
+- **详细说明**：
+  - **CI 失效（本次核心发现）**：`ci.yml` 的 `push`/`pull_request` 都过滤 `branches: [main]`，但本仓库是 fork，根本没有 `main` 分支（默认与开发分支是 `custom/main`，上游镜像在 `vendor/main`）——**CI 从建仓起就没触发过，也永远不会触发**。这也解释了 `gh workflow list` 里看不到它。改为 `[custom/main]`；`vendor/main` 由 sync-vendor.ps1 推进，不需要 CI。
+  - **机制自检入 CI**：新增「Check custom-development invariants」步骤跑 `check-registry.sh`，把"每次登记必须全绿"从口头约定变成 CI 强制，可自动拦住整文件伪差异（pitfalls #7）与半重命名（pitfalls #2）两类坑。放在三平台矩阵里是有意的，顺带验证换行符规则在 Linux/macOS 上也成立。
+  - **`sh` → `bash`**：`check-registry.sh` 用了 `declare -A` / `[[ ]]` / `BASH_REMATCH` / `pipefail` 等 bash 专有特性，而 Ubuntu runner 的 `sh` 是 dash——用 `sh` 调用会直接报错。全部文档与脚本内的调用示例统一改为 `bash`。
+  - **修正过程中的自伤**：批量 `s|sh CUSTOMIZATIONS/scripts/|bash ...|` 时，模式子串匹配到了 `pw**sh** CUSTOMIZATIONS/scripts/` 里的 `sh`，产出 4 处 `pwbash`，已修正。**与 pitfalls #3 是同一类错误（模式边界不当）**。
+- **验证方式**：js-yaml 解析确认 `on = {push: [custom/main], pull_request: [custom/main]}`、步骤含 Check custom-development invariants；`grep -rn "pwbash"` 无残留；`grep -rn "sh CUSTOMIZATIONS/scripts"` 无残留；换行符仍为 CRLF；check-registry.sh 四节全绿
+- **基于上游版本**：0.2.0（commit e7371659）
 
 ### 2026-09-23 - CUSTOM-20260923-006
 - **功能**：`publish.yml` 改为纯手动打包，去掉与手动发布重复的自动触发

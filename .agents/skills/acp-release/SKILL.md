@@ -36,7 +36,7 @@ git status --porcelain       # 必须干净（release-vsix.sh 会拦）
 
 工作区不干净 → 先让用户提交或 stash。**不要在脏工作区上打包**。
 
-同时确认 registry.md 里的自定义改动都已登记（`sh CUSTOMIZATIONS/scripts/check-registry.sh` 全绿）。
+同时确认 registry.md 里的自定义改动都已登记（`bash CUSTOMIZATIONS/scripts/check-registry.sh` 全绿）。
 
 ---
 
@@ -82,7 +82,7 @@ code --install-extension zouv.acp-client-custom-<版本>.vsix
 ### 3. 打包（构建 + lint + 测试 + vsce）
 
 ```bash
-sh CUSTOMIZATIONS/scripts/release-vsix.sh <版本>
+bash CUSTOMIZATIONS/scripts/release-vsix.sh <版本>
 ```
 
 该脚本依次执行：分支/工作区检查 → 写版本号 → `npm install` → `npm run lint` → `npm run compile` →

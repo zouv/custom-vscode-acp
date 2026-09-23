@@ -90,7 +90,7 @@ git ls-files --others --exclude-standard
 ### 第五步：一致性自检（必须执行）
 
 ```bash
-sh CUSTOMIZATIONS/scripts/check-registry.sh
+bash CUSTOMIZATIONS/scripts/check-registry.sh
 ```
 
 脚本做三件事，**退出码非 0 必须修到全绿才算登记完成**：

@@ -48,19 +48,26 @@
 - **验证**：`grep -rn "acp\.\|acp-sessions\|acp-chat" src/ package.json` 无（非故意保留的）残留；
   两个扩展同时安装后控制台无冲突告警。详见 `registry.md` 的 CUSTOM-20260923-001。
 
-## 3. 批量重命名时，"带引号边界"的替换模式会漏掉长字符串内的片段
+## 3. 批量替换的模式边界：太紧会漏、太松会误伤（同一类错误，两个方向都踩过）
 
-- **日期**：2026-09-23（做坑点 2 的重命名时踩到）
-- **现象**：用 `s/"acp-sessions"/"acpc-sessions"/g` 批量替换，`package.json` 里
+- **日期**：2026-09-23（做坑点 2 的重命名时踩到"太紧"；做 007 的 `sh`→`bash` 时踩到"太松"）
+- **现象（太紧→漏）**：用 `s/"acp-sessions"/"acpc-sessions"/g` 批量替换，`package.json` 里
   `"id": "acp-sessions"` 改成功了，但 `"when": "view == acp-sessions"` 里的 `acp-sessions`
   **原封不动**——渲染出的菜单条件全部失效。
-- **根因**：模式带了引号边界，只能命中"独立成串"的出现；`view == acp-sessions` 里
-  `acp-sessions` 前面是空格、后面才是引号，不匹配 `"acp-sessions"`。
-- **解法**：对长字符串内的片段补独立模式（`s/== acp-sessions/== acpc-sessions/g`），
-  或一开始就用**不带引号边界的词形模式**批量处理。
-- **教训**：批量重命名必须**双向验证**——正向确认替换发生，**反向 grep 确认没有残留**。
-  只做正向就会漏掉这类"看起来改了其实没改"的片段。
-- **验证**：`grep -rn "== acp-" src/ package.json` 为空。
+- **现象（太松→误伤）**：用 `s|sh CUSTOMIZATIONS/scripts/|bash CUSTOMIZATIONS/scripts/|g` 批量替换，
+  模式的 `sh` 子串匹配到了 `pw**sh** CUSTOMIZATIONS/scripts/`，把 4 处 `pwsh` 改成了 **`pwbash`**。
+- **根因**：两者是同一个问题的两面——**模式没锚定到词/引号的边界**。
+  太紧时（带引号）匹配不到长字符串内的片段；太松时（裸 `sh`）会咬进别的单词里。
+- **解法**：
+  - 太紧 → 对长字符串内的片段补独立模式（`s/== acp-sessions/== acpc-sessions/g`），
+    或一开始就用**不带引号边界的词形模式**；
+  - 太松 → 加左边界，例如 `s|\bsh CUSTOMIZATIONS/scripts/|bash ...|g`，
+    或用 `([^a-z]|^)sh ` 之类避免咬进 `pwsh`。
+- **教训**：
+  1. 批量重命名/替换必须**双向验证**——正向确认替换发生，**反向 grep 确认没有残留**；
+  2. 还要**同时 grep 被误伤的目标**（本次若没顺手查 `pwbash`，`pwsh` 调用说明就被悄悄改坏了）；
+  3. 写完 sed 别只看"改了多少处"，要 `git diff` 扫一眼**改动内容**是否符合预期。
+- **验证**：`grep -rn "== acp-" src/ package.json` 为空；`grep -rn "pwbash"` 为空。
 
 ## 4. 两处 `acp.` 是**扩展内作用域**，不该跟着重命名
 

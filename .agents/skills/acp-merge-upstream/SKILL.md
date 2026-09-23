@@ -147,7 +147,7 @@ grep -rn "registerCommand('acp\.\|executeCommand('acp\.\|getConfiguration('acp')
 改完再跑一次确认无残留，然后：
 
 ```bash
-sh CUSTOMIZATIONS/scripts/check-registry.sh   # §3 会做命名空间卫生检查
+bash CUSTOMIZATIONS/scripts/check-registry.sh   # §3 会做命名空间卫生检查
 ```
 
 ### 6. 验证

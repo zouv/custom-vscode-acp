@@ -63,4 +63,4 @@ foreach ($line in ($content -split "`n")) {
 Write-Host "  $overviewRowCount 条"
 Write-Host ""
 
-Write-Host "一致性自检: sh CUSTOMIZATIONS/scripts/check-registry.sh" -ForegroundColor Green
+Write-Host "一致性自检: bash CUSTOMIZATIONS/scripts/check-registry.sh" -ForegroundColor Green
