@@ -1,3 +1,7 @@
+// [CUSTOM-BEGIN] CUSTOM-20260923-010 - 多会话/多 agent 并行改造：生命周期事件补充 agent 名，
+// 使 SessionManager 能在单一订阅点把 agentId 反查回配置键（配合 SessionManager 的事件接线改造）。
+// 纯新增字段，现有消费者按需解构，无破坏性。
+// [CUSTOM-END] CUSTOM-20260923-010
 import { spawn, ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
@@ -122,13 +126,13 @@ export class AgentManager extends EventEmitter {
     child.on('error', (err) => {
       logError(`Agent "${name}" process error`, err);
       sendError('agent/error', { agentName: name, errorType: err.message });
-      this.emit('agent-error', { agentId: id, error: err });
+      this.emit('agent-error', { agentId: id, name, error: err });
     });
 
     child.on('close', (code, signal) => {
       log(`Agent "${name}" exited (code=${code}, signal=${signal})`);
       this.agents.delete(id);
-      this.emit('agent-closed', { agentId: id, code, signal });
+      this.emit('agent-closed', { agentId: id, name, code, signal });
     });
 
     return instance;

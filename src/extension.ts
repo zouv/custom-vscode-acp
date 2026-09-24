@@ -10,7 +10,11 @@ import { SessionHistoryStore } from './core/SessionHistoryStore';
 import { SessionUpdateHandler } from './handlers/SessionUpdateHandler';
 import { SessionTreeProvider } from './ui/SessionTreeProvider';
 import { StatusBarManager } from './ui/StatusBarManager';
-import { ChatWebviewProvider } from './ui/ChatWebviewProvider';
+// [CUSTOM-BEGIN] CUSTOM-20260923-011 - Chat 面板改为路由层（ChatRouterProvider）。
+// 视图 id 仍是唯一的 `acpc-chat`，但注册的 provider 换成按聚焦 agent 分发的新/旧面板路由。
+// `ChatWebviewProvider` 本身**零改动**，由 LegacyPanelAdapter 用 facade 包装后接入。
+// [CUSTOM-END] CUSTOM-20260923-011
+import { ChatRouterProvider } from './ui/chat';
 import { getAgentNames } from './config/AgentConfig';
 import { fetchRegistry } from './config/RegistryClient';
 import { log, logError, disposeChannels, getOutputChannel, getTrafficChannel } from './utils/Logger';
@@ -47,64 +51,76 @@ export function activate(context: vscode.ExtensionContext): void {
     treeDataProvider: sessionTreeProvider,
   });
 
-  const chatWebviewProvider = new ChatWebviewProvider(
+  const chatRouter = new ChatRouterProvider(
     context.extensionUri,
     sessionManager,
     sessionUpdateHandler,
   );
   const chatViewRegistration = vscode.window.registerWebviewViewProvider(
-    ChatWebviewProvider.viewType,
-    chatWebviewProvider,
+    ChatRouterProvider.viewType,
+    chatRouter,
     { webviewOptions: { retainContextWhenHidden: true } },
   );
 
   const statusBarManager = new StatusBarManager(sessionManager);
 
-  // Notify chat webview when active session changes
-  sessionManager.on('active-session-changed', () => {
-    chatWebviewProvider.notifyActiveSessionChanged();
+  // [CUSTOM-BEGIN] CUSTOM-20260923-010 - 事件接线改为 session 作用域。
+  // 多会话/多 agent 并行后，后台会话的更新不得打到前台面板上：所有转发都以
+  // `sessionManager.getActiveSessionId()`（= 聚焦会话）为过滤条件。
+  const isFocused = (sessionId: string | null | undefined): boolean =>
+    !!sessionId && sessionId === sessionManager.getActiveSessionId();
+
+  // NOTE: `active-session-changed` is NOT wired here — ChatRouterProvider
+  // subscribes to it itself, because a focus change is what decides which panel
+  // (modern vs legacy) owns the view.
+
+  // Clear chat when a new conversation is started for the focused agent.
+  // A background agent's new conversation must NOT wipe the visible panel.
+  sessionManager.on('clear-chat', (agentName: string) => {
+    if (agentName !== sessionManager.getFocusedAgentName()) { return; }
+    chatRouter.clearChat();
   });
 
-  // Clear chat when new conversation is started
-  sessionManager.on('clear-chat', () => {
-    chatWebviewProvider.clearChat();
-  });
-
-  // Forward mode/model changes to webview
-  sessionManager.on('mode-changed', (_sessionId: string, _modeId: string) => {
-    const session = sessionManager.getActiveSession();
+  // Forward mode/model changes to webview (focused session only)
+  sessionManager.on('mode-changed', (sessionId: string, _modeId: string) => {
+    if (!isFocused(sessionId)) { return; }
+    const session = sessionManager.getSession(sessionId);
     if (session?.modes) {
-      chatWebviewProvider.notifyModesUpdate(session.modes);
+      chatRouter.notifyModesUpdate(session.modes);
     }
   });
 
-  sessionManager.on('model-changed', (_sessionId: string, _modelId: string) => {
-    const session = sessionManager.getActiveSession();
+  sessionManager.on('model-changed', (sessionId: string, _modelId: string) => {
+    if (!isFocused(sessionId)) { return; }
+    const session = sessionManager.getSession(sessionId);
     if (session?.models) {
-      chatWebviewProvider.notifyModelsUpdate(session.models);
+      chatRouter.notifyModelsUpdate(session.models);
     }
   });
 
   // Session-load replay state — drive the webview overlay.
-  sessionManager.on('session-load-start', () => {
-    chatWebviewProvider.notifyLoadSessionStart();
+  sessionManager.on('session-load-start', (sessionId: string) => {
+    if (!isFocused(sessionId)) { return; }
+    chatRouter.notifyLoadSessionStart();
   });
-  sessionManager.on('session-load-end', (_sessionId: string, _agentName: string, ok: boolean) => {
-    chatWebviewProvider.notifyLoadSessionEnd(ok);
+  sessionManager.on('session-load-end', (sessionId: string, _agentName: string, ok: boolean) => {
+    if (!isFocused(sessionId)) { return; }
+    chatRouter.notifyLoadSessionEnd(ok);
     if (ok) {
       // The loadSession response carries modes/models/configOptions for the
       // restored session. Re-send the state so the pickers pick them up
       // (the original `active-session-changed` was emitted before the RPC
       // resolved, when those fields were still null).
-      chatWebviewProvider.notifyActiveSessionChanged();
+      chatRouter.notifyActiveSessionChanged();
     }
   });
 
   // Session metadata (title) update — forward to chat banner.
   sessionManager.on('session-info-changed', (sessionId: string, update: any) => {
-    if (sessionId !== sessionManager.getActiveSessionId()) { return; }
-    chatWebviewProvider.notifySessionInfoUpdate(update?.title);
+    if (!isFocused(sessionId)) { return; }
+    chatRouter.notifySessionInfoUpdate(update?.title);
   });
+  // [CUSTOM-END] CUSTOM-20260923-010
 
   // --- Commands ---
 
@@ -133,16 +149,19 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!agentName) { return; }
     }
 
-    // If switching agents and there's chat content, confirm
+    // [CUSTOM-BEGIN] CUSTOM-20260923-010 - 文案修正：切换 agent 不再断开原 agent。
+    // 上游是单 agent 模型，这里原本断言「将断开 X 并清空历史」；多 agent 并行后
+    // 原 agent 保持连接（会话继续存活），只是聊天面板转为显示新的 agent。
+    // [CUSTOM-END] CUSTOM-20260923-010
     const currentAgent = sessionManager.getActiveAgentName();
-    if (currentAgent && currentAgent !== agentName && chatWebviewProvider.hasChatContent) {
+    if (currentAgent && currentAgent !== agentName && chatRouter.hasChatContent) {
       const choice = await vscode.window.showWarningMessage(
-        `Switch to ${agentName}? This will disconnect ${currentAgent} and clear the chat history.`,
+        `Switch chat panel to ${agentName}? ${currentAgent} stays connected in the background.`,
         'Switch Agent',
         'Cancel',
       );
       if (choice !== 'Switch Agent') { return; }
-      chatWebviewProvider.clearChat();
+      chatRouter.clearChat();
     }
 
     try {
@@ -172,9 +191,13 @@ export function activate(context: vscode.ExtensionContext): void {
     }
 
     // Confirm if there's existing chat content
-    if (chatWebviewProvider.hasChatContent) {
+    // [CUSTOM-BEGIN] CUSTOM-20260923-012 - 文案与新面板语义一致。
+    // 多会话下「新建会话」只是开一个新标签，旧会话记录保留、可随时切回，
+    // 因此不能说「会清空聊天记录」。（旧面板仍是单会话，确实会被替换。）
+    // [CUSTOM-END] CUSTOM-20260923-012
+    if (chatRouter.hasChatContent) {
       const choice = await vscode.window.showWarningMessage(
-        'Start a new conversation? This will clear the current chat history.',
+        'Start a new conversation? The current one stays available in its tab.',
         'New Conversation',
         'Cancel',
       );
@@ -334,10 +357,12 @@ export function activate(context: vscode.ExtensionContext): void {
       return;
     }
 
-    // Confirm if there's existing chat content with a different active session.
-    if (chatWebviewProvider.hasChatContent) {
+    // [CUSTOM-BEGIN] CUSTOM-20260923-012 - 同上：新面板里打开另一个会话只是切换标签，
+    // 当前会话的记录不会被替换掉。
+    // [CUSTOM-END] CUSTOM-20260923-012
+    if (chatRouter.hasChatContent) {
       const choice = await vscode.window.showWarningMessage(
-        'Open a different session? This will replace the current chat history.',
+        'Open a different session? The current one stays available in its tab.',
         'Open Session',
         'Cancel',
       );
@@ -469,7 +494,7 @@ export function activate(context: vscode.ExtensionContext): void {
       title: 'Attach File to Chat',
     });
     if (uris && uris.length > 0) {
-      chatWebviewProvider.attachFile(uris[0]);
+      chatRouter.attachFile(uris[0]);
     }
   });
 
@@ -526,7 +551,7 @@ export function activate(context: vscode.ExtensionContext): void {
       dispose: () => {
         sessionManager.dispose();
         sessionUpdateHandler.dispose();
-        chatWebviewProvider.dispose();
+        chatRouter.dispose();
         sessionTreeProvider.dispose();
         disposeChannels();
       },

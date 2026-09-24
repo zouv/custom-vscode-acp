@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 // =============================================================================
-// check-registry.mjs — 自定义开发机制的完整性自检（四节）
+// check-registry.mjs — 自定义开发机制的完整性自检（六节）
 //   1) 代码里有 CUSTOM 标记但 registry.md 改动总览未登记
 //   2) 总览表登记的文件但代码里找不到对应标记
 //   3) 命名空间卫生：src/ 与 package.json 不应残留上游 acp.* 标识符
 //   4) 换行符卫生：上游共有文件 CRLF、纯自定义文件 LF
+//   5) webview 客户端脚本：模板字符串拼接后能否解析
+//   6) 源码卫生：不得含 NUL 等控制字符（含 NUL 的文件会被 grep 当二进制跳过）
 //
 // 用法：node CUSTOMIZATIONS/scripts/check-registry.mjs
 // 退出码：0 全部一致；1 有差异（按提示修文档或补标记）
@@ -231,6 +233,57 @@ try {
   console.log('  → 运行 node CUSTOMIZATIONS/scripts/normalize-eol.mjs 修正');
   errors += 1;
 }
+
+// ---------------------------------------------------------------------------
+// §5 webview 客户端脚本卫生（委托给 check-webview-client.mjs）
+// ---------------------------------------------------------------------------
+console.log('\n== 5) webview 客户端脚本：模板字符串拼接后能否解析 ==');
+try {
+  const out = execFileSync(
+    process.execPath,
+    [join(PROJECT_ROOT, 'CUSTOMIZATIONS', 'scripts', 'check-webview-client.mjs')],
+    { encoding: 'utf8' },
+  );
+  console.log('  ' + out.trim());
+} catch (e) {
+  const out = `${e.stdout ?? ''}${e.stderr ?? ''}`;
+  for (const line of out.split('\n')) {
+    if (line.trim().startsWith('[')) { console.log('  ' + line.trim()); }
+  }
+  errors += 1;
+}
+
+// ---------------------------------------------------------------------------
+// §6 源码卫生：不得含 NUL 等控制字符
+// 危害：文件一旦含 NUL，`grep` 会把它当**二进制**处理并跳过，搜索工具静默失效。
+// 来源：编辑器/工具写入时把 `\0` 这类转义落成了真实控制字节（本仓库实际发生过，
+// CUSTOM-20260923-011 的 ChatPanelHost.ts 注释里混入 2 个 NUL）。
+// ---------------------------------------------------------------------------
+console.log('\n== 6) 源码卫生：不得含 NUL 等控制字符 ==');
+// 按码点判断而不是嵌字面控制字符的正则——否则检查脚本自己就带控制字符（本行上一版就踩了）。
+const isBadControl = (code) => code === 0 || code < 9 || (code > 13 && code < 32);
+let ctlHits = 0;
+const ctlTargets = [...walk(join(PROJECT_ROOT, 'src')), ...walk(join(PROJECT_ROOT, 'CUSTOMIZATIONS', 'scripts'))];
+for (const abs of ctlTargets) {
+  let text;
+  try {
+    text = readFileSync(abs, 'utf8');
+  } catch {
+    continue;
+  }
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (!isBadControl(code)) continue;
+    const line = text.slice(0, i).split('\n').length;
+    const hex = code.toString(16).padStart(2, '0');
+    console.log(`  [CTRL-BYTE] ${toPosix(relative(PROJECT_ROOT, abs))}:${line}: 0x${hex}`);
+    ctlHits++;
+    break;
+  }
+}
+if (ctlHits === 0) console.log('  (无控制字符)');
+errors += ctlHits;
+
 
 // ---------------------------------------------------------------------------
 console.log('');

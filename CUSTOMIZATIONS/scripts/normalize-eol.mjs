@@ -32,9 +32,13 @@ const SKIP = /\.(png|jpe?g|gif|ico|svg|vsix|exe|dll|zip|gz|woff2?|icns)$/i;
 // 在 Linux/macOS 上会因 shebang 解析失败而无法执行。
 const CUSTOM_ONLY = /^(CUSTOMIZATIONS\/|\.agents\/|AGENTS\.md$|\.gitattributes$)/;
 
+// 注意：这里必须同时列**未跟踪**文件（--others --exclude-standard）。
+// 只用 `git ls-files` 会漏掉新建但尚未 `git add` 的文件，导致新文件带着 LF 通过检查、
+// 直到提交后才被发现（pitfall #7 的复发路径）。本仓库曾因此让整个 src/ui/chat/ 新树
+// 静默绕过 CRLF 检查。
 const files = explicit.length
   ? explicit
-  : execFileSync('git', ['ls-files'], { encoding: 'utf8' })
+  : execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard'], { encoding: 'utf8' })
       .split('\n')
       .filter(Boolean);
 
