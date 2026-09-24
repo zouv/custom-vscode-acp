@@ -11,6 +11,20 @@
 > 而 `AGENTS.md` 把 `registry.md` 列为每次任务前必读。
 
 ---
+### 2026-09-23 - CUSTOM-20260923-017
+- **功能**：修复阻断级 bug —— 新面板加载遮罩「Loading session history…」常驻不消失
+- **改动文件**：`src/ui/chat/html/styles.ts`、`CUSTOMIZATIONS/scripts/check-webview-client.mjs`、`CUSTOMIZATIONS/docs/pitfalls.md`、`CUSTOMIZATIONS/registry.md`、`CUSTOMIZATIONS/docs/changelog.md`
+- **来源**：用户 F5 实测反馈（本仓库新面板的**首次真实运行**）
+- **根因**：`hidden` 属性**不是魔法属性**，它依赖浏览器默认样式表里的 `[hidden] { display: none }`；而**作者样式表里的任何 `display` 声明都会覆盖它**——这与选择器权重无关，是「作者样式 > UA 样式」的层叠顺序。所以 CSS 里写了 `display: flex` 的元素，`hidden` **完全失效**。
+  中招三个：`#loadOverlay`（本次症状，且它是 `position:fixed; inset:0; z-index:40`，**同时吞掉整块面板的点击**，输入框也点不了）、`#agentBar`、`#attachments`。
+  **关键线索**：截图里遮罩**后面**的内容其实已完整渲染（Markdown 表格、代码块、工具卡片全在）——加载是成功的，问题在遮罩本身，这把范围从"加载逻辑"直接缩到了"遮罩显隐"。
+- **修法**：`styles.ts` 的 `<style>` 顶部加一条全局规则 `[hidden] { display: none !important; }`，用 `!important` 把 `[hidden]` 的语义从被覆盖的状态抢回来。**不需要改任何 JS**，现有的 `.hidden = true/false` 赋值在规则生效后就是对的。注释里写明了"不要删"的理由与影响范围。
+- **附带发现并修复的检查器缺口（值得单记）**：修 CSS 时我在 `styles.ts` 注释里又写了反引号（pitfall #11 的**第三次**复发），而 `check-webview-client.mjs` **报了 OK** —— 因为它当时只扫 `html/client/*.ts`，`styles.ts` 在上一级目录，**不在扫描范围内**。表现为 **tsc 报错、检查器说没问题**：一个专为防这类 bug 而写的工具，对范围外的同类 bug 视而不见。
+  已把扫描范围扩到整个 `html/` 树（14 个模块）。扩范围后第一版立刻误报 13 处假阳性（把 TS 注释里合法的反引号也当错误），已改为**只在模板体内**报错。最后用负向测试在真实文件上确认：往 `styles.ts` 注入模板体内反引号 → 精确报 `[BACKTICK] styles.ts:17` 且 exit 1；还原后复检通过。
+- **这是"静态检查全绿 ≠ 界面能用"的样本**：tsc / ESLint / webpack / 单测都不模拟 CSS 层叠，而本次首跑发现的唯一 bug 恰好是个纯 CSS 层叠问题。
+- **验证方式**：`node CUSTOMIZATIONS/scripts/check-webview-client.mjs` 通过（14 模块扫描 + 8 模块拼接校验）；`check-webview-client` 负向测试确认能检出；`npx tsc -p . --noEmit` 无错误；`check-registry.mjs` 六节全绿。
+  **待用户 F5 复验**：打开 session 时遮罩加载完成后消失、加载期间正常出现；只连 1 个 agent 时顶部无空白条；无附件时输入框上方无多余空隙；输入框可点击、Send 可用。
+- **基于上游版本**：0.2.0（commit e7371659）
 ### 2026-09-23 - CUSTOM-20260923-016
 - **功能**：文档去冗余——拆分账本、修掉一条不可用的机制规则、清理重复规则
 - **改动文件**：`CUSTOMIZATIONS/registry.md`、`CUSTOMIZATIONS/docs/changelog.md`（新增）、`CUSTOMIZATIONS/README.md`、`AGENTS.md`、`CUSTOMIZATIONS/architecture.md`、`.agents/skills/acp-record-change/SKILL.md`、`.agents/skills/acp-merge-upstream/SKILL.md`

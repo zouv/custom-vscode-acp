@@ -7,6 +7,15 @@ export function styles(): string {
   return `<style>
   * { box-sizing: border-box; }
 
+  /* ⚠️ 不要删这条规则。
+     'hidden' 属性靠 UA 样式表的 [hidden]{display:none} 生效，而**作者样式里的任何 display
+     声明都会覆盖它**——这与选择器权重无关，是"作者样式 > UA 样式"的层叠顺序决定的。
+     本文件里 .load-overlay / .agent-bar / .attachments 都需要 flex 布局，没有这条 !important
+     的话它们会**永远可见**（曾导致加载遮罩常驻不消失、并吞掉整个面板的点击）。
+     改了这条之后：给任何用 hidden 控制的元素加 display 都要先想一下这里。
+     另：本文件是模板字符串，注释里禁用反引号——用单引号。 */
+  [hidden] { display: none !important; }
+
   body {
     margin: 0;
     padding: 0;
