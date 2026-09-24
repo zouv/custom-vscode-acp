@@ -2,7 +2,7 @@
   "name": "acp-client-custom",
   "displayName": "ACP Client (Custom)",
   "description": "Agent Client Protocol client for VS Code — connect to GitHub Copilot, Claude Code, Gemini CLI, Qwen Code, Codex CLI, OpenCode, OpenClaw, Kiro CLI, Hermes Agent, and any ACP-compatible AI coding agent. Custom fork of formulahendry/vscode-acp.",
-  "version": "0.2.0-custom.1",
+  "version": "0.2.0-custom.2",
   "publisher": "zouv",
   "license": "MIT",
   "icon": "resources/icon.png",

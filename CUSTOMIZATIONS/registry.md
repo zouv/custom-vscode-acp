@@ -1,10 +1,10 @@
 ---
 current_upstream_version: "0.2.0"
 current_upstream_commit: "e7371659e3ac100db842b419b1361205a193032e"
-custom_version: "0.2.0-custom.1"
+custom_version: "0.2.0-custom.2"
 last_merge_date: "2026-09-23"
-last_release_version: "v0.2.0-custom.1"
-last_release_date: "2026-09-23"
+last_release_version: "v0.2.0-custom.2"
+last_release_date: "2026-09-24"
 vendor_branch: "vendor/main"
 upstream_remote: "https://github.com/formulahendry/vscode-acp.git"
 ---

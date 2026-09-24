@@ -55,7 +55,23 @@ console.log('当前版本:', p.version);
 
 `release-vsix.sh` 会自动写入 `package.json` 的 `version`，无需手改。
 
-### 2. 写 release notes
+### 2. 打包（构建 + lint + 测试 + vsce）
+
+```bash
+bash CUSTOMIZATIONS/scripts/release-vsix.sh <版本>
+```
+
+该脚本依次执行：分支/工作区检查 → 写版本号 → `npm install` → `npm run lint` → `npm run compile` →
+`npm test`（拉起真实 VS Code Extension Host）→ `npx @vscode/vsce package` → 校验产物洁净 →
+输出 `release/zouv.acp-client-custom-<版本>.vsix`。
+
+**任何一步失败都必须停下**，不要跳过测试强行打包。
+
+> ⚠️ **顺序要求**：打包脚本第一步就检查工作区干净（`git status --porcelain` 为空），
+> 而 release notes 是**新建文件**——先写它会让工作区变脏、脚本直接拒绝。
+> 所以必须**先打包、再写 notes**（下面第 2、3 步的次序就是这么排的）。
+
+### 3. 写 release notes
 
 新建 `CUSTOMIZATIONS/release-notes/v<版本>.md`，结构参考：
 
@@ -78,18 +94,6 @@ console.log('当前版本:', p.version);
 下载下方的 `zouv.acp-client-custom-<版本>.vsix`，然后：
 code --install-extension zouv.acp-client-custom-<版本>.vsix
 ```
-
-### 3. 打包（构建 + lint + 测试 + vsce）
-
-```bash
-bash CUSTOMIZATIONS/scripts/release-vsix.sh <版本>
-```
-
-该脚本依次执行：分支/工作区检查 → 写版本号 → `npm install` → `npm run lint` → `npm run compile` →
-`npm test`（拉起真实 VS Code Extension Host）→ `npx @vscode/vsce package` → 校验产物洁净 →
-输出 `release/zouv.acp-client-custom-<版本>.vsix`。
-
-**任何一步失败都必须停下**，不要跳过测试强行打包。
 
 ### 4. 更新 registry.md frontmatter
 
