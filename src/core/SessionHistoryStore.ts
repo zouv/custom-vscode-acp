@@ -1,3 +1,10 @@
+// [CUSTOM-BEGIN] CUSTOM-20260923-010 - 多会话支持：引入「活跃会话」豁免。
+// 上游的 enforceCap 按 lastActiveAt 淘汰超限条目，而多会话会大幅加速会话创建，
+// 活跃会话可能被驱逐从而从树上消失（进程却还活着）。现在 SessionManager 会把
+// 每个 agent 的活跃 sessionId 集合推进来，enforceCap 与 reconcileFromAgent 都
+// 永不驱逐活跃 id。注意 STATE_KEY 仍是 'acp.sessionHistory.v1' —— 那是
+// workspaceState 的 Memento key，扩展内作用域，改名会丢历史（见 pitfalls #4）。
+// [CUSTOM-END] CUSTOM-20260923-010
 import * as vscode from 'vscode';
 
 /**
@@ -50,6 +57,14 @@ export class SessionHistoryStore {
   /** Fires whenever the cache mutates. Tree view subscribes for refresh. */
   readonly onDidChange = this._onDidChange.event;
 
+  /**
+   * [CUSTOM-20260923-010] agentName → live session ids, pushed by
+   * SessionManager. These are exempt from capacity eviction and from
+   * `session/list` reconciliation: a live session's process is running, so
+   * silently dropping it from the cache would make it vanish from the tree.
+   */
+  private liveSessionIds: Map<string, Set<string>> = new Map();
+
   constructor(
     private readonly workspaceState: vscode.Memento,
     private readonly capPerAgent: number = DEFAULT_CAP_PER_AGENT,
@@ -58,6 +73,24 @@ export class SessionHistoryStore {
     if (raw && raw.version === 1 && Array.isArray(raw.entries)) {
       this.entries = raw.entries;
     }
+  }
+
+  /**
+   * [CUSTOM-20260923-010] Replace the set of live session ids for an agent.
+   * Called by SessionManager whenever its session index changes.
+   */
+  setLiveSessions(agentName: string, sessionIds: Iterable<string>): void {
+    const ids = new Set(sessionIds);
+    if (ids.size === 0) {
+      this.liveSessionIds.delete(agentName);
+    } else {
+      this.liveSessionIds.set(agentName, ids);
+    }
+  }
+
+  /** [CUSTOM-20260923-010] True if the session has a running process. */
+  private isLive(agentName: string, sessionId: string): boolean {
+    return this.liveSessionIds.get(agentName)?.has(sessionId) ?? false;
   }
 
   /**
@@ -154,12 +187,26 @@ export class SessionHistoryStore {
    * Reconcile against an agent-provided list (called only when the agent
    * supports `session/list`). Keeps the local store consistent with the
    * agent for future use, but the tree itself uses the agent's list directly.
+   *
+   * [CUSTOM-20260923-010] `liveSessionIds` (optional) is unioned with the
+   * internally-tracked live set. Live sessions are never pruned: some agents
+   * omit freshly-created sessions from `session/list` until the turn ends,
+   * and pruning them would make an in-flight session disappear from the tree.
    */
-  reconcileFromAgent(agentName: string, knownSessionIds: Set<string>): void {
+  reconcileFromAgent(
+    agentName: string,
+    knownSessionIds: Set<string>,
+    liveSessionIds?: Iterable<string>,
+  ): void {
+    const live = new Set(this.liveSessionIds.get(agentName) ?? []);
+    if (liveSessionIds) {
+      for (const id of liveSessionIds) { live.add(id); }
+    }
     let changed = false;
     this.entries = this.entries.filter(e => {
       if (e.agentName !== agentName) { return true; }
       if (knownSessionIds.has(e.sessionId)) { return true; }
+      if (live.has(e.sessionId)) { return true; }
       changed = true;
       return false;
     });
@@ -169,8 +216,13 @@ export class SessionHistoryStore {
   private enforceCap(agentName: string): void {
     const forAgent = this.list(agentName);
     if (forAgent.length <= this.capPerAgent) { return; }
-    const surplus = forAgent.slice(this.capPerAgent);
-    const stale = new Set(surplus.map(e => e.sessionId));
+    // [CUSTOM-20260923-010] Live sessions are never evicted, so the surplus is
+    // computed over the evictable tail only. If every entry is live we
+    // simply exceed the cap until sessions close — correctness over tidiness.
+    const evictable = forAgent.filter(e => !this.isLive(agentName, e.sessionId));
+    if (evictable.length <= this.capPerAgent) { return; }
+    const stale = new Set(evictable.slice(this.capPerAgent).map(e => e.sessionId));
+    if (stale.size === 0) { return; }
     this.entries = this.entries.filter(
       e => !(e.agentName === agentName && stale.has(e.sessionId)),
     );

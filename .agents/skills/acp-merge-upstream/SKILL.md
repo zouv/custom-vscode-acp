@@ -112,32 +112,27 @@ git merge --no-edit vendor/main
 
 ### 4. 冲突处理
 
-按 `CUSTOMIZATIONS/README.md` 的冲突策略速查表处理：
+**策略表只存一份**：[`CUSTOMIZATIONS/README.md`](../../../CUSTOMIZATIONS/README.md) 的「冲突策略速查」。
+按它处理即可，本文件不复制一份——两处各持一份必然会在加规则时跑偏。
 
-| 冲突文件特征 | 策略 |
-|---|---|
-| 在 `CUSTOMIZATIONS/src/` 或 `patches/` 下 | keep-ours |
-| registry 条目标记 `keep-ours` | keep-ours |
-| registry 条目标记 `keep-theirs` | keep-theirs |
-| `package-lock.json` | 接受上游版本后 `npm install` 重新生成 |
-| 含 `[CUSTOM-BEGIN]` 标记 | merge-manual（保留标记块内的自定义代码，标记外优先用上游） |
-| 其他 | merge-manual（逐块分析） |
-
-**`package.json` 特殊处理**（它是 JSON、无标记，但几乎每次上游更新都会改）：
+只有一条在这里强调：**`package.json` 特殊处理**（它是 JSON、无标记，但几乎每次上游更新都会改）：
 逐字段比对——身份字段（name/publisher/displayName/repository/bugs/homepage）与命名空间（`acpc.*`、`acp-client-custom`、`acpc-sessions`、`acpc-chat`）**必须保留我们的**；
 上游新增的命令/设置项**必须接受**，并且**新增的 `acp.*` 要立刻改成 `acpc.*`**。
+另外 `scripts` 块里有一条本仓库自定义的 `dev:host`（启动测试环境用），合并时要保留。
 
 `CUSTOMIZATIONS/registry.md` 自身冲突必须人工合并，并检查 frontmatter 合法性。
 
 ### 5. ⚠️ 重新执行命名空间扫描（不可跳过）
 
-冲突处理完后，**在验证之前**，全仓扫描上游带进来的 `acp.*`：
+冲突处理完后、**在验证之前**，跑一致性自检——**不要手写 grep**：
 
 ```bash
-# 找出所有上游形态的 acp.* 标识符（排除故意保留的两处）
-grep -rn "registerCommand('acp\.\|executeCommand('acp\.\|getConfiguration('acp')\|createTreeView('acp-\|createOutputChannel('ACP Client')\|createOutputChannel('ACP Traffic')\|'acp-sessions'\|'acp-chat'\|== acp-sessions\|== acp-chat\|command:acp\." \
-  src/ package.json
+node CUSTOMIZATIONS/scripts/check-registry.mjs
 ```
+
+它的 **§3** 就是 `acp.*` → `acpc.*` 残留扫描（覆盖 `src/` 与 `package.json`）。
+**为什么用脚本而不是内联 grep**：模式表（`NS_PATTERNS`）只有脚本里一份，
+将来新增要扫描的形态时不会漏；手写 grep 是它的副本，两边必然分叉。
 
 对每处命中：先确认它**不是**下面两个故意保留项，然后改成 `acpc.*` 形态：
 
@@ -176,7 +171,8 @@ npm test            # 会拉起真实 VS Code Extension Host
 | `vendor_branch` | `vendor/main`（固定） |
 | `last_merge_date` | 今天 |
 
-并在变更日志顶部追加一条记录（change-id 用 `CUSTOM-YYYYMMDD-NNN`），说明合并了哪些上游改动、处理了哪些冲突、命名空间扫描结果。
+并在 `CUSTOMIZATIONS/docs/changelog.md` **顶部**追加一条记录（change-id 用 `CUSTOM-YYYYMMDD-NNN`），说明合并了哪些上游改动、处理了哪些冲突、命名空间扫描结果。
+注意：**账本分两个文件**——`registry.md` 只有「改动总览」，日志在 `docs/changelog.md`，容易只更新前一个。
 
 ### 8. 汇报（不自动提交）
 
@@ -216,5 +212,5 @@ git reset --hard <合并前的 commit>    # 已提交但未推送时
 - 冲突文件清单与各自的处理策略
 - **命名空间重扫结果**（扫描到几处、改了哪些、是否有故意保留项）
 - `npm run lint` / `compile` / `test` 的实际输出
-- registry.md 更新了哪些字段、变更日志新增条目
+- registry.md（总览）更新了哪些字段、`docs/changelog.md` 新增条目
 - 建议的提交命令

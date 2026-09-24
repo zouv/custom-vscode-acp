@@ -12,10 +12,16 @@ import { SessionUpdateHandler } from '../handlers/SessionUpdateHandler';
 import { log, logError, logTraffic } from '../utils/Logger';
 import { version as extensionVersion } from '../../package.json';
 
+// [CUSTOM-BEGIN] CUSTOM-20260923-012 - 暴露终端 handler。
+// `TerminalHandler` 此前只在 connect() 里作为局部变量存在（仅被 AcpClientImpl 的私有字段引用），
+// 聊天面板拿不到任何句柄，于是工具卡片上的终端 chip 是无数据的死控件。
+// [CUSTOM-END] CUSTOM-20260923-012
 export interface ConnectionInfo {
   connection: ClientSideConnection;
   client: AcpClientImpl;
   initResponse: InitializeResponse;
+  /** Terminal handler for this connection — lets the chat panel read terminal output. */
+  terminals: TerminalHandler;
 }
 
 /**
@@ -90,7 +96,7 @@ export class ConnectionManager {
 
     log(`ConnectionManager: initialized. Agent: ${initResponse.agentInfo?.name || 'unknown'} v${initResponse.agentInfo?.version || '?'}`);
 
-    const info: ConnectionInfo = { connection, client, initResponse };
+    const info: ConnectionInfo = { connection, client, initResponse, terminals: terminalHandler };
     this.connections.set(agentId, info);
 
     return info;

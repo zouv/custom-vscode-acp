@@ -152,6 +152,32 @@ export class TerminalHandler {
     return { terminalId };
   }
 
+  // [CUSTOM-BEGIN] CUSTOM-20260923-012 - 只读访问器：让聊天面板能展示终端输出。
+  // ACP 的 `Terminal` 工具内容只是一个引用（{terminalId}），终端归客户端所有、也由客户端渲染。
+  // 上游只能通过 `terminalOutput()` 读到内容，但那条路径对未知 id **抛异常**，不适合 UI 调用。
+  // [CUSTOM-END] CUSTOM-20260923-012
+  /**
+   * Read a managed terminal's current state without throwing.
+   * Returns `null` when the terminal id is unknown (e.g. already released).
+   */
+  readOutput(terminalId: string): {
+    output: string;
+    truncated: boolean;
+    exited: boolean;
+    exitCode: number | null;
+    exitSignal: string | null;
+  } | null {
+    const managed = this.terminals.get(terminalId);
+    if (!managed) { return null; }
+    return {
+      output: managed.output,
+      truncated: managed.truncated,
+      exited: managed.exited,
+      exitCode: managed.exitCode,
+      exitSignal: managed.exitSignal,
+    };
+  }
+
   async terminalOutput(params: TerminalOutputRequest): Promise<TerminalOutputResponse> {
     const managed = this.terminals.get(params.terminalId);
     if (!managed) {
