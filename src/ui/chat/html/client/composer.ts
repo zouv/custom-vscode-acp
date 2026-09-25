@@ -27,8 +27,46 @@ export const composerClient = `
     configOptions: [],
     attachments: [],
     slashIndex: 0,
-    slashMatches: []
+    slashMatches: [],
+    // [CUSTOM-20260925-058] Draft mode: a new session that does not exist yet.
+    // '{ draftId, cwd }' while the panel is on a draft, else null. The two modes
+    // are mutually exclusive — 'setFocus' clears this and 'setDraft' clears
+    // 'sessionId' — because 'send()' branches on it.
+    draft: null,
+    /** A create-then-send is in flight; blocks a second send. */
+    draftPending: false
   };
+
+  // [CUSTOM-20260925-050] Per-session drafts. Switching sessions used to clear
+  // the textarea outright, so checking another tab lost whatever you had typed.
+  // Persisted through the same webview-local state as the scroll memory.
+  var drafts = {};
+  var draftTimer = null;
+
+  function stashDraft() {
+    if (state.sessionId) { drafts[state.sessionId] = input.value; }
+  }
+
+  function persistDraftsSoon() {
+    if (draftTimer) { return; }
+    draftTimer = window.setTimeout(function () {
+      draftTimer = null;
+      if (NS.boot && NS.boot.persistUi) { NS.boot.persistUi({ drafts: drafts }); }
+    }, 300);
+  }
+
+  function restoreDraft(sessionId) {
+    var text = sessionId ? drafts[sessionId] : undefined;
+    input.value = text === undefined ? '' : text;
+    autoGrow();
+  }
+
+  /** Drop a closed session's draft (hygiene: ids are never reused). */
+  function forgetDraft(sessionId) {
+    if (!sessionId || drafts[sessionId] === undefined) { return; }
+    delete drafts[sessionId];
+    persistDraftsSoon();
+  }
 
   function init() {
     input = NS.dom.qs('promptInput');
@@ -38,7 +76,17 @@ export const composerClient = `
     pickersEl = NS.dom.qs('configPickers');
 
     input.addEventListener('keydown', onKeyDown);
-    input.addEventListener('input', function () { updateSlashPopup(); });
+    input.addEventListener('input', function () {
+      stashDraft();
+      persistDraftsSoon();
+      updateSlashPopup();
+    });
+    // [CUSTOM-20260925-050] Restore the per-session drafts (same webview-local
+    // state the scroll memory uses; each document keeps its own copy).
+    if (NS.boot && NS.boot.recallUi) {
+      var ui = NS.boot.recallUi();
+      if (ui && ui.drafts) { drafts = ui.drafts; }
+    }
     sendBtn.addEventListener('click', function () {
       if (state.running) { cancel(); } else { send(); }
     });
@@ -52,7 +100,9 @@ export const composerClient = `
   }
 
   function canCompose() {
-    return !!state.sessionId && !state.loading;
+    // [CUSTOM-20260925-058] A draft has no sessionId yet but is perfectly
+    // composable — its first message is what creates the session.
+    return (!!state.sessionId || !!state.draft) && !state.loading;
   }
 
   function refreshControls() {
@@ -61,6 +111,18 @@ export const composerClient = `
     sendBtn.disabled = !enabled && !state.running;
     sendBtn.className = 'send-stop ' + (state.running ? 'stop' : 'send');
     sendBtn.textContent = state.running ? '\\u25a0 Stop' : 'Send';
+    if (state.draftPending) {
+      // A create-then-send is in flight: the button must not accept a second one.
+      sendBtn.disabled = true;
+      sendBtn.textContent = 'Creating\\u2026';
+      input.placeholder = 'Creating this session\\u2026';
+      return;
+    }
+    if (state.draft) {
+      // Say why the tab says "New session": the first message is what creates it.
+      input.placeholder = 'Your first message creates this session\\u2026';
+      return;
+    }
     if (state.commands.length > 0) {
       input.placeholder = 'Type a message, or / for commands\\u2026';
     } else {
@@ -73,9 +135,34 @@ export const composerClient = `
     // prompt, and clearing the textarea first would lose the user's draft.
     if (state.running) { return; }
     var text = input.value;
-    if (!text || text.trim().length === 0 || !state.sessionId) { return; }
+    if (!text || text.trim().length === 0) { return; }
+
+    if (state.draft) {
+      // [CUSTOM-20260925-058] A draft has no session yet, so the host creates it
+      // and THEN sends ('createDraftAndSend').
+      //
+      // **The textarea is deliberately NOT cleared here.** Creating the session
+      // can fail (the agent will not start, the directory is gone), and in that
+      // case both the draft tab and the typed text must survive. Clearing
+      // happens on 'draftResolved'; on 'draftFailed' the text stays put.
+      if (state.draftPending) { return; }
+      state.draftPending = true;
+      NS.bridge.post({
+        type: 'createDraftAndSend',
+        draftId: state.draft.draftId,
+        cwd: state.draft.cwd || undefined,
+        text: text
+      });
+      refreshControls();
+      return;
+    }
+
+    if (!state.sessionId) { return; }
     NS.bridge.post({ type: 'sendPrompt', sessionId: state.sessionId, text: text });
     input.value = '';
+    // [CUSTOM-20260925-050] The draft is consumed by sending it.
+    stashDraft();
+    persistDraftsSoon();
     hideSlash();
     autoGrow();
   }
@@ -146,7 +233,9 @@ export const composerClient = `
     NS.dom.clear(slashPopup);
     for (var i = 0; i < state.slashMatches.length; i++) {
       var cmd = state.slashMatches[i];
-      var item = NS.dom.el('div', 'slash-item' + (i === state.slashIndex ? ' active' : ''));
+      // [CUSTOM-20260925-047] A real <button>: the popup was mouse-only before.
+      var item = NS.dom.el('button', 'slash-item' + (i === state.slashIndex ? ' active' : ''));
+      item.type = 'button';
       item.appendChild(NS.dom.el('span', 'slash-name', '/' + cmd.name));
       var desc = cmd.description || cmd.inputHint || '';
       if (desc) { item.appendChild(NS.dom.el('span', 'slash-desc', desc)); }
@@ -276,7 +365,10 @@ export const composerClient = `
   }
 
   function menuItem(menu, option, value, label) {
-    var item = NS.dom.el('div', 'picker-item' + (String(option.currentValue) === String(value) ? ' active' : ''), label);
+    // [CUSTOM-20260925-047] A real <button> — the config menus were mouse-only.
+    var item = NS.dom.el('button', 'picker-item' + (String(option.currentValue) === String(value) ? ' active' : ''), label);
+    item.type = 'button';
+    item.setAttribute('aria-pressed', String(option.currentValue) === String(value) ? 'true' : 'false');
     item.addEventListener('click', function (event) {
       event.stopPropagation();
       closeMenus();
@@ -314,18 +406,77 @@ export const composerClient = `
     }
   }
 
+  // --- Draft mode (CUSTOM-20260925-058) ------------------------------------
+
+  /** Switch the composer into draft mode: enabled, but bound to no session yet. */
+  function setDraft(draft) {
+    // Leaving a real session: keep its typed text under its own id.
+    if (state.sessionId) { stashDraft(); }
+    state.sessionId = null;
+    state.agentName = null;
+    state.running = false;
+    state.loading = false;
+    state.draft = draft ? { draftId: draft.draftId, cwd: draft.cwd || null } : null;
+    state.draftPending = false;
+    state.attachments = [];
+    // No session ⇒ no 'meta' yet: mode/model/commands only arrive once the agent
+    // has created the session. That is inherent to a draft, not an oversight.
+    state.commands = [];
+    state.configOptions = [];
+    hideSlash();
+    renderPickers();
+    renderAttachments();
+    refreshControls();
+    autoGrow();
+  }
+
+  /** The user picked a directory for the focused draft. */
+  function updateDraftCwd(draftId, cwd) {
+    if (!state.draft || state.draft.draftId !== draftId) { return; }
+    state.draft.cwd = cwd || null;
+    refreshControls();
+  }
+
+  /** The first message was accepted: leave draft mode and clear the box. */
+  function resolveDraft() {
+    state.draft = null;
+    state.draftPending = false;
+    input.value = '';
+    autoGrow();
+    refreshControls();
+  }
+
+  /** Creating the session failed: stay in draft mode AND keep the typed text. */
+  function failDraft() {
+    state.draftPending = false;
+    refreshControls();
+    input.focus();
+  }
+
   // --- Public API ----------------------------------------------------------
 
   function setFocus(summary, meta) {
-    var changed = !state.sessionId || !summary || summary.sessionId !== state.sessionId;
+    // [CUSTOM-20260925-058] Draft mode and session mode are mutually exclusive —
+    // 'send()' branches on 'state.draft', so a stale one would misroute a send.
+    var wasDraft = !!state.draft;
+    state.draft = null;
+    state.draftPending = false;
+    var changed = wasDraft || !state.sessionId || !summary || summary.sessionId !== state.sessionId;
+    // [CUSTOM-20260925-050] Stash BEFORE the id changes, so the outgoing
+    // session's draft is filed under its own id rather than the incoming one.
+    if (changed) { stashDraft(); }
     state.sessionId = summary ? summary.sessionId : null;
     state.agentName = summary ? summary.agentName : null;
     state.running = summary ? !!summary.running : false;
     state.loading = summary ? !!summary.loading : false;
     if (changed) {
-      input.value = '';
       state.attachments = [];
       hideSlash();
+      // [CUSTOM-20260925-050] Only on an actual switch: re-assigning the value
+      // for the SAME session would move the caret to the end while the user is
+      // typing (a 'focus' for the already-focused session does arrive — e.g.
+      // clicking it again in the tree).
+      restoreDraft(state.sessionId);
     }
     if (meta) {
       state.commands = meta.availableCommands || [];
@@ -363,6 +514,9 @@ export const composerClient = `
   }
 
   function focusInput() { input.focus(); }
+  // [CUSTOM-20260925-047] Lets boot.ts decide whether it is appropriate to move
+  // the caret into the composer (no session / still loading = it is not).
+  function isComposable() { return canCompose(); }
 
   NS.composer = {
     init: init,
@@ -371,7 +525,13 @@ export const composerClient = `
     setMeta: setMeta,
     setAttachments: setAttachments,
     setLoading: setLoading,
-    focusInput: focusInput
+    focusInput: focusInput,
+    isComposable: isComposable,
+    forgetDraft: forgetDraft,
+    setDraft: setDraft,
+    updateDraftCwd: updateDraftCwd,
+    resolveDraft: resolveDraft,
+    failDraft: failDraft
   };
 })(window.__acpc = window.__acpc || {});
 `;

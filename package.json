@@ -94,6 +94,11 @@
         "title": "ACP (Custom): Open Chat Panel"
       },
       {
+        "command": "acpc.openChatInEditor",
+        "title": "ACP (Custom): Open Chat in Editor Area",
+        "icon": "$(open-preview)"
+      },
+      {
         "command": "acpc.addAgent",
         "title": "ACP (Custom): Add Agent Configuration",
         "icon": "$(add)"
@@ -179,6 +184,11 @@
       ],
       "view/title": [
         {
+          "command": "acpc.openChatInEditor",
+          "when": "view == acpc-sessions",
+          "group": "navigation@0"
+        },
+        {
           "command": "acpc.addAgent",
           "when": "view == acpc-sessions",
           "group": "navigation@1"
@@ -223,6 +233,11 @@
         {
           "command": "acpc.restartAgent",
           "when": "view == acpc-chat"
+        },
+        {
+          "command": "acpc.openChatInEditor",
+          "when": "view == acpc-chat",
+          "group": "navigation@0"
         }
       ],
       "view/item/context": [
@@ -268,6 +283,11 @@
         "mac": "cmd+shift+a"
       },
       {
+        "command": "acpc.openChatInEditor",
+        "key": "ctrl+alt+a",
+        "mac": "cmd+alt+a"
+      },
+      {
         "command": "acpc.cancelTurn",
         "key": "escape",
         "when": "acpc.turnInProgress"
@@ -280,18 +300,18 @@
           "type": "object",
           "description": "Agent configurations. Each key is the agent name, value has command, args, and env.",
           "default": {
+            "Claude Code": {
+              "command": "npx",
+              "args": [
+                "@agentclientprotocol/claude-agent-acp@latest"
+              ],
+              "env": {}
+            },
             "GitHub Copilot": {
               "command": "npx",
               "args": [
                 "@github/copilot-language-server@latest",
                 "--acp"
-              ],
-              "env": {}
-            },
-            "Claude Code": {
-              "command": "npx",
-              "args": [
-                "@agentclientprotocol/claude-agent-acp@latest"
               ],
               "env": {}
             },

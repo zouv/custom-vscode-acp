@@ -1,5 +1,5 @@
 // [CUSTOM-BEGIN] CUSTOM-20260923-011 - 新 Chat 面板（Claude Code 优先）与面板路由层：新增文件。
-// 记录渲染：user / assistant / thought / tool / plan / content / notice 七类。
+// 记录渲染：user / assistant / thought / tool / plan / content / notice / permission 八类。
 // 维护 entryId → {对象, DOM 节点} 映射，使 revise / toolUpdate 能就地打补丁而不是重绘整条时间线。
 // 同时追踪「还没有渲染成 HTML 的 assistant 记录」，由扩展侧 SafeMarkdown 往返渲染
 // （CSP 只允许带 nonce 的内联脚本，marked 不能进 webview 包）。
@@ -15,24 +15,80 @@ export const transcriptViewClient = `
   var pending = {};
   var sessionId = null;
   var messagesEl = null;
+  // [CUSTOM-20260924-021] Explicit append order. Object key order is NOT usable
+  // here: entry ids are strings but Object.keys ordering guarantees only cover
+  // integer-like keys, and the outline must list turns in the order they were
+  // placed (a mis-ordered outline silently jumps to the wrong message).
+  var order = [];
+  // [CUSTOM-20260924-022] entryId -> { text, node }: the streaming text tail we
+  // can extend in place instead of rewriting the whole string per chunk.
+  var tails = {};
+  // [CUSTOM-20260924-027] entryId -> true once we have asked the extension for
+  // a tool view model (ask once; a missing invocation must not loop).
+  var requestedViews = {};
+  // [CUSTOM-20260925-045] Running count of user entries. The outline's "is
+  // there anything to navigate?" check used to walk EVERY entry on every
+  // append/revise — and 'append'/'revise' fire per streamed message. Counting
+  // here (the only place entries are added) makes it O(1). Maintained in
+  // place() and zeroed in reset(); 'patch' never changes an entry's kind, so
+  // the count cannot drift.
+  var userCount = 0;
+  // [CUSTOM-20260925-048] Screen-reader pacing. 'aria-live' on #messages would
+  // otherwise announce EVERY streamed chunk (the bubble's text is rewritten
+  // dozens of times per reply, and a reader would hear the whole answer
+  // repeatedly from the start). 'aria-busy=true' while any entry is still
+  // streaming makes assistive tech defer announcements until the entry settles,
+  // at which point the finished text is announced once — which is what a reader
+  // actually wants. A counter rather than a scan, because this is updated on
+  // every streamed chunk.
+  var streamingCount = 0;
+  var lastBusy = null;
 
   // Only these keys may be copied onto a stored entry. Narrowing the write
   // prevents a future message shape from silently corrupting entry objects.
-  var PATCH_KEYS = ['text', 'html', 'streaming', 'elapsedMs', 'plan', 'content'];
+  // [CUSTOM-20260925-038] 这四个替换型键名必须与**记录字段名**逐字相同
+  // （plan -> entries / content -> blocks）。曾经写的是 'plan' / 'content'，
+  // 于是 patch 落进 entry.plan 而 buildPlan 读 entry.entries —— 更新静默丢弃
+  // （patch() 不认识的那个键只是被拷进对象，没有任何报错）。
+  // 改这里之前先对照 src/ui/chat/transcript/types.ts 的 EntryPatch。
+  var PATCH_KEYS = ['text', 'html', 'streaming', 'elapsedMs', 'entries', 'blocks', 'permission'];
 
   function init(container) {
     messagesEl = container;
+  }
+
+  /** [CUSTOM-20260925-048] Reflect the streaming state; writes only on change. */
+  function refreshBusy() {
+    if (!messagesEl) { return; }
+    var busy = streamingCount > 0 ? 'true' : 'false';
+    if (busy === lastBusy) { return; }
+    lastBusy = busy;
+    messagesEl.setAttribute('aria-busy', busy);
+  }
+
+  // [CUSTOM-20260925-044] The coalescer moved into toolCallView (it owns
+  // refreshGrouping, so it should own the coalescing too, and update() needs it
+  // as well). This stays as the transcript's own entry point so the messages
+  // container is resolved in exactly one place.
+  function refreshGroupingSoon() {
+    if (messagesEl) { NS.toolCallView.refreshGroupingSoon(messagesEl); }
   }
 
   function reset() {
     nodes = {};
     objects = {};
     pending = {};
+    order = [];
+    tails = {};
+    requestedViews = {};
+    userCount = 0;
+    streamingCount = 0;
     // Must be cleared too: a stale id would tag the next markdown batch with
     // the previous session, and the extension would render it for a session
     // the webview then filters out.
     sessionId = null;
     if (messagesEl) { NS.dom.clear(messagesEl); }
+    refreshBusy();
   }
 
   function hasPending() {
@@ -93,12 +149,17 @@ export const transcriptViewClient = `
   function buildContent(entry) {
     var wrap = NS.dom.el('div', 'entry entry-content');
     var blocks = entry.blocks || [];
-    if (blocks.length === 0) {
-      wrap.appendChild(NS.dom.el('div', 'tool-text', '(empty content)'));
-      return wrap;
-    }
+    var rendered = 0;
     for (var i = 0; i < blocks.length; i++) {
+      // [CUSTOM-20260924-026] Blank text blocks are invisible: rendering them
+      // left a bare strip behind (the extension now filters them out, this is
+      // the backstop for snapshots that already contain one).
+      if (blocks[i] && blocks[i].type === 'text' && NS.toolCallView.isBlank(blocks[i].text)) { continue; }
       wrap.appendChild(NS.toolCallView.renderContentItem({ type: 'content', block: blocks[i] }));
+      rendered++;
+    }
+    if (rendered === 0) {
+      wrap.appendChild(NS.dom.el('div', 'tool-text', '(empty content)'));
     }
     return wrap;
   }
@@ -119,6 +180,14 @@ export const transcriptViewClient = `
     if (entry.kind === 'thought') { return buildThought(entry); }
     if (entry.kind === 'plan') { return buildPlan(entry); }
     if (entry.kind === 'content') { return buildContent(entry); }
+    // [CUSTOM-20260924-020] Permission card (panel-side replacement for the
+    // window-level QuickPick).
+    if (entry.kind === 'permission') {
+      var permWrap = NS.dom.el('div', 'entry entry-permission');
+      permWrap.appendChild(NS.permissionView.render(entry.permission || {}));
+      return permWrap;
+    }
+    // [CUSTOM-END] CUSTOM-20260924-020
     if (entry.kind === 'notice') {
       return NS.dom.el('div', 'entry entry-notice ' + entry.level, entry.text);
     }
@@ -130,26 +199,125 @@ export const transcriptViewClient = `
     return NS.dom.el('div', 'entry');
   }
 
+  // [CUSTOM-20260924-029] The type icon lives INSIDE the content host, so every
+  // rewrite of that host (streaming text, markdown html) has to put it back.
+  // Keeping it here avoids restructuring any entry's layout.
+  function takeIcon(host) {
+    var icon = host.querySelector('.rec-icon');
+    if (icon && icon.parentNode) { icon.parentNode.removeChild(icon); }
+    return icon;
+  }
+
+  function putIcon(host, icon) {
+    if (icon) { host.insertBefore(icon, host.firstChild); }
+  }
+
   function applyAssistant(bubble, entry) {
-    if (entry.html !== undefined && entry.html !== null) {
+    // [CUSTOM-20260925-036] An EMPTY html string is not a rendered message.
+    // markdown.render() can return '' (blank-ish input), and treating that as
+    // "we have HTML" turned the bubble into an empty bordered box - one of the
+    // two shapes the "blank bars" report showed. Fall back to the raw text.
+    var hasHtml = entry.html !== undefined && entry.html !== null && entry.html !== '';
+    if (hasHtml) {
+      // The bubble becomes sanitized HTML: any text node we were appending to
+      // is gone, so the delta bookkeeping must go with it.
+      delete tails[entry.id];
+      var icon = takeIcon(bubble);
       bubble.className = 'bubble md';
       NS.dom.setSanitizedHtml(bubble, entry.html);
+      putIcon(bubble, icon);
       NS.links.decorateCodeBlocks(bubble);
-    } else {
-      bubble.className = 'bubble';
-      bubble.textContent = entry.text || '';
+      return;
     }
+    bubble.className = 'bubble';
+    setStreamingText(bubble, entry.id, entry.text || '');
+  }
+
+  /**
+   * [CUSTOM-20260924-022] Streaming text is monotonic, so a new chunk is almost
+   * always "the old string plus a suffix". Re-assigning textContent each time
+   * rewrites the whole accumulated reply (O(n^2) per reply) and re-creates the
+   * text node. Appending only the suffix keeps it O(delta).
+   *
+   * Falls back to a full replace whenever the prefix relation does not hold:
+   *   · no previous text node (first paint / hydrate / reset / after HTML)
+   *   · not a prefix - e.g. the 64KB clamp rewrites the trailing marker
+   *   · the host element was replaced (plan/content rebuilds swap nodes)
+   */
+  function setStreamingText(host, entryId, next) {
+    var tail = tails[entryId];
+    if (tail && tail.node.parentNode === host && next.length >= tail.text.length
+      && next.indexOf(tail.text) === 0) {
+      var delta = next.slice(tail.text.length);
+      if (delta.length > 0) { tail.node.appendData(delta); }
+      tail.text = next;
+      return;
+    }
+    delete tails[entryId];
+    var icon = takeIcon(host);
+    host.textContent = next;
+    putIcon(host, icon);
+    // Remember the node we just created so the next chunk can extend it. It is
+    // the LAST child now (the icon, when present, sits in front of it).
+    var first = host.lastChild;
+    if (first && first.nodeType === 3) { tails[entryId] = { text: next, node: first }; }
+  }
+
+  /**
+   * [CUSTOM-20260924-027] A tool entry without its view model used to render as
+   * a bare tool box — an empty shell that updateTool could never repair (it only
+   * patches the status / title / body, none of which exist in a shell). That is
+   * what "the tool call isn't displayed" looked like.
+   *
+   * Two things happen here instead: a minimal but *real* card is built from the
+   * entry's own id (so it never renders blank), and the extension is asked once
+   * for the actual view model — which then arrives as a toolUpdate and patches
+   * this card through the normal path.
+   */
+  function placeholderToolView(entry) {
+    if (!requestedViews[entry.id]) {
+      requestedViews[entry.id] = true;
+      console.warn('[acpc] tool entry without toolView, requesting it:', entry.id, entry.toolCallId);
+      NS.bridge.postForSession({ type: 'needToolView', entryId: entry.id, toolCallId: entry.toolCallId });
+    }
+    return {
+      toolCallId: entry.toolCallId,
+      title: entry.toolCallId,
+      kind: 'other',
+      status: 'pending',
+      command: null,
+      locations: [],
+      items: []
+    };
   }
 
   function place(entry, toolView) {
     var node;
-    if (entry.kind === 'tool' && toolView) {
-      node = NS.toolCallView.render(toolView);
+    if (entry.kind === 'tool') {
+      node = NS.toolCallView.render(toolView || placeholderToolView(entry));
     } else {
       node = build(entry);
     }
+    // Drives the three-tier spacing ladder in the stylesheet (same-kind blocks
+    // sit tight, cross-kind blocks get air, user messages start a new turn).
+    node.setAttribute('data-kind', entry.kind);
+    // [CUSTOM-20260924-021] Per-entry anchor. The outline (and anything that
+    // later needs to find a specific record's DOM node) keys off this instead
+    // of re-deriving positions from the entry list.
+    node.setAttribute('data-entry-id', entry.id);
+    // [CUSTOM-20260924-028] Type icon. Must happen here (not inside the build
+    // functions) so it covers hydrate and both append paths at once; attach is
+    // idempotent, so the rebuild paths can call it again safely.
+    NS.icons.attach(node, entry);
     objects[entry.id] = entry;
     nodes[entry.id] = node;
+    order.push(entry.id);
+    // [CUSTOM-20260925-045] The one place entries are added, so the one place
+    // the outline's anchor count can change.
+    if (entry.kind === 'user') { userCount++; }
+    // [CUSTOM-20260925-048] ...and the one place the streaming count can grow.
+    if (entry.streaming) { streamingCount++; }
+    refreshBusy();
     markPending(entry);
     return node;
   }
@@ -164,8 +332,11 @@ export const transcriptViewClient = `
       var entry = entries[i];
       messagesEl.appendChild(place(entry, entry.toolView));
     }
-    NS.toolCallView.refreshGrouping(messagesEl);
-    NS.scroll.toBottom();
+    refreshGroupingSoon();
+    // [CUSTOM-20260924-022] No unconditional toBottom() here: the scroll target
+    // is now a decision (restore the remembered position vs. stick to bottom)
+    // and it belongs to boot.applyFocus. Leaving it here made scroll memory
+    // silently ineffective - every session switch landed at the bottom.
   }
 
   /**
@@ -177,14 +348,27 @@ export const transcriptViewClient = `
     if (!messagesEl) { return; }
     if (objects[entry.id]) {
       if (entry.kind === 'tool' && toolView) {
-        updateTool(entry.id, toolView);
+        var existing = nodes[entry.id];
+        if (existing && existing.parentNode && !existing.querySelector('.tool-head')) {
+          // The card exists only as an empty shell (it was placed before its
+          // view model was available). updateTool can only patch
+          // .tool-status/.tool-title/.tool-body, so it can NEVER repair a shell
+          // -- which is why a shell used to be permanent. Rebuild instead.
+          var rebuilt = NS.toolCallView.render(toolView);
+          rebuilt.setAttribute('data-kind', 'tool');
+          existing.parentNode.replaceChild(rebuilt, existing);
+          nodes[entry.id] = rebuilt;
+          refreshGroupingSoon();
+        } else {
+          updateTool(entry.id, toolView);
+        }
       } else {
         patch(entry.id, entry);
       }
       return;
     }
     messagesEl.appendChild(place(entry, toolView));
-    if (entry.kind === 'tool') { NS.toolCallView.refreshGrouping(messagesEl); }
+    if (entry.kind === 'tool') { refreshGroupingSoon(); }
     NS.scroll.follow();
   }
 
@@ -193,9 +377,17 @@ export const transcriptViewClient = `
     var node = nodes[entryId];
     if (!entry || !node || !changes) { return; }
 
+    // [CUSTOM-20260925-048] Capture before the copy: a streaming -> settled
+    // transition is the moment to let assistive tech speak.
+    var wasStreaming = !!entry.streaming;
     for (var i = 0; i < PATCH_KEYS.length; i++) {
       var key = PATCH_KEYS[i];
       if (Object.prototype.hasOwnProperty.call(changes, key)) { entry[key] = changes[key]; }
+    }
+    if (wasStreaming !== !!entry.streaming) {
+      streamingCount += entry.streaming ? 1 : -1;
+      if (streamingCount < 0) { streamingCount = 0; }
+      refreshBusy();
     }
 
     if (entry.kind === 'assistant') {
@@ -209,28 +401,68 @@ export const transcriptViewClient = `
       }
     } else if (entry.kind === 'thought') {
       var body = node.querySelector('.thought-body');
-      if (body) { body.textContent = entry.text || ''; }
+      if (body) { setStreamingText(body, entryId, entry.text || ''); }
       var summary = node.querySelector('summary');
       if (summary && entry.streaming === false) {
+        // [CUSTOM-20260924-028] Replace only the label, keep the type icon: this
+        // rewrite (streaming -> "Thought for Ns") used to clear the whole
+        // summary, which would have wiped the icon on every finalized block.
+        var keep = [];
+        for (var s = 0; s < summary.childNodes.length; s++) {
+          var child = summary.childNodes[s];
+          if (child.nodeType === 1 && child.className === 'rec-icon') { keep.push(child); }
+        }
         NS.dom.clear(summary);
+        for (var k = 0; k < keep.length; k++) { summary.appendChild(keep[k]); }
         summary.appendChild(document.createTextNode(thoughtLabel(entry)));
+        // Auto-collapse: a finished reasoning block must stop occupying the
+        // viewport. Its finalize fires exactly when the answer starts (or the
+        // turn ends), which is precisely when the reader wants it out of the
+        // way. The node itself IS the <details> element, so set .open on it.
+        node.open = false;
       }
     } else if (entry.kind === 'plan') {
       var rebuilt = buildPlan(entry);
+      rebuilt.setAttribute('data-kind', entry.kind);
+      NS.icons.attach(rebuilt, entry);
       node.parentNode.replaceChild(rebuilt, node);
       nodes[entryId] = rebuilt;
     } else if (entry.kind === 'content') {
       var rebuiltContent = buildContent(entry);
+      rebuiltContent.setAttribute('data-kind', entry.kind);
       node.parentNode.replaceChild(rebuiltContent, node);
       nodes[entryId] = rebuiltContent;
+    } else if (entry.kind === 'permission') {
+      // [CUSTOM-20260924-020] Patch the existing card in place (rather than
+      // rebuilding) so the button the user is aiming at never moves/disappears
+      // mid-click. The data-kind attribute is already on the wrapper.
+      var card = node.querySelector('.perm');
+      if (card) { NS.permissionView.applyState(card, entry.permission || {}); }
     }
     NS.scroll.follow();
   }
 
   function updateTool(entryId, tool) {
     var node = nodes[entryId];
+    var entry = objects[entryId];
+    // [CUSTOM-20260924-023] Keep the stored view model in step with the patch:
+    // the conversation rail reads its status field to colour the dot, and tool
+    // status is not part of PATCH_KEYS.
+    if (entry) { entry.toolView = tool; }
     if (!node) { return; }
-    NS.toolCallView.update(node, tool);
+    // [CUSTOM-20260924-027] A card that was placed before its view model existed
+    // is a bare tool shell, and update can only patch an existing head. The
+    // append path learned this in 018; this path was the remaining gap, which is
+    // why such a card stayed empty forever.
+    if (tool && !node.querySelector('.tool-head')) {
+      var rebuilt = NS.toolCallView.render(tool);
+      rebuilt.setAttribute('data-kind', 'tool');
+      if (node.parentNode) { node.parentNode.replaceChild(rebuilt, node); }
+      nodes[entryId] = rebuilt;
+      refreshGroupingSoon();
+    } else {
+      NS.toolCallView.update(node, tool);
+    }
     NS.scroll.follow();
   }
 
@@ -245,6 +477,13 @@ export const transcriptViewClient = `
     return out;
   }
 
+  // [CUSTOM-20260924-021] Ordered accessors for the conversation outline.
+  function ordered() { return order; }
+  function entryOf(id) { return objects[id]; }
+  function nodeOf(id) { return nodes[id]; }
+  // [CUSTOM-20260925-045] O(1) replacement for the outline's full walk.
+  function userAnchorCount() { return userCount; }
+
   NS.transcriptView = {
     init: init,
     reset: reset,
@@ -252,7 +491,11 @@ export const transcriptViewClient = `
     append: append,
     patch: patch,
     updateTool: updateTool,
-    pendingMarkdown: pendingMarkdown
+    pendingMarkdown: pendingMarkdown,
+    ordered: ordered,
+    entry: entryOf,
+    node: nodeOf,
+    userAnchorCount: userAnchorCount
   };
 })(window.__acpc = window.__acpc || {});
 `;

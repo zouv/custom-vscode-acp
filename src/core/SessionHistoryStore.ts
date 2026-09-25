@@ -109,6 +109,32 @@ export class SessionHistoryStore {
     return this.entries.find(e => e.agentName === agentName && e.sessionId === sessionId);
   }
 
+  // [CUSTOM-BEGIN] CUSTOM-20260925-057 - 每会话工作目录：目录候选来源之一。
+  /**
+   * Distinct directories this agent's sessions have used, most recently active
+   * first. Backs the "recently used" group of the new-session directory picker.
+   *
+   * `list()` is already sorted by `lastActiveAt` descending, so the first
+   * sighting of a directory IS its most recent use — no timestamps needed.
+   *
+   * **Scope caveat**: this store lives in `workspaceState`, so it only knows
+   * directories used *while this workspace was open*. That is still the only
+   * durable source we have, but a fresh workspace starts empty — which is why
+   * the picker also merges the agent-side `session/list` (that one spans
+   * directories, as the "Open previous session" list shows).
+   */
+  recentDirectories(agentName: string): string[] {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const entry of this.list(agentName)) {
+      if (!entry.cwd || seen.has(entry.cwd)) { continue; }
+      seen.add(entry.cwd);
+      out.push(entry.cwd);
+    }
+    return out;
+  }
+  // [CUSTOM-END] CUSTOM-20260925-057
+
   /**
    * Insert (or no-op if present) a new session entry. Called when the client
    * successfully creates a session via `session/new`.

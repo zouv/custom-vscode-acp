@@ -2,7 +2,7 @@
 // 面板路由层：仍然是**唯一一个** `acpc-chat` 视图（package.json 不动、不引入 view 级 when、
 // 不用 setContext），由本类按「当前聚焦会话所属的 agent」决定渲染新面板还是旧面板。
 //
-// 为什么选单视图路由而不是双视图条件显隐（见 CUSTOMIZATIONS/architecture.md §5）：
+// 为什么选单视图路由而不是双视图条件显隐（见 CUSTOMIZATIONS/docs/arch/chat-panel.md §5）：
 //   · `acpc-chat.focus` 有 5 个调用点（extension.ts ×4 + SessionTreeProvider 的树项命令），
 //     单视图下全部不用改；
 //   · 侧边栏不会出现两个聊天入口；
@@ -13,18 +13,14 @@ import * as vscode from 'vscode';
 
 import type { SessionManager } from '../../core/SessionManager';
 import type { SessionUpdateHandler } from '../../handlers/SessionUpdateHandler';
+import type { PermissionBridge } from '../../handlers/PermissionBridge';
 import { log } from '../../utils/Logger';
 import { ChatPanelHost } from './ChatPanelHost';
 import { LegacyPanelAdapter } from './LegacyPanelAdapter';
 import { ChatWebviewProvider } from '../ChatWebviewProvider';
 import type { IChatPanel, PanelContext, PanelId } from './panelContract';
-
-/**
- * Agents whose chat panel is the rewritten one. Matched against the
- * `acpc.agents` configuration KEY (e.g. "Claude Code"), not against the
- * display name the agent reports in `initialize`.
- */
-const MODERN_AGENTS: ReadonlySet<string> = new Set(['Claude Code']);
+import { isModernAgent } from './panelContract';
+import { ChatEditorPanel } from './ChatEditorPanel';
 
 const LOG_PREFIX = 'chat-router';
 
@@ -36,16 +32,25 @@ export class ChatRouterProvider implements vscode.WebviewViewProvider {
 
   private readonly modern: ChatPanelHost;
   private readonly legacy: LegacyPanelAdapter;
+  // [CUSTOM-BEGIN] CUSTOM-20260924-019 - 编辑区面板（第二个 surface，仅 Claude Code）。
+  private readonly editor: ChatEditorPanel;
+  // [CUSTOM-END] CUSTOM-20260924-019
 
   constructor(
     extensionUri: vscode.Uri,
     private readonly sessionManager: SessionManager,
     sessionUpdateHandler: SessionUpdateHandler,
+    // [CUSTOM-BEGIN] CUSTOM-20260924-020 - 透传给 ChatPanelHost（它注册为 PermissionPresenter）
+    permissionBridge?: PermissionBridge,
+    // [CUSTOM-END] CUSTOM-20260924-020
   ) {
-    this.modern = new ChatPanelHost(extensionUri, sessionManager, sessionUpdateHandler);
+    this.modern = new ChatPanelHost(extensionUri, sessionManager, sessionUpdateHandler, permissionBridge);
     this.legacy = new LegacyPanelAdapter(
       new ChatWebviewProvider(extensionUri, sessionManager, sessionUpdateHandler),
     );
+    // [CUSTOM-BEGIN] CUSTOM-20260924-019
+    this.editor = new ChatEditorPanel(this.modern, sessionManager, extensionUri, () => this.context());
+    // [CUSTOM-END] CUSTOM-20260924-019
 
     // Any focus change may cross the panel boundary (Claude Code ⇄ other agent).
     this.sessionManager.on('active-session-changed', () => this.syncActivePanel());
@@ -89,6 +94,12 @@ export class ChatRouterProvider implements vscode.WebviewViewProvider {
     this.current?.attachFile(uri);
   }
 
+  // [CUSTOM-BEGIN] CUSTOM-20260924-019 - 打开编辑区面板（`acpc.openChatInEditor`）。
+  openEditorChat(): void {
+    this.editor.open();
+  }
+  // [CUSTOM-END] CUSTOM-20260924-019
+
   notifyActiveSessionChanged(): void {
     this.syncActivePanel();
   }
@@ -117,6 +128,7 @@ export class ChatRouterProvider implements vscode.WebviewViewProvider {
   }
 
   dispose(): void {
+    this.editor.dispose();
     this.current?.detach();
     this.current = null;
     this.view = null;
@@ -126,8 +138,7 @@ export class ChatRouterProvider implements vscode.WebviewViewProvider {
   // --- Routing -------------------------------------------------------------
 
   private panelIdForFocus(): PanelId {
-    const agentName = this.sessionManager.getFocusedAgentName();
-    return agentName && MODERN_AGENTS.has(agentName) ? 'modern' : 'legacy';
+    return isModernAgent(this.sessionManager.getFocusedAgentName()) ? 'modern' : 'legacy';
   }
 
   private context(): PanelContext {
@@ -139,9 +150,29 @@ export class ChatRouterProvider implements vscode.WebviewViewProvider {
 
   /** Re-evaluate which panel should own the view, then refresh its focus. */
   private syncActivePanel(): void {
-    if (!this.view) { return; }
-    this.activate(this.panelIdForFocus(), false);
-    this.current?.onFocusChanged(this.context());
+    const id = this.panelIdForFocus();
+    const ctx = this.context();
+
+    // [CUSTOM-BEGIN] CUSTOM-20260924-019 / CUSTOM-20260925-031 - 不变量：编辑区面存在 ⟹
+    // 聚焦 agent（**若有**）属于 MODERN_AGENTS。
+    // 焦点跨到别的 agent 时先关掉编辑区面板：legacy 面板的对话内容存在 webview DOM 里，
+    // 留着它只会显示上一个 agent 的陈旧内容。
+    // **没有聚焦会话（agentName 为 null）不再算违规**——那是个合法状态（窗口重载后就是这样），
+    // 031 之前它会让"打开编辑区面板"的按钮必被拒（见 ChatEditorPanel.open 的说明）。
+    if (ctx.agentName && id !== 'modern' && this.editor.isOpen) {
+      this.editor.close('focus-changed');
+    }
+    // [CUSTOM-END] CUSTOM-20260924-019 / CUSTOM-20260925-031
+
+    if (!this.view) {
+      // 侧边栏从未打开（用户只用编辑区面板）时，焦点也必须推给 modern host，
+      // 否则面板永远停在 attach 那一刻的快照上。旧实现在这里直接 return。
+      if (id === 'modern' && this.editor.isOpen) { this.modern.onFocusChanged(ctx); }
+      return;
+    }
+
+    this.activate(id, false);
+    this.current?.onFocusChanged(ctx);
   }
 
   private activate(id: PanelId, force: boolean): void {

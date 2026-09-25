@@ -14,6 +14,8 @@
 // [CUSTOM-END] CUSTOM-20260923-010
 import * as vscode from 'vscode';
 import { EventEmitter } from 'node:events';
+import { existsSync, statSync } from 'node:fs';
+import { isAbsolute } from 'node:path';
 
 import type {
   NewSessionResponse,
@@ -33,6 +35,9 @@ import { AgentManager } from './AgentManager';
 import { ConnectionManager, ConnectionInfo } from './ConnectionManager';
 import { SessionUpdateHandler } from '../handlers/SessionUpdateHandler';
 import { SessionHistoryStore } from './SessionHistoryStore';
+// [CUSTOM-BEGIN] CUSTOM-20260924-020
+import type { PermissionBridge } from '../handlers/PermissionBridge';
+// [CUSTOM-END] CUSTOM-20260924-020
 import { getAgentConfigs } from '../config/AgentConfig';
 import { log, logError } from '../utils/Logger';
 import { sendEvent, sendError } from '../utils/TelemetryManager';
@@ -109,6 +114,49 @@ export type AgentConnectionError =
  *   - `session-closed`         (sessionId, agentName, reason)  [new]
  * All other events are unchanged and already session-scoped.
  */
+export interface DefaultCwdDecision {
+  cwd: string;
+  /** Which level of the chain produced it. */
+  reason: 'configured' | 'workspace' | 'process';
+  /** Set when a configured value was REJECTED, so the caller can log why. */
+  ignoredConfigured?: 'relative' | 'missing';
+}
+
+/**
+ * [CUSTOM-20260925-057] The "which directory does a new session get" policy,
+ * as a **pure function**.
+ *
+ * Extracted from the class so it can be tested directly. The alternative —
+ * driving `vscode.workspace.getConfiguration()` from a test — would mean
+ * writing to real user or workspace settings files, which a test has no
+ * business doing. Everything vscode-shaped is therefore passed in, including
+ * the directory check.
+ *
+ * A configured value that is relative or not an existing directory is
+ * **rejected, not passed on**: `session/new` with a bogus cwd fails deep
+ * inside the agent, where the reason is hard to see.
+ */
+export function pickDefaultCwd(
+  configured: string | undefined,
+  workspaceFolder: string | undefined,
+  processCwd: string,
+  isDirectory: (candidate: string) => boolean,
+): DefaultCwdDecision {
+  const trimmed = typeof configured === 'string' ? configured.trim() : '';
+  const fallback: 'workspace' | 'process' = workspaceFolder ? 'workspace' : 'process';
+  const fallbackCwd = workspaceFolder || processCwd;
+  if (!trimmed) {
+    return { cwd: fallbackCwd, reason: fallback };
+  }
+  if (!isAbsolute(trimmed)) {
+    return { cwd: fallbackCwd, reason: fallback, ignoredConfigured: 'relative' };
+  }
+  if (!isDirectory(trimmed)) {
+    return { cwd: fallbackCwd, reason: fallback, ignoredConfigured: 'missing' };
+  }
+  return { cwd: trimmed, reason: 'configured' };
+}
+
 export class SessionManager extends EventEmitter {
   private sessions: Map<string, SessionInfo> = new Map();
 
@@ -184,6 +232,11 @@ export class SessionManager extends EventEmitter {
   /** Client-side session history (optional — only used for tier-2 tree). */
   private historyStore: SessionHistoryStore | null = null;
 
+  // [CUSTOM-BEGIN] CUSTOM-20260924-020
+  /** Permission bridge (optional — only used to retire pending prompts on cancel). */
+  private permissionBridge: PermissionBridge | null = null;
+  // [CUSTOM-END] CUSTOM-20260924-020
+
   constructor(
     private readonly agentManager: AgentManager,
     private readonly connectionManager: ConnectionManager,
@@ -219,6 +272,14 @@ export class SessionManager extends EventEmitter {
     this.historyStore = store;
   }
 
+  // [CUSTOM-BEGIN] CUSTOM-20260924-020 - 权限桥（晚绑定，理由同 setHistoryStore：
+  // 桥由 extension.ts 构造，而 SessionManager 的构造早于它）。
+  // 用途只有一个：取消轮次时必须把待决的权限请求回答掉，见 cancelTurn。
+  setPermissionBridge(bridge: PermissionBridge): void {
+    this.permissionBridge = bridge;
+  }
+  // [CUSTOM-END] CUSTOM-20260924-020
+
   /** Public accessor for downstream UI. */
   getHistoryStore(): SessionHistoryStore | null {
     return this.historyStore;
@@ -233,10 +294,40 @@ export class SessionManager extends EventEmitter {
     return this.capabilities.get(agentName);
   }
 
-  private getWorkspaceCwd(): string {
-    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    return cwd || process.cwd();
+  // [CUSTOM-BEGIN] CUSTOM-20260925-057 - 每会话工作目录：`getWorkspaceCwd()` → `resolveDefaultCwd()`。
+  //
+  // 从上游到这里，cwd 一直是「工作区第一个文件夹」，硬编码在四处调用点里。ACP 其实把 cwd 定义成
+  // **会话级**属性（`NewSessionRequest.cwd`："The working directory for this session"），
+  // 与 agent 进程的 cwd 无关——2026-09-25 用真实适配器实测确认过（见
+  // `CUSTOMIZATIONS/scripts/probe-session-cwd.mjs`：进程在 A 目录、会话声明 B 目录，
+  // shell 的 `pwd`、`ls`、以及读相对路径**全部落在 B**，A 那边的东西一个都没出现）。
+  // 所以「不同会话用不同目录」只需把这条链的参数化，不需要按 cwd 分进程。
+  //
+  // 顺带让 `acpc.defaultWorkingDirectory` 真正生效——它此前在 package.json 里声明了、
+  // **代码里零处读取**，与 pitfall #5 的 `acpc.turnInProgress` 是同一类「声明了却没接线」。
+  /**
+   * The cwd a session gets when the caller does not name one. Three levels:
+   *   1. `acpc.defaultWorkingDirectory`;
+   *   2. the first workspace folder;
+   *   3. `process.cwd()`.
+   *
+   * A configured value that is relative or does not exist is **ignored with a
+   * log line** rather than handed to the agent: `session/new` with a bogus cwd
+   * fails deep inside the agent, where the reason is hard to see.
+   */
+  resolveDefaultCwd(): string {
+    const decision = pickDefaultCwd(
+      vscode.workspace.getConfiguration('acpc').get<string>('defaultWorkingDirectory'),
+      vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+      process.cwd(),
+      candidate => existsSync(candidate) && statSync(candidate).isDirectory(),
+    );
+    if (decision.ignoredConfigured) {
+      log(`SessionManager: ignoring acpc.defaultWorkingDirectory (${decision.ignoredConfigured})`);
+    }
+    return decision.cwd;
   }
+  // [CUSTOM-END] CUSTOM-20260925-057
 
   private summarizeCapabilities(caps: AgentCapabilities | undefined | null): AgentCapabilitySummary {
     const sc: any = (caps as any)?.sessionCapabilities;
@@ -399,9 +490,19 @@ export class SessionManager extends EventEmitter {
    * process if needed. This is the atomic primitive behind multi-chat.
    *
    * New sessions are never destroyed implicitly — the caller decides focus.
+   *
+   * [CUSTOM-20260925-057] `opts.cwd` names this session's working directory.
+   * Omitted ⇒ {@link resolveDefaultCwd}. It is also handed to the process spawn
+   * as a *preference*, but that only matters for the very first spawn of that
+   * agent (the process is reused across sessions), and only for adapters that
+   * care — the one we ship against does not (see resolveDefaultCwd's note).
    */
-  async createSession(agentName: string, opts: { focus?: boolean } = {}): Promise<SessionInfo> {
-    const { focus = true } = opts;
+  async createSession(
+    agentName: string,
+    opts: { focus?: boolean; cwd?: string } = {},
+  ): Promise<SessionInfo> {
+    const { focus = true, cwd: requestedCwd } = opts;
+    const cwd = requestedCwd || this.resolveDefaultCwd();
 
     const configs = getAgentConfigs();
     const config = configs[agentName];
@@ -409,13 +510,12 @@ export class SessionManager extends EventEmitter {
       throw new Error(`Unknown agent: ${agentName}. Available: ${Object.keys(configs).join(', ')}`);
     }
 
-    log(`SessionManager: creating session for agent "${agentName}"`);
+    log(`SessionManager: creating session for agent "${agentName}" in ${cwd}`);
     sendEvent('agent/connect.start', { agentName });
     const connectStartTime = Date.now();
 
     try {
-      const cwd = this.getWorkspaceCwd();
-      const connInfo = await this.ensureConnected(agentName);
+      const connInfo = await this.ensureConnected(agentName, cwd);
       const agentId = this.findAgentIdForConnection(connInfo);
       if (!agentId) {
         throw new Error(`Unable to locate agent process for "${agentName}".`);
@@ -726,6 +826,13 @@ export class SessionManager extends EventEmitter {
     const session = this.sessions.get(sessionId);
     if (!session) { return; }
 
+    // [CUSTOM-BEGIN] CUSTOM-20260924-020 - 先回答待决的权限请求，再发 session/cancel。
+    // ACP 契约：会话被取消时，客户端必须把每个待决的 `session/request_permission`
+    // 以 `{ outcome: 'cancelled' }` 结束。少了这一步，agent 会一直卡在等答复上
+    // ——旧实现（只有 QuickPick）从来没有解决过这个 promise。
+    this.permissionBridge?.cancelSession(sessionId);
+    // [CUSTOM-END] CUSTOM-20260924-020
+
     const connInfo = this.connectionManager.getConnection(session.agentId);
     if (!connInfo) { return; }
 
@@ -910,21 +1017,27 @@ export class SessionManager extends EventEmitter {
    * point (not after session creation) so that a probed-but-sessionless
    * agent is correctly reported as connected.
    */
-  async ensureConnected(agentName: string): Promise<ConnectionInfo> {
+  async ensureConnected(agentName: string, preferredCwd?: string): Promise<ConnectionInfo> {
     // [CUSTOM-20260923-010] Collapse concurrent calls for the same agent onto
     // one connection attempt — otherwise a probe/connect race spawns two
     // processes for one agent name.
     const inFlight = this.connecting.get(agentName);
     if (inFlight) { return inFlight; }
 
-    const attempt = this.ensureConnectedOnce(agentName).finally(() => {
+    const attempt = this.ensureConnectedOnce(agentName, preferredCwd).finally(() => {
       this.connecting.delete(agentName);
     });
     this.connecting.set(agentName, attempt);
     return attempt;
   }
 
-  private async ensureConnectedOnce(agentName: string): Promise<ConnectionInfo> {
+  /**
+   * [CUSTOM-20260925-057] `preferredCwd` only affects a *newly spawned* process;
+   * an already-running agent keeps the cwd it was spawned with. That is a real
+   * limitation but not a correctness one for the adapter we ship against — it
+   * resolves everything relative to the SESSION cwd (see resolveDefaultCwd).
+   */
+  private async ensureConnectedOnce(agentName: string, preferredCwd?: string): Promise<ConnectionInfo> {
     // Already connected and initialized? Reuse the existing connection.
     const registeredId = this.agentProcesses.get(agentName);
     if (registeredId) {
@@ -958,7 +1071,7 @@ export class SessionManager extends EventEmitter {
       throw new Error(`Unknown agent: ${agentName}.`);
     }
 
-    const workspaceCwd = this.getWorkspaceCwd();
+    const workspaceCwd = preferredCwd || this.resolveDefaultCwd();
     const agentInstance = this.agentManager.spawnAgent(agentName, config, workspaceCwd);
     const agentId = agentInstance.id;
 
@@ -1046,7 +1159,40 @@ export class SessionManager extends EventEmitter {
    * (disconnectAgent early-returned on the now-missing map entry). Both are
    * removed: loading a session now simply adds one alongside the others.
    */
-  async loadSession(agentName: string, sessionId: string): Promise<SessionInfo> {
+  // [CUSTOM-BEGIN] CUSTOM-20260925-033 - 「打开一个已存在的会话」的唯一决策点。
+  // 抽出理由：树命令（`acpc.openSession`）和聊天面板的历史会话选择器要做**同一件事**，
+  // 各自判断一次 load/resume 迟早会漂移成"面板和树打开方式不一样"。
+  // 优先 `session/load`：它会重放历史（面板因此能显示完整记录），resume 不会。
+  // 返回实际走的那条路，供调用方决定要不要提示「历史未重放」。
+  // [CUSTOM-20260925-057] `opts.cwd` = the directory the session belongs to.
+  // The history picker knows it and passes it; when omitted, load/resume fall
+  // back to the local history cache (see loadSession). Ignored for a session
+  // that is already live — a session's cwd is fixed at creation, which is a
+  // property of the protocol, not a limitation here.
+  async openExistingSession(
+    agentName: string,
+    sessionId: string,
+    opts: { cwd?: string } = {},
+  ): Promise<'live' | 'load' | 'resume'> {
+    const existing = this.sessions.get(sessionId);
+    if (existing) {
+      this.focusSession(sessionId, { force: true });
+      return 'live';
+    }
+    const caps = this.getCachedCapabilities(agentName);
+    if (caps?.load) {
+      await this.loadSession(agentName, sessionId, opts.cwd);
+      return 'load';
+    }
+    if (caps?.resume) {
+      await this.resumeSession(agentName, sessionId, opts.cwd);
+      return 'resume';
+    }
+    throw new Error(`Agent "${agentName}" does not support loading or resuming sessions.`);
+  }
+  // [CUSTOM-END] CUSTOM-20260925-033
+
+  async loadSession(agentName: string, sessionId: string, requestedCwd?: string): Promise<SessionInfo> {
     // Already live? Just focus it.
     const existing = this.sessions.get(sessionId);
     if (existing) {
@@ -1060,7 +1206,15 @@ export class SessionManager extends EventEmitter {
       throw new Error(`Agent "${agentName}" does not support session/load.`);
     }
 
-    const cwd = this.getWorkspaceCwd();
+    // [CUSTOM-20260925-057] The session's OWN directory, not the current
+    // workspace's. The caller may name it (the history picker knows it), and
+    // otherwise the local history cache does — which is what makes opening a
+    // session from ANOTHER directory work. Until this change the agent was
+    // always told the current workspace, so a session belonging to
+    // `D:\some\other\project` was reopened as if it lived here.
+    const cwd = requestedCwd
+      || this.historyStore?.get(agentName, sessionId)?.cwd
+      || this.resolveDefaultCwd();
     const agentId = this.findAgentIdForConnection(conn);
     if (!agentId) {
       throw new Error(`Unable to locate agent process for "${agentName}".`);
@@ -1137,7 +1291,7 @@ export class SessionManager extends EventEmitter {
    *
    * [CUSTOM-20260923-010] Same single-session eviction removal as loadSession.
    */
-  async resumeSession(agentName: string, sessionId: string): Promise<SessionInfo> {
+  async resumeSession(agentName: string, sessionId: string, requestedCwd?: string): Promise<SessionInfo> {
     const existing = this.sessions.get(sessionId);
     if (existing) {
       this.focusSession(sessionId, { force: true });
@@ -1150,7 +1304,11 @@ export class SessionManager extends EventEmitter {
       throw new Error(`Agent "${agentName}" does not support session/resume.`);
     }
 
-    const cwd = this.getWorkspaceCwd();
+    // [CUSTOM-20260925-057] Same resolution as loadSession — the session's own
+    // directory, with the local history cache as the fallback.
+    const cwd = requestedCwd
+      || this.historyStore?.get(agentName, sessionId)?.cwd
+      || this.resolveDefaultCwd();
     const agentId = this.findAgentIdForConnection(conn);
     if (!agentId) {
       throw new Error(`Unable to locate agent process for "${agentName}".`);

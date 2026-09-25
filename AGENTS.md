@@ -107,7 +107,7 @@ npm run lint
 | 改动类型 | 更新哪里 |
 |---------|---------|
 | 任何自定义功能/修改 | `registry.md` 的**改动总览** + **变更日志**（record-change skill） |
-| 新增/移动函数、改数据流或接口 | `architecture.md`（§0.5 路由 / §1 职责表 / §2 反查表 / §3 链路 / §5 新面板） |
+| 新增/移动函数、改数据流或接口 | `architecture.md`（§0.5 路由 / §1 职责表 / §2 反查表 / §3 链路）；**改 `src/ui/chat/**` 另加 `docs/arch/chat-panel.md`**（原 §5，按模块拆出） |
 | 解决了一个反复折腾才定位的问题 | `CUSTOMIZATIONS/docs/pitfalls.md` |
 | 改了启动/构建/验收流程 | `CUSTOMIZATIONS/docs/dev-workflow.md` |
 | 机制/规则变更 | `CUSTOMIZATIONS/README.md` |

@@ -2,12 +2,14 @@
 // 扩展侧 transcript 的数据模型。与旧面板的关键差异：记录是**结构化**的（而非 DOM 字符串），
 // 因此可以按会话存储、跨面板切换保活、并在 Phase 3 里把工具调用详情渲染成 diff / terminal。
 // [CUSTOM-END] CUSTOM-20260923-011
-import type { PlanEntry, ToolCallStatus, ToolKind } from '@agentclientprotocol/sdk';
+// [CUSTOM-BEGIN] CUSTOM-20260924-020 - transcript 增加 `permission` 记录类型（面板内权限卡）。
+// [CUSTOM-END] CUSTOM-20260924-020
+import type { PermissionOptionKind, PlanEntry, ToolCallStatus, ToolKind } from '@agentclientprotocol/sdk';
 
 import type { ContentBlockView } from '../content/contentBlocks';
 
 /** Why a plan/tool entry exists in the transcript. */
-export type TranscriptEntryKind = 'user' | 'assistant' | 'thought' | 'tool' | 'plan' | 'content' | 'notice';
+export type TranscriptEntryKind = 'user' | 'assistant' | 'thought' | 'tool' | 'plan' | 'content' | 'notice' | 'permission';
 
 interface EntryBase {
   /** Stable id, unique within a session. Assigned by TranscriptStore. */
@@ -67,6 +69,43 @@ export interface NoticeEntry extends EntryBase {
   text: string;
 }
 
+// [CUSTOM-BEGIN] CUSTOM-20260924-020
+/** One agent-offered choice in a permission prompt (ACP `PermissionOption`). */
+export interface PermissionOptionView {
+  optionId: string;
+  name: string;
+  kind: PermissionOptionKind;
+}
+
+/**
+ * Where an answer to a permission prompt currently has to come from:
+ * `pending` = the buttons on the card, `deferred` = a window-level dialog
+ * (the card's buttons are disabled to keep one answer path), `selected` /
+ * `cancelled` = settled.
+ */
+export type PermissionStatus = 'pending' | 'deferred' | 'selected' | 'cancelled';
+
+/**
+ * A permission card in the transcript. It lives next to the tool call it
+ * belongs to (`toolCallId`) and is the panel-side replacement for the
+ * window-level QuickPick that was easy to miss.
+ */
+export interface PermissionState {
+  promptId: string;
+  toolCallId: string;
+  title: string;
+  kind?: ToolKind;
+  options: PermissionOptionView[];
+  status: PermissionStatus;
+  selectedOptionId?: string;
+}
+
+export interface PermissionEntry extends EntryBase {
+  kind: 'permission';
+  permission: PermissionState;
+}
+// [CUSTOM-END] CUSTOM-20260924-020
+
 export type TranscriptEntry =
   | UserEntry
   | AssistantEntry
@@ -74,7 +113,8 @@ export type TranscriptEntry =
   | ToolEntry
   | PlanEntryRecord
   | ContentEntry
-  | NoticeEntry;
+  | NoticeEntry
+  | PermissionEntry;
 
 /** Full snapshot of one session's transcript, sent on focus/boot. */
 export interface TranscriptSnapshot {
@@ -93,10 +133,18 @@ export interface EntryPatch {
   html?: string;
   streaming?: boolean;
   elapsedMs?: number;
+  // [CUSTOM-20260925-038] 键名与记录字段名**必须逐字相同**（`PlanEntryRecord.entries` /
+  // `ContentEntry.blocks`）。原先这里叫 `plan` / `content`，而客户端 `PATCH_KEYS` 抄的也是
+  // 这两个名字，于是 patch 被写进 `entry.plan`，而渲染函数读的是 `entry.entries` ——
+  // 更新**静默丢弃**（客户端 `patch()` 对未知键不报错），表现为 plan 卡永远停在第一次快照。
+  // tsc / lint / webpack / check-webview-client 都看不见这类错位，所以这里刻意用与记录
+  // 一样的名字，让「抄错名字」在阅读时就能被发现。
   /** Replacement plan entries (ACP `plan` updates replace the whole list). */
-  plan?: PlanEntry[];
+  entries?: PlanEntry[];
   /** Replacement content blocks (non-text message content). */
-  content?: ContentBlockView[];
+  blocks?: ContentBlockView[];
+  /** Replacement permission state (CUSTOM-20260924-020). */
+  permission?: PermissionState;
 }
 
 /**

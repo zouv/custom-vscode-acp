@@ -2,11 +2,16 @@
 // 扩展侧的每会话记录存储。这是「切标签瞬时完成」的关键：transcript 不在 webview 里，
 // 而在扩展宿主中，切走再切回只需推一次快照，不需要重新 session/load。
 // [CUSTOM-END] CUSTOM-20260923-011
+// [CUSTOM-BEGIN] CUSTOM-20260924-026
+import { isBlankText } from '../content/contentBlocks';
+// [CUSTOM-END] CUSTOM-20260924-026
 import type {
   AssistantEntry,
   ContentEntry,
   EntryPatch,
   NoticeEntry,
+  PermissionEntry,
+  PermissionState,
   PlanEntryRecord,
   ThoughtEntry,
   ToolEntry,
@@ -107,19 +112,9 @@ export class TranscriptStore {
     return false;
   }
 
-  /** True when this specific session has content. */
-  sessionHasContent(sessionId: string): boolean {
-    return (this.sessions.get(sessionId)?.entries.length ?? 0) > 0;
-  }
-
-  listSessionIds(): string[] {
-    return Array.from(this.sessions.keys());
-  }
-
-  /** Number of entries currently held (diagnostics/tests). */
-  size(sessionId: string): number {
-    return this.sessions.get(sessionId)?.entries.length ?? 0;
-  }
+  // [CUSTOM-20260925-052] `sessionHasContent`, `listSessionIds` and `size` were
+  // removed here — all three had no callers. The live-session bookkeeping the
+  // host actually needs goes the other way (setLiveSessionIds below).
 
   // --- Appends -------------------------------------------------------------
 
@@ -161,6 +156,29 @@ export class TranscriptStore {
     }));
   }
 
+  // [CUSTOM-BEGIN] CUSTOM-20260924-020 - 权限卡：一个 promptId 一条记录。
+  // 与 plan 同一套路（ACP 也是"同一件事的重复通知"），重复到达时复用已有记录而不是堆卡片。
+  appendPermission(sessionId: string, permission: PermissionState): PermissionEntry | null {
+    const t = this.sessions.get(sessionId);
+    if (t) {
+      const existing = t.entries.find(
+        e => e.kind === 'permission' && (e as PermissionEntry).permission.promptId === permission.promptId,
+      );
+      if (existing) {
+        (existing as PermissionEntry).permission = permission;
+        t.touched = ++this.clock;
+        return existing as PermissionEntry;
+      }
+    }
+    return this.append<PermissionEntry>(sessionId, s => ({
+      id: this.nextEntryId(s),
+      kind: 'permission',
+      at: Date.now(),
+      permission,
+    }));
+  }
+  // [CUSTOM-END] CUSTOM-20260924-020
+
   appendTool(sessionId: string, toolCallId: string): ToolEntry | null {    // One transcript row per tool call, even if the agent re-announces it.
     const t = this.sessions.get(sessionId);
     if (t) {
@@ -182,8 +200,14 @@ export class TranscriptStore {
     const t = this.sessions.get(sessionId);
     if (!t) { return null; }
     const last = t.entries[t.entries.length - 1];
-    if (last && last.kind === 'assistant' && last.streaming
-      && (messageId === undefined || last.messageId === undefined || last.messageId === messageId)) {
+    const merges = !!last && last.kind === 'assistant' && last.streaming
+      && (messageId === undefined || last.messageId === undefined || last.messageId === messageId);
+    // [CUSTOM-20260924-026] Merging blank text into an open bubble is fine (it
+    // is how paragraph breaks arrive), but STARTING a bubble from blank text is
+    // never wanted: the agent sends "\n\n" after a tool call, and the old code
+    // opened a new entry for it, which rendered as an empty bordered bubble.
+    if (!merges && isBlankText(text)) { return null; }
+    if (merges) {
       last.text = clampText(last.text + text);
       last.html = undefined;
       t.touched = ++this.clock;
@@ -204,8 +228,13 @@ export class TranscriptStore {
     const t = this.sessions.get(sessionId);
     if (!t) { return null; }
     const last = t.entries[t.entries.length - 1];
-    if (last && last.kind === 'thought' && last.streaming
-      && (messageId === undefined || last.messageId === undefined || last.messageId === messageId)) {
+    const merges = !!last && last.kind === 'thought' && last.streaming
+      && (messageId === undefined || last.messageId === undefined || last.messageId === messageId);
+    // [CUSTOM-20260924-026] Same rule as the assistant entry above: never start
+    // a reasoning block that has nothing in it (it showed up as a bare
+    // "Thought" row with an empty body).
+    if (!merges && isBlankText(text)) { return null; }
+    if (merges) {
       last.text = clampText(last.text + text);
       t.touched = ++this.clock;
       return last;
@@ -261,9 +290,14 @@ export class TranscriptStore {
       if (patch.streaming !== undefined) { entry.streaming = patch.streaming; }
       if (patch.elapsedMs !== undefined) { entry.elapsedMs = patch.elapsedMs; }
     } else if (entry.kind === 'plan') {
-      if (patch.plan !== undefined) { entry.entries = patch.plan; }
+      // [CUSTOM-20260925-038] 键名 = 记录字段名（`entries`），不要写成 `plan`。
+      if (patch.entries !== undefined) { entry.entries = patch.entries; }
     } else if (entry.kind === 'content') {
-      if (patch.content !== undefined) { entry.blocks = patch.content; }
+      // [CUSTOM-20260925-038] 同上，键名 = `blocks`。
+      if (patch.blocks !== undefined) { entry.blocks = patch.blocks; }
+    } else if (entry.kind === 'permission') {
+      // [CUSTOM-20260924-020]
+      if (patch.permission !== undefined) { entry.permission = patch.permission; }
     }
     t.touched = ++this.clock;
     return entry;
@@ -275,13 +309,10 @@ export class TranscriptStore {
   }
 
   /** Assistant entries that still need markdown rendering. */
-  entriesNeedingMarkdown(sessionId: string): AssistantEntry[] {
-    const t = this.sessions.get(sessionId);
-    if (!t) { return []; }
-    return t.entries.filter(
-      (e): e is AssistantEntry => e.kind === 'assistant' && e.html === undefined && e.text.length > 0,
-    );
-  }
+  // [CUSTOM-20260925-052] `entriesNeedingMarkdown` was removed here: no callers.
+  // The markdown round-trip is driven from the CLIENT side (transcriptView keeps
+  // its own `pending` map and posts `renderMarkdown`), so a host-side query for
+  // "who still needs html" was never on the path.
 
   // --- Internals -----------------------------------------------------------
 

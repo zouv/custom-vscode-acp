@@ -12,6 +12,17 @@ import { isTerminalStatus, type ToolInvocation } from './types';
  * Per-session tool-call index. Flat by construction — ACP has no nesting
  * concept (verified: zero matches for parent/subagent/child across all 239
  * schema definitions), so any tree is an inference layered on top.
+ *
+ * [CUSTOM-20260925-043] There is deliberately **no per-session cap** here,
+ * unlike `TranscriptStore` (500 entries / 24 sessions). A naive LRU would be a
+ * visible regression: `ChatPanelHost.snapshotOf` hydrates every tool entry's
+ * view model from this store, so evicting an invocation whose transcript row
+ * still exists renders that row as exactly the "empty shell" that
+ * CUSTOM-20260924-027 was written to eliminate. A cap only becomes safe once
+ * the store knows which ids the transcript still references — i.e. a reference
+ * count pushed in from the host, mirroring `TranscriptStore.setLiveSessionIds`.
+ * Until then growth is bounded in practice by the transcript cap × session
+ * count; only a session with thousands of tool calls would notice.
  */
 export class ToolInvocationStore {
   private bySession: Map<string, Map<string, ToolInvocation>> = new Map();
@@ -73,18 +84,28 @@ export class ToolInvocationStore {
     return this.bySession.get(sessionId)?.get(toolCallId);
   }
 
+  /**
+   * Invocations in chronological order.
+   *
+   * [CUSTOM-20260925-043] **No `sort` here.** A `Map` iterates in insertion
+   * order, and `startedAt` is stamped at insertion and never revised (an update
+   * to an existing call reuses the record, so it never moves) — the two orders
+   * are identical by construction. The former `.sort((a, b) => a.startedAt -
+   * b.startedAt)` was therefore an O(n log n) no-op that allocated and ran on
+   * every tool notification, including every `tool_call_update`.
+   */
   list(sessionId: string): ToolInvocation[] {
     const m = this.bySession.get(sessionId);
-    return m ? Array.from(m.values()).sort((a, b) => a.startedAt - b.startedAt) : [];
+    return m ? Array.from(m.values()) : [];
   }
 
   drop(sessionId: string): void {
     this.bySession.delete(sessionId);
   }
 
-  dropAgentSessions(sessionIds: Iterable<string>): void {
-    for (const id of sessionIds) { this.bySession.delete(id); }
-  }
+  // [CUSTOM-20260925-052] `dropAgentSessions` was removed here — no callers. The
+  // host drops a session's index through `drop(sessionId)` when the session
+  // closes, which is the only case that arises.
 
   private put(sessionId: string, inv: ToolInvocation): void {
     let m = this.bySession.get(sessionId);

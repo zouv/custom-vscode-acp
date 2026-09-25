@@ -3,8 +3,24 @@
 // [CUSTOM-END] CUSTOM-20260923-011
 import * as vscode from 'vscode';
 
+// [CUSTOM-BEGIN] CUSTOM-20260924-019 - agent → 面板实现的策略集中到契约层。
+// 原先只有 ChatRouterProvider 需要它，编辑区面板（ChatEditorPanel）也要用；放在这里
+// 可以避免 host ← router ← host 的循环依赖。
+// [CUSTOM-END] CUSTOM-20260924-019
+
 /** Which implementation is currently owning the single chat view. */
 export type PanelId = 'modern' | 'legacy';
+
+/**
+ * Agents whose chat panel is the rewritten one. Matched against the
+ * `acpc.agents` configuration KEY (e.g. "Claude Code"), not against the
+ * display name the agent reports in `initialize`.
+ */
+export const MODERN_AGENTS: ReadonlySet<string> = new Set(['Claude Code']);
+
+export function isModernAgent(agentName: string | null | undefined): boolean {
+  return !!agentName && MODERN_AGENTS.has(agentName);
+}
 
 /** Focused agent + session, as understood by the router. */
 export interface PanelContext {

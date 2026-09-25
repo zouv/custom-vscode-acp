@@ -107,6 +107,17 @@ function extractCommand(rawInput: unknown): string | null {
   return null;
 }
 
+// [CUSTOM-20260925-052] The three helpers below have no callers today — the
+// client renders the glyphs and labels itself (see the STATUS_GLYPH / KIND_LABEL
+// maps at the top of html/client/toolCallView.ts). They are kept rather than
+// deleted because they are the HOST-side spelling of the same knowledge, and a
+// host-side renderer (a log line, a tree item, a future panel) would want them.
+//
+// **If you change one, change the other.** Two copies of the same mapping is
+// exactly the drift that produced CUSTOM-20260925-038 (a key renamed on one side
+// only, updates silently dropped). Collapsing them properly means sending the
+// glyph/label from the host in ToolCallView — a protocol change, not this round.
+
 /** Human-readable status glyph. Keyed on the four real `ToolCallStatus` values. */
 export function statusGlyph(status: ToolCallStatus): string {
   switch (status) {

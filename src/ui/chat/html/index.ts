@@ -5,16 +5,22 @@
 // [CUSTOM-END] CUSTOM-20260923-011
 import type * as vscode from 'vscode';
 
+import type { SurfaceKey } from '../ChatSurface';
 import { shell } from './shell';
 import { styles } from './styles';
 import { body } from './body';
 import { clientScript } from './client';
 
-export function renderChatHtml(webview: vscode.Webview, nonce: string): string {
+/**
+ * [CUSTOM-20260925-050] `surface` reaches the document as a body class so the
+ * stylesheet can give the editor-area panel the editor's background instead of
+ * the sidebar's. Defaults to 'view' so the sidebar path reads unchanged.
+ */
+export function renderChatHtml(webview: vscode.Webview, nonce: string, surface: SurfaceKey = 'view'): string {
   return [
     shell(webview, nonce),
     styles(),
-    body(),
+    body(surface),
     clientScript(nonce),
   ].join('\n');
 }
