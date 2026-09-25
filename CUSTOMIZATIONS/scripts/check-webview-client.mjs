@@ -15,10 +15,14 @@
 //   **新增任何模板字符串模块，只要放在 `src/ui/chat/html/` 下就会被自动覆盖**——
 //   这也是不要在别处新建同类模块的原因。
 //
-// 用法：node CUSTOMIZATIONS/scripts/check-webview-client.mjs
+// 用法：node CUSTOMIZATIONS/scripts/check-webview-client.mjs [--fix]
+//   --fix：把模板体内（**只在模板体内**）的反引号就地换成单引号，然后照常校验。
+//          加它的理由：这一类错误在本项目复发过七次以上，而修法永远是同一个机械动作。
+//          按 pitfall #11 自己的教训——「能自动化的纪律就不要留给记忆」。
+//          （文件头注释里的反引号不受影响：范围只覆盖模板体。）
 // 退出码：0 通过；1 有语法错误或模板体里出现反引号
 // =============================================================================
-import { readFileSync, readdirSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, existsSync, writeFileSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -103,6 +107,56 @@ let errors = 0;
 const moduleFiles = walk(HTML_DIR)
   .filter((abs) => readFileSync(abs, 'utf8').includes('`'))
   .sort();
+
+/**
+ * The template body as a LINE RANGE (open line → last closing line).
+ *
+ * `extractTemplate` stops at the first stray backtick, which is what makes it a
+ * good checker and a useless fixer. Locating the range first lets `--fix`
+ * rewrite the whole body in one pass.
+ *
+ * Only lines with EXACTLY one backtick count, so a single-line template
+ * (`return \`<script …>\`;`) is left alone — it cannot contain a stray one.
+ */
+function templateRange(lines) {
+  let open = -1;
+  let close = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const ticks = (lines[i].match(/`/g) || []).length;
+    if (open < 0) {
+      if (isOpenLine(lines[i]) && ticks === 1) { open = i; }
+      continue;
+    }
+    if (isCloseLine(lines[i]) && ticks === 1) { close = i; }
+  }
+  return open >= 0 && close > open ? { open, close } : null;
+}
+
+if (process.argv.includes('--fix')) {
+  let fixedFiles = 0;
+  let fixedTicks = 0;
+  for (const abs of moduleFiles) {
+    // Split/join on '\n' only: the '\r' stays at each line's end, so CRLF files
+    // are not silently converted to LF (see pitfalls #7).
+    const lines = readFileSync(abs, 'utf8').split('\n');
+    const range = templateRange(lines);
+    if (!range) { continue; }
+    let here = 0;
+    for (let i = range.open + 1; i < range.close; i++) {
+      const ticks = (lines[i].match(/`/g) || []).length;
+      if (ticks > 0) { lines[i] = lines[i].split('`').join("'"); here += ticks; }
+    }
+    if (here > 0) {
+      writeFileSync(abs, lines.join('\n'));
+      console.log(`  [FIX] ${rel(abs)}: 模板体内 ${here} 处反引号 → 单引号`);
+      fixedFiles++;
+      fixedTicks += here;
+    }
+  }
+  if (fixedTicks > 0) {
+    console.log(`  → 已修复 ${fixedFiles} 个文件、${fixedTicks} 处；下面是修复后的校验`);
+  }
+}
 
 // --- 1) 每个模板模块：反引号 / 闭合 检查 -------------------------------------
 for (const abs of moduleFiles) {

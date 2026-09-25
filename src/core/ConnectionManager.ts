@@ -8,6 +8,7 @@ import { AcpClientImpl } from './AcpClientImpl';
 import { FileSystemHandler } from '../handlers/FileSystemHandler';
 import { TerminalHandler } from '../handlers/TerminalHandler';
 import { PermissionHandler } from '../handlers/PermissionHandler';
+import type { PermissionBridge } from '../handlers/PermissionBridge';
 import { SessionUpdateHandler } from '../handlers/SessionUpdateHandler';
 import { log, logError, logTraffic } from '../utils/Logger';
 import { version as extensionVersion } from '../../package.json';
@@ -33,6 +34,11 @@ export class ConnectionManager {
 
   constructor(
     private readonly sessionUpdateHandler: SessionUpdateHandler,
+    // [CUSTOM-BEGIN] CUSTOM-20260924-020 - 权限桥注入。
+    // 每个连接都会新建一个 PermissionHandler，而它此前拿不到任何 UI 服务；
+    // 桥是唯一的出口（面板卡片 / 弹框），因此在构造连接时一并传下去。
+    private readonly permissionBridge?: PermissionBridge,
+    // [CUSTOM-END] CUSTOM-20260924-020
   ) {}
 
   /**
@@ -58,7 +64,7 @@ export class ConnectionManager {
     // Create handlers
     const fsHandler = new FileSystemHandler();
     const terminalHandler = new TerminalHandler();
-    const permissionHandler = new PermissionHandler();
+    const permissionHandler = new PermissionHandler(this.permissionBridge);
 
     // Create client implementation
     const client = new AcpClientImpl(

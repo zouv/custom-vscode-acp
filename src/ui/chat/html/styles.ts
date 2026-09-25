@@ -16,6 +16,40 @@ export function styles(): string {
      另：本文件是模板字符串，注释里禁用反引号——用单引号。 */
   [hidden] { display: none !important; }
 
+  /* --- 键盘可达性基础设施（CUSTOM-20260925-047）------------------------
+     面板此前**完全无法用键盘操作**：标签、抽屉行、菜单项、斜杠项、工具卡头、
+     diff 头、文件 chip 都是 div/span + click，既不可聚焦也没有 Enter/Space 处理。
+     它们现在都是真正的 <button>，这一块的职责是**把 UA 的按钮样式抹平**，
+     使外观与改动前一致，并补上面板从来没有过的焦点环。
+
+     位置有讲究：必须放在下方各 class 规则**之前**，让同权重的 class 规则覆盖它。
+     （'.chip' / '.tab.active' / '.outline-item:hover' / '.rail-dot.turn' 都在后面，
+     它们要么权重更高、要么同权重后出现，所以外观不受影响。） */
+  button { font-family: inherit; font-size: inherit; color: inherit; }
+  /* [CUSTOM-20260925-058] '.session-title'（显示工作目录的那格）从 span 变成了按钮，
+     因此也进这个清单。**注意它不加 width: 100%**——它自身有 'flex: 1' 要吃掉剩余
+     宽度，两者会打架。 */
+  .tab, .outline-item, .picker-item, .slash-item,
+  .tool-head, .diff-head, .chip, .session-title {
+    background: transparent;
+    border: none;
+    text-align: left;
+    cursor: pointer;
+  }
+  /* 宽度：这三个都在**块级容器**里（.outline-list / .picker-menu / .slash-popup），
+     按钮默认是 inline-block（收缩到内容宽），所以必须显式铺满。
+     **'.tab' 不在此列**——它是 '.tabs'（flex 行）的子项，给 flex 子项写 width: 100%
+     会解析成"容器内容宽的 100%"，而容器宽又由子项决定（循环），浏览器只能退回
+     max-content 求解，结果是每个标签都被撑到最宽那个的宽度、整条标签栏变形。 */
+  .outline-item, .picker-item, .slash-item, .tool-head, .diff-head { width: 100%; }
+  .picker-item, .slash-item { display: block; }
+  /* .rail-dot 也是 <button>：它自带 background（两级样式权重更高），但 '.turn' 那档
+     **只设了 background、没设 border**，不抹掉 UA 的 2px outset 就会多出一圈边框。
+     padding 同理——它的尺寸完全由 CSS 决定，多 1px 就会偏位。 */
+  .rail-dot { padding: 0; border: none; background: transparent; }
+  /* 焦点必须可见。用 :focus-visible 而不是 :focus，鼠标点击不会留下焦点环。 */
+  :focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+
   body {
     margin: 0;
     padding: 0;
@@ -90,6 +124,11 @@ export function styles(): string {
   }
   .tab-dot.running { background: var(--vscode-progressBar-background); animation: pulse 1.2s ease-in-out infinite; }
   .tab-dot.loading { background: var(--vscode-charts-yellow); }
+  /* [CUSTOM-20260925-052] 设计预留、**从未接线**：没有任何 JS 会给标签加 attention
+     类（全仓库 grep 只命中这一行）。它的本意是"后台会话在等你"（比如那边有待决的权限
+     请求）——而那件事目前由窗口级弹框承担，面板内不做提示（用户 2026-09-25 明确决定）。
+     留着是为了将来接线时不用重新想配色。**看到它没生效别当 bug 修**：先确认要不要做
+     那个功能，而不是去找"为什么类没加上"。 */
   .tab-dot.attention { background: var(--vscode-charts-blue); }
   .tab-close {
     border: none; background: transparent; color: inherit; cursor: pointer;
@@ -111,9 +150,82 @@ export function styles(): string {
     min-height: 22px;
     border-bottom: 1px solid var(--vscode-panel-border);
     font-size: 0.9em;
+    /* Anchor for the conversation outline dropdown. Do NOT add overflow here. */
+    position: relative;
     color: var(--vscode-descriptionForeground);
   }
   .session-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  /* --- Conversation outline (CUSTOM-20260924-021) ---------------------- */
+  /* 抽屉从标题栏下沿展开。.session-header 没有 overflow: hidden（已核对），
+     否则绝对定位的抽屉会被裁掉——这是这类浮层最常见的失灵原因。 */
+  .outline-btn {
+    flex: none; cursor: pointer; font-family: inherit; font-size: 1em; line-height: 1;
+    padding: 2px 5px; border-radius: 3px;
+    background: transparent; color: var(--vscode-icon-foreground, currentColor);
+    border: 1px solid transparent;
+  }
+  .outline-btn:hover { background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground)); }
+  /* Icon buttons in the session header (history / clock, CUSTOM-20260925-035). */
+  .outline-btn .btn-icon { display: inline-flex; align-items: center; }
+  .outline-btn .btn-icon svg { display: block; width: 14px; height: 14px; }
+  .outline-btn.on {
+    background: var(--vscode-list-activeSelectionBackground);
+    color: var(--vscode-list-activeSelectionForeground);
+  }
+  .outline {
+    position: absolute; top: 100%; left: 6px; right: 6px; z-index: 25;
+    max-height: 50vh; overflow-y: auto;
+    background: var(--vscode-dropdown-background, var(--vscode-editorWidget-background));
+    color: var(--vscode-dropdown-foreground, var(--vscode-foreground));
+    border: 1px solid var(--vscode-dropdown-border, var(--vscode-panel-border));
+    border-radius: 4px;
+    box-shadow: 0 3px 12px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.35));
+  }
+  .outline-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 8px; font-size: 0.85em;
+    color: var(--vscode-descriptionForeground);
+    border-bottom: 1px solid var(--vscode-panel-border);
+    position: sticky; top: 0;
+    background: inherit;
+  }
+  .outline-more { margin-left: auto; }
+  /* [CUSTOM-20260925-058] 目录抽屉里的分组标题 / 说明行。观感沿用 .picker-group，
+     因为它俩都是"同一类浮层里的分组头"。 */
+  .outline-group {
+    padding: 5px 8px 2px; font-size: 0.82em; line-height: 1.35;
+    color: var(--vscode-descriptionForeground);
+  }
+  /* 草稿标签：会话还不存在，所以是空心虚线点 + 斜体标签，与真实会话区分开。 */
+  .tab-draft .tab-dot {
+    background: transparent;
+    border: 1px dashed var(--vscode-descriptionForeground);
+  }
+  .tab-draft .tab-label { font-style: italic; }
+  .outline-item {
+    display: flex; align-items: baseline; gap: 8px;
+    padding: 4px 8px; cursor: pointer;
+    border-left: 2px solid transparent;
+  }
+  .outline-item:hover { background: var(--vscode-list-hoverBackground); }
+  .outline-item.active {
+    background: var(--vscode-list-activeSelectionBackground);
+    color: var(--vscode-list-activeSelectionForeground);
+    border-left-color: var(--vscode-focusBorder);
+  }
+  .outline-time {
+    flex: none; font-size: 0.82em; font-variant-numeric: tabular-nums;
+    color: var(--vscode-descriptionForeground);
+  }
+  .outline-item.active .outline-time { color: inherit; opacity: 0.85; }
+  .outline-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* [CUSTOM-20260925-057] 历史会话行右侧的目录提示（只显示最后一段，全路径在 tooltip 里）。
+     没有它的话，245 条跨目录会话只能靠 hover 才知道各自属于哪个项目。 */
+  .outline-cwd {
+    flex: 0 0 auto; max-width: 40%; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+    font-size: 0.82em; color: var(--vscode-descriptionForeground);
+  }
   .usage-bar { flex: 0 0 auto; font-variant-numeric: tabular-nums; }
   .usage-track {
     display: inline-block; width: 60px; height: 6px; border-radius: 3px;
@@ -127,15 +239,84 @@ export function styles(): string {
 
   /* --- Messages -------------------------------------------------------- */
   .message-area { position: relative; flex: 1; min-height: 0; display: flex; }
+  /* --- Conversation rail (CUSTOM-20260924-023) ------------------------- */
+  /* 左侧引导条：轮次大点 + 步骤小点，随内容滚动（track 由 JS 做 translateY(-scrollTop)）。
+     注意本元素**不能**写 display——hidden 属性靠文件顶部的 [hidden]{display:none!important}
+     生效，那条规则就是为它兜底的（见 pitfalls #13）；absolute 定位的元素默认就是块级。
+     条本身 pointer-events: none，避免挡住左侧文字的选区；只有点可点。 */
+  .rail {
+    position: absolute; left: 0; top: 0; bottom: 0; width: 20px;
+    overflow: hidden; z-index: 3; pointer-events: none;
+  }
+  .rail-track { position: absolute; left: 0; top: 0; width: 100%; height: 0; }
+  .rail-line {
+    position: absolute; width: 1px; left: 9.5px;
+    background: var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  }
+  .rail-dot {
+    position: absolute; border-radius: 50%; box-sizing: border-box;
+    pointer-events: auto; cursor: pointer;
+  }
+  /* 两级：轮次点更大且实心，步骤点小且空心。margin-top 取负的一半尺寸，
+     这样 JS 只需写 top = 中心 y（绝对定位元素的 margin 会参与位移，这里正好要用）。 */
+  .rail-dot.turn {
+    left: 5px; width: 10px; height: 10px; margin-top: -5px;
+    background: var(--vscode-descriptionForeground, #888);
+  }
+  .rail-dot.step {
+    left: 6.5px; width: 7px; height: 7px; margin-top: -3.5px;
+    border: 1px solid var(--vscode-descriptionForeground, #888);
+    background: var(--vscode-editor-background);
+  }
+  .rail-dot.turn.done { opacity: 0.75; }
+  .rail-dot.step.done { opacity: 0.6; }
+  .rail-dot.running {
+    border-color: var(--vscode-charts-blue, var(--vscode-focusBorder));
+    background: var(--vscode-charts-blue, var(--vscode-focusBorder));
+  }
+  .rail-dot.failed {
+    border-color: var(--vscode-charts-red, #f14c4c);
+    background: var(--vscode-charts-red, #f14c4c);
+  }
+  .rail-dot.active {
+    opacity: 1;
+    box-shadow: 0 0 0 2px var(--vscode-focusBorder);
+  }
   .messages {
     flex: 1;
     overflow-y: auto;
-    padding: 8px 10px 4px;
+    /* padding-left 给左侧引导条留出通道（.rail 是绝对定位的兄弟节点，覆盖在这条空隙上） */
+    padding: 8px 10px 4px 19px;
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    /* 间距交给下面的阶梯控制。统一 gap 会让「同属一组的连续推理」和「跨类型的独立块」
+       看起来一样疏——那正是"不同段区分度太低"的来源。 */
+    gap: 0;
     scrollbar-width: thin;
   }
+  /* [CUSTOM-20260925-037] 子项**不许被压缩**——这条是 .messages 用 flex 排布的前提，别删。
+     规范：flex 子项的「自动最小尺寸」在其 overflow 不是 visible 时**等于 0**。而工具卡
+     .tool 正好有 overflow: hidden，于是内容一超出容器，flex 就把 206 张卡一起压成 2px
+     （只剩两条边框），卡片内容被 overflow 裁掉——用户看到的就是"整屏白条"。
+     用户气泡 / plan 卡没有 overflow，自动最小尺寸是内容高度，压不动，所以它们看起来是好的：
+     user h=31 / tool h=2 / plan 正常 这组数据就是这条规范留下的指纹。
+     加 flex-shrink: 0 之后，溢出的内容会交给 .messages 的 overflow-y: auto 去滚。
+     对照：.tab-strip 同样是 flex + overflow，但它的子项早就写了 flex: 0 0 auto，所以从没出过这个问题。 */
+  .messages > * { flex: 0 0 auto; }
+
+  /* [CUSTOM-20260925-049] Drop feedback: shown while a file is dragged over the
+     panel. Uses the focus border so it is visible in every theme. */
+  body.drop-active .message-area {
+    outline: 2px dashed var(--vscode-focusBorder);
+    outline-offset: -4px;
+  }
+  /* 三档间距阶梯：同类紧 / 跨类松 / 轮次边界最松。
+     data-kind 由 transcriptView.place() 打在每条上，这里纯用兄弟选择器实现。 */
+  .messages > * + * { margin-top: 10px; }
+  .messages > [data-kind="thought"] + [data-kind="thought"] { margin-top: 2px; }
+  .messages > [data-kind="tool"]    + [data-kind="tool"]    { margin-top: 4px; }
+  .messages > [data-kind="content"] + [data-kind="content"] { margin-top: 2px; }
+  .messages > [data-kind="user"] { margin-top: 16px; }
   .jump-latest {
     position: absolute; right: 14px; bottom: 12px;
     padding: 3px 10px; border-radius: 12px; cursor: pointer;
@@ -146,6 +327,15 @@ export function styles(): string {
   .jump-latest:hover { background: var(--vscode-button-hoverBackground); }
 
   .empty-state { margin: auto; text-align: center; color: var(--vscode-descriptionForeground); padding: 20px; }
+  /* 空态里的「连接」按钮（CUSTOM-20260925-032）：面板自己就能把 agent 拉起来，
+     不必先去 Agents 视图。 */
+  .empty-connect {
+    margin-top: 10px; padding: 4px 14px; border-radius: 4px; cursor: pointer;
+    font-family: inherit; font-size: 0.95em;
+    background: var(--vscode-button-background); color: var(--vscode-button-foreground);
+    border: 1px solid var(--vscode-button-border, transparent);
+  }
+  .empty-connect:hover { background: var(--vscode-button-hoverBackground); }
   .empty-title { font-weight: 600; margin: 0 0 6px; }
   .empty-hint { margin: 0; font-size: 0.92em; }
   kbd {
@@ -174,8 +364,62 @@ export function styles(): string {
   }
   .entry-assistant .bubble.md { white-space: normal; }
   .entry-notice { align-self: center; font-size: 0.9em; padding: 2px 8px; border-radius: 4px; }
+  /* --- Record-type icons (CUSTOM-20260924-028) -------------------------- */
+  /* 每类记录左侧一个内联 SVG 图标。用 currentColor 描边，所以自动跟随所在文字的颜色
+     （用户气泡=按钮前景色、推理=次要色、工具卡=正文色）。 */
+  .rec-icon {
+    display: inline-flex; align-items: center; vertical-align: -1px;
+    margin-right: 4px; opacity: 0.7;
+  }
+  .rec-icon svg { display: block; }
+  .tool-icon { flex: 0 0 auto; display: inline-flex; align-items: center; opacity: 0.7; }
+  .tool-icon svg { display: block; }
+  /* --- Permission card (CUSTOM-20260924-020) --------------------------- */
+  /* 面板内的权限请求卡：替代窗口级 QuickPick。配色故意用 warn 边框而不是普通卡片，
+     因为它是**阻塞的**——agent 在等到答复前不会继续。 */
+  .entry-permission { align-self: stretch; }
+  .perm {
+    border: 1px solid var(--vscode-inputValidation-warningBorder, var(--vscode-panel-border));
+    border-left-width: 3px;
+    border-radius: 6px;
+    padding: 8px 10px;
+    background: var(--vscode-inputValidation-warningBackground, var(--vscode-editor-background));
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .perm.pending { border-left-color: var(--vscode-charts-yellow, var(--vscode-editorWarning-foreground)); }
+  .perm.deferred { opacity: 0.75; }
+  .perm.selected, .perm.cancelled { border-left-color: var(--vscode-panel-border); background: transparent; }
+  .perm-head { display: flex; align-items: center; gap: 6px; }
+  .perm-badge {
+    flex: none; width: 16px; height: 16px; border-radius: 50%;
+    background: var(--vscode-editorWarning-foreground, var(--vscode-descriptionForeground));
+    color: var(--vscode-editor-background);
+    font-size: 0.75em; font-weight: 700; line-height: 16px; text-align: center;
+  }
+  .perm-title { flex: 1; font-size: 0.95em; word-break: break-word; }
+  .perm-kind {
+    flex: none; font-size: 0.8em; padding: 0 5px; border-radius: 3px;
+    color: var(--vscode-descriptionForeground);
+    border: 1px solid var(--vscode-panel-border);
+  }
+  .perm-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+  .perm-btn {
+    padding: 3px 12px; border-radius: 4px; cursor: pointer;
+    font-family: inherit; font-size: 0.92em;
+    border: 1px solid var(--vscode-button-border, transparent);
+    background: var(--vscode-button-secondaryBackground, var(--vscode-button-background));
+    color: var(--vscode-button-secondaryForeground, var(--vscode-button-foreground));
+  }
+  .perm-btn.allow {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+  }
+  .perm-btn:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
+  .perm-btn:disabled { cursor: default; opacity: 0.5; }
+  .perm-note { font-size: 0.88em; color: var(--vscode-descriptionForeground); }
   /* Non-text message content (image / resource chips) */
-  .entry-content { align-self: stretch; gap: 2px; }  .entry-notice.info { color: var(--vscode-descriptionForeground); }
+  .entry-content { align-self: stretch; gap: 2px; }
+  .entry-notice.info { color: var(--vscode-descriptionForeground); }
   .entry-notice.warn { color: var(--vscode-editorWarning-foreground, var(--vscode-foreground)); }
   .entry-notice.error {
     color: var(--vscode-inputValidation-errorForeground);
@@ -221,6 +465,34 @@ export function styles(): string {
   }
   .content-image { max-width: 100%; border-radius: 4px; margin: 4px 0; }
 
+  /* [CUSTOM-20260925-050] 编辑区面与编辑器标签同处一列：用侧边栏底色会像"外部面板
+     贴在了编辑区里"。类名由 body(surface) 打在 <body> 上（见 html/body.ts）。
+     侧边栏面不加任何规则——它必须保持侧边栏底色。 */
+  .surface-editor {
+    background: var(--vscode-editor-background);
+  }
+  .surface-editor .composer,
+  .surface-editor .load-overlay {
+    background: var(--vscode-editor-background);
+  }
+
+  /* [CUSTOM-20260925-050] 尊重系统的"减少动效"偏好。面板的 pulse / spin 是纯装饰
+     （进度点、加载圈），关掉不影响任何状态表达。 */
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+
+  /* [CUSTOM-20260925-051] 代码块的语言标签。放**左上角**——右上角归 Copy 按钮。
+     pointer-events: none 让它不挡住代码的选区。 */
+  .code-lang {
+    position: absolute; top: 4px; left: 6px;
+    font-family: var(--vscode-editor-font-family); font-size: 0.78em;
+    color: var(--vscode-descriptionForeground);
+    pointer-events: none;
+  }
+  /* 只有带语言标签的代码块才需要让出顶部空间，否则普通代码块会凭空多出一条空白。 */
+  .code-wrap.has-lang pre { padding-top: 20px; }
+
   /* Copy button injected into rendered code blocks */
   .code-wrap { position: relative; }
   .code-copy {
@@ -233,18 +505,41 @@ export function styles(): string {
   }
   .code-wrap:hover .code-copy { opacity: 1; }
 
-  /* --- Thoughts -------------------------------------------------------- */
+  /* --- Thoughts --------------------------------------------------------
+     三级视觉层次里最轻的一档（L1 气泡 / L2 卡片 / L3 轻卡）。
+     折叠态刻意做得很安静：无背景、无边框、次要色、略小字号——推理是辅助信息。
+     展开态给出淡背景 + 边框 + 圆角，与折叠态形成**强对比**。
+     缺了这个对比时，展开与折叠只差高度，读者分辨不出"这是一段独立内容"。 */
   .thought {
-    border-left: 2px solid var(--vscode-panel-border);
-    padding-left: 8px; margin: 2px 0;
+    border-radius: 4px;
     color: var(--vscode-descriptionForeground);
-    font-style: italic; font-size: 0.95em;
+    font-size: 0.9em;
   }
-  .thought > summary { cursor: pointer; font-style: normal; user-select: none; }
+  .thought > summary {
+    cursor: pointer;
+    user-select: none;
+    list-style: none;
+    padding: 1px 2px;
+    border-radius: 3px;
+  }
+  .thought > summary::-webkit-details-marker { display: none; }
+  /* 自定义折叠标记：原生三角太小且样式不可控（Chromium 下基本没法调） */
+  .thought > summary::before {
+    content: '▸';
+    display: inline-block; width: 12px; opacity: .7;
+  }
+  .thought[open] > summary::before { content: '▾'; }
+  .thought[open] {
+    background: var(--vscode-textCodeBlock-background);
+    border: 1px solid var(--vscode-panel-border);
+    padding: 2px 6px 4px;
+  }
+  .thought[open] > summary { color: var(--vscode-foreground); }
   .thought-body {
     max-height: 300px; overflow-y: auto;
     white-space: pre-wrap; word-break: break-word;
-    margin-top: 4px; opacity: 0.85;
+    margin-top: 3px; padding-left: 14px;
+    font-style: italic; opacity: 0.85;
   }
   .thought-spin {
     display: inline-block; width: 8px; height: 8px; border-radius: 50%;

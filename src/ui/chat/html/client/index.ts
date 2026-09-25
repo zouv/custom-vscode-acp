@@ -6,20 +6,38 @@
 // 运行时引用（如 NS.bridge 由 boot 提供）不受顺序影响。
 // [CUSTOM-END] CUSTOM-20260923-011
 import { domClient } from './dom';
+import { iconsClient } from './icons';
 import { scrollClient } from './scroll';
 import { linksClient } from './links';
+import { permissionViewClient } from './permissionView';
 import { toolCallViewClient } from './toolCallView';
 import { transcriptViewClient } from './transcriptView';
+import { outlineClient } from './outline';
+import { sessionMenuClient } from './sessionMenu';
+import { directoryMenuClient } from './directoryMenu';
+import { railClient } from './rail';
 import { tabsClient } from './tabs';
 import { composerClient } from './composer';
 import { bootClient } from './boot';
 
 const MODULES: ReadonlyArray<string> = [
   domClient,
+  // Record-type icons are used by both transcriptView and toolCallView, so they
+  // are registered before either of them.
+  iconsClient,
   scrollClient,
   linksClient,
+  // Must precede transcriptView: build() dispatches on entry kind at runtime,
+  // which only works once every view module has been registered.
+  permissionViewClient,
   toolCallViewClient,
   transcriptViewClient,
+  outlineClient,
+  sessionMenuClient,
+  // [CUSTOM-20260925-058] The draft page's directory drawer (same drawer shape
+  // as sessionMenu, which is why it sits next to it).
+  directoryMenuClient,
+  railClient,
   tabsClient,
   composerClient,
   bootClient,

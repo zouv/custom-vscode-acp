@@ -17,11 +17,20 @@ export const linksClient = `
     var pres = root.querySelectorAll('pre');
     for (var i = 0; i < pres.length; i++) {
       var pre = pres[i];
-      if (pre.parentNode && pre.parentNode.className === 'code-wrap') { continue; }
-      var wrap = NS.dom.el('div', 'code-wrap');
+      // Starts-with rather than equality: the wrapper also carries 'has-lang'
+      // when a language label was added below.
+      if (pre.parentNode && String(pre.parentNode.className).indexOf('code-wrap') === 0) { continue; }
+      // [CUSTOM-20260925-051] Surface the fenced language. SafeMarkdown already
+      // emits 'data-lang' (and validates it to a boring character set there) —
+      // it was simply never rendered. No syntax highlighter is added: that
+      // would mean a new dependency plus a CSP change.
+      var lang = pre.getAttribute('data-lang');
+      var wrap = NS.dom.el('div', lang ? 'code-wrap has-lang' : 'code-wrap');
       pre.parentNode.insertBefore(wrap, pre);
       wrap.appendChild(pre);
+      if (lang) { wrap.appendChild(NS.dom.el('span', 'code-lang', lang)); }
       var btn = NS.dom.el('button', 'code-copy', 'Copy');
+      btn.type = 'button';
       btn.setAttribute('data-code-copy', '1');
       wrap.appendChild(btn);
     }
@@ -50,6 +59,11 @@ export const linksClient = `
     var body = card ? card.querySelector(bodySelector) : null;
     if (!body) { return; }
     body.hidden = !body.hidden;
+    // [CUSTOM-20260925-047] The header is a <button> now, so the expanded state
+    // is worth announcing. (Enter/Space activate it natively — a button's
+    // activation dispatches a click, which is what this delegated handler sees,
+    // so no separate keydown branch is needed.)
+    header.setAttribute('aria-expanded', body.hidden ? 'false' : 'true');
     var caret = header.querySelector('.tool-caret');
     if (caret) { caret.textContent = body.hidden ? '\\u25b8' : '\\u25be'; }
 
@@ -68,6 +82,21 @@ export const linksClient = `
 
       var copyBtn = closestWithAttr(target, 'data-code-copy');
       if (copyBtn) { event.preventDefault(); onCopyClicked(copyBtn); return; }
+
+      // [CUSTOM-BEGIN] CUSTOM-20260924-020 - 权限卡按钮。放在最前面：它们是
+      // session 作用域的消息，且按钮上同时带 data-perm-id 与 data-perm-option。
+      var permBtn = closestWithAttr(target, 'data-perm-option');
+      if (permBtn) {
+        event.preventDefault();
+        if (permBtn.disabled) { return; }
+        NS.bridge.postForSession({
+          type: 'permissionAnswer',
+          promptId: permBtn.getAttribute('data-perm-id'),
+          optionId: permBtn.getAttribute('data-perm-option')
+        });
+        return;
+      }
+      // [CUSTOM-END] CUSTOM-20260924-020
 
       var diffHead = closestWithAttr(target, 'data-diff-toggle');
       if (diffHead) { event.preventDefault(); toggleBody(diffHead, '.diff-body'); return; }

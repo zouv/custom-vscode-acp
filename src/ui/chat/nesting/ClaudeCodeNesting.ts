@@ -32,6 +32,23 @@ const SUBAGENT_WORD = /\b(sub-?agent|delegate|spawn)\b/i;
 /** rawInput keys that suggest a sub-agent descriptor. */
 const SUBAGENT_INPUT_KEY = /sub-?agent|agent_?type|agenttype/i;
 
+// [CUSTOM-20260925-043] The two caches behind the memoisation, declared up here
+// so nothing reads them before initialisation. Both are keyed on object
+// identity, which is what makes them safe: `ToolInvocationStore.upsert*`
+// REPLACES `kind` / `title` / `rawInput` / `rawOutput` / `_meta` wholesale
+// rather than mutating them in place, so a reference change is exactly the
+// invalidation signal — no version counter to keep in sync, and no way for a
+// stale entry to survive a real change.
+//
+// `taskLikeCache` is per-invocation; `payloadTextCache` is per-PAYLOAD (an
+// invocation's `_meta` and `rawOutput` are separate objects, and the same
+// payload can be probed for many different child ids).
+const taskLikeCache = new WeakMap<
+  ToolInvocation,
+  { kind: unknown; title: unknown; rawInput: unknown; result: boolean }
+>();
+const payloadTextCache = new WeakMap<object, string>();
+
 interface Decision {
   parentId?: string;
   inferred?: boolean;
@@ -117,6 +134,24 @@ export class ClaudeCodeNesting implements NestingStrategy {
 
 /** Parent/child links are only ever claimed for task-delegation calls. */
 export function isTaskLike(inv: ToolInvocation): boolean {
+  // [CUSTOM-20260925-043] Memoised: `apply()` calls this once per candidate per
+  // round, and the answer only changes when one of its three inputs changes.
+  // `ToolInvocationStore.upsert*` REPLACES those fields rather than mutating
+  // them, so identity comparison is the exact invalidation signal — no version
+  // counter needed, and a stale hit is impossible.
+  const cached = taskLikeCache.get(inv);
+  if (cached
+    && cached.kind === inv.kind
+    && cached.title === inv.title
+    && cached.rawInput === inv.rawInput) {
+    return cached.result;
+  }
+  const result = computeTaskLike(inv);
+  taskLikeCache.set(inv, { kind: inv.kind, title: inv.title, rawInput: inv.rawInput, result });
+  return result;
+}
+
+function computeTaskLike(inv: ToolInvocation): boolean {
   if (inv.kind === 'think') { return false; }
 
   const title = (inv.title ?? '').trim();
@@ -130,6 +165,7 @@ export function isTaskLike(inv: ToolInvocation): boolean {
   return false;
 }
 
+/** See `isTaskLike` — same identity-based invalidation. */
 /**
  * Does `parent`'s payload mention `childId`?
  *
@@ -141,17 +177,44 @@ function mentionsId(parent: ToolInvocation, childId: string): boolean {
   return payloadContains(parent.rawOutput, childId) || payloadContains(parent.meta, childId);
 }
 
-function payloadContains(value: unknown, needle: string): boolean {
-  if (value === undefined || value === null) { return false; }
-  if (typeof value === 'string') { return value.includes(needle); }
-  let text: string | undefined;
+// [CUSTOM-20260925-043] Serialised-payload cache.
+//
+// `payloadContains` used to `JSON.stringify` the parent's payload on EVERY
+// candidate check of every round of every tool update. A Task's `rawOutput` is
+// routinely tens or hundreds of KB, so re-serialising the same unchanged object
+// dozens of times per update was the single most expensive thing in the host's
+// chat path — and it was pure waste, because the payload only ever changes when
+// the store replaces it wholesale.
+//
+// Keyed on the PAYLOAD OBJECT itself (not the invocation): the cache entry is
+// invalidated by the identity change that `upsert*` performs, and a WeakMap
+// guarantees it cannot outlive the payload. The stored value is the string
+// already sliced to `MAX_SCAN_CHARS`, so the memory held is bounded by
+// `min(payload size, MAX_SCAN_CHARS)` — strictly less than the transient string
+// the old code built and threw away on every call.
+/** Scan-limited serialisation of a payload, or null when it cannot be scanned. */
+function scanText(value: unknown): string | null {
+  if (typeof value === 'string') { return value.slice(0, MAX_SCAN_CHARS); }
+  if (!value || typeof value !== 'object') { return null; }
+  const cached = payloadTextCache.get(value);
+  if (cached !== undefined) { return cached; }
+  let text: string;
   try {
     text = JSON.stringify(value);
   } catch {
-    return false;
+    return null;
   }
-  if (typeof text !== 'string') { return false; }
-  return text.slice(0, MAX_SCAN_CHARS).includes(needle);
+  if (typeof text !== 'string') { return null; }
+  // Slicing BEFORE caching keeps the cache bounded *and* is exactly what the
+  // search below would do anyway — so this changes no semantics.
+  text = text.slice(0, MAX_SCAN_CHARS);
+  payloadTextCache.set(value, text);
+  return text;
+}
+
+function payloadContains(value: unknown, needle: string): boolean {
+  const text = scanText(value);
+  return text === null ? false : text.includes(needle);
 }
 
 /** Effective end of an interval: a still-running call is open up to `now`. */

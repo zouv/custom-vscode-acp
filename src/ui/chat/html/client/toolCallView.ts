@@ -25,6 +25,12 @@ export const toolCallViewClient = `
     execute: 'Run', think: 'Think', fetch: 'Fetch', switch_mode: 'Mode', other: 'Tool'
   };
 
+  // [CUSTOM-20260925-039] Kept in step with SafeMarkdown's SAFE_LINK_SCHEME
+  // (src/ui/chat/markdown.ts) and the host's allowlist in
+  // ChatPanelHost.handleOpenLink — a link the host would reject must never
+  // render as a clickable chip.
+  var OPENABLE_SCHEME = /^(https?:|mailto:)/i;
+
   function splitLines(text) {
     if (text === null || text === undefined) { return []; }
     var value = String(text);
@@ -105,13 +111,23 @@ export const toolCallViewClient = `
     return out;
   }
 
-  function renderDiff(item) {
+  function renderDiff(item, key) {
     var el = NS.dom.el;
     var wrap = el('div', 'diff');
+    // [CUSTOM-20260925-040] Identity used to carry the user's expansion state
+    // across a body rebuild (see fillToolBody). The ACP Diff item gives no id,
+    // so the caller-supplied positional key plus the path is the best available
+    // handle — and it stays stable under reordering within one tool call.
+    if (key) { wrap.setAttribute('data-expand-key', key); }
     var result = computeDiff(item.oldText, item.newText);
 
-    var head = el('div', 'diff-head');
+    // [CUSTOM-20260925-047] A real <button>: Enter/Space toggle the body for
+    // free, and aria-expanded describes the state to a screen reader. The card
+    // head was click-only before.
+    var head = el('button', 'diff-head');
+    head.type = 'button';
     head.setAttribute('data-diff-toggle', '1');
+    head.setAttribute('aria-expanded', 'false');
     var caret = el('span', 'tool-caret', '\\u25b8');
     head.appendChild(caret);
     var path = el('span', 'diff-path', item.path || '(new file)');
@@ -146,12 +162,33 @@ export const toolCallViewClient = `
     return wrap;
   }
 
-  function renderContentItem(item) {
+  /** [CUSTOM-20260924-026] Blank = whitespace OR zero-width characters. */
+  function isBlank(text) {
+    var s = String(text === undefined || text === null ? '' : text);
+    for (var i = 0; i < s.length; i++) {
+      var code = s.charCodeAt(i);
+      // 0x200b..0x200d zero-width space/joiners, 0x2060 word joiner, 0xfeff BOM
+      if (code === 0xfeff || code === 0x2060 || (code >= 0x200b && code <= 0x200d)) { continue; }
+      // Anything that is not whitespace (and not one of the above) is visible.
+      if (s.charAt(i).trim().length > 0) { return false; }
+    }
+    return true;
+  }
+
+  /**
+   * Render one entry of a tool call's content collection.
+   *
+   * 'key' is an optional stable identity supplied by the caller, used only by
+   * the diff renderer to survive a body rebuild (CUSTOM-20260925-040).
+   */
+  function renderContentItem(item, key) {
     var el = NS.dom.el;
-    if (item.type === 'diff') { return renderDiff(item); }
+    if (item.type === 'diff') { return renderDiff(item, key); }
 
     if (item.type === 'terminal') {
-      var chip = el('span', 'chip', '\\u25b6 terminal ' + item.terminalId);
+      // [CUSTOM-20260925-047] A real <button> -> keyboard reachable.
+      var chip = el('button', 'chip', '\\u25b6 terminal ' + item.terminalId);
+      chip.type = 'button';
       chip.setAttribute('data-terminal', item.terminalId);
       chip.title = 'Open the terminal output for this tool call';
       var wrapTerm = el('div', 'chip-row');
@@ -161,7 +198,12 @@ export const toolCallViewClient = `
 
     var block = item.block;
     if (!block) { return el('span', ''); }
-    if (block.type === 'text') { return el('div', 'tool-text', block.text); }
+    // [CUSTOM-20260924-026] A blank text block is invisible content: rendering
+    // it produced an empty .tool-text strip (margin 3px 0 with nothing inside).
+    // Cosmetic only, so an empty inline span is enough — no need to hide nodes.
+    if (block.type === 'text') {
+      return isBlank(block.text) ? el('span', '') : el('div', 'tool-text', block.text);
+    }
     if (block.type === 'image') {
       var img = document.createElement('img');
       img.className = 'content-image';
@@ -170,9 +212,27 @@ export const toolCallViewClient = `
       return img;
     }
     if (block.type === 'resource_link') {
-      var linkChip = el('span', 'chip', (block.title || block.name || block.uri));
-      linkChip.setAttribute('data-href', block.uri);
-      linkChip.title = block.uri;
+      // [CUSTOM-20260925-039] 'path' 由扩展侧判定（本地文件，含相对路径）。
+      // 这里只负责把点击导向正确的通道：本地文件走 data-path -> openFile，
+      // 可放行协议走 data-href -> openLink。两者都不是就做成**静态 chip**——
+      // 此前一律写 data-href，于是点一个本地文件只会弹出
+      // 'Blocked link with unsupported scheme: file' 而什么都不打开。
+      // [CUSTOM-20260925-047] 只有**能点**的才做成 <button>；打不开的用 <span>，
+      // 否则它会白白占一个 tab 停靠位（键盘用户一路 Tab 过去全是死控件）。
+      var openable = !!block.path || OPENABLE_SCHEME.test(String(block.uri || ''));
+      var linkChip = openable
+        ? el('button', 'chip', (block.title || block.name || block.uri))
+        : el('span', 'chip chip-static', (block.title || block.name || block.uri));
+      if (openable) { linkChip.type = 'button'; }
+      if (block.path) {
+        linkChip.setAttribute('data-path', block.path);
+        linkChip.title = block.path;
+      } else if (openable) {
+        linkChip.setAttribute('data-href', block.uri);
+        linkChip.title = block.uri;
+      } else {
+        linkChip.title = String(block.uri || '') + ' (this link type cannot be opened)';
+      }
       var row = el('div', 'chip-row');
       row.appendChild(linkChip);
       return row;
@@ -187,6 +247,164 @@ export const toolCallViewClient = `
     return el('span', '');
   }
 
+  /**
+   * [CUSTOM-20260925-040] The single builder for a tool card's body.
+   *
+   * 'render' and 'update' used to build it twice, independently — which is how
+   * 'locations' came to be rendered on first paint and then dropped by every
+   * later update (the update path never re-emitted the chips, and its
+   * 'NS.dom.clear(body)' removed the ones already there). One builder makes
+   * that class of drift impossible.
+   */
+  function fillToolBody(body, tool) {
+    var el = NS.dom.el;
+    NS.dom.clear(body);
+    if (tool.command) {
+      body.appendChild(el('div', 'tool-command', tool.command));
+    }
+    var locations = tool.locations || [];
+    if (locations.length > 0) {
+      var row = el('div', 'chip-row');
+      for (var i = 0; i < locations.length; i++) {
+        var loc = locations[i];
+        // [CUSTOM-20260925-047] A real <button> -> keyboard reachable.
+        var chip = el('button', 'chip', loc.name + (loc.line ? ':' + loc.line : ''));
+        chip.type = 'button';
+        chip.setAttribute('data-path', loc.path);
+        if (loc.line) { chip.setAttribute('data-line', String(loc.line)); }
+        chip.title = loc.path + (loc.line ? ':' + loc.line : '');
+        row.appendChild(chip);
+      }
+      body.appendChild(row);
+    }
+    var items = tool.items || [];
+    for (var j = 0; j < items.length; j++) {
+      // Positional key so a rebuilt diff keeps the user's expansion state.
+      body.appendChild(renderContentItem(items[j], 'i' + j + ':' + (items[j].path || '')));
+    }
+    if (!tool.command && locations.length === 0 && items.length === 0) {
+      body.appendChild(el('div', 'diff-note', 'No detail reported for this tool call.'));
+    }
+    return body;
+  }
+
+  /**
+   * [CUSTOM-20260925-040] Expansion state of the nested collapsibles inside a
+   * tool body, keyed by 'data-expand-key'.
+   *
+   * A running command receives a 'tool_call_update' on every output chunk, and
+   * the body is rebuilt each time; without this, a diff the user just opened
+   * re-collapsed under their cursor on the next chunk.
+   */
+  function captureExpansion(body) {
+    var out = {};
+    if (!body || !body.querySelectorAll) { return out; }
+    var blocks = body.querySelectorAll('[data-expand-key]');
+    for (var i = 0; i < blocks.length; i++) {
+      var inner = blocks[i].querySelector('.diff-body');
+      if (inner) { out[blocks[i].getAttribute('data-expand-key')] = !inner.hidden; }
+    }
+    return out;
+  }
+
+  function applyExpansion(body, state) {
+    if (!body || !body.querySelectorAll) { return; }
+    var blocks = body.querySelectorAll('[data-expand-key]');
+    for (var i = 0; i < blocks.length; i++) {
+      var block = blocks[i];
+      var key = block.getAttribute('data-expand-key');
+      if (!Object.prototype.hasOwnProperty.call(state, key)) { continue; }
+      var open = state[key];
+      var inner = block.querySelector('.diff-body');
+      if (!inner || inner.hidden === !open) { continue; }
+      inner.hidden = !open;
+      // [CUSTOM-20260925-047] Keep aria-expanded in step with the restored state.
+      var diffHead = block.querySelector('.diff-head');
+      if (diffHead) { diffHead.setAttribute('aria-expanded', open ? 'true' : 'false'); }
+      var caret = block.querySelector('.tool-caret');
+      if (caret) { caret.textContent = open ? '\\u25be' : '\\u25b8'; }
+    }
+  }
+
+  // [CUSTOM-20260925-044] Above this length a string is not hashed at all:
+  // fingerprinting becomes the caller's "rebuild unconditionally" case instead
+  // of risking a wrong cache hit. 256K chars is far past any normal diff, so in
+  // practice every real card gets the fast path.
+  var HASH_LIMIT = 262144;
+
+  /**
+   * [CUSTOM-20260925-044] FNV-1a hash of a string, plus its length — or null
+   * when the string is too long to hash cheaply.
+   *
+   * Length alone is NOT a usable change signal: an update that rewrites a diff
+   * (or a command, or a text block) with the SAME number of characters would
+   * produce an identical signature and leave the old rendering on screen
+   * forever. Hashing costs one O(n) pass, which is far cheaper than re-running
+   * the LCS and rebuilding up to MAX_RENDER_LINES DOM rows.
+   */
+  function fingerprintText(value) {
+    if (value === null || value === undefined) { return '-'; }
+    var s = String(value);
+    if (s.length > HASH_LIMIT) { return null; }
+    var h = 2166136261;
+    for (var i = 0; i < s.length; i++) {
+      h = Math.imul(h ^ s.charCodeAt(i), 16777619) >>> 0;
+    }
+    return h + ':' + s.length;
+  }
+
+  /**
+   * [CUSTOM-20260925-040] Cheap identity of everything the body renders.
+   *
+   * Most 'tool_call_update's change only the status, which lives in the head —
+   * rebuilding the body for those also re-runs every diff's LCS for nothing.
+   * Returns **null** when the body cannot be fingerprinted cheaply; the caller
+   * must then rebuild unconditionally.
+   *
+   * Deliberately never stringifies a payload: an image block's data URI is
+   * megabytes long, so image-bearing cards opt out of the cache instead.
+   */
+  function bodySignature(tool) {
+    var command = fingerprintText(tool.command);
+    if (command === null) { return null; }
+    // [CUSTOM-20260925-044] The leading 'cmd:' is now a HASH, not a length —
+    // see fingerprintText for why a length is not a safe change signal.
+    var parts = ['cmd:' + command];
+    var locations = tool.locations || [];
+    for (var i = 0; i < locations.length; i++) {
+      parts.push('loc:' + locations[i].path + ':' + (locations[i].line || 0));
+    }
+    var items = tool.items || [];
+    for (var j = 0; j < items.length; j++) {
+      var item = items[j];
+      if (item.type === 'diff') {
+        var oldFp = fingerprintText(item.oldText);
+        var newFp = fingerprintText(item.newText);
+        if (oldFp === null || newFp === null) { return null; }
+        parts.push('diff:' + item.path + ':' + oldFp + ':' + newFp);
+      } else if (item.type === 'terminal') {
+        parts.push('term:' + item.terminalId);
+      } else if (item.block) {
+        var block = item.block;
+        // An image's data URI is megabytes long, so it is never scanned: the
+        // card opts out of the cache rather than risk a stale render.
+        if (block.type === 'image') { return null; }
+        var textFp = fingerprintText(block.text);
+        if (textFp === null) { return null; }
+        // Every field any non-image renderer reads, so a change cannot slip
+        // past the signature (an under-covered field = permanently stale card).
+        parts.push('blk:' + block.type
+          + ':' + textFp
+          + ':' + (block.uri || '')
+          + ':' + (block.name || '')
+          + ':' + (block.title || '')
+          + ':' + (block.mimeType || '')
+          + ':' + (block.byteLength || 0));
+      }
+    }
+    return parts.join('|');
+  }
+
   /** Build the DOM for a tool call. */
   function render(tool) {
     var el = NS.dom.el;
@@ -194,8 +412,16 @@ export const toolCallViewClient = `
     wrap.setAttribute('data-tool-id', tool.toolCallId);
     if (tool.parentId) { wrap.setAttribute('data-parent-id', tool.parentId); }
 
-    var head = el('div', 'tool-head');
+    // [CUSTOM-20260925-047] A real <button> — see the diff head above.
+    var head = el('button', 'tool-head');
+    head.type = 'button';
     head.setAttribute('data-tool-toggle', '1');
+    head.setAttribute('aria-expanded', 'false');
+    // [CUSTOM-20260924-028] Type icon first, then the caret/status/kind/title.
+    // The head is never cleared wholesale (update only rewrites the status,
+    // kind and title spans), so the icon survives every patch.
+    var icon = NS.icons && NS.icons.toolIcon ? NS.icons.toolIcon() : null;
+    if (icon) { head.appendChild(icon); }
     head.appendChild(el('span', 'tool-caret', '\\u25b8'));
     head.appendChild(el('span', 'tool-status tc-' + tool.status, STATUS_GLYPH[tool.status] || '\\u2022'));
     head.appendChild(el('span', 'tool-kind', KIND_LABEL[tool.kind] || 'Tool'));
@@ -209,28 +435,9 @@ export const toolCallViewClient = `
 
     var body = el('div', 'tool-body');
     body.hidden = true;
-    if (tool.command) {
-      body.appendChild(el('div', 'tool-command', tool.command));
-    }
-    if (tool.locations && tool.locations.length > 0) {
-      var row = el('div', 'chip-row');
-      for (var i = 0; i < tool.locations.length; i++) {
-        var loc = tool.locations[i];
-        var chip = el('span', 'chip', loc.name + (loc.line ? ':' + loc.line : ''));
-        chip.setAttribute('data-path', loc.path);
-        if (loc.line) { chip.setAttribute('data-line', String(loc.line)); }
-        chip.title = loc.path + (loc.line ? ':' + loc.line : '');
-        row.appendChild(chip);
-      }
-      body.appendChild(row);
-    }
-    var items = tool.items || [];
-    for (var j = 0; j < items.length; j++) {
-      body.appendChild(renderContentItem(items[j]));
-    }
-    if (!tool.command && (!tool.locations || tool.locations.length === 0) && items.length === 0) {
-      body.appendChild(el('div', 'diff-note', 'No detail reported for this tool call.'));
-    }
+    fillToolBody(body, tool);
+    var signature = bodySignature(tool);
+    if (signature !== null) { wrap.setAttribute('data-body-sig', signature); }
     wrap.appendChild(body);
     return wrap;
   }
@@ -266,6 +473,11 @@ export const toolCallViewClient = `
       status.className = 'tool-status tc-' + tool.status;
       status.textContent = STATUS_GLYPH[tool.status] || '\\u2022';
     }
+    // [CUSTOM-20260924-027] The kind label is patchable too: a card built from a
+    // placeholder starts as "Tool" and must pick up the real kind (Read / Edit /
+    // Run / …) when the view model finally arrives.
+    var kind = node.querySelector('.tool-kind');
+    if (kind) { kind.textContent = KIND_LABEL[tool.kind] || 'Tool'; }
     var title = node.querySelector('.tool-title');
     if (title && tool.title) {
       title.textContent = tool.title;
@@ -273,14 +485,50 @@ export const toolCallViewClient = `
     }
     var body = node.querySelector('.tool-body');
     if (body) {
-      NS.dom.clear(body);
-      if (tool.command) { body.appendChild(NS.dom.el('div', 'tool-command', tool.command)); }
-      var items = tool.items || [];
-      for (var i = 0; i < items.length; i++) {
-        body.appendChild(renderContentItem(items[i]));
+      // [CUSTOM-20260925-040] Rebuild through the shared builder (so 'locations'
+      // arriving late are actually rendered) while carrying over the user's
+      // expansion state — and skip the whole rebuild when nothing the body
+      // renders has changed (which is the common case: updates usually only
+      // move the status).
+      var signature = bodySignature(tool);
+      var previous = node.getAttribute('data-body-sig');
+      if (signature === null || previous === null || signature !== previous) {
+        var expansion = captureExpansion(body);
+        fillToolBody(body, tool);
+        applyExpansion(body, expansion);
+        if (signature === null) { node.removeAttribute('data-body-sig'); }
+        else { node.setAttribute('data-body-sig', signature); }
       }
     }
-    if (node.parentNode) { refreshGrouping(node.parentNode); }
+    // [CUSTOM-20260925-044] Coalesced, not synchronous: this runs on every
+    // output chunk of a running command (see refreshGroupingSoon).
+    if (node.parentNode) { refreshGroupingSoon(node.parentNode); }
+  }
+
+  /**
+   * [CUSTOM-20260925-044] Coalesced 'refreshGrouping' — at most one full walk
+   * per animation frame.
+   *
+   * 'refreshGrouping' is a 'querySelectorAll' over the whole transcript, and
+   * 'update()' used to run it **synchronously** on every tool update — which is
+   * the common case, since a running command emits one update per output chunk.
+   * 'transcriptView' already coalesced it for the append path via the shared
+   * rAF queue; the coalescer now lives here, next to the function it coalesces,
+   * so both paths use it and there is no second copy to forget.
+   */
+  var groupingPending = false;
+  var groupingRoot = null;
+
+  function refreshGroupingSoon(root) {
+    if (root) { groupingRoot = root; }
+    if (groupingPending) { return; }
+    groupingPending = true;
+    NS.dom.schedule(function () {
+      groupingPending = false;
+      var target = groupingRoot;
+      groupingRoot = null;
+      if (target) { refreshGrouping(target); }
+    });
   }
 
   /**
@@ -332,6 +580,10 @@ export const toolCallViewClient = `
     render: render,
     update: update,
     refreshGrouping: refreshGrouping,
+    // [CUSTOM-20260925-044] The coalesced form — the one every caller should
+    // use unless it is already inside a rAF pass (transcriptView's delegate).
+    refreshGroupingSoon: refreshGroupingSoon,
+    isBlank: isBlank,
     // Reused by transcriptView for 'content' entries (non-text message
     // blocks) so there is exactly one renderer per ContentBlock variant.
     renderContentItem: renderContentItem

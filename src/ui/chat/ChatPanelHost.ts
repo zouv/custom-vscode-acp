@@ -8,6 +8,8 @@
 //   · 记录在 panel 未 attach 时也照常累积（后台会话继续跑），只是 postMessage 被守卫丢弃。
 //   · 所有发出的消息都带 sessionId；所有收到的消息都先校验 sessionId 与 SessionManager 匹配，
 //     不匹配一律丢弃并记日志，绝不静默落到「当前聚焦会话」上。
+//   · 两个 surface（侧边栏视图 / 编辑区面板）共享本实例：`post()` 广播、`boot` 只回给发起者
+//     （CUSTOM-20260924-019，见 ChatSurface.ts）。
 // [CUSTOM-END] CUSTOM-20260923-011
 import * as vscode from 'vscode';
 
@@ -18,29 +20,54 @@ import type { SessionUpdateHandler, SessionUpdateListener } from '../../handlers
 import { log } from '../../utils/Logger';
 import { renderChatHtml, createNonce } from './html';
 import { SafeMarkdown } from './markdown';
+import { Outbox } from './Outbox';
 import type {
   Attachment,
   ChatToExt,
   CloseReason,
   ExtToChat,
+  ExtToChatMessage,
   SessionMeta,
   SessionSummary,
   TranscriptSnapshotWire,
 } from './protocol';
 import type { IChatPanel, PanelContext } from './panelContract';
+import { isModernAgent, MODERN_AGENTS } from './panelContract';
+import { viewSurface, type ChatSurface, type SurfaceKey } from './ChatSurface';
+import type { PermissionPresenter, PermissionState } from '../../handlers/PermissionBridge';
+import { PermissionBridge } from '../../handlers/PermissionBridge';
 import { TranscriptStore } from './transcript/TranscriptStore';
 import { ToolInvocationStore } from './transcript/ToolInvocationStore';
 import { toToolCallView } from './content/toolCalls';
-import { toContentView } from './content/contentBlocks';
+import { toContentView, hasVisibleContent } from './content/contentBlocks';
 import { resolveNestingStrategy } from './nesting/NestingStrategy';
 
 /** Prefix of the output channel used for panel-level diagnostics. */
 const LOG_PREFIX = 'chat-panel';
 
-export class ChatPanelHost implements IChatPanel {
+/**
+ * [CUSTOM-20260924-022] Message types that must NEVER be delayed or merged.
+ *
+ * INV-C: `sessionsChanged` drives the Send/Stop button — a late one leaves a
+ * stale `Send` after the turn already started.
+ * INV-D: `sessionClosed` must remove its tab immediately.
+ * `boot`/`focus` are full snapshots and are always preceded by a flush, so they
+ * can never arrive before an append they already contain (INV-E).
+ */
+const STRUCTURAL_MESSAGE_TYPES: ReadonlySet<string> = new Set([
+  'boot', 'focus', 'sessionsChanged', 'sessionClosed', 'meta', 'attachments', 'error',
+]);
+
+export class ChatPanelHost implements IChatPanel, PermissionPresenter {
   readonly id = 'modern' as const;
 
-  private view: vscode.WebviewView | null = null;
+  // [CUSTOM-BEGIN] CUSTOM-20260924-019 - 单视图 → 多 surface（侧边栏 + 编辑区）。
+  // 状态仍然只有这一份，两个面读同一个 store；`post()` 默认广播，两边自动同源。
+  // `lastActive` 只用于「把某个面提到前面」（附件 chip），不参与路由决策。
+  private readonly surfaces = new Map<SurfaceKey, ChatSurface>();
+  private lastActive: SurfaceKey | null = null;
+  // [CUSTOM-END] CUSTOM-20260924-019
+
   private readonly transcripts = new TranscriptStore();
   private readonly tools = new ToolInvocationStore();
   private readonly markdown = new SafeMarkdown();
@@ -56,16 +83,37 @@ export class ChatPanelHost implements IChatPanel {
 
   private focused: PanelContext = { agentName: null, sessionId: null };
 
+  // [CUSTOM-BEGIN] CUSTOM-20260924-022 - 合帧队列 + 标签栏快照签名（见 refreshSessions）。
+  private readonly outbox: Outbox;
+  private lastSessionsSignature: string | null = null;
+  // [CUSTOM-END] CUSTOM-20260924-022
+
   private readonly updateListener: SessionUpdateListener;
   private readonly subscriptions: vscode.Disposable[] = [];
+  // [CUSTOM-20260925-041] Held so dispose() can UNREGISTER the listener. The
+  // legacy provider does this (ChatWebviewProvider.dispose ->
+  // removeListener) while this host only ever added one, leaving the
+  // registration to be swept up by SessionUpdateHandler.dispose() — correct by
+  // accident, not by contract.
+  private readonly sessionUpdateHandler: SessionUpdateHandler;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
     private readonly sessionManager: SessionManager,
     sessionUpdateHandler: SessionUpdateHandler,
+    private readonly permissionBridge?: PermissionBridge,
   ) {
+    this.sessionUpdateHandler = sessionUpdateHandler;
+    // The host IS the permission presenter for the modern panel: no other
+    // object knows whether a surface is on screen and which session is focused.
+    this.permissionBridge?.setPresenter(this);
+    // [CUSTOM-20260924-022] One frame of coalescing for order-coupled messages.
+    this.outbox = new Outbox({
+      send: message => this.postNow(message),
+      log: message => log(`${LOG_PREFIX}: ${message}`),
+    });
     this.updateListener = (update: SessionNotification) => this.onSessionUpdate(update);
-    sessionUpdateHandler.addListener(this.updateListener);
+    this.sessionUpdateHandler.addListener(this.updateListener);
 
     const refresh = () => this.refreshSessions();
     const on = (event: string, handler: (...args: any[]) => void) => {
@@ -93,7 +141,17 @@ export class ChatPanelHost implements IChatPanel {
     on('agent-disconnected', refresh);
     on('session-info-changed', refresh);
     on('session-load-start', refresh);
-    on('session-load-end', refresh);
+    on('session-load-end', (sessionId: string) => {
+      // [CUSTOM-20260925-055] A replay is a FINITE recorded stream, so once it
+      // ends nothing can still be streaming — but nothing else closes the
+      // entries it created: `finalizeTurn` only runs for a prompt WE sent, and a
+      // `session/load` is not one. Left open, the trailing assistant entry keeps
+      // the client in its streaming state forever and pins `aria-busy` to true,
+      // which silently mutes the screen reader. (Found by
+      // src/test/chat-panel.test.ts against a real captured replay.)
+      this.finalizeEntries(sessionId);
+      refresh();
+    });
     on('active-session-changed', (_sessionId: string | null, agentName: string | null) => {
       // The router owns focus decisions, but a focus change originating from
       // elsewhere (e.g. the tree) must still reach an attached panel.
@@ -105,18 +163,48 @@ export class ChatPanelHost implements IChatPanel {
   // --- IChatPanel ----------------------------------------------------------
 
   attach(view: vscode.WebviewView, ctx: PanelContext): void {
-    this.view = view;
+    this.attachSurface(viewSurface(view), ctx);
+  }
+
+  /**
+   * [CUSTOM-20260924-019] Attach (or re-attach) one surface. The same entry
+   * point serves the sidebar view and the editor panel, so the HTML is rendered
+   * per document — each webview needs its own CSP nonce and its own
+   * `cspSource`, which is why the html string is never shared between surfaces.
+   */
+  attachSurface(surface: ChatSurface, ctx: PanelContext): void {
+    this.surfaces.set(surface.key, surface);
+    this.lastActive = surface.key;
     this.focused = ctx;
-    view.webview.options = {
+    surface.webview.options = {
       enableScripts: true,
       localResourceRoots: [this.extensionUri],
     };
-    view.webview.html = renderChatHtml(view.webview, createNonce());
-    this.pushBoot();
+    surface.setHtml(renderChatHtml(surface.webview, createNonce(), surface.key));
+    // Targeted: a broadcast boot would force the OTHER document to reset and
+    // re-hydrate (losing its scroll position) every time a surface attaches.
+    this.pushBoot(surface.key);
   }
 
   detach(): void {
-    this.view = null;
+    this.detachSurface('view');
+  }
+
+  detachSurface(key: SurfaceKey): void {
+    this.surfaces.delete(key);
+    if (this.lastActive === key) {
+      this.lastActive = this.surfaces.keys().next().value ?? null;
+    }
+    // [CUSTOM-20260924-020] Last surface gone: any permission card still
+    // waiting for a click is now unreachable, and the agent is blocked on it.
+    // The bridge moves those prompts to the dialog instead of hanging.
+    if (this.attachedCount === 0) { this.permissionBridge?.onPresenterLost(); }
+    // [CUSTOM-END] CUSTOM-20260924-020
+  }
+
+  /** Zero means there is nowhere to render; every push must bail out. */
+  private get attachedCount(): number {
+    return this.surfaces.size;
   }
 
   onFocusChanged(ctx: PanelContext): void {
@@ -144,27 +232,68 @@ export class ChatPanelHost implements IChatPanel {
       void vscode.window.showWarningMessage('Attach File: no session is focused.');
       return;
     }
-    const attachment: Attachment = { path: uri.fsPath, name: basename(uri.fsPath) };
-    const list = this.attachments.get(sessionId) ?? [];
-    if (!list.some(a => a.path === attachment.path)) { list.push(attachment); }
-    this.attachments.set(sessionId, list);
-    this.post({ type: 'attachments', sessionId, attachments: list });
-    this.view?.show?.(true);
+    this.addAttachments(sessionId, [{ path: uri.fsPath, name: basename(uri.fsPath) }]);
+    // [CUSTOM-BEGIN] CUSTOM-20260924-019 - 提到「最近交互过的面」而不是固定的侧边栏视图。
+    // 旧写法 `view?.show?.(true)` 对 WebviewPanel 会静默失效（面板没有 `show`），
+    // 表现为附件 chip 不显示也不报错。
+    const surface = this.surfaces.get(this.lastActive ?? 'view') ?? this.surfaces.values().next().value;
+    surface?.reveal(true);
+    // [CUSTOM-END] CUSTOM-20260924-019
   }
 
-  onMessage(message: unknown): void {
+  /**
+   * [CUSTOM-20260925-049] Add attachments to a session's pending list.
+   *
+   * Extracted from `attachFile` so the drag-and-drop path can share it — that
+   * path must NOT reveal a surface, because the drop already happened on a
+   * visible one and raising another panel would steal focus for no reason.
+   */
+  private addAttachments(sessionId: string, incoming: Attachment[]): void {
+    const list = this.attachments.get(sessionId) ?? [];
+    for (const attachment of incoming) {
+      if (!list.some(existing => existing.path === attachment.path)) { list.push(attachment); }
+    }
+    this.attachments.set(sessionId, list);
+    this.post({ type: 'attachments', sessionId, attachments: list });
+  }
+
+  /** Files dropped onto (or pasted into) the panel. */
+  private handleAttachPaths(sessionId: string, paths: unknown): void {
+    if (!Array.isArray(paths)) { return; }
+    const incoming: Attachment[] = [];
+    for (const raw of paths) {
+      if (typeof raw !== 'string' || raw.length === 0) { continue; }
+      incoming.push({ path: raw, name: basename(raw) });
+    }
+    if (incoming.length === 0) { return; }
+    this.addAttachments(sessionId, incoming);
+    log(`${LOG_PREFIX}: attached ${incoming.length} dropped/pasted file(s) to ${sessionId}`);
+  }
+
+  onMessage(message: unknown, from: SurfaceKey = 'view'): void {
     const msg = message as Partial<ChatToExt> & { type?: string };
     if (!msg || typeof msg.type !== 'string') { return; }
+    this.lastActive = from;
 
     switch (msg.type) {
       case 'ready':
-        this.pushBoot();
+        this.pushBoot(from);
         return;
       case 'newSession': {
-        const agentName = (msg as { agentName?: string }).agentName;
-        if (!agentName) { return; }
-        void this.sessionManager.connectToAgent(agentName).catch(e => this.reportError(null, e));
+        // [CUSTOM-BEGIN] CUSTOM-20260924-024 - 修「+ 按钮点了没反应」。
+        // 原先这里调 `connectToAgent(agentName)`，而它的语义是**已有会话就复用**
+        // （SessionManager.connectToAgent：liveIds.length > 0 时只 focusSession），
+        // 于是「开新会话」在有会话时退化成「聚焦已有会话」。开新会话必须走
+        // newConversation → createSession —— 那才是 010 引入的原子操作。
+        const agentName = (msg as { agentName?: string }).agentName ?? this.focused.agentName;
+        if (!agentName) {
+          this.reportError(null, new Error(
+            'No agent to start a session with. Connect one in the Agents view first.'));
+          return;
+        }
+        void this.sessionManager.newConversation(agentName).catch(e => this.reportError(null, e));
         return;
+        // [CUSTOM-END] CUSTOM-20260924-024
       }
       case 'focusAgent': {
         const agentName = (msg as { agentName?: string }).agentName;
@@ -174,6 +303,47 @@ export class ChatPanelHost implements IChatPanel {
         if (next) { this.sessionManager.focusSession(next); }
         return;
       }
+
+      // [CUSTOM-BEGIN] CUSTOM-20260925-032/033 - 面板内的「连接」与「历史会话」。
+      // 都按设计不带 sessionId（要用它们时往往根本没有聚焦会话），所以在守卫之前处理。
+      case 'connectAgent': {
+        this.handleConnectAgent((msg as { agentName?: string }).agentName);
+        return;
+      }
+      case 'listHistory': {
+        void this.handleListHistory((msg as { agentName?: string }).agentName);
+        return;
+      }
+      case 'openHistorySession': {
+        void this.handleOpenHistorySession(
+          (msg as { agentName?: string }).agentName ?? '',
+          (msg as { sessionId?: string }).sessionId ?? '',
+          // [CUSTOM-20260925-057] The row carries the session's own directory;
+          // see handleOpenHistorySession for why it matters.
+          (msg as { cwd?: string }).cwd || undefined,
+        );
+        return;
+      }
+      // [CUSTOM-END] CUSTOM-20260925-032/033
+
+      // [CUSTOM-BEGIN] CUSTOM-20260925-058 - 草稿页：同样按设计不带 sessionId
+      // （草稿就是"还没有会话"），所以在守卫之前处理。
+      case 'listDirectoryChoices':
+        void this.handleListDirectoryChoices((msg as { agentName?: string }).agentName, from);
+        return;
+      case 'pickDirectory':
+        void this.handlePickDirectory(from);
+        return;
+      case 'createDraftAndSend':
+        void this.handleCreateDraftAndSend(
+          (msg as { draftId?: string }).draftId ?? '',
+          (msg as { agentName?: string }).agentName,
+          (msg as { cwd?: string }).cwd,
+          (msg as { text?: string }).text ?? '',
+          from,
+        );
+        return;
+      // [CUSTOM-END] CUSTOM-20260925-058
 
       // --- NOT session-scoped: must be handled BEFORE the guard below -----
       // These carry no top-level `sessionId` by design, so routing them
@@ -189,6 +359,14 @@ export class ChatPanelHost implements IChatPanel {
       case 'copy':
         void vscode.env.clipboard.writeText((msg as { text?: string }).text ?? '');
         return;
+      // [CUSTOM-20260925-029] NOT session-scoped: forward to the output channel.
+      case 'clientLog': {
+        const level = (msg as { level?: string }).level ?? 'info';
+        const text = (msg as { message?: string }).message ?? '';
+        log(`${LOG_PREFIX}: client(${level}): ${text}`);
+        return;
+      }
+      // [CUSTOM-END] CUSTOM-20260925-029
       case 'openLink':
         void this.handleOpenLink((msg as { href?: string }).href ?? '');
         return;
@@ -232,6 +410,11 @@ export class ChatPanelHost implements IChatPanel {
         this.post({ type: 'attachments', sessionId, attachments: list });
         return;
       }
+      // [CUSTOM-20260925-049] Session-scoped: sits AFTER the guard above.
+      case 'attachPath':
+        this.handleAttachPaths(sessionId, (msg as { paths?: unknown }).paths);
+        return;
+      // [CUSTOM-END] CUSTOM-20260925-049
       case 'setMode':
         void this.sessionManager.setMode(sessionId, (msg as { modeId: string }).modeId)
           .then(() => this.pushMeta(sessionId))
@@ -251,8 +434,20 @@ export class ChatPanelHost implements IChatPanel {
           .then(() => this.pushMeta(sessionId))
           .catch(e => this.reportError(sessionId, e));
         return;
+      // [CUSTOM-20260924-027] Session-scoped: it must sit AFTER the guard above.
+      case 'needToolView': {
+        this.resendToolView(
+          sessionId,
+          (msg as { entryId?: string }).entryId ?? '',
+          (msg as { toolCallId?: string }).toolCallId ?? '',
+          from,
+        );
+        return;
+      }
+      // [CUSTOM-END] CUSTOM-20260924-027
       case 'openFile':
         void this.handleOpenFile(
+          sessionId,
           (msg as { path?: string }).path ?? '',
           (msg as { line?: number }).line,
         );
@@ -260,15 +455,33 @@ export class ChatPanelHost implements IChatPanel {
       case 'openTerminal':
         this.handleOpenTerminal(sessionId, (msg as { terminalId?: string }).terminalId ?? '');
         return;
+      // [CUSTOM-20260924-020] Session-scoped: it must sit AFTER the guard above.
+      case 'permissionAnswer': {
+        const promptId = (msg as { promptId?: string }).promptId;
+        if (promptId) {
+          this.permissionBridge?.answer(promptId, (msg as { optionId?: string }).optionId);
+        }
+        return;
+      }
+      // [CUSTOM-END] CUSTOM-20260924-020
       default:
         break;
     }
   }
 
   dispose(): void {
+    // [CUSTOM-20260925-041] Unregister first: an update arriving while the
+    // rest of this method runs would otherwise index into state that is being
+    // torn down.
+    this.sessionUpdateHandler.removeListener(this.updateListener);
+    this.outbox.dispose();
     for (const d of this.subscriptions) { d.dispose(); }
     this.subscriptions.length = 0;
-    this.view = null;
+    this.surfaces.clear();
+    this.lastActive = null;
+    // setPresenter(null) also cancels every prompt still awaiting an answer:
+    // nothing can render or answer them once the host is gone.
+    this.permissionBridge?.setPresenter(null);
   }
 
   // --- Prompt handling -----------------------------------------------------
@@ -379,6 +592,15 @@ export class ChatPanelHost implements IChatPanel {
     this.sessionManager.touchHistory(sessionId);
     this.refreshSessions();
     this.pushTurnState(sessionId);
+    // [CUSTOM-20260924-022] Batching health check: a high merged/queued ratio
+    // means the coalescing is doing its job; if `queued` stays large at turn
+    // end something is bypassing the outbox.
+    // [CUSTOM-20260925-041] Per-turn, not cumulative (see Outbox.resetStats).
+    // `queued` here is normally 0-2 (the frame still in flight); a value that
+    // stays large across turns is the real signal.
+    const stats = this.outbox.stats();
+    log(`${LOG_PREFIX}: outbox sent=${stats.sent} merged=${stats.merged} queued=${stats.queued}`);
+    this.outbox.resetStats();
   }
 
   // --- Session update → transcript ----------------------------------------
@@ -421,6 +643,17 @@ export class ChatPanelHost implements IChatPanel {
         // Replay path (`session/load`).
         const text = textOf(data.content);
         if (text.length === 0) { return; }
+        // [CUSTOM-20260925-053] A user chunk IS a turn boundary, so it must
+        // close any assistant prose still marked as streaming. Nothing else
+        // does it on the replay path: `finalizeTurn` only runs for a prompt we
+        // sent, and the tool_call branch only fires when a tool follows. An
+        // entry left `streaming: true` forever keeps the client's copy in the
+        // streaming state — which among other things pins `aria-busy` to true
+        // (CUSTOM-20260925-048) and silently mutes the screen reader for the
+        // rest of the session. The legacy panel finalizes the pending assistant
+        // turn here too ("finalizes pending assistant turn", its
+        // user_message_chunk branch).
+        this.finalizeEntries(sessionId, { only: 'assistant' });
         const entry = this.transcripts.appendUser(sessionId, text);
         if (entry) { this.post({ type: 'append', sessionId, entries: [entry] }); }
         return;
@@ -466,7 +699,10 @@ export class ChatPanelHost implements IChatPanel {
         const existing = previousId ? this.transcripts.getEntry(sessionId, previousId) : undefined;
         if (existing && existing.kind === 'plan') {
           existing.entries = data.entries ?? [];
-          this.post({ type: 'revise', sessionId, entryId: existing.id, patch: { plan: existing.entries } });
+          // [CUSTOM-20260925-038] 键名是 `entries`（= 记录字段名），不是 `plan`。
+          // 曾用 `plan` 导致客户端的 patch 写进 entry.plan 而渲染读 entry.entries，
+          // 于是 Todo 列表永远停在第一次快照且没有任何报错。
+          this.post({ type: 'revise', sessionId, entryId: existing.id, patch: { entries: existing.entries } });
           return;
         }
         const entry = this.transcripts.appendPlan(sessionId, data.entries ?? []);
@@ -507,11 +743,18 @@ export class ChatPanelHost implements IChatPanel {
    * Non-text content in a message chunk becomes a real transcript entry so the
    * webview renders it (image inline, resource as a chip, …) instead of a
    * `[image content]` placeholder.
+   *
+   * [CUSTOM-20260924-026] An **empty text block** reaches here whenever the
+   * agent uses one as a chunk separator (`textOf` returns '' so the caller
+   * treats it as non-text). `toContentView` maps it to a perfectly valid
+   * `{type:'text', text:''}` view, and rendering that produced a blank strip in
+   * the transcript — that was the source of the "empty bars" between real
+   * blocks. A block nobody can see is not content: drop it.
    */
   private postContentNotice(sessionId: string, block: unknown): void {
     const view = toContentView(block as ContentBlock | null);
-    if (!view) { return; }
-    const entry = this.transcripts.appendContent(sessionId, [view]);
+    if (!hasVisibleContent(view)) { return; }
+    const entry = this.transcripts.appendContent(sessionId, [view!]);
     if (entry) { this.post({ type: 'append', sessionId, entries: [entry] }); }
   }
 
@@ -574,9 +817,14 @@ export class ChatPanelHost implements IChatPanel {
     await vscode.env.openExternal(parsed);
   }
 
-  private async handleOpenFile(rawPath: string, line?: number): Promise<void> {
+  private async handleOpenFile(sessionId: string, rawPath: string, line?: number): Promise<void> {
     if (!rawPath) { return; }
-    const session = this.focused.sessionId ? sessionOf(this.sessionManager, this.focused.sessionId) : undefined;
+    // [CUSTOM-20260925-039] Resolve relative paths against the session that OWNS
+    // the chip rather than whatever happens to be focused. The `verifySession`
+    // guard already validated this id, so there is one source of truth for the
+    // working directory (previously this read `this.focused.sessionId`, which
+    // was equivalent only because the client filters by the focused session).
+    const session = sessionOf(this.sessionManager, sessionId);
     const uri = fileUri(rawPath, session?.cwd);
     try {
       const doc = await vscode.workspace.openTextDocument(uri);
@@ -618,14 +866,364 @@ export class ChatPanelHost implements IChatPanel {
     if (entry) { this.post({ type: 'append', sessionId, entries: [entry] }); }
   }
 
-  // --- Outbound messages ---------------------------------------------------
+  // --- Permission presenter (CUSTOM-20260924-020) --------------------------
 
-  private post(message: ExtToChat | { type: 'markdownRendered'; items: Array<{ entryId: string; sessionId: string; html: string }> }): void {
-    void this.view?.webview.postMessage(message);
+  /**
+   * Can this prompt be answered on a card the user will actually see?
+   *
+   * Three conditions, all required: the prompt belongs to the focused session
+   * (a card for another session would be filtered out client-side and the
+   * agent would wait on an invisible button), the agent is a modern-panel one
+   * (legacy sessions have no transcript here), and some surface exists. A
+   * hidden surface is raised — without stealing focus — because the agent is
+   * blocked until this is answered.
+   */
+  canPresent(sessionId: string): boolean {
+    if (this.focused.sessionId !== sessionId) { return false; }
+    if (!isModernAgent(this.focused.agentName)) { return false; }
+    const surface = this.surfaces.get(this.lastActive ?? 'view') ?? this.surfaces.values().next().value;
+    if (!surface) { return false; }
+    if (!surface.visible) { surface.reveal(true); }
+    return true;
   }
 
-  private pushBoot(): void {
-    if (!this.view) { return; }
+  show(state: PermissionState): void {
+    const session = sessionOf(this.sessionManager, state.sessionId);
+    if (!session) { return; }
+    this.transcripts.ensureSession(state.sessionId, session.agentName);
+    const entry = this.transcripts.appendPermission(state.sessionId, state);
+    if (entry) { this.post({ type: 'append', sessionId: state.sessionId, entries: [entry] }); }
+  }
+
+  update(state: PermissionState): void {
+    // appendPermission returns the existing entry for this promptId (after
+    // applying the new state), so `patch` below only needs to tell the webview.
+    const entry = this.transcripts.appendPermission(state.sessionId, state);
+    if (!entry) { return; }
+    this.post({ type: 'revise', sessionId: state.sessionId, entryId: entry.id, patch: { permission: state } });
+  }
+
+  // --- Tool views (CUSTOM-20260924-027) ------------------------------------
+
+  /**
+   * The client reported a tool card with no view model.
+   *
+   * This is the recovery path for a card that was placed before its view model
+   * existed (a bare `.tool` shell that `updateTool` used to be unable to repair).
+   * If the invocation is genuinely gone there is nothing to send — but the log
+   * line is the answer to "why is this card empty", which used to be invisible
+   * (it only produced a `console.warn` inside the webview console).
+   */
+  private resendToolView(sessionId: string, entryId: string, toolCallId: string, to: SurfaceKey): void {
+    const inv = toolCallId ? this.tools.get(sessionId, toolCallId) : undefined;
+    if (!inv) {
+      log(`${LOG_PREFIX}: client asked for the view of tool ${toolCallId || '(no id)'} in ${sessionId} but the invocation is not in the store (entry ${entryId})`);
+      return;
+    }
+    log(`${LOG_PREFIX}: resending view for tool ${toolCallId} (client had none for entry ${entryId})`);
+    // Targeted at the surface that asked: the other one already has it, and an
+    // unnecessary toolUpdate would be a visual no-op anyway.
+    this.post({ type: 'toolUpdate', sessionId, entryId, tool: toToolCallView(inv) }, to);
+  }
+
+  // --- Panel entry points: connect + history (CUSTOM-20260925-032/033) ------
+
+  /** Falls back to the panel's own agent when nothing is focused. */
+  private panelAgent(preferred?: string): string | null {
+    if (preferred) { return preferred; }
+    if (this.focused.agentName) { return this.focused.agentName; }
+    for (const agentName of MODERN_AGENTS) { return agentName; }
+    return null;
+  }
+
+  /** Workspace folder used to scope the local history cache, when there is one. */
+  private workspaceCwd(): string | undefined {
+    return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  }
+
+  /**
+   * [CUSTOM-20260925-032] "Connect" button.
+   *
+   * [CUSTOM-20260925-058] Now means "make sure the process is up, then hand back
+   * to the client": the client opens a DRAFT, and the session is created on the
+   * first message. Creating one here (as `connectToAgent` does when none exists)
+   * would leave an empty session in the agent's history for a user who only
+   * wanted to check that the agent starts — and `session/close` does not remove
+   * it again. The connectivity feedback the button exists for is preserved
+   * because `ensureConnected` still throws when the process will not start.
+   *
+   * If sessions already exist, the newest is focused (reuse, not pile up).
+   */
+  private handleConnectAgent(agentName?: string): void {
+    const agent = this.panelAgent(agentName);
+    if (!agent) {
+      this.reportError(null, new Error('No agent available to connect.'));
+      return;
+    }
+    log(`${LOG_PREFIX}: connect requested for ${agent}`);
+    void this.sessionManager.ensureConnected(agent)
+      .then(() => {
+        const ids = this.sessionManager.getSessionIdsForAgent(agent);
+        const newest = ids[ids.length - 1];
+        if (newest) { this.sessionManager.focusSession(newest); }
+        // No session to focus: the client's draft page is the right place to be.
+      })
+      .catch(e => this.reportError(null, e));
+  }
+
+  /**
+   * [CUSTOM-20260925-033] History picker contents for one agent.
+   *
+   * Source order matters: **the local cache first when the agent is not
+   * connected**, because `sessionManager.listSessions` calls `ensureConnected`
+   * and would spawn an agent process just to render a menu. Once it IS connected
+   * the agent-side list wins: it is authoritative and includes sessions this
+   * window never saw.
+   */
+  private async handleListHistory(agentName?: string): Promise<void> {
+    const agent = this.panelAgent(agentName);
+    if (!agent) {
+      this.post({ type: 'history', agentName: '', sessions: [], source: 'local', error: 'No agent selected.' });
+      return;
+    }
+
+    const connected = this.sessionManager.isAgentConnected(agent);
+    const caps = this.sessionManager.getCachedCapabilities(agent);
+    const local = () => {
+      const entries = this.sessionManager.getHistoryStore()?.list(agent, this.workspaceCwd()) ?? [];
+      const live = new Set(this.sessionManager.getSessionIdsForAgent(agent));
+      return {
+        source: 'local' as const,
+        sessions: entries
+          // Live sessions are already tabs; the picker is for the other ones.
+          .filter(e => !live.has(e.sessionId))
+          .map(e => ({
+            sessionId: e.sessionId,
+            title: e.title ?? e.firstPrompt ?? null,
+            cwd: e.cwd,
+            updatedAt: e.lastActiveAt,
+          })),
+      };
+    };
+
+    try {
+      if (connected && caps?.list) {
+        const response = await this.sessionManager.listSessions(agent);
+        const live = new Set(this.sessionManager.getSessionIdsForAgent(agent));
+        this.post({
+          type: 'history',
+          agentName: agent,
+          source: 'agent',
+          sessions: response.sessions
+            .filter(s => !live.has(String((s as { sessionId?: unknown }).sessionId ?? '')))
+            .map(s => {
+              const info = s as { sessionId?: unknown; title?: unknown; cwd?: unknown; updatedAt?: unknown };
+              return {
+                sessionId: String(info.sessionId ?? ''),
+                title: typeof info.title === 'string' ? info.title : null,
+                cwd: typeof info.cwd === 'string' ? info.cwd : undefined,
+                updatedAt: typeof info.updatedAt === 'string' ? info.updatedAt : undefined,
+              };
+            }),
+        });
+        return;
+      }
+      const fallback = local();
+      this.post({ type: 'history', agentName: agent, ...fallback });
+    } catch (e: any) {
+      // An agent-side failure still has the cache as a usable answer.
+      const fallback = local();
+      this.post({
+        type: 'history',
+        agentName: agent,
+        ...fallback,
+        error: `Could not query the agent (${e?.message ?? e}); showing the local cache.`,
+      });
+    }
+  }
+
+  /** [CUSTOM-20260925-033] Open a session from the picker (load, else resume). */
+  private async handleOpenHistorySession(agentName: string, sessionId: string, cwd?: string): Promise<void> {
+    const agent = this.panelAgent(agentName);
+    if (!agent || !sessionId) { return; }
+    log(`${LOG_PREFIX}: opening history session ${sessionId} of ${agent}${cwd ? ` (cwd ${cwd})` : ''}`);
+    try {
+      // [CUSTOM-20260925-057] Pass the session's OWN directory. The picker shows
+      // sessions from other directories (the agent-side list spans them), and
+      // without this the agent was told the current workspace instead — so a
+      // session belonging elsewhere was reopened as if it lived here.
+      const how = await this.sessionManager.openExistingSession(agent, sessionId, { cwd });
+      if (how === 'resume') {
+        const entry = this.transcripts.appendNotice(sessionId, 'info',
+          'Resumed without replaying history (this agent does not support session/load).');
+        if (entry) { this.post({ type: 'append', sessionId, entries: [entry] }); }
+      }
+    } catch (e) {
+      this.reportError(null, e);
+    }
+  }
+
+  // --- Draft page: directory choices + create-on-first-send (058) ----------
+
+  /** How many recent directories the picker offers (keeps the drawer scannable). */
+  private static readonly MAX_RECENT_DIRECTORIES = 8;
+
+  /**
+   * [CUSTOM-20260925-058] Candidate directories for the draft page.
+   *
+   * Targeted at the asking surface: it is that document's draft being edited.
+   */
+  private async handleListDirectoryChoices(agentName: string | undefined, to: SurfaceKey): Promise<void> {
+    const agent = this.panelAgent(agentName);
+    this.post({
+      type: 'directoryChoices',
+      agentName: agent,
+      workspaceFolders: (vscode.workspace.workspaceFolders ?? []).map(folder => folder.uri.fsPath),
+      recent: await this.recentDirectories(agent),
+      defaultCwd: this.sessionManager.resolveDefaultCwd(),
+    }, to);
+  }
+
+  /**
+   * Directories this agent has used, most recent first.
+   *
+   * Two sources, merged: the local history cache (durable, but `workspaceState`
+   * scoped — a fresh workspace knows nothing) and the AGENT's own
+   * `session/list`, which spans directories (it is what the "open previous
+   * session" picker shows). The agent side needs a live connection and the
+   * `list` capability, so it is only consulted when both are present — a
+   * directory list is never worth spawning a process for.
+   */
+  private async recentDirectories(agent: string | null): Promise<string[]> {
+    if (!agent) { return []; }
+    const merged: string[] = [];
+    const push = (candidate: unknown): void => {
+      if (typeof candidate !== 'string' || candidate.length === 0) { return; }
+      if (merged.includes(candidate)) { return; }
+      if (merged.length >= ChatPanelHost.MAX_RECENT_DIRECTORIES) { return; }
+      merged.push(candidate);
+    };
+
+    for (const cwd of this.sessionManager.getHistoryStore()?.recentDirectories(agent) ?? []) {
+      push(cwd);
+    }
+    if (this.sessionManager.isAgentConnected(agent)
+      && this.sessionManager.getCachedCapabilities(agent)?.list) {
+      try {
+        const response = await this.sessionManager.listSessions(agent);
+        for (const session of response.sessions) {
+          push((session as { cwd?: unknown }).cwd);
+        }
+      } catch (e) {
+        // A failed agent query is not worth failing the picker over: the local
+        // cache is still a usable answer.
+        log(`${LOG_PREFIX}: directory choices: agent list failed (${String(e)})`);
+      }
+    }
+    return merged;
+  }
+
+  /** Native folder picker — the webview cannot open one itself. */
+  private async handlePickDirectory(to: SurfaceKey): Promise<void> {
+    const picked = await vscode.window.showOpenDialog({
+      canSelectFiles: false,
+      canSelectFolders: true,
+      canSelectMany: false,
+      openLabel: 'Use this directory',
+      defaultUri: vscode.Uri.file(this.sessionManager.resolveDefaultCwd()),
+    });
+    this.post({ type: 'directoryPicked', path: picked?.[0]?.fsPath ?? null }, to);
+  }
+
+  /**
+   * [CUSTOM-20260925-058] The draft's first message: create the session **with
+   * the chosen directory**, then send.
+   *
+   * This is the whole point of the draft page. Creating the session earlier (on
+   * `+`) and recreating it when the directory changes would be simpler code, but
+   * `session/close` does NOT remove a session from the agent's history — so every
+   * directory change would leave another empty session behind (my own two
+   * capture sessions are visible in that list as evidence).
+   *
+   * On failure the draft is left alone: the client keeps the tab AND the typed
+   * text, and shows the message.
+   */
+  private async handleCreateDraftAndSend(
+    draftId: string,
+    agentName: string | undefined,
+    cwd: string | undefined,
+    text: string,
+    to: SurfaceKey,
+  ): Promise<void> {
+    const agent = this.panelAgent(agentName);
+    if (!agent) {
+      this.post({ type: 'draftFailed', draftId, message: 'No agent to start a session with.' }, to);
+      return;
+    }
+    if (text.trim().length === 0) {
+      this.post({ type: 'draftFailed', draftId, message: 'Nothing to send.' }, to);
+      return;
+    }
+    const target = cwd?.trim() || this.sessionManager.resolveDefaultCwd();
+    log(`${LOG_PREFIX}: draft ${draftId}: creating a session for ${agent} in ${target}`);
+
+    try {
+      const session = await this.sessionManager.createSession(agent, { cwd: target, focus: true });
+      // Resolve the draft BEFORE starting the turn: `handleSendPrompt` awaits the
+      // whole turn (it is what carries the stop reason back), and the client must
+      // be able to swap its draft tab for the real one immediately.
+      this.post({ type: 'draftResolved', draftId, sessionId: session.sessionId }, to);
+      void this.handleSendPrompt(session.sessionId, text)
+        .catch(e => this.reportError(session.sessionId, e));
+    } catch (e: any) {
+      this.post({ type: 'draftFailed', draftId, message: e?.message ?? String(e) }, to);
+    }
+  }
+
+  // --- Outbound messages ---------------------------------------------------
+
+  // [CUSTOM-BEGIN] CUSTOM-20260924-019 - 单目标 → 广播（可定向）。
+  // 两个面同时存在时，除 `boot` 外的一切都必须两端一致：客户端本来就按
+  // `currentSessionId` 过滤，所以广播既安全又是让两侧保持同步的最简做法。
+  //
+  // [CUSTOM-20260924-022] 这里同时是**合帧队列的入口**：按消息类型决定走
+  // 「攒一帧再发」（可按条目合并）还是「立即发」（结构性）。路由表放在这一处，
+  // 而不是散在每个调用点——漏改一个调用点就会静默破坏 INV-A（revise 越过 append）
+  // 或 INV-C（sessionsChanged 被延迟，Send/Stop 按钮状态错）。
+  private post(message: ExtToChat | { type: 'markdownRendered'; items: Array<{ entryId: string; sessionId: string; html: string }> }, to?: SurfaceKey): void {
+    const type = (message as { type?: string }).type ?? '';
+    if (!to && !STRUCTURAL_MESSAGE_TYPES.has(type)) {
+      this.outbox.enqueue(message as ExtToChatMessage);
+      return;
+    }
+    this.postNow(message, to);
+  }
+
+  /** Broadcast (or target) immediately, bypassing the coalescing queue. */
+  private postNow(message: ExtToChat | { type: 'markdownRendered'; items: Array<{ entryId: string; sessionId: string; html: string }> }, to?: SurfaceKey): void {
+    if (to) {
+      const only = this.surfaces.get(to);
+      if (only) { this.send(only, message); }
+      return;
+    }
+    for (const surface of this.surfaces.values()) { this.send(surface, message); }
+  }
+
+  private send(surface: ChatSurface, message: ExtToChat | { type: 'markdownRendered'; items: Array<{ entryId: string; sessionId: string; html: string }> }): void {
+    // Watch the returned promise: a payload that fails structured clone rejects,
+    // and a bare `void` would swallow that. Silent send failures are exactly
+    // what makes "the UI just shows nothing" impossible to diagnose.
+    const sent = surface.webview.postMessage(message);
+    void sent?.then(undefined, (e: unknown) => {
+      log(`${LOG_PREFIX}: postMessage failed for "${(message as { type?: string }).type}" on "${surface.key}": ${String(e)}`);
+    });
+  }
+  // [CUSTOM-END] CUSTOM-20260924-019
+
+  private pushBoot(to?: SurfaceKey): void {
+    if (this.attachedCount === 0) { return; }
+    // INV-E: the snapshot must not overtake anything still sitting in the queue.
+    this.outbox.flush();
     this.refreshLiveSessionIds();
     const sessions = this.buildSummaries();
     const focused = this.focused.sessionId ? this.buildSummary(this.focused.sessionId) : null;
@@ -635,11 +1233,12 @@ export class ChatPanelHost implements IChatPanel {
       sessions,
       snapshot: focused ? this.snapshotOf(focused.sessionId) : null,
       meta: focused ? this.metaOf(focused.sessionId) : null,
-    });
+    }, to);
   }
 
   private pushFocus(): void {
-    if (!this.view) { return; }
+    if (this.attachedCount === 0) { return; }
+    this.outbox.flush();
     const sessionId = this.focused.sessionId;
     const summary = sessionId ? this.buildSummary(sessionId) : null;
     this.post({
@@ -651,6 +1250,7 @@ export class ChatPanelHost implements IChatPanel {
   }
 
   private pushMeta(sessionId: string): void {
+    if (this.attachedCount === 0) { return; }
     if (this.focused.sessionId !== sessionId) { return; }
     this.post({ type: 'meta', sessionId, meta: this.metaOf(sessionId) });
   }
@@ -661,9 +1261,19 @@ export class ChatPanelHost implements IChatPanel {
   }
 
   private refreshSessions(): void {
-    if (!this.view) { return; }
+    if (this.attachedCount === 0) { return; }
     this.refreshLiveSessionIds();
-    this.post({ type: 'sessionsChanged', sessions: this.buildSummaries() });
+    const sessions = this.buildSummaries();
+    // [CUSTOM-20260924-022] This runs on EVERY agent message chunk, so without
+    // the signature check each streamed token rebuilt the whole tab strip and
+    // agent dropdown on the client. Skipping the no-op case is also what keeps
+    // `flushThenPost` from flushing the coalescing queue on every chunk.
+    const signature = sessions
+      .map(s => `${s.sessionId}|${s.agentName}|${s.title ?? ''}|${s.loading ? 1 : 0}|${s.running ? 1 : 0}`)
+      .join('\n');
+    if (signature === this.lastSessionsSignature) { return; }
+    this.lastSessionsSignature = signature;
+    this.outbox.flushThenPost({ type: 'sessionsChanged', sessions });
   }
 
   // --- State assembly ------------------------------------------------------
@@ -709,7 +1319,17 @@ export class ChatPanelHost implements IChatPanel {
       entries: snapshot.entries.map(entry => {
         if (entry.kind !== 'tool') { return entry; }
         const inv = this.tools.get(sessionId, entry.toolCallId);
-        return inv ? { ...entry, toolView: toToolCallView(inv) } : entry;
+        if (!inv) {
+          // NOT temporary (the earlier label said otherwise): a tool entry whose
+          // invocation cannot be found is sent WITHOUT a view model, so the client
+          // renders it as an empty shell — and this log line is the only place
+          // that says WHY. 027's lesson was that the reason must be visible in the
+          // output channel rather than in a webview console nobody opens, and it
+          // costs one line only when the invocation is genuinely gone.
+          log(`${LOG_PREFIX}: snapshot missing invocation ${entry.toolCallId} in ${sessionId}`);
+          return entry;
+        }
+        return { ...entry, toolView: toToolCallView(inv) };
       }),
     };
   }

@@ -9,12 +9,12 @@ export const domClient = `
 (function (NS) {
   'use strict';
 
-  var ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-
-  function esc(value) {
-    return String(value === undefined || value === null ? '' : value)
-      .replace(/[&<>"']/g, function (c) { return ESCAPES[c]; });
-  }
+  // [CUSTOM-20260925-052] An 'esc()' helper used to live here (and was never
+  // called). It is deliberately NOT replaced: every insertion in this client
+  // goes through NS.dom.el / textContent / setSanitizedHtml, and a general
+  // escape helper is an invitation to build HTML by string concatenation —
+  // which is the one habit the rest of this file exists to prevent. If you
+  // think you need it, use the DOM API instead.
 
   var ALLOWED_TAGS = {};
   'P BR CODE PRE STRONG EM DEL S UL OL LI BLOCKQUOTE H1 H2 H3 H4 H5 H6 HR TABLE THEAD TBODY TR TH TD A SPAN DIV DETAILS SUMMARY'.split(' ')
@@ -80,13 +80,38 @@ export const domClient = `
 
   function qs(id) { return document.getElementById(id); }
 
+  // [CUSTOM-BEGIN] CUSTOM-20260924-021 - 一帧一次的回调队列。
+  // 存在的理由是**读写分离**：DOM 写入在消息任务里同步做完，所有布局读取
+  // （scrollHeight / clientHeight / offsetTop）集中在下一帧的回调里，避免
+  // 「写 → 读 → 写」交替触发多次强制重排。
+  // 单个回调抛异常不得饿死同帧的其他回调。
+  var frameScheduled = false;
+  var frameQueue = [];
+
+  function schedule(fn) {
+    frameQueue.push(fn);
+    if (frameScheduled) { return; }
+    frameScheduled = true;
+    var flush = function () {
+      frameScheduled = false;
+      var pending = frameQueue;
+      frameQueue = [];
+      for (var i = 0; i < pending.length; i++) {
+        try { pending[i](); } catch (e) { /* keep draining the queue */ }
+      }
+    };
+    if (window.requestAnimationFrame) { window.requestAnimationFrame(flush); }
+    else { window.setTimeout(flush, 16); }
+  }
+  // [CUSTOM-END] CUSTOM-20260924-021
+
   NS.dom = {
-    esc: esc,
     sanitize: sanitize,
     el: el,
     clear: clear,
     setSanitizedHtml: setSanitizedHtml,
-    qs: qs
+    qs: qs,
+    schedule: schedule
   };
 })(window.__acpc = window.__acpc || {});
 `;

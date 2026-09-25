@@ -15,6 +15,9 @@ import { StatusBarManager } from './ui/StatusBarManager';
 // `ChatWebviewProvider` 本身**零改动**，由 LegacyPanelAdapter 用 facade 包装后接入。
 // [CUSTOM-END] CUSTOM-20260923-011
 import { ChatRouterProvider } from './ui/chat';
+// [CUSTOM-BEGIN] CUSTOM-20260924-020
+import { PermissionBridge } from './handlers/PermissionBridge';
+// [CUSTOM-END] CUSTOM-20260924-020
 import { getAgentNames } from './config/AgentConfig';
 import { fetchRegistry } from './config/RegistryClient';
 import { log, logError, disposeChannels, getOutputChannel, getTrafficChannel } from './utils/Logger';
@@ -30,7 +33,11 @@ export function activate(context: vscode.ExtensionContext): void {
   // --- Core services ---
   const sessionUpdateHandler = new SessionUpdateHandler();
   const agentManager = new AgentManager();
-  const connectionManager = new ConnectionManager(sessionUpdateHandler);
+  // [CUSTOM-BEGIN] CUSTOM-20260924-020 - 权限桥：构造顺序必须是 bridge → ConnectionManager
+  // （每个连接都要拿到它）。构造早于 ChatPanelHost，后者在自己的构造函数里注册为 presenter。
+  const permissionBridge = new PermissionBridge();
+  const connectionManager = new ConnectionManager(sessionUpdateHandler, permissionBridge);
+  // [CUSTOM-END] CUSTOM-20260924-020
   const sessionManager = new SessionManager(
     agentManager,
     connectionManager,
@@ -44,6 +51,19 @@ export function activate(context: vscode.ExtensionContext): void {
   sessionManager.setHistoryStore(historyStore);
   context.subscriptions.push({ dispose: () => historyStore.dispose() });
 
+  // [CUSTOM-BEGIN] CUSTOM-20260924-020 - 权限桥的两条接线：
+  //   · setSessionLookup 让退回弹框时能标明「哪个会话在请求」（并发请求不再无法区分）；
+  //   · session-closed 把该会话所有待决请求按 ACP 契约回答成 cancelled，否则 agent 永久挂起。
+  sessionManager.setPermissionBridge(permissionBridge);
+  permissionBridge.setSessionLookup(sessionId => {
+    const session = sessionManager.getSession(sessionId);
+    return session ? { title: session.title, agentName: session.agentName } : undefined;
+  });
+  sessionManager.on('session-closed', (sessionId: string) => {
+    permissionBridge.cancelSession(sessionId);
+  });
+  // [CUSTOM-END] CUSTOM-20260924-020
+
   // --- UI ---
   const workspaceCwd = () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   const sessionTreeProvider = new SessionTreeProvider(sessionManager, historyStore, workspaceCwd);
@@ -55,6 +75,7 @@ export function activate(context: vscode.ExtensionContext): void {
     context.extensionUri,
     sessionManager,
     sessionUpdateHandler,
+    permissionBridge,
   );
   const chatViewRegistration = vscode.window.registerWebviewViewProvider(
     ChatRouterProvider.viewType,
@@ -237,6 +258,14 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.executeCommand('acpc-chat.focus');
   });
 
+  // [CUSTOM-BEGIN] CUSTOM-20260924-019 - 在编辑区（编辑器标签页）打开聊天面板。
+  // 与侧边栏并存、共享同一份会话记录；仅对新面板（Claude Code）开放，其它 agent 由
+  // ChatEditorPanel.open() 给出提示并拒绝。
+  const openChatInEditorCmd = vscode.commands.registerCommand('acpc.openChatInEditor', () => {
+    chatRouter.openEditorChat();
+  });
+  // [CUSTOM-END] CUSTOM-20260924-019
+
   // Send Prompt (from keybinding — just focus chat)
   const sendPromptCmd = vscode.commands.registerCommand('acpc.sendPrompt', async () => {
     vscode.commands.executeCommand('acpc-chat.focus');
@@ -371,28 +400,20 @@ export function activate(context: vscode.ExtensionContext): void {
 
     try {
       await vscode.commands.executeCommand('acpc-chat.focus');
-      // Decide load vs resume based on capabilities. Prefer load (replays
-      // history) for the richer experience.
-      const caps = sessionManager.getCachedCapabilities(agentName);
-      if (caps?.load) {
-        await vscode.window.withProgress(
-          {
-            location: vscode.ProgressLocation.Notification,
-            title: `Loading session…`,
-            cancellable: false,
-          },
-          async () => {
-            await sessionManager.loadSession(agentName, sessionId);
-          },
-        );
-      } else if (caps?.resume) {
-        await sessionManager.resumeSession(agentName, sessionId);
+      // [CUSTOM-BEGIN] CUSTOM-20260925-033 - load/resume 的决策收敛到
+      // SessionManager.openExistingSession（面板的历史会话选择器走同一条路）。
+      const how = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'Opening session…',
+          cancellable: false,
+        },
+        () => sessionManager.openExistingSession(agentName, sessionId),
+      );
+      if (how === 'resume') {
         vscode.window.showInformationMessage('Resumed session (history not replayed).');
-      } else {
-        vscode.window.showErrorMessage(
-          `Agent "${agentName}" does not support loading or resuming sessions.`,
-        );
       }
+      // [CUSTOM-END] CUSTOM-20260925-033
     } catch (e: any) {
       logError('Failed to open session', e);
       vscode.window.showErrorMessage(`Failed to open session: ${e.message}`);
@@ -532,6 +553,7 @@ export function activate(context: vscode.ExtensionContext): void {
     openChatCmd,
     sendPromptCmd,
     cancelTurnCmd,
+    openChatInEditorCmd,
     restartAgentCmd,
     showLogCmd,
     showTrafficCmd,
@@ -551,7 +573,10 @@ export function activate(context: vscode.ExtensionContext): void {
       dispose: () => {
         sessionManager.dispose();
         sessionUpdateHandler.dispose();
+        // [CUSTOM-20260924-020] 先回答掉所有待决权限请求，再拆面板。
+        permissionBridge.cancelAll();
         chatRouter.dispose();
+        permissionBridge.dispose();
         sessionTreeProvider.dispose();
         disposeChannels();
       },
