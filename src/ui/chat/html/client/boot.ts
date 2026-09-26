@@ -140,6 +140,10 @@ export const bootClient = `
   function requestMarkdown() {
     if (!currentSessionId) { return; }
     var pending = NS.transcriptView.pendingMarkdown();
+    // [CUSTOM-20260925-066] Tool text blocks queue on the same round-trip.
+    if (NS.toolCallView && NS.toolCallView.pendingMarkdownItems) {
+      pending = pending.concat(NS.toolCallView.pendingMarkdownItems());
+    }
     if (pending.length === 0) { return; }
     NS.bridge.post({ type: 'renderMarkdown', items: pending });
   }
@@ -299,6 +303,16 @@ export const bootClient = `
     if (toggle) { toggle.className = flat ? 'nest-toggle off' : 'nest-toggle'; }
   }
 
+  /** [CUSTOM-20260925-065] Show the per-record wall-clock stamp (see .rec-time). */
+  function applyTimes(on) {
+    var messages = NS.dom.qs('messages');
+    var toggle = NS.dom.qs('timeToggle');
+    if (messages) {
+      if (on) { messages.classList.add('show-times'); } else { messages.classList.remove('show-times'); }
+    }
+    if (toggle) { toggle.className = on ? 'nest-toggle' : 'nest-toggle off'; }
+  }
+
   function onMessage(event) {
     var message = event.data;
     if (!message || !message.type) { return; }
@@ -308,6 +322,11 @@ export const bootClient = `
         NS.tabs.setSessions(message.sessions || []);
         applyFocus(message.focused, message.snapshot, message.meta);
         syncFocusedState(message.sessions || []);
+        break;
+
+      // [CUSTOM-20260926-077] Outline pin/width prefs come back with boot.
+      case 'uiPrefs':
+        NS.outline.applyPrefs(message);
         break;
 
       case 'sessionsChanged':
@@ -371,7 +390,10 @@ export const bootClient = `
         var items = message.items || [];
         for (var j = 0; j < items.length; j++) {
           if (items[j].sessionId !== currentSessionId) { continue; }
-          NS.transcriptView.patch(items[j].entryId, { html: items[j].html });
+          // [CUSTOM-20260925-066] A keyed item is a sub-block of a tool card, not
+          // a transcript record: there is no entry to patch, there is an element.
+          if (items[j].key) { NS.toolCallView.applyMarkdown(items[j].key, items[j].html); }
+          else { NS.transcriptView.patch(items[j].entryId, { html: items[j].html }); }
         }
         // [CUSTOM-20260924-022] Markdown grew the transcript, so a restored
         // scroll position has to be re-applied (no-op once the user scrolled).
@@ -574,6 +596,8 @@ export const bootClient = `
     NS.tabs.init();
     NS.composer.init();
     NS.links.installDelegatedHandlers(document.body);
+    // [CUSTOM-20260925-067] Menu with context-appropriate items (no Cut/Paste).
+    NS.contextMenu.install();
     // [CUSTOM-20260925-049]
     installFileDrop(document.body);
     installImagePaste(NS.dom.qs('promptInput'));
@@ -602,6 +626,21 @@ export const bootClient = `
         var flat = !(messages && messages.classList.contains('flat-tools'));
         applyGrouping(flat);
         persistUi({ flatTools: flat });
+      });
+    }
+
+    // [CUSTOM-20260925-065] Wall-clock stamps per record, off by default.
+    // A CLASS on #messages rather than re-rendering: the .rec-time spans are always
+    // in the DOM (see transcriptView.place), so toggling is a pure style flip —
+    // exactly the mechanism applyGrouping above uses.
+    applyTimes(ui.showTimes === true);
+    var timeToggle = NS.dom.qs('timeToggle');
+    if (timeToggle) {
+      timeToggle.addEventListener('click', function () {
+        var messages = NS.dom.qs('messages');
+        var on = !(messages && messages.classList.contains('show-times'));
+        applyTimes(on);
+        persistUi({ showTimes: on });
       });
     }
 

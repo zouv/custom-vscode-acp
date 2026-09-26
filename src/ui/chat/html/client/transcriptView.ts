@@ -26,6 +26,10 @@ export const transcriptViewClient = `
   // [CUSTOM-20260924-027] entryId -> true once we have asked the extension for
   // a tool view model (ask once; a missing invocation must not loop).
   var requestedViews = {};
+  // [CUSTOM-20260926-071] entryId -> record node, for user messages whose fold was
+  // decided by the fallback proxy because the panel had no layout yet. Cleared by
+  // resolvePendingFolds (or reset).
+  var pendingFolds = {};
   // [CUSTOM-20260925-045] Running count of user entries. The outline's "is
   // there anything to navigate?" check used to walk EVERY entry on every
   // append/revise — and 'append'/'revise' fire per streamed message. Counting
@@ -33,6 +37,9 @@ export const transcriptViewClient = `
   // place() and zeroed in reset(); 'patch' never changes an entry's kind, so
   // the count cannot drift.
   var userCount = 0;
+  // [CUSTOM-20260926-076] 大纲现在收 user+assistant（不再只收 user），这条计数也
+  // 覆盖两者。与 userCount 并列：userCount 仍是 rail/其它路径的语义，别合并。
+  var messageCount = 0;
   // [CUSTOM-20260925-048] Screen-reader pacing. 'aria-live' on #messages would
   // otherwise announce EVERY streamed chunk (the bubble's text is rewritten
   // dozens of times per reply, and a reader would hear the whole answer
@@ -56,6 +63,28 @@ export const transcriptViewClient = `
   function init(container) {
     messagesEl = container;
   }
+
+  // --- 时间显示（CUSTOM-20260925-065）--------------------------------------
+  // 每条记录都已经带 'at'（TranscriptStore 在 append 时打的时间戳），只是从来没显示过。
+  // 两个层次：**hover 看完整时刻**（零成本、零噪声），以及头部「Times」开关打开后
+  // 每条前面显示 HH:MM。
+
+  function pad2(n) { return n < 10 ? '0' + n : String(n); }
+
+  function clockLabel(at) {
+    if (!at) { return ''; }
+    var d = new Date(at);
+    return pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+  }
+
+  function fullStamp(at) {
+    if (!at) { return ''; }
+    var d = new Date(at);
+    return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+  }
+
+  // 时长的格式化在 NS.dom.duration（最底层模块）——toolCallView 也要用，而模块加载顺序
+  // 只允许依赖指向前方。
 
   /** [CUSTOM-20260925-048] Reflect the streaming state; writes only on change. */
   function refreshBusy() {
@@ -81,14 +110,22 @@ export const transcriptViewClient = `
     order = [];
     tails = {};
     requestedViews = {};
+    pendingFolds = {};
     userCount = 0;
+    messageCount = 0;
     streamingCount = 0;
     // Must be cleared too: a stale id would tag the next markdown batch with
     // the previous session, and the extension would render it for a session
     // the webview then filters out.
     sessionId = null;
     if (messagesEl) { NS.dom.clear(messagesEl); }
+    // [CUSTOM-20260926-070] Those nodes are gone: drop their layout observations
+    // too. ResizeObserver holds strong references to what it observes, so a
+    // session switch would otherwise keep every discarded node alive.
+    if (NS.rail && NS.rail.resetNodes) { NS.rail.resetNodes(); }
     refreshBusy();
+    // [CUSTOM-20260925-066] Rendered tool HTML belongs to the previous session.
+    if (NS.toolCallView && NS.toolCallView.resetMarkdown) { NS.toolCallView.resetMarkdown(); }
   }
 
   function hasPending() {
@@ -99,9 +136,17 @@ export const transcriptViewClient = `
   }
 
   function markPending(entry) {
-    if (entry.kind === 'assistant' && entry.text && (entry.html === undefined || entry.html === null)) {
-      pending[entry.id] = entry.text;
-    }
+    var text = entry.text;
+    if (!text) { return; }
+    if (entry.html !== undefined && entry.html !== null && entry.html !== '') { return; }
+    if (entry.kind === 'assistant') { pending[entry.id] = text; return; }
+    // [CUSTOM-20260926-072] A thought renders markdown through the same round-trip,
+    // but only once it has SETTLED: html for a block that is still streaming would
+    // freeze a prefix of the text while the stream keeps appending. A settled
+    // thought collapses immediately anyway, so the reader sees the rendered form
+    // rather than a flicker. markPending runs for every placed record, so this also
+    // covers records hydrated from a snapshot (replay / session switch).
+    if (entry.kind === 'thought' && entry.streaming === false) { pending[entry.id] = text; }
   }
 
   function flushPending() {
@@ -109,11 +154,27 @@ export const transcriptViewClient = `
     NS.boot.requestMarkdown();
   }
 
+  /**
+   * [CUSTOM-20260925-061] The fold triangle for a <details>.
+   *
+   * A REAL element rather than 'summary::before': a pseudo-element always paints
+   * BEFORE the content, so the type icon (which icons.attach prepends to the
+   * summary) ended up to the LEFT of the caret. Building the caret first and
+   * letting the icon prepend itself yields [icon][caret][label].
+   *
+   * It is empty on purpose - the glyph and its direction are CSS-driven off the
+   * parent's [open] state, so toggling needs no JS.
+   */
+  function foldCaret() {
+    return NS.dom.el('span', 'fold-caret');
+  }
+
   function buildThought(entry) {
     var details = document.createElement('details');
     details.className = 'thought';
     details.open = !!entry.streaming;
     var summary = document.createElement('summary');
+    summary.appendChild(foldCaret());
     if (entry.streaming) {
       summary.appendChild(NS.dom.el('span', 'thought-spin'));
       summary.appendChild(document.createTextNode('Thinking\\u2026'));
@@ -121,8 +182,284 @@ export const transcriptViewClient = `
       summary.appendChild(document.createTextNode(thoughtLabel(entry)));
     }
     details.appendChild(summary);
-    details.appendChild(NS.dom.el('div', 'thought-body', entry.text));
+    var body = NS.dom.el('div', 'thought-body');
+    applyThoughtBody(body, entry);
+    details.appendChild(body);
     return details;
+  }
+
+  /**
+   * [CUSTOM-20260926-072] The reasoning body: same markdown round-trip as an
+   * assistant bubble (extension-side SafeMarkdown, client-side sanitize), so the
+   * agent's backticks and '- ' list markers stop showing up as literal text.
+   *
+   * Falls back to the raw text while the block is streaming, and when html has not
+   * arrived yet - which is also what makes a stored snapshot without html render.
+   */
+  function applyThoughtBody(body, entry) {
+    var hasHtml = entry.html !== undefined && entry.html !== null && entry.html !== '';
+    if (hasHtml) {
+      // The bubble is now HTML: any text node we were appending to is gone, so the
+      // delta bookkeeping must go with it (same rule as applyAssistant).
+      delete tails[entry.id];
+      body.className = 'thought-body md';
+      NS.dom.setSanitizedHtml(body, entry.html);
+      NS.links.decorateScrollables(body);
+      return;
+    }
+    body.className = 'thought-body';
+    setStreamingText(body, entry.id, entry.text || '');
+  }
+
+  /**
+   * [CUSTOM-20260926-072] Markdown bookkeeping for a record that renders through
+   * the round-trip. Shared by the assistant and thought branches because they need
+   * the same two rules:
+   *   · html arrived -> stop asking for it (otherwise every later patch re-renders);
+   *   · the record settled WITHOUT html -> ask now. The finalize patch carries only
+   *     { streaming, elapsedMs }, so a check that looked at 'html' alone would never
+   *     ask for a thought's markdown at all.
+   */
+  function trackMarkdown(entryId, entry, changes) {
+    if (changes.html !== undefined && changes.html !== null) {
+      delete pending[entryId];
+      return;
+    }
+    if (entry.streaming === false && entry.text) {
+      pending[entryId] = entry.text;
+      flushPending();
+    }
+  }
+
+  /**
+   * [CUSTOM-20260925-061] A multi-line USER message folds like a thought block.
+   *
+   * The first line lives in the <summary> and the REST live in the body - the
+   * whole text is deliberately NOT repeated, which would show it twice while
+   * expanded.
+   *
+   * A single-line message gets no fold affordance at all: there is nothing to
+   * fold, and a permanent triangle on every short message is pure noise.
+   *
+   * Open by default: a message the user just sent must not appear hidden.
+   *
+   * [CUSTOM-20260925-064] The body is an INLINE span, so expanding continues the
+   * same text flow: the split point is an implementation detail and must not show
+   * up as an extra line break.
+   *
+   * [CUSTOM-20260926-071] The judgement is no longer "is there a \\n / is the text
+   * longer than N chars". Both of those are PROXIES for "does it look multi-line",
+   * and a proxy is blind to the case the user reported twice: a message with no
+   * newline anywhere (shorter than any threshold) that wraps to three lines in a
+   * narrow sidebar. Pitfalls #25, one round later.
+   *
+   * So the direct signal is used instead: the folded structure is built FIRST
+   * (caret and icon present - they take horizontal room, and building them later
+   * would measure a different width than the one that renders), inserted, and then
+   * MEASURED. If it turns out to occupy one line, it is reverted to a plain bubble.
+   */
+  function buildUserBubble(entry) {
+    var details = document.createElement('details');
+    details.className = 'user-fold';
+    details.open = true;
+    var summary = NS.dom.el('summary', 'bubble');
+    // Caret before the label, so the prepended icon lands leftmost (see foldCaret).
+    summary.appendChild(foldCaret());
+    summary.appendChild(document.createTextNode(entry.text || ''));
+    details.appendChild(summary);
+    return details;
+  }
+
+  /** The text node of a summary, skipping the caret span and the type icon. */
+  function textNodeOf(host) {
+    for (var i = 0; i < host.childNodes.length; i++) {
+      if (host.childNodes[i].nodeType === 3) { return host.childNodes[i]; }
+    }
+    return null;
+  }
+
+  /**
+   * Line boxes covered by text[0..len) of this text node, or 0 when unmeasurable
+   * (no createRange, or the node has no layout yet - a hidden panel reports height
+   * 0 for everything).
+   *
+   * A range ending exactly at a line boundary can report an extra zero-height rect
+   * on the following line. Counting those would make every prefix look like it
+   * spilled onto two lines, which is why they are filtered rather than counted.
+   */
+  function rangeLines(textNode, len) {
+    if (!textNode || !document.createRange) { return 0; }
+    var range;
+    try {
+      range = document.createRange();
+      range.setStart(textNode, 0);
+      range.setEnd(textNode, len);
+    } catch (e) { return 0; }
+    var rects = range.getClientRects ? range.getClientRects() : null;
+    if (!rects) { return 0; }
+    var lines = 0;
+    for (var i = 0; i < rects.length; i++) {
+      if (rects[i].height > 0) { lines++; }
+    }
+    return lines;
+  }
+
+  /** Longest prefix of the text that still sits on ONE rendered line (or -1). */
+  function firstLineEnd(textNode, text) {
+    // Every probe walks the whole text node, so a pathological 64KB message (the
+    // store's per-entry clamp) is not worth probing: let the caller fall back.
+    if (text.length > FOLD_MEASURE_LIMIT) { return -1; }
+    var lo = 1;
+    var hi = text.length;
+    var best = -1;
+    while (lo <= hi) {
+      var mid = (lo + hi) >> 1;
+      if (rangeLines(textNode, mid) <= 1) { best = mid; lo = mid + 1; }
+      else { hi = mid - 1; }
+    }
+    return best;
+  }
+
+  /** Pull a measured split back to a word boundary (and off a surrogate pair). */
+  function tidySplit(text, split) {
+    if (split <= 0) { return 0; }
+    if (split >= text.length) { return 0; }
+    var space = text.lastIndexOf(' ', split);
+    if (space > split / 2) { split = space + 1; }
+    // Never cut a surrogate pair in half: the two halves would render as two
+    // replacement glyphs once summary and body are separate nodes.
+    var code = text.charCodeAt(split - 1);
+    if (code >= 0xd800 && code <= 0xdbff) { split--; }
+    return split;
+  }
+
+  /** A logical line break with something visible after it: multi-line by definition. */
+  function newlineSplit(text) {
+    var nl = text.indexOf('\\n');
+    if (nl < 0) { return null; }
+    if (NS.toolCallView.isBlank(text.slice(nl + 1))) { return null; }
+    return { split: nl, drop: 1 };
+  }
+
+  /** Roughly one panel width worth of text (fallback only, see planFold). */
+  var FOLD_PREVIEW_CHARS = 160;
+  /** Above this length the layout probe is skipped in favour of the fallback. */
+  var FOLD_MEASURE_LIMIT = 2000;
+
+  /** [CUSTOM-20260925-064] The old proxy judgement, kept for the unmeasurable case. */
+  function heuristicFold(text) {
+    var hard = newlineSplit(text);
+    if (hard) { return hard; }
+    if (text.length <= FOLD_PREVIEW_CHARS) { return null; }
+    // Prefer a word boundary: the expanded body continues from here, so cutting a
+    // word in half would be visible once it is expanded.
+    var head = text.slice(0, FOLD_PREVIEW_CHARS);
+    var space = head.lastIndexOf(' ');
+    return { split: space > FOLD_PREVIEW_CHARS / 2 ? space + 1 : FOLD_PREVIEW_CHARS, drop: 0 };
+  }
+
+  /**
+   * [CUSTOM-20260926-071] Where to fold this message, plus whether the answer came
+   * from a real measurement.
+   *
+   * 'drop' is the number of characters AT the split that belong to neither half.
+   * It is 1 when the split lands on a line break: the boundary between <summary>
+   * and the body already renders as a line break, so keeping the '\\n' as well
+   * would add one blank line the moment the block is expanded.
+   *
+   * Order: a logical break wins (exact, and no measurement can improve on it), then
+   * the measured line count, then - only when nothing can be measured - the old
+   * proxy, flagged so the caller can re-decide later.
+   */
+  function planFold(textNode, text) {
+    var hard = newlineSplit(text);
+    if (hard) { return { plan: hard, measured: true }; }
+    if (textNode) {
+      var total = rangeLines(textNode, text.length);
+      if (total > 0) {
+        if (total <= 1) { return { plan: null, measured: true }; }
+        var tidied = tidySplit(text, firstLineEnd(textNode, text));
+        if (tidied > 0) { return { plan: { split: tidied, drop: 0 }, measured: true }; }
+      }
+    }
+    return { plan: heuristicFold(text), measured: false };
+  }
+
+  /** Replace a folded record with a plain bubble (measured as one line after all). */
+  function unfoldUser(wrapper, details, text) {
+    var bubble = NS.dom.el('div', 'bubble', text);
+    var summary = details.querySelector('summary');
+    putIcon(bubble, summary ? takeIcon(summary) : null);
+    if (details.parentNode === wrapper) {
+      wrapper.insertBefore(bubble, details);
+      wrapper.removeChild(details);
+    }
+  }
+
+  /**
+   * [CUSTOM-20260926-071] Decide and apply one user record's fold. MUST run after
+   * the record is in the DOM: the decision is a measurement.
+   *
+   * Idempotent, and safe to call again: it restores the pristine text into the
+   * summary before re-deciding, so the re-decide path (resolvePendingFolds) sees
+   * the same input the first pass did.
+   */
+  function settleUserFold(wrapper, entry) {
+    if (!wrapper || !wrapper.querySelector) { return; }
+    var text = entry.text || '';
+    var details = wrapper.querySelector('details.user-fold');
+    var summary = details ? details.querySelector('summary') : null;
+    var textNode = summary ? textNodeOf(summary) : null;
+    if (!details || !textNode) {
+      // First pass: the caller put a plain bubble (or nothing) here.
+      details = buildUserBubble(entry);
+      // NOT firstElementChild: place() prepends the .rec-time stamp, so that would
+      // be the timestamp span and this would DELETE it. Ask for the bubble instead —
+      // the same trap the test helper hit (CUSTOM-20260925-068).
+      var previous = wrapper.querySelector('.bubble, details.user-fold');
+      if (previous) {
+        putIcon(details.querySelector('summary'), takeIcon(previous));
+        wrapper.removeChild(previous);
+      }
+      wrapper.appendChild(details);
+      summary = details.querySelector('summary');
+      textNode = summary ? textNodeOf(summary) : null;
+    } else {
+      var body = details.querySelector('.fold-body');
+      if (body) { details.removeChild(body); }
+      textNode.data = text;
+    }
+    var decided = planFold(textNode, text);
+    // 'heuristic' is a promise to try again once the panel has a real size; see
+    // resolvePendingFolds. 'done' means the answer came from layout and is final.
+    wrapper.setAttribute('data-fold', decided.measured ? 'done' : 'heuristic');
+    if (!decided.measured) { pendingFolds[entry.id] = wrapper; }
+    if (!decided.plan) {
+      unfoldUser(wrapper, details, text);
+      return;
+    }
+    if (textNode) { textNode.data = text.slice(0, decided.plan.split); }
+    details.appendChild(NS.dom.el('span', 'fold-body', text.slice(decided.plan.split + decided.plan.drop)));
+  }
+
+  /**
+   * [CUSTOM-20260926-071] Re-decide the records whose fold came from the fallback
+   * proxy because they were hydrated while the panel had no layout (background
+   * editor group, webview not yet revealed). Called by the rail's ResizeObserver -
+   * which observes exactly the event we are waiting for (a record getting a real
+   * size) - and one-shot per record: a measured answer is final.
+   */
+  function resolvePendingFolds() {
+    for (var id in pendingFolds) {
+      if (!Object.prototype.hasOwnProperty.call(pendingFolds, id)) { continue; }
+      var node = pendingFolds[id];
+      var entry = objects[id];
+      if (!node || !node.parentNode || !entry) { delete pendingFolds[id]; continue; }
+      var box = node.getBoundingClientRect ? node.getBoundingClientRect() : null;
+      if (!box || box.height === 0) { continue; }
+      delete pendingFolds[id];
+      settleUserFold(node, entry);
+    }
   }
 
   function thoughtLabel(entry) {
@@ -155,7 +492,8 @@ export const transcriptViewClient = `
       // left a bare strip behind (the extension now filters them out, this is
       // the backstop for snapshots that already contain one).
       if (blocks[i] && blocks[i].type === 'text' && NS.toolCallView.isBlank(blocks[i].text)) { continue; }
-      wrap.appendChild(NS.toolCallView.renderContentItem({ type: 'content', block: blocks[i] }));
+      wrap.appendChild(NS.toolCallView.renderContentItem(
+        { type: 'content', block: blocks[i] }, 'c' + i, entry.id));
       rendered++;
     }
     if (rendered === 0) {
@@ -167,7 +505,7 @@ export const transcriptViewClient = `
   function build(entry) {
     if (entry.kind === 'user') {
       var userEntry = NS.dom.el('div', 'entry entry-user');
-      userEntry.appendChild(NS.dom.el('div', 'bubble', entry.text));
+      userEntry.appendChild(buildUserBubble(entry));
       return userEntry;
     }
     if (entry.kind === 'assistant') {
@@ -226,7 +564,7 @@ export const transcriptViewClient = `
       bubble.className = 'bubble md';
       NS.dom.setSanitizedHtml(bubble, entry.html);
       putIcon(bubble, icon);
-      NS.links.decorateCodeBlocks(bubble);
+      NS.links.decorateScrollables(bubble);
       return;
     }
     bubble.className = 'bubble';
@@ -291,12 +629,34 @@ export const transcriptViewClient = `
     };
   }
 
+  /**
+   * [CUSTOM-20260926-070] Let the rail observe this record for layout changes.
+   *
+   * Called from every place that puts a node into #messages or replaces one: the
+   * two creation sites (hydrate / append) and the four rebuild-in-place sites
+   * (append's shell -> card, patch's plan, patch's content, updateTool). A missed
+   * call is invisible — that record's rail dot simply stops moving after the next
+   * unfold, which is the bug this exists to fix. Must run AFTER the node is in the
+   * DOM: observing a detached node measures 0 and would park its dot at the top.
+   */
+  function watchNode(node) {
+    if (node && NS.rail && NS.rail.watch) { NS.rail.watch(node); }
+  }
+
   function place(entry, toolView) {
     var node;
     if (entry.kind === 'tool') {
-      node = NS.toolCallView.render(toolView || placeholderToolView(entry));
+      node = NS.toolCallView.render(toolView || placeholderToolView(entry), entry.id);
     } else {
       node = build(entry);
+    }
+    // [CUSTOM-20260925-065] The wall-clock stamp of every record. The element is
+    // ALWAYS in the DOM; a class on #messages decides whether it is visible (the
+    // same mechanism the sub-agent toggle uses), so flipping the toggle never has
+    // to re-render anything. Hover shows the full timestamp regardless.
+    if (entry.at) {
+      node.insertBefore(NS.dom.el('span', 'rec-time', clockLabel(entry.at)), node.firstChild);
+      node.title = fullStamp(entry.at);
     }
     // Drives the three-tier spacing ladder in the stylesheet (same-kind blocks
     // sit tight, cross-kind blocks get air, user messages start a new turn).
@@ -315,6 +675,7 @@ export const transcriptViewClient = `
     // [CUSTOM-20260925-045] The one place entries are added, so the one place
     // the outline's anchor count can change.
     if (entry.kind === 'user') { userCount++; }
+    if (entry.kind === 'user' || entry.kind === 'assistant') { messageCount++; }
     // [CUSTOM-20260925-048] ...and the one place the streaming count can grow.
     if (entry.streaming) { streamingCount++; }
     refreshBusy();
@@ -328,9 +689,21 @@ export const transcriptViewClient = `
     if (!snapshot) { return; }
     sessionId = snapshot.sessionId;
     var entries = snapshot.entries || [];
+    // [CUSTOM-20260926-071] User-message folds are decided by MEASUREMENT, so they
+    // are settled once the whole snapshot is in the DOM - settling inside the loop
+    // would force one layout per message while the appends keep re-dirtying it.
+    // It is still synchronous: boot reads this container's geometry the moment
+    // hydrate() returns (scroll restore + rail), so those heights must be final.
+    var folds = [];
     for (var i = 0; i < entries.length; i++) {
       var entry = entries[i];
-      messagesEl.appendChild(place(entry, entry.toolView));
+      var node = place(entry, entry.toolView);
+      messagesEl.appendChild(node);
+      watchNode(node);
+      if (entry.kind === 'user') { folds.push({ node: node, entry: entry }); }
+    }
+    for (var f = 0; f < folds.length; f++) {
+      settleUserFold(folds[f].node, folds[f].entry);
     }
     refreshGroupingSoon();
     // [CUSTOM-20260924-022] No unconditional toBottom() here: the scroll target
@@ -354,10 +727,11 @@ export const transcriptViewClient = `
           // view model was available). updateTool can only patch
           // .tool-status/.tool-title/.tool-body, so it can NEVER repair a shell
           // -- which is why a shell used to be permanent. Rebuild instead.
-          var rebuilt = NS.toolCallView.render(toolView);
+          var rebuilt = NS.toolCallView.render(toolView, entry.id);
           rebuilt.setAttribute('data-kind', 'tool');
           existing.parentNode.replaceChild(rebuilt, existing);
           nodes[entry.id] = rebuilt;
+          watchNode(rebuilt);
           refreshGroupingSoon();
         } else {
           updateTool(entry.id, toolView);
@@ -367,7 +741,11 @@ export const transcriptViewClient = `
       }
       return;
     }
-    messagesEl.appendChild(place(entry, toolView));
+    var placed = place(entry, toolView);
+    messagesEl.appendChild(placed);
+    watchNode(placed);
+    // [CUSTOM-20260926-071] The fold decision for a user message is a measurement.
+    if (entry.kind === 'user') { settleUserFold(placed, entry); }
     if (entry.kind === 'tool') { refreshGroupingSoon(); }
     NS.scroll.follow();
   }
@@ -393,24 +771,30 @@ export const transcriptViewClient = `
     if (entry.kind === 'assistant') {
       var bubble = node.querySelector('.bubble');
       if (bubble) { applyAssistant(bubble, entry); }
-      if (changes.html !== undefined && changes.html !== null) {
-        delete pending[entryId];
-      } else if (entry.streaming === false && entry.text) {
-        pending[entryId] = entry.text;
-        flushPending();
-      }
+      trackMarkdown(entryId, entry, changes);
     } else if (entry.kind === 'thought') {
       var body = node.querySelector('.thought-body');
-      if (body) { setStreamingText(body, entryId, entry.text || ''); }
+      if (body) { applyThoughtBody(body, entry); }
+      // [CUSTOM-20260926-072] Shared with the assistant branch: without it, the
+      // finalize revise would re-render the raw text over the markdown that had
+      // just arrived - the block would visibly revert to literal backticks at the
+      // exact moment it settles.
+      trackMarkdown(entryId, entry, changes);
       var summary = node.querySelector('summary');
       if (summary && entry.streaming === false) {
-        // [CUSTOM-20260924-028] Replace only the label, keep the type icon: this
-        // rewrite (streaming -> "Thought for Ns") used to clear the whole
-        // summary, which would have wiped the icon on every finalized block.
+        // [CUSTOM-20260924-028] Replace only the label, keep the decorations: this
+        // rewrite (streaming -> "Thought for Ns") used to clear the whole summary,
+        // which wiped the icon on every finalized block.
+        // [CUSTOM-20260925-061] Keep **every element** child (icon, caret) and drop
+        // only text + the streaming spinner. The previous version named the icon
+        // explicitly, which would have silently wiped the caret added this round -
+        // "keep the elements" cannot fall behind the way a name list does.
         var keep = [];
         for (var s = 0; s < summary.childNodes.length; s++) {
           var child = summary.childNodes[s];
-          if (child.nodeType === 1 && child.className === 'rec-icon') { keep.push(child); }
+          if (child.nodeType !== 1) { continue; }
+          if (child.className === 'thought-spin') { continue; }
+          keep.push(child);
         }
         NS.dom.clear(summary);
         for (var k = 0; k < keep.length; k++) { summary.appendChild(keep[k]); }
@@ -427,11 +811,13 @@ export const transcriptViewClient = `
       NS.icons.attach(rebuilt, entry);
       node.parentNode.replaceChild(rebuilt, node);
       nodes[entryId] = rebuilt;
+      watchNode(rebuilt);
     } else if (entry.kind === 'content') {
       var rebuiltContent = buildContent(entry);
       rebuiltContent.setAttribute('data-kind', entry.kind);
       node.parentNode.replaceChild(rebuiltContent, node);
       nodes[entryId] = rebuiltContent;
+      watchNode(rebuiltContent);
     } else if (entry.kind === 'permission') {
       // [CUSTOM-20260924-020] Patch the existing card in place (rather than
       // rebuilding) so the button the user is aiming at never moves/disappears
@@ -455,13 +841,14 @@ export const transcriptViewClient = `
     // append path learned this in 018; this path was the remaining gap, which is
     // why such a card stayed empty forever.
     if (tool && !node.querySelector('.tool-head')) {
-      var rebuilt = NS.toolCallView.render(tool);
+      var rebuilt = NS.toolCallView.render(tool, entryId);
       rebuilt.setAttribute('data-kind', 'tool');
       if (node.parentNode) { node.parentNode.replaceChild(rebuilt, node); }
       nodes[entryId] = rebuilt;
+      watchNode(rebuilt);
       refreshGroupingSoon();
     } else {
-      NS.toolCallView.update(node, tool);
+      NS.toolCallView.update(node, tool, entryId);
     }
     NS.scroll.follow();
   }
@@ -483,6 +870,7 @@ export const transcriptViewClient = `
   function nodeOf(id) { return nodes[id]; }
   // [CUSTOM-20260925-045] O(1) replacement for the outline's full walk.
   function userAnchorCount() { return userCount; }
+  function messageAnchorCount() { return messageCount; }
 
   NS.transcriptView = {
     init: init,
@@ -492,10 +880,13 @@ export const transcriptViewClient = `
     patch: patch,
     updateTool: updateTool,
     pendingMarkdown: pendingMarkdown,
+    // [CUSTOM-20260926-071] Called by the rail when a record gains a real size.
+    resolvePendingFolds: resolvePendingFolds,
     ordered: ordered,
     entry: entryOf,
     node: nodeOf,
-    userAnchorCount: userAnchorCount
+    userAnchorCount: userAnchorCount,
+    messageAnchorCount: messageAnchorCount
   };
 })(window.__acpc = window.__acpc || {});
 `;

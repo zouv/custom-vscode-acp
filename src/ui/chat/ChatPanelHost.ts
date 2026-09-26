@@ -27,9 +27,11 @@ import type {
   CloseReason,
   ExtToChat,
   ExtToChatMessage,
+  MarkdownRendered,
   SessionMeta,
   SessionSummary,
   TranscriptSnapshotWire,
+  UiPrefs,
 } from './protocol';
 import type { IChatPanel, PanelContext } from './panelContract';
 import { isModernAgent, MODERN_AGENTS } from './panelContract';
@@ -41,6 +43,12 @@ import { ToolInvocationStore } from './transcript/ToolInvocationStore';
 import { toToolCallView } from './content/toolCalls';
 import { toContentView, hasVisibleContent } from './content/contentBlocks';
 import { resolveNestingStrategy } from './nesting/NestingStrategy';
+import {
+  choiceChanges,
+  choiceSnapshotFromState,
+  choiceSnapshotPatched,
+  type ChoiceSnapshot,
+} from './sessionChoices';
 
 /** Prefix of the output channel used for panel-level diagnostics. */
 const LOG_PREFIX = 'chat-panel';
@@ -57,6 +65,9 @@ const LOG_PREFIX = 'chat-panel';
 const STRUCTURAL_MESSAGE_TYPES: ReadonlySet<string> = new Set([
   'boot', 'focus', 'sessionsChanged', 'sessionClosed', 'meta', 'attachments', 'error',
 ]);
+
+/** [CUSTOM-20260926-077] globalState key for the outline pin/width prefs. */
+const UI_PREFS_KEY = 'acpc.outlinePrefs.v1';
 
 export class ChatPanelHost implements IChatPanel, PermissionPresenter {
   readonly id = 'modern' as const;
@@ -80,8 +91,26 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
   private readonly toolEntryIds: Map<string, string> = new Map();
   /** sessionId → entry id of the single plan card (ACP replaces the list). */
   private readonly planEntryIds: Map<string, string> = new Map();
+  // [CUSTOM-20260925-063] Sessions that produced output while they were NOT the
+  // focused one. Surfaced as the tab-strip "attention" dot, which is a HINT and
+  // never a notification: no dialog, no focus stealing.
+  private readonly unread: Set<string> = new Set();
+  // [CUSTOM-20260926-073] sessionId → last known switchable state (mode + config
+  // options), for the "Switched to <model>" notice. The cache is written ONLY here
+  // (never read back from SessionManager at diff time), because the two paths that
+  // report a change — our own setter and the agent's `*_update` notification — race
+  // against SessionManager's listener order. Whatever lands first announces, and
+  // the other one diffs to nothing: that is the de-duplication, by construction.
+  private readonly choices: Map<string, ChoiceSnapshot> = new Map();
+  // [CUSTOM-20260926-075] sessionId → last known title, for the rename notice.
+  // Same "the cache is ours" rule as `choices`: SessionManager may already have
+  // applied the new title by the time our listener runs, so its copy cannot tell us
+  // what the OLD one was.
+  private readonly sessionTitles: Map<string, string> = new Map();
 
   private focused: PanelContext = { agentName: null, sessionId: null };
+  /** [CUSTOM-20260926-077] Outline pin/width prefs, cached from globalState. */
+  private uiPrefs: UiPrefs | null = null;
 
   // [CUSTOM-BEGIN] CUSTOM-20260924-022 - 合帧队列 + 标签栏快照签名（见 refreshSessions）。
   private readonly outbox: Outbox;
@@ -102,8 +131,11 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
     private readonly sessionManager: SessionManager,
     sessionUpdateHandler: SessionUpdateHandler,
     private readonly permissionBridge?: PermissionBridge,
+    // [CUSTOM-20260926-077] globalState for UI prefs that survive webview disposal.
+    private readonly globalState?: vscode.Memento,
   ) {
     this.sessionUpdateHandler = sessionUpdateHandler;
+    this.uiPrefs = this.globalState?.get<UiPrefs>(UI_PREFS_KEY) ?? null;
     // The host IS the permission presenter for the modern panel: no other
     // object knows whether a surface is on screen and which session is focused.
     this.permissionBridge?.setPresenter(this);
@@ -131,6 +163,10 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
       this.attachments.delete(sessionId);
       this.usage.delete(sessionId);
       this.planEntryIds.delete(sessionId);
+      // [CUSTOM-20260926-073] Session ids are never reused, so a stale switch
+      // baseline could only ever suppress the first notice of a new session.
+      this.choices.delete(sessionId);
+      this.sessionTitles.delete(sessionId);
       for (const key of Array.from(this.toolEntryIds.keys())) {
         if (key.startsWith(`${sessionId}::`)) { this.toolEntryIds.delete(key); }
       }
@@ -152,11 +188,15 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
       this.finalizeEntries(sessionId);
       refresh();
     });
-    on('active-session-changed', (_sessionId: string | null, agentName: string | null) => {
+    on('active-session-changed', (sessionId: string | null, agentName: string | null) => {
       // The router owns focus decisions, but a focus change originating from
       // elsewhere (e.g. the tree) must still reach an attached panel.
-      this.focused = { agentName, sessionId: _sessionId };
+      this.focused = { agentName, sessionId };
+      // [CUSTOM-20260925-063] Focusing a session consumes its unread marker, and
+      // the strip has to be told — otherwise the attention dot lingers.
+      if (sessionId) { this.unread.delete(sessionId); }
       this.pushFocus();
+      this.refreshSessions();
     });
   }
 
@@ -367,6 +407,18 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
         return;
       }
       // [CUSTOM-END] CUSTOM-20260925-029
+      // [CUSTOM-20260926-077] Outline pin/width prefs: NOT session-scoped, persist
+      // to globalState so they survive webview disposal (window reload / editor panel).
+      case 'setUiPref': {
+        const outlineMode = (msg as { outlineMode?: string }).outlineMode === 'sidebar' ? 'sidebar' : 'popup';
+        const outlineWidth = Number((msg as { outlineWidth?: unknown }).outlineWidth);
+        this.uiPrefs = {
+          outlineMode,
+          outlineWidth: Number.isFinite(outlineWidth) ? outlineWidth : 240,
+        };
+        this.globalState?.update(UI_PREFS_KEY, this.uiPrefs);
+        return;
+      }
       case 'openLink':
         void this.handleOpenLink((msg as { href?: string }).href ?? '');
         return;
@@ -417,12 +469,14 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
       // [CUSTOM-END] CUSTOM-20260925-049
       case 'setMode':
         void this.sessionManager.setMode(sessionId, (msg as { modeId: string }).modeId)
-          .then(() => this.pushMeta(sessionId))
+          // [CUSTOM-20260926-073] Announce the switch in the transcript, not just in
+          // the picker: the record is what a reader scrolls back through.
+          .then(() => { this.syncChoices(sessionId); this.pushMeta(sessionId); })
           .catch(e => this.reportError(sessionId, e));
         return;
       case 'setModel':
         void this.sessionManager.setModel(sessionId, (msg as { modelId: string }).modelId)
-          .then(() => this.pushMeta(sessionId))
+          .then(() => { this.syncChoices(sessionId); this.pushMeta(sessionId); })
           .catch(e => this.reportError(sessionId, e));
         return;
       case 'setConfigOption':
@@ -431,7 +485,7 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
           (msg as { configId: string }).configId,
           (msg as { value: string }).value,
         )
-          .then(() => this.pushMeta(sessionId))
+          .then(() => { this.syncChoices(sessionId); this.pushMeta(sessionId); })
           .catch(e => this.reportError(sessionId, e));
         return;
       // [CUSTOM-20260924-027] Session-scoped: it must sit AFTER the guard above.
@@ -479,6 +533,7 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
     this.subscriptions.length = 0;
     this.surfaces.clear();
     this.lastActive = null;
+    this.unread.clear();
     // setPresenter(null) also cancels every prompt still awaiting an answer:
     // nothing can render or answer them once the host is gone.
     this.permissionBridge?.setPresenter(null);
@@ -569,6 +624,54 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
     this.pushMeta(sessionId);
   }
 
+  // --- Switch notices (CUSTOM-20260926-073) --------------------------------
+
+  /** The session's switchable state right now, or null when it has no session. */
+  private choiceState(sessionId: string): ChoiceSnapshot | null {
+    const session = sessionOf(this.sessionManager, sessionId);
+    if (!session) { return null; }
+    return choiceSnapshotFromState(session.modes, session.configOptions);
+  }
+
+  /**
+   * Diff a session's switchable state against the cached snapshot and announce
+   * whatever moved (model / mode / any other config option).
+   *
+   * The FIRST snapshot of a session is a BASELINE, not a change: opening a session
+   * must not print "Switched to <the model it already had>". That also covers the
+   * two racing reporters of the same change — whichever arrives first announces,
+   * the second diffs to nothing.
+   *
+   * `next` lets a caller pass a state built from a NOTIFICATION payload (see
+   * onSessionUpdate); omitted, the state is read from SessionManager.
+   */
+  private syncChoices(sessionId: string, next?: ChoiceSnapshot | null): void {
+    const state = next === undefined ? this.choiceState(sessionId) : next;
+    if (!state) { return; }
+    const previous = this.choices.get(sessionId);
+    this.choices.set(sessionId, state);
+    if (!previous) { return; }
+    const labels = choiceChanges(previous, state);
+    if (labels.length === 0) { return; }
+    const entry = this.transcripts.appendNotice(sessionId, 'switch', labels.join(' · '));
+    if (entry) { this.post({ type: 'append', sessionId, entries: [entry] }); }
+  }
+
+  /**
+   * [CUSTOM-20260926-075] Announce a RENAME — not a title being assigned for the
+   * first time. The first `session_info_update` of a session is normally the
+   * auto-generated title ("Fix the parser bug"), and printing a line for it would
+   * add noise to every single session. So the baseline is seeded from the title the
+   * session already had, and only a later, different title is announced.
+   */
+  private announceRename(sessionId: string, title: string): void {
+    const previous = this.sessionTitles.get(sessionId) ?? '';
+    this.sessionTitles.set(sessionId, title);
+    if (!title || !previous || title === previous) { return; }
+    const entry = this.transcripts.appendNotice(sessionId, 'info', `Session renamed to “${title}”`);
+    if (entry) { this.post({ type: 'append', sessionId, entries: [entry] }); }
+  }
+
   /**
    * Close streaming entries and tell the webview, so its copy of the entry
    * learns `streaming: false` (and, for thoughts, the elapsed time).
@@ -613,6 +716,13 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
 
     this.transcripts.ensureSession(sessionId, session.agentName);
 
+    // [CUSTOM-20260926-073] Take the switch baseline here, at the top, because this
+    // runs for every update of every session regardless of whether a surface is
+    // attached — so a baseline exists before any switch can be reported.
+    if (!this.choices.has(sessionId)) { this.syncChoices(sessionId); }
+    // [CUSTOM-20260926-075] ...and the rename baseline, for the same reason.
+    if (!this.sessionTitles.has(sessionId)) { this.sessionTitles.set(sessionId, session.title ?? ''); }
+
     switch (data.sessionUpdate) {
       case 'agent_message_chunk': {
         const text = textOf(data.content);
@@ -633,7 +743,19 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
 
       case 'agent_thought_chunk': {
         const text = textOf(data.content);
-        if (text.length === 0) { return; }
+        if (text.length === 0) {
+          // [CUSTOM-20260926-075] Non-text content inside a THOUGHT chunk (an image
+          // the agent pasted into its reasoning, a resource link) used to be dropped
+          // on the floor. It becomes a content record like any other.
+          //
+          // The thought is closed first, and that is not cosmetic: entries only
+          // merge into the LAST one, so a thought left open here would be stranded
+          // with a permanent "Thinking…" spinner while the next thought chunk opens
+          // a second block.
+          this.finalizeEntries(sessionId, { only: 'thought' });
+          this.postContentNotice(sessionId, data.content);
+          return;
+        }
         const entry = this.transcripts.appendThoughtChunk(sessionId, text, data.messageId ?? undefined);
         if (entry) { this.post({ type: 'append', sessionId, entries: [entry] }); }
         return;
@@ -724,7 +846,7 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
         return;
       }
 
-      default:
+      default: {
         // available_commands_update / config_option_update / current_mode_update /
         // session_info_update are handled by SessionManager + the legacy provider's
         // listener; the host only needs to re-read state after they land.
@@ -735,7 +857,25 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
           this.pushMeta(sessionId);
           this.refreshSessions();
         }
+        // [CUSTOM-20260926-075] A rename notice does not depend on the switch
+        // baseline, so it is handled before the guard below.
+        if (data.sessionUpdate === 'session_info_update') {
+          this.announceRename(sessionId, typeof data.title === 'string' ? data.title : '');
+        }
+        // [CUSTOM-20260926-073] A switch the agent pushed (or that another surface
+        // triggered). The PAYLOAD is used rather than SessionManager's copy: our
+        // listener may run before SessionManager's, in which case its state is still
+        // the old one and the diff would come out empty. If our own setter already
+        // reported this change, the diff here is empty and nothing prints twice.
+        const previous = this.choices.get(sessionId);
+        if (!previous) { return; }
+        if (data.sessionUpdate === 'config_option_update') {
+          this.syncChoices(sessionId, choiceSnapshotPatched(previous, { configOptions: data.configOptions }));
+        } else if (data.sessionUpdate === 'current_mode_update') {
+          this.syncChoices(sessionId, choiceSnapshotPatched(previous, { modeId: data.currentModeId }));
+        }
         return;
+      }
     }
   }
 
@@ -785,14 +925,18 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
 
   // --- Markdown round-trip -------------------------------------------------
 
-  private handleRenderMarkdown(items: Array<{ entryId: string; sessionId: string; text: string }>): void {
-    const rendered: Array<{ entryId: string; sessionId: string; html: string }> = [];
+  private handleRenderMarkdown(items: Array<{ entryId: string; sessionId: string; text: string; key?: string }>): void {
+    const rendered: Array<{ entryId: string; sessionId: string; html: string; key?: string }> = [];
     for (const item of items) {
       const sessionId = verifySession(this.sessionManager, item);
       if (!sessionId) { continue; }
       const html = this.markdown.render(item.text);
-      this.transcripts.patch(sessionId, item.entryId, { html });
-      rendered.push({ entryId: item.entryId, sessionId, html });
+      // [CUSTOM-20260925-066] A KEYED item is a sub-block of a tool card, not a
+      // transcript record: there is nothing in the store to patch, the HTML goes
+      // back to the element that asked for it. Skipping the patch also avoids a
+      // pointless lookup for an id that can never be found.
+      if (!item.key) { this.transcripts.patch(sessionId, item.entryId, { html }); }
+      rendered.push({ entryId: item.entryId, sessionId, html, key: item.key });
     }
     if (rendered.length > 0) {
       this.post({ type: 'markdownRendered', items: rendered });
@@ -1190,8 +1334,22 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
   // 「攒一帧再发」（可按条目合并）还是「立即发」（结构性）。路由表放在这一处，
   // 而不是散在每个调用点——漏改一个调用点就会静默破坏 INV-A（revise 越过 append）
   // 或 INV-C（sessionsChanged 被延迟，Send/Stop 按钮状态错）。
-  private post(message: ExtToChat | { type: 'markdownRendered'; items: Array<{ entryId: string; sessionId: string; html: string }> }, to?: SurfaceKey): void {
+  private post(message: ExtToChat | MarkdownRendered, to?: SurfaceKey): void {
     const type = (message as { type?: string }).type ?? '';
+    // [CUSTOM-20260925-063] One choke point for "a session produced output": every
+    // transcript-bearing message goes through here, so the unread marker cannot be
+    // remembered on some append paths and forgotten on others (which is what a
+    // per-call-site approach would eventually do).
+    if (type === 'append' || type === 'revise' || type === 'toolUpdate') {
+      const sessionId = (message as { sessionId?: string }).sessionId;
+      if (sessionId && this.focused.sessionId !== sessionId && !this.unread.has(sessionId)) {
+        this.unread.add(sessionId);
+        // Tell the strip immediately. Without this the dot could wait for the next
+        // unrelated refresh — some append paths (a notice, terminal output) never
+        // call refreshSessions themselves.
+        this.refreshSessions();
+      }
+    }
     if (!to && !STRUCTURAL_MESSAGE_TYPES.has(type)) {
       this.outbox.enqueue(message as ExtToChatMessage);
       return;
@@ -1200,7 +1358,7 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
   }
 
   /** Broadcast (or target) immediately, bypassing the coalescing queue. */
-  private postNow(message: ExtToChat | { type: 'markdownRendered'; items: Array<{ entryId: string; sessionId: string; html: string }> }, to?: SurfaceKey): void {
+  private postNow(message: ExtToChat | MarkdownRendered, to?: SurfaceKey): void {
     if (to) {
       const only = this.surfaces.get(to);
       if (only) { this.send(only, message); }
@@ -1209,7 +1367,7 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
     for (const surface of this.surfaces.values()) { this.send(surface, message); }
   }
 
-  private send(surface: ChatSurface, message: ExtToChat | { type: 'markdownRendered'; items: Array<{ entryId: string; sessionId: string; html: string }> }): void {
+  private send(surface: ChatSurface, message: ExtToChat | MarkdownRendered): void {
     // Watch the returned promise: a payload that fails structured clone rejects,
     // and a bare `void` would swallow that. Silent send failures are exactly
     // what makes "the UI just shows nothing" impossible to diagnose.
@@ -1234,6 +1392,11 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
       snapshot: focused ? this.snapshotOf(focused.sessionId) : null,
       meta: focused ? this.metaOf(focused.sessionId) : null,
     }, to);
+    // [CUSTOM-20260926-077] Bring the outline pin/width prefs along with the boot,
+    // so a recreated webview (editor panel reopen / window reload) restores them.
+    if (this.uiPrefs) {
+      this.post({ type: 'uiPrefs', ...this.uiPrefs }, to);
+    }
   }
 
   private pushFocus(): void {
@@ -1269,7 +1432,7 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
     // agent dropdown on the client. Skipping the no-op case is also what keeps
     // `flushThenPost` from flushing the coalescing queue on every chunk.
     const signature = sessions
-      .map(s => `${s.sessionId}|${s.agentName}|${s.title ?? ''}|${s.loading ? 1 : 0}|${s.running ? 1 : 0}`)
+      .map(s => `${s.sessionId}|${s.agentName}|${s.title ?? ''}|${s.loading ? 1 : 0}|${s.running ? 1 : 0}|${s.unread ? 1 : 0}`)
       .join('\n');
     if (signature === this.lastSessionsSignature) { return; }
     this.lastSessionsSignature = signature;
@@ -1301,6 +1464,10 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
       createdAt: session.createdAt,
       loading: this.sessionManager.isLoading(session.sessionId),
       running: this.sessionManager.isTurnInFlight(session.sessionId),
+      // [CUSTOM-20260925-063] Drives the tab-strip "attention" dot. NOTE:
+      // refreshSessions()'s signature string must include it too, or the strip
+      // would never be told this changed (022's signature de-dup trap).
+      unread: this.unread.has(session.sessionId),
     };
   }
 

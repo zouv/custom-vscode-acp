@@ -181,7 +181,66 @@ export const toolCallViewClient = `
    * 'key' is an optional stable identity supplied by the caller, used only by
    * the diff renderer to survive a body rebuild (CUSTOM-20260925-040).
    */
-  function renderContentItem(item, key) {
+  /**
+   * [CUSTOM-20260925-066] Tool results arrive as MARKDOWN, not plain text.
+   *
+   * Claude Code wraps shell output in a '''console fence (12 of them in the
+   * captured replay), so rendering the text verbatim showed the literal backticks
+   * and lost the code-block styling and Copy button. Tool text therefore goes
+   * through the SAME round-trip as assistant prose ('SafeMarkdown' on the host,
+   * sanitized again on this side) instead of a second, weaker renderer.
+   *
+   * Two caches, both cleared per session:
+   *   · mdCache  - key -> rendered HTML, so a body rebuild (which happens whenever
+   *                bodySignature changes) puts the HTML straight back;
+   *   · mdPending - key -> { entryId, text, host } for the next renderMarkdown batch.
+   */
+  var mdCache = {};
+  var mdPending = {};
+
+  /** Re-render this host from the cache, or queue it for the next round-trip. */
+  function markdownText(host, key, entryId, text) {
+    if (Object.prototype.hasOwnProperty.call(mdCache, key)) {
+      applyRendered(host, mdCache[key]);
+      return;
+    }
+    if (!Object.prototype.hasOwnProperty.call(mdPending, key)) {
+      mdPending[key] = { entryId: entryId, text: text, host: host };
+    }
+  }
+
+  function applyRendered(host, html) {
+    NS.dom.setSanitizedHtml(host, html);
+    // Code blocks need their Copy button and tables their scroll wrapper - the same
+    // decoration assistant bubbles get.
+    NS.links.decorateScrollables(host);
+  }
+
+  /** Items to ask the host for (merged with the assistant bubbles' own batch). */
+  function pendingMarkdownItems() {
+    var out = [];
+    for (var key in mdPending) {
+      if (!Object.prototype.hasOwnProperty.call(mdPending, key)) { continue; }
+      out.push({ entryId: mdPending[key].entryId, key: key, text: mdPending[key].text });
+    }
+    return out;
+  }
+
+  /** The host rendered one of them: cache it and, if the node still exists, show it. */
+  function applyMarkdown(key, html) {
+    mdCache[key] = html;
+    var item = mdPending[key];
+    delete mdPending[key];
+    if (item && item.host && item.host.parentNode) { applyRendered(item.host, html); }
+  }
+
+  /** Session switch: rendered HTML belongs to the previous transcript. */
+  function resetMarkdown() {
+    mdCache = {};
+    mdPending = {};
+  }
+
+  function renderContentItem(item, key, entryId) {
     var el = NS.dom.el;
     if (item.type === 'diff') { return renderDiff(item, key); }
 
@@ -202,7 +261,11 @@ export const toolCallViewClient = `
     // it produced an empty .tool-text strip (margin 3px 0 with nothing inside).
     // Cosmetic only, so an empty inline span is enough — no need to hide nodes.
     if (block.type === 'text') {
-      return isBlank(block.text) ? el('span', '') : el('div', 'tool-text', block.text);
+      if (isBlank(block.text)) { return el('span', ''); }
+      var textHost = el('div', 'tool-text');
+      // [CUSTOM-20260925-066] Markdown, not raw text - see markdownText above.
+      markdownText(textHost, (entryId || '') + '#' + (key || ''), entryId || '', block.text);
+      return textHost;
     }
     if (block.type === 'image') {
       var img = document.createElement('img');
@@ -256,7 +319,7 @@ export const toolCallViewClient = `
    * 'NS.dom.clear(body)' removed the ones already there). One builder makes
    * that class of drift impossible.
    */
-  function fillToolBody(body, tool) {
+  function fillToolBody(body, tool, entryId) {
     var el = NS.dom.el;
     NS.dom.clear(body);
     if (tool.command) {
@@ -280,7 +343,7 @@ export const toolCallViewClient = `
     var items = tool.items || [];
     for (var j = 0; j < items.length; j++) {
       // Positional key so a rebuilt diff keeps the user's expansion state.
-      body.appendChild(renderContentItem(items[j], 'i' + j + ':' + (items[j].path || '')));
+      body.appendChild(renderContentItem(items[j], 'i' + j + ':' + (items[j].path || ''), entryId));
     }
     if (!tool.command && locations.length === 0 && items.length === 0) {
       body.appendChild(el('div', 'diff-note', 'No detail reported for this tool call.'));
@@ -406,7 +469,7 @@ export const toolCallViewClient = `
   }
 
   /** Build the DOM for a tool call. */
-  function render(tool) {
+  function render(tool, entryId) {
     var el = NS.dom.el;
     var wrap = el('div', 'tool');
     wrap.setAttribute('data-tool-id', tool.toolCallId);
@@ -425,9 +488,12 @@ export const toolCallViewClient = `
     head.appendChild(el('span', 'tool-caret', '\\u25b8'));
     head.appendChild(el('span', 'tool-status tc-' + tool.status, STATUS_GLYPH[tool.status] || '\\u2022'));
     head.appendChild(el('span', 'tool-kind', KIND_LABEL[tool.kind] || 'Tool'));
+    // [CUSTOM-20260926-074] The agent's own tool name, when it reported one.
+    applyToolName(head, tool);
     var title = el('span', 'tool-title', tool.title || tool.toolCallId);
     title.title = tool.title || '';
     head.appendChild(title);
+    applyDuration(head, tool);
     if (tool.inferredParent) {
       head.appendChild(inferredMarker());
     }
@@ -435,11 +501,59 @@ export const toolCallViewClient = `
 
     var body = el('div', 'tool-body');
     body.hidden = true;
-    fillToolBody(body, tool);
+    fillToolBody(body, tool, entryId);
     var signature = bodySignature(tool);
     if (signature !== null) { wrap.setAttribute('data-body-sig', signature); }
     wrap.appendChild(body);
     return wrap;
+  }
+
+  /**
+   * [CUSTOM-20260926-074] Put the agent's own tool name in the card head ("Bash" /
+   * "Read" / "Edit"), when it reported one.
+   *
+   * It sits NEXT TO the kind chip rather than replacing it: the kind is ACP's
+   * coarse vocabulary (Run / Read / Edit / Search), the name is the specific tool,
+   * and both are useful — the kind is what a non-Claude agent can always provide.
+   * Absent for any agent that publishes no _meta, so the chip has to be
+   * addable, removable AND patchable (a placeholder card becomes the real card via
+   * 'update', which is the path that once lost 'locations').
+   */
+  function applyToolName(head, tool) {
+    var name = tool.toolName || '';
+    var node = head.querySelector('.tool-name');
+    if (!name) {
+      if (node && node.parentNode) { node.parentNode.removeChild(node); }
+      return;
+    }
+    if (node) { node.textContent = name; return; }
+    node = NS.dom.el('span', 'tool-name', name);
+    var title = head.querySelector('.tool-title');
+    if (title) { head.insertBefore(node, title); } else { head.appendChild(node); }
+  }
+
+  /**
+   * [CUSTOM-20260925-065] Put the call's duration in the card head, once it has
+   * finished. A still-running call shows nothing: the pulsing status glyph already
+   * says "in progress", and a live counter would mean a ticking re-render.
+   *
+   * Used by BOTH render and update — the duration appears on the update that
+   * reports completion, so the update path must be able to create the span (the
+   * same gap that made 027's shell permanent).
+   */
+  function applyDuration(head, tool) {
+    var label = NS.dom.duration(tool.elapsedMs);
+    var node = head.querySelector('.tool-time');
+    if (!label) {
+      if (node && node.parentNode) { node.parentNode.removeChild(node); }
+      return;
+    }
+    if (!node) {
+      node = NS.dom.el('span', 'tool-time');
+      head.appendChild(node);
+    }
+    node.textContent = label;
+    node.title = 'This tool call took ' + label;
   }
 
   function inferredMarker() {
@@ -450,7 +564,7 @@ export const toolCallViewClient = `
   }
 
   /** Apply a fresh view model to an existing card. */
-  function update(node, tool) {
+  function update(node, tool, entryId) {
     if (!node) { return; }
 
     // Parent link can appear (or disappear) on any update, since the strategy
@@ -478,6 +592,13 @@ export const toolCallViewClient = `
     // Run / …) when the view model finally arrives.
     var kind = node.querySelector('.tool-kind');
     if (kind) { kind.textContent = KIND_LABEL[tool.kind] || 'Tool'; }
+    // [CUSTOM-20260926-074] Same reason as the kind label above: a card built from
+    // a placeholder starts without a tool name and must pick it up on the update
+    // that finally carries the view model.
+    if (head) { applyToolName(head, tool); }
+    // [CUSTOM-20260925-065] The duration only exists once the call has finished,
+    // which arrives on an update — so it has to be applied here too.
+    if (head) { applyDuration(head, tool); }
     var title = node.querySelector('.tool-title');
     if (title && tool.title) {
       title.textContent = tool.title;
@@ -494,7 +615,7 @@ export const toolCallViewClient = `
       var previous = node.getAttribute('data-body-sig');
       if (signature === null || previous === null || signature !== previous) {
         var expansion = captureExpansion(body);
-        fillToolBody(body, tool);
+        fillToolBody(body, tool, entryId);
         applyExpansion(body, expansion);
         if (signature === null) { node.removeAttribute('data-body-sig'); }
         else { node.setAttribute('data-body-sig', signature); }
@@ -584,6 +705,11 @@ export const toolCallViewClient = `
     // use unless it is already inside a rAF pass (transcriptView's delegate).
     refreshGroupingSoon: refreshGroupingSoon,
     isBlank: isBlank,
+    // [CUSTOM-20260925-066] Tool text rides the same markdown round-trip as
+    // assistant prose: these three are what boot.ts and transcriptView need.
+    pendingMarkdownItems: pendingMarkdownItems,
+    applyMarkdown: applyMarkdown,
+    resetMarkdown: resetMarkdown,
     // Reused by transcriptView for 'content' entries (non-text message
     // blocks) so there is exactly one renderer per ContentBlock variant.
     renderContentItem: renderContentItem

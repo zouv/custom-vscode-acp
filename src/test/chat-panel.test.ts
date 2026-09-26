@@ -33,6 +33,7 @@ import { SessionHistoryStore } from '../core/SessionHistoryStore';
 import { SessionManager, pickDefaultCwd, type SessionInfo } from '../core/SessionManager';
 import { SessionUpdateHandler } from '../handlers/SessionUpdateHandler';
 import { isBlankText } from '../ui/chat/content/contentBlocks';
+import { choiceChanges, choiceSnapshotFromState, choiceSnapshotPatched } from '../ui/chat/sessionChoices';
 import type { ChatSurface, SurfaceKey } from '../ui/chat/ChatSurface';
 import { ChatPanelHost } from '../ui/chat/ChatPanelHost';
 import type { ExtToChatMessage, TranscriptSnapshotWire } from '../ui/chat/protocol';
@@ -605,6 +606,59 @@ suite('chat panel: draft page creates the session on first send', () => {
   });
 });
 
+suite('chat panel: unread marker for background sessions', () => {
+  // [CUSTOM-20260925-063] The marker lives on the HOST (it alone knows both "which
+  // session got output" and "which one is focused"), so it is observable from the
+  // protocol stream — no DOM needed.
+
+  const chunk = (sessionId: string, text: string): FixtureNotification => ({
+    phase: 'live',
+    turn: 1,
+    at: Date.now(),
+    update: {
+      sessionId,
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
+    } as unknown as SessionNotification,
+  });
+
+  interface SummaryWire { sessionId: string; unread: boolean }
+
+  function summaries(harness: Harness): SummaryWire[] {
+    for (let i = harness.surface.sent.length - 1; i >= 0; i--) {
+      const message = harness.surface.sent[i] as { type?: string; sessions?: SummaryWire[] };
+      if (message.type === 'sessionsChanged') { return message.sessions ?? []; }
+    }
+    return [];
+  }
+
+  test('output on a BACKGROUND session marks it unread; focusing clears it', function () {
+    const harness = makeHarness('session-A', 'Claude Code');
+    registerFakeSession(harness.sessionManager, 'session-B', 'Claude Code');
+    harness.surface.sent.length = 0;
+
+    harness.handler.handleUpdate(chunk('session-B', 'output while you were away').update);
+
+    const marked = summaries(harness).find(s => s.sessionId === 'session-B');
+    assert.ok(marked, 'sessionsChanged must mention session B');
+    assert.strictEqual(marked.unread, true,
+      'output on a non-focused session must mark it unread — and the strip has to be '
+      + 'told, which only happens if refreshSessions includes unread in its signature');
+
+    // Focusing it consumes the marker.
+    harness.sessionManager.emit('active-session-changed', 'session-B', 'Claude Code');
+    const afterFocus = summaries(harness).find(s => s.sessionId === 'session-B');
+    assert.strictEqual(afterFocus?.unread, false, 'focusing a session must clear its unread marker');
+  });
+
+  test('output on the FOCUSED session is never unread', function () {
+    const harness = makeHarness('session-A', 'Claude Code');
+    harness.surface.sent.length = 0;
+    harness.handler.handleUpdate(chunk('session-A', 'this is the one you are watching').update);
+    const focused = summaries(harness).find(s => s.sessionId === 'session-A');
+    assert.strictEqual(focused?.unread, false);
+  });
+});
+
 suite('chat panel: real session/load replay', () => {
 
   test('fixture exists and covers both phases', function () {
@@ -710,5 +764,120 @@ suite('chat panel: real session/load replay', () => {
     console.log('  replay:', JSON.stringify(replay));
     console.log('  agent :', fixture.agentInfo?.name, fixture.agentInfo?.version);
     assert.ok(Object.keys(live).length > 0 && Object.keys(replay).length > 0);
+  });
+});
+
+suite('chat panel: switch snapshot diff (model / mode / options)', () => {
+  // [CUSTOM-20260926-073] All of the switch-notice judgement lives in
+  // src/ui/chat/sessionChoices.ts; ChatPanelHost only caches snapshots and posts the
+  // line (see syncChoices). These cases pin the diff against the REAL ACP payload
+  // shapes, including the rule that is easiest to get wrong: one switch is reported
+  // twice — once by our own setter, once by the agent's `config_option_update` — and
+  // the second report must diff to nothing.
+  const CONFIG_OPTIONS: any[] = [
+    {
+      id: 'model', name: 'Model', category: 'model', type: 'select',
+      currentValue: 'deepseek-v4-pro[1m]',
+      options: [
+        { value: 'deepseek-v4-pro[1m]', name: 'deepseek-v4-pro[1M]' },
+        { value: 'sonnet', name: 'Sonnet' },
+      ],
+    },
+    {
+      id: 'mode', name: 'Mode', category: 'mode', type: 'select', currentValue: 'default',
+      options: [{ value: 'default', name: 'Manual' }, { value: 'plan', name: 'Plan' }],
+    },
+    {
+      id: 'effort', name: 'Reasoning effort', category: 'thought_level', type: 'select',
+      currentValue: 'high',
+      // Grouped shape: ACP allows one level of grouping, and the label lives inside.
+      options: [{ group: 'levels', name: 'Levels', options: [{ value: 'high', name: 'High' }, { value: 'low', name: 'Low' }] }],
+    },
+  ];
+  const MODES = {
+    currentModeId: 'default',
+    availableModes: [{ id: 'default', name: 'Manual' }, { id: 'plan', name: 'Plan' }],
+  };
+
+  /** The same option list with one option's value replaced. */
+  function withValue(id: string, value: string): any[] {
+    return CONFIG_OPTIONS.map(option => (option.id === id ? { ...option, currentValue: value } : option));
+  }
+
+  test('a model switch reads like the reference implementation', () => {
+    const before = choiceSnapshotFromState(MODES, CONFIG_OPTIONS);
+    const after = choiceSnapshotFromState(MODES, withValue('model', 'sonnet'));
+    assert.deepStrictEqual(choiceChanges(before, after), ['Switched to Sonnet']);
+  });
+
+  test('a mode switch is labelled the same way whether it arrives as a mode or as an option', () => {
+    const before = choiceSnapshotFromState(MODES, CONFIG_OPTIONS);
+    // (a) through session.modes (a `current_mode_update`)
+    assert.deepStrictEqual(
+      choiceChanges(before, choiceSnapshotFromState({ ...MODES, currentModeId: 'plan' }, CONFIG_OPTIONS)),
+      ['Switched to Plan mode'],
+    );
+    // (b) through a config option with category 'mode' — which is how Claude Code
+    // reports it. The reader must not be able to tell which channel was used.
+    assert.deepStrictEqual(
+      choiceChanges(before, choiceSnapshotFromState(MODES, withValue('mode', 'plan'))),
+      ['Switched to Plan mode'],
+    );
+  });
+
+  test('an option with no model/mode meaning names itself', () => {
+    const before = choiceSnapshotFromState(MODES, CONFIG_OPTIONS);
+    const after = choiceSnapshotFromState(MODES, withValue('effort', 'low'));
+    // The label comes out of the GROUPED options list, and a bare "Switched to Low"
+    // would be a riddle — hence the option's own name.
+    assert.deepStrictEqual(choiceChanges(before, after), ['Reasoning effort: Low']);
+  });
+
+  test('the primary fact comes first when a switch cascades', () => {
+    const before = choiceSnapshotFromState(MODES, CONFIG_OPTIONS);
+    const after = choiceSnapshotFromState(MODES, withValue('effort', 'low').map(o => (
+      o.id === 'model' ? { ...o, currentValue: 'sonnet' } : o
+    )));
+    assert.deepStrictEqual(
+      choiceChanges(before, after),
+      ['Switched to Sonnet', 'Reasoning effort: Low'],
+      'a model switch often adjusts a derived option in the same response; the reader wants the cause first',
+    );
+  });
+
+  test('the second report of the same switch is silent', () => {
+    const before = choiceSnapshotFromState(MODES, CONFIG_OPTIONS);
+    const after = choiceSnapshotFromState(MODES, withValue('model', 'sonnet'));
+    assert.strictEqual(choiceChanges(before, after).length, 1);
+    // This is the de-duplication: whichever of the two reporters lands first
+    // announces, and the other one diffs against the cache we just wrote.
+    assert.deepStrictEqual(choiceChanges(after, after), []);
+    // Nothing moved at all is also empty (e.g. re-opening a session).
+    assert.deepStrictEqual(choiceChanges(before, before), []);
+  });
+
+  test('a notification payload patches the snapshot without losing the rest', () => {
+    const before = choiceSnapshotFromState(MODES, CONFIG_OPTIONS);
+    const fromConfig = choiceSnapshotPatched(before, { configOptions: withValue('model', 'sonnet') });
+    assert.deepStrictEqual(choiceChanges(before, fromConfig), ['Switched to Sonnet']);
+    // A mode payload carries an id and nothing else: the option map and the mode
+    // NAME must both survive, or the line would read "Switched to plan mode".
+    const fromMode = choiceSnapshotPatched(before, { modeId: 'plan' });
+    assert.deepStrictEqual(choiceChanges(before, fromMode), ['Switched to Plan mode']);
+    assert.deepStrictEqual(fromMode.options, before.options, 'a mode update must not drop the options');
+  });
+
+  test('a state that APPEARS is initialization, not a switch', () => {
+    // The first snapshot of a session is empty (SessionManager has nothing yet) and
+    // the option list lands a moment later. Announcing that would print a line full
+    // of "Model: … · Mode: … · Reasoning effort: …" for every session.
+    const empty = choiceSnapshotFromState(null, null);
+    assert.deepStrictEqual(choiceChanges(empty, empty), []);
+    assert.deepStrictEqual(choiceChanges(empty, choiceSnapshotFromState(MODES, CONFIG_OPTIONS)), []);
+    // But once the state is KNOWN, a real change is announced as usual.
+    assert.deepStrictEqual(
+      choiceChanges(choiceSnapshotFromState(MODES, CONFIG_OPTIONS), choiceSnapshotFromState(MODES, withValue('model', 'sonnet'))),
+      ['Switched to Sonnet'],
+    );
   });
 });

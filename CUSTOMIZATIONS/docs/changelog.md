@@ -17,6 +17,307 @@
 
 ---
 
+### 2026-09-26 - CUSTOM-20260926-077
+- **功能**：会话大纲二次优化——图标按类型着色、时间右移并显示秒级、钉住状态宿主级持久化、钉住按钮并入计数行
+- **改动文件**：`src/ui/chat/html/client/outline.ts`、`src/ui/chat/html/body.ts`、`src/ui/chat/html/styles.ts`、`src/ui/chat/html/client/boot.ts`、`src/ui/chat/protocol.ts`、`src/ui/chat/ChatPanelHost.ts`、`src/ui/chat/ChatRouterProvider.ts`、`src/extension.ts`、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/*`
+- **来源**：用户 F5 复验 076 的侧栏后提的 4 点反馈
+- **详细说明**：
+  - **①类型区分度不高**：user/assistant 都是 12px 线稿图标、形状差异在窄侧栏里不明显。改为按 kind 着色——`renderInto` 给图标 span 追加 `outline-kind-<kind>` 后缀类，CSS 里 `.outline-kind-user` 用 `--vscode-button-background`（与 transcript 用户气泡同色蓝）、`.outline-kind-assistant` 用 `--vscode-descriptionForeground`（灰）；SVG 是 `stroke=currentColor`，改 `color` 即变色，零空间成本。
+  - **②时间占左侧空间 + 要秒级**：`timeLabel` 从 `HH:MM` 改 `HH:MM:SS`，且 `.outline-time` 从「图标与文本之间」移到每项最右（正文 `.outline-text` 的 `flex:1` 占满左侧、时间紧凑靠右）。
+  - **③钉住状态应跨会话还原**：根因是 `outlineMode/outlineWidth` 存在 webview 本地 `vscode.setState`，只活在同一实例 reload，窗口重载 / 编辑器面板关闭重开会丢。改为宿主级持久化：新增非会话作用域消息 `setUiPref`（webview→ext）与 `uiPrefs`（ext→webview，随 boot 定向带回）；`ChatPanelHost` 构造新增可选 `globalState` 形参（extension.ts 传 `context.globalState`，key `acpc.outlinePrefs.v1`），`onMessage` 里在 `verifySession` 守卫**之前**处理 `setUiPref` 并 `globalState.update`；客户端 `outline.init` 不再从本地状态读，改由 boot 后 `applyPrefs(prefs)` 恢复（幂等）。`setUiPref` 在守卫之前处理是 §5.4 规则二（非会话作用域）。
+  - **④钉住按钮独占一栏**：把 `#outlinePin` 从独立的 `.outline-bar` 并进 `.outline-head`（"N messages" 同一行），动态计数放进 `.outline-head-info` 子容器（render 只清它、不抹掉钉住按钮），删除 `.outline-bar` 与相关 CSS。
+- **验证方式**：`lint` / `check-registry` / `compile` / `compile-tests` 全绿；`npm test` **58 passing**（`chat-client.test.ts` 大纲用例更新为断言 `.outline-kind-user/-assistant` 着色 + 时间两个冒号 + 桩 `.outline-head-info`）。**待用户 F5 复验**：图标蓝/灰分明；时间在右且到秒；钉住后关闭会话再打开（乃至重载窗口）仍还原钉住与宽度；钉住按钮与 "N messages" 同一行。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-26 - CUSTOM-20260926-076
+- **功能**：会话大纲「钉住式右侧栏」——☰ 按钮右移、大纲扩到 user+assistant 并带类型图标 / hover 全文，新增可调宽的常驻右侧栏形态
+- **改动文件**：`src/ui/chat/html/body.ts`、`src/ui/chat/html/styles.ts`、`src/ui/chat/html/client/outline.ts`、`src/ui/chat/html/client/icons.ts`、`src/ui/chat/html/client/transcriptView.ts`、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/*`
+- **详细说明**：
+  - 用户提出三项：①把 ☰ 从 header 最左移到右侧；②在大纲下拉之外再加一个「固定显示在右侧、宽度可调、只显示 message 类内容（带类型图标、缩略信息、hover 看更多、点击跳转）」的侧栏模式；③先评估必要性/可行性并设计交互，确认后再改。
+  - **必要性/可行性**：当前大纲是"点开即收"的下拉，只列 user、无图标、跳转即关，适合临时查一句、不适合边看边导航。改动**纯客户端**（§5.9 已声明不动协议/命令/package.json），复用 `scroll.jumpTo` / `transcriptView.ordered/entry/node` / `icons` / `persistUi` 全齐，唯一从零写的是分隔条拖拽。
+  - **形态**：钉住模式（用户确认）——下拉与侧栏并存；下拉头部新增静态「固定到右侧」钉住条（`#outlineBar`，不被 `render()` 清掉），点它把大纲从下拉钉成常驻右栏（`#outlineSidebar`，`#messages` 的 flex 兄弟、定宽）。`mode`（popup/sidebar）与 `width`（180px~50%）走 `NS.boot.persistUi`（vscode.setState）持久化，重载恢复。
+  - **内容**：`anchors()` 从「只收 user」扩到「user+assistant」（用户确认），每项 = 类型图标（`NS.icons` 新增 `icon` 导出）+ 时间 + 摘要（80 字截断）+ 原生 title 全文（hover 看更多）；`transcriptView` 新增 `messageAnchorCount()`（user+assistant，O(1) 驱动 ☰ 显隐）。
+  - **交互差异**：侧栏是常驻导航——跳转后不关；下拉维持「跳完收起」；点击外部只关下拉、不关侧栏；`close()`（会话切换语义）在侧栏模式下 no-op，避免 boot 的 close 把刚恢复的侧栏关掉。
+  - **调宽**：`#outlineResize` pointer 事件拖拽，`width = clamp(start - dx, 180, area*0.5)`（拖左变宽、拖右变窄），`pointerup` 时持久化并 `NS.rail.reflow()`（`#messages` 变窄会改折行 → 左 rail 圆点要重对齐）。
+  - **测试**：`chat-client.test.ts` 加载 `outlineClient`（桩 DOM 补 `classList.toggle`），新增 2 条大纲逻辑用例。
+- **验证方式**：`check-registry` / `lint` / `compile` 全绿；`chat-client.test.js` 10 passing（新增 2 条：锚点只收 user+assistant 且每项带图标/时间/摘要/jump-id/title、摘要截 80 字带省略号）。**待用户 F5 复验**：☰ 在右；下拉带图标；pin 出侧栏可拖宽；点击跳转不关侧栏；hover 有全文；重载恢复宽度与形态。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-26 - CUSTOM-20260926-069
+- **功能**：记录区底部留白 4px → 24px（滚到底时不再像"还有内容没拉出来"）
+- **改动文件**：`src/ui/chat/html/styles.ts`、`CUSTOMIZATIONS/*`
+- **来源**：用户 F5 复验反馈（图3）：「最后一个对话底部多留一些间隔，现在总会误以为没拉到底部」
+- **详细说明**：`.messages` 的 `padding-bottom` 原为 4px，而输入区 `.composer` 紧贴在它下面且带一条上边框——最后一条记录几乎贴着那条线，看起来像被截断。留白本身就是"到头了"的信号，所以这是一行 CSS 的事；没有动 `scroll.follow()`（它的贴底判据用 `scrollHeight`，padding 已经算在内）。
+- **验证方式**：`tsc` / `lint` / `compile` / `check-webview-client` / `check-registry` 全绿，`npm test` 56 passing。**待用户 F5 复验**：滚到底时最后一条与输入框之间有约 24px 留白，"回到最新"按钮位置不变。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-26 - CUSTOM-20260926-070
+- **功能**：左侧引导线的圆点在**任何布局变化**后重新对齐（展开折叠块、展开工具卡、图片加载完）
+- **改动文件**：`src/ui/chat/html/client/rail.ts`、`src/ui/chat/html/client/transcriptView.ts`、`CUSTOMIZATIONS/*`
+- **来源**：用户 F5 复验反馈（图5）：「如果有内容块触发了 unfold，左侧引导线的圆点没有重对齐」
+- **根因**：圆点的 `top` 只在 `rail.measure()` 里算，而它只由三个时机触发——标记集变化（`invalidate`）、window resize、markdown 回填（`reflow`）。`<details>` 展开、工具卡正文展开（`links.toggleBody` 改的是 `hidden` 属性，**没有任何事件**）、图片加载完成都不在其中 ⇒ 条目高度变了而圆点留在旧位置。
+- **详细说明**：
+  - **不枚举触发事件，而是观察布局本身**：`rail.ts` 内一个 `ResizeObserver` 观察**每条记录节点**，回调 → `reflow()`（只测量不重建）。理由与 pitfalls #24/#25 同源——手写的事件清单会静默落后（这次就是）。**不做 `toggle` 兜底**：它只覆盖 `<details>`，工具卡那条根本没有事件，属于"半个修复且没有信号"。Chromium 的 webview 恒有 ResizeObserver，缺失时经日志桥 `console.warn` 一次。
+  - **回调跳过 streaming 的记录**：流式正文每个 chunk 都会让节点变大，全量测量会毁掉本模块的设计前提（"流式期间零布局读取"，见 rail.ts 文件头）。streaming 条目的**首行**不可能移动，圆点本来就是对的。
+  - **挂载点**：`transcriptView` 里"把节点放进 `#messages`"与"替换节点"的**全部 6 处**（hydrate / append、append 的壳→卡重建、patch 的 plan / content、updateTool），外加本轮的折叠换子。漏一处 = 那条记录的圆点从此不再动，且完全静默。`reset()` 调 `resetNodes()`（ResizeObserver **强引用**被观察元素，不 disconnect 会随会话切换一直留着废弃节点）。
+  - `measure()` 增加守卫：容器高度为 0（后台编辑器组 / 未 reveal 的 webview）直接返回并保留 `needMeasure`，否则所有点被钉到 `top: 0` 且被当成真相。
+- **验证方式**：`check-webview-client`（15 个模块拼接后可解析）/ `tsc` / `lint` / `compile` / `check-registry` 全绿，`npm test` 56 passing。**交互无法自动测**（布局类问题的分界线见 `dev-workflow.md`）。**待用户 F5 复验**：展开/收起任意 thought、折叠的用户消息、工具卡、diff 后，左侧圆点立刻与首行重新对齐。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-26 - CUSTOM-20260926-071
+- **功能**：用户消息的折叠判据改为**实测渲染行数**（长句子折行也折叠；一行放得下就不折叠）
+- **改动文件**：`src/ui/chat/html/client/transcriptView.ts`、`src/ui/chat/html/client/rail.ts`、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/*`
+- **来源**：用户 F5 复验反馈（图4 + 文字）：「多行的对话还是没有显示 fold 按钮」——064 已经把判据扩到"有换行 **或** 长度 > 160"，但用户依然看不到折叠。
+- **根因**：阈值与换行一样是**代理信号**（pitfalls #25 的第二次复发）。判据问的是"文本像不像多行"，而用户看的是"屏幕上占了几行"：窄侧边栏里一条 100 字、不含任何换行的消息会折成三行，却因为没到 160 字而不折叠。
+- **详细说明**：
+  - **换成直接信号**：先把真正会渲染的结构建出来（`<details class="user-fold">` + caret + 图标——它们占横向空间，宽度必须是对的），插入 DOM 后用 `Range.getClientRects()` **只框住文本节点**数行盒（`height > 0` 的矩形个数；行长边界的零高矩形要滤掉），多于一行才保留折叠、只有一行就**退回普通气泡**。
+  - **切分点**：在"一行以内"的前缀上二分 → 回退到最近空格 → 不切断代理对；文本里 `\n` 之后还有可见内容时**优先按 `\n` 切**（那是精确答案，测量改善不了）。切在 `\n` 上时**那个换行符被丢弃**：summary 与 body 的块边界本身已经渲染成一次换行，留着会多出一整行空行（064 的实现一直有这个小缺陷）。
+  - **量不出来时**（隐藏面板的 0 高矩形 / 无 `createRange` / 超 2000 字）回退旧判据，并给节点打 `data-fold="heuristic"`；等它第一次拿到真实尺寸（正是 070 那个 ResizeObserver 报的事件）**只重判一次**，两个方向都要能改（折→不折、不折→折）。
+  - `hydrate()` 里在**整个快照落地之后**统一结算一次（循环内逐条结算会边追加边强制布局）。
+- **验证方式**：`npm test` **56 passing**（`chat-client.test.ts` 新增/改写 4 条：只折行无换行的消息折叠、一行放得下的长文本不折叠、回退档 + 重判能把折叠改回去、多行折叠不再重复原文）。桩 DOM 补了一个**确定性 Range 模型**（每 N 字一行、可调），因此被测的是我们的逻辑而不是浏览器的换行算法。**待用户 F5 复验**：窄侧边栏里 100 字以内的无换行消息出现 ▸；展开后原文不重复、不多出换行；宽编辑区面板里同一条若一行放得下则**不**出现 ▸。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-26 - CUSTOM-20260926-072
+- **功能**：思考块按 markdown 渲染；顺带修好 GFM 任务列表的勾选态
+- **改动文件**：`src/ui/chat/markdown.ts`、`src/ui/chat/transcript/types.ts`、`src/ui/chat/transcript/TranscriptStore.ts`、`src/ui/chat/html/client/transcriptView.ts`、`src/ui/chat/html/styles.ts`、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/*`
+- **来源**：用户 F5 复验反馈（图1，放大后可见**字面反引号**与**字面 `- ` 列表符**）：「输出按 markdown 显示还是有些没有支持」
+- **根因**：`buildThought` 用 `NS.dom.el('div','thought-body', entry.text)` 写**纯文本**，思考块从未走 markdown 往返（`markPending` 当时只认 `assistant`）。夹具里 `agent_thought_chunk` 有 492 条、比正文的 422 条还多，所以这是最显眼的一处。
+- **详细说明**：
+  - **复用助手气泡那条往返**（宿主 `SafeMarkdown` → 客户端 `sanitize`），不写第二个更弱的渲染器。
+  - `ThoughtEntry` 加 `html`；`TranscriptStore.patch` 的 thought 分支补 `html`（**不加就是静默丢弃**：宿主自己的补丁落不了库，切会话又变回纯文本）；`appendThoughtChunk` 的**合并分支要清 `html`**（助手分支一直有，思考分支没有 ⇒ 之后每个 chunk 都会带上过期前缀的 html）。
+  - **流式期间不渲染 markdown**：只从定稿的 revise 排 pending（否则会把某个前缀的 html 冻在还在长的正文上）。`patch` 的 thought 分支与助手共用新的 `trackMarkdown`：html 到了就不再请求；**定稿时若没有 html 就重新排 pending**（finalize 的 revise 不带 html 键，只判断 `changes.html` 会永远不排）——这正是"定稿瞬间 markdown 反被原文覆盖"的两个方向。
+  - 加载态（hydrate）也覆盖：`buildThought` 直接按 `entry.html` 决定渲染方式，否则从快照恢复的思考块会永远停在纯文本。
+  - `styles.ts`：markdown 规则作用域从 `.bubble` 扩到 `.bubble, .md` 共享（各写一套 = 同一份知识存两份）；`.thought-body.md` 回到 `white-space: normal`（pre-wrap 会把 marked 的换行再加一倍）；正文保持斜体（推理的视觉身份），但 `pre`/`code`/`table` 内重置为非斜体。
+  - **任务列表**：`marked` 默认输出 `<input type="checkbox" disabled>`，而客户端白名单没有 INPUT ⇒ 被 unwrap，`- [x] 做完了` 与未完成长得一模一样。改成覆盖渲染器的 `checkbox` 钩子输出字形 span（**不**把表单控件加进白名单；覆盖 `checkbox` 而不是 `listitem`，是为了不重写 marked 自己那套紧/松列表的插入位置）。
+- **验证方式**：`npm test` **56 passing**（新增 2 条：流式期间不渲染 + 定稿后 `.thought-body` 变 md；后续 revise 不得把 markdown 换回原文）。**待用户 F5 复验**：思考块里的 ``` 围栏与 `- ` 列表按 markdown 显示（有代码块样式与 Copy 按钮）；流式输出期间仍是纯文本、定稿后变形；`- [x]` 有勾选字形。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-26 - CUSTOM-20260926-073
+- **功能**：切换模型/模式/配置项后，记录区留一条分隔式提示（"Switched to deepseek-v4-pro[1M]"）
+- **改动文件**：**新增** `src/ui/chat/sessionChoices.ts`、`src/ui/chat/ChatPanelHost.ts`、`src/ui/chat/transcript/types.ts`、`src/ui/chat/html/styles.ts`、`src/test/chat-panel.test.ts`、`CUSTOMIZATIONS/*`
+- **来源**：用户 F5 复验反馈（图2 是 Claude 官方插件的同款提示）：「切换大模型后也会有一个内容输出，请加上支持」
+- **详细说明**：
+  - 三个入口（`setModel` / `setMode` / `setConfigOption`）此前只 `pushMeta()`，transcript 里不留任何痕迹。
+  - **纯函数放 `sessionChoices.ts`**（取快照 / 按载荷打补丁 / 算差异 → 人类可读的一句话），宿主只做缓存与发帖。抽出来的理由是可测：真正的分支判断（谁先到、同一次切换被上报两次怎么办、级联变更怎么表述）在编排器里没法单测。
+  - **去重靠"缓存由我们独占"**：同一次切换有两条上报路径——我们自己的 setter，和 agent 的 `config_option_update` / `current_mode_update`。先到的那条算出差异并提示，后到的那条与我们刚写入的快照一比就是空的。**通知路径用载荷**而不是 `SessionManager` 的状态：两个监听器的先后顺序不保证，读状态可能拿到改前或改后。
+  - **首次见到某会话只做基线**（在 `onSessionUpdate` 顶部播种），所以打开会话不会打印"切到它本来就有的模型"。
+  - 表述：model → `Switched to <名字>`（与官方同款）；mode → `Switched to <名字> mode`（无论来自 `session.modes` 还是 category='mode' 的配置项，读者不该看出差别）；其它配置项 → `<选项名>: <值名>`（只说 "Switched to High" 是个谜语）。同一次响应里的级联变更合成**一条**（分隔符 ` · `），并把 model/mode 排在前面。
+  - 渲染：`NoticeEntry['level']` 增加 `'switch'`（**表现形式，不是严重级别**），CSS 用左右虚线做成分隔式一行。协议不变。
+- **验证方式**：`npm test` **56 passing**（`chat-panel.test.ts` 新增 7 条：模型 / 模式两条通道 / 其它配置项 / 级联顺序 / **同一次切换第二次上报必须静默** / 载荷打补丁不丢其它状态 / 空状态不崩）。**待用户 F5 复验**：切换模型或模式后出现居中分隔式提示；再切一次不出现重复的两条；`session/load` 重开会话时不出现"切到当前模型"的噪声。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-26 - CUSTOM-20260926-074
+- **功能**：工具卡头部显示 agent 自己报的工具名（Bash / Read / Edit …）
+- **改动文件**：`src/ui/chat/content/toolCalls.ts`、`src/ui/chat/html/client/toolCallView.ts`、`src/ui/chat/html/styles.ts`、`CUSTOMIZATIONS/*`
+- **来源**：用户在确认第 2 项范围时勾选的「工具卡显示真实工具名」
+- **详细说明**：ACP 的 `kind` 是粗粒度词表（Run / Read / Edit / Search），两张 "Run" 卡只能靠标题区分。夹具里 **12/12 个**工具调用都带 `_meta.claudeCode.toolName`，所以从 `inv.meta` 取出来作为 `.tool-name` chip 与 kind 标签**并列**（不替换：kind 是任何 agent 都能给的那一层）。`_meta` 按定义是厂商私有的，只认这一种已知形状、其余一律静默——猜第二个厂商的键正是 §5.6 警告的"把推断当事实"。chip 必须可加、可删、可改：`update` 路径也要调（占位卡靠 update 才拿到真实视图模型，这是 027/040 反复踩过的那条路）。
+- **验证方式**：`check-webview-client` / `tsc` / `lint` / `compile` / `check-registry` 全绿，`npm test` 56 passing。**待用户 F5 复验**：工具卡头部出现 Bash / Read 等真实工具名，泛化的 RUN / READ 标签同时保留。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-26 - CUSTOM-20260926-075
+- **功能**：会话被重命名时留一条轻提示；思考块里的非文本内容不再被丢弃
+- **改动文件**：`src/ui/chat/ChatPanelHost.ts`、`CUSTOMIZATIONS/*`
+- **来源**：用户在确认第 2 项范围时勾选的另外两项（内容块审计的结论）
+- **详细说明**：
+  - **改名提示**：`session_info_update` 此前只更新标签栏与会话历史。现在缓存"上一次的标题"（**宿主独占**，因为 `SessionManager` 可能已经先应用了新标题，它的状态答不出"旧标题是什么"），且**只提示真正的改名**——一条会话的第一次 `session_info_update` 通常是自动生成的标题，为它打印一行等于给每个新会话都加噪声。
+  - **思考块内非文本内容**：`agent_thought_chunk` 带的图片/资源此前直接 `return` 丢掉。现在复用 `postContentNotice` 变成 content 记录，**但先 `finalizeEntries(only:'thought')`**：记录只并入"最后一条"，不关掉旧思考块的话它会永远停在 `Thinking…`（后续 thought chunk 会另起一条）。
+  - 审计结论里**刻意没做**的：`available_commands_update`（斜杠菜单已经消费它，再提示是噪声）、`usage_update` 的成本数字（令牌条里已有）、用户消息里的非文本内容（replay 路径上没出现过）。
+- **验证方式**：`tsc` / `lint` / `compile` / `check-webview-client` / `check-registry` 全绿，`npm test` 56 passing。**待用户 F5 复验**：让 agent 改一次会话标题（或从树里重命名）后出现一条轻提示，而新会话的自动标题**不**产生提示。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-26 - CUSTOM-20260925-068
+- **功能**：**客户端逻辑的常驻测试**（桩 DOM）——`src/test/chat-client.test.ts`
+- **改动文件**：**新增** `src/test/chat-client.test.ts`、`CUSTOMIZATIONS/*`
+- **来源**：本轮排查 064 时，读代码怎么看都对，最后是**用一个临时桩 DOM 把客户端那段逻辑真跑了一遍**才定性。
+  那个探测当场抓到了 bug ⇒ 说明客户端**逻辑**层一直在自动测试的覆盖范围之外，而这层恰恰是 bug 高发区。
+- **详细说明**：
+  - **只加载被测链路的模块**：`dom`（工具）→ `icons`（图标，用于断言挂载顺序）→ `links`（装饰）→
+    `toolCallView` → `transcriptView`；其余协作者（scroll / outline / rail / boot / bridge）给**最小替身**。
+    **刻意不加载 boot**：它的 `init()` 会去接十几个 `body.ts` 提供的元素，为了让它跑起来就得把桩扩张成一个
+    假 DOM——那只会得到一堆与产品无关的桩代码。**边界画在被测链路上**。
+  - 覆盖四条**只有逻辑、不涉布局**的断言：①单行用户消息不给折叠；②多行折叠且 summary+body 能**原样重建**
+    原文（防重复显示）；③**长单行也给折叠**（064 的修复——"看起来多行"≠"有换行"）；
+    ④**INV-J**：折叠三角排在类型图标**之后**，且收束那次 summary 重写后**图标与三角都还在**。
+  - **它能测什么 / 不能测什么**写进了文件头：能测结构、顺序、类名、内容切分（**逻辑**）；
+    **不能测**布局、尺寸、换行位置、颜色、焦点（需要真 Chromium——用 jsdom 之类的近似实现去测布局
+    只会给出**假信心**，这条界线与 `dev-workflow.md` 的分区表一致）。
+  - 桩是**外部 API 的测试替身**（同文件里早就有个假 Memento），不是我们自己知识的第二份拷贝——
+    后者才是 pitfalls #19 说的漂移来源。
+- **过程记录（几处都是"测试自身的假设错了"，值得记）**：①最初按"容器的第一个元素子节点"取记录，
+  而 065 之后 `place()` 会把 `.rec-time` 插到最前 ⇒ **第一例是假通过**；改为按 `[data-kind]` 标记定位。
+  ②用户记录是**包着 details 的 div**，而 Thought 记录**本身就是 details** ⇒ 只认一种形态会让两条用例都误判"无折叠"。
+  两次都是"测试错了、产品没错"，而这**正是桩 DOM 的代价**：它的假设也要被检验。
+- **验证方式**：`npm test` **45 passing**（本文件 4 条）；`lint` / `tsc` / `compile` / `check-registry` 均通过。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-26 - CUSTOM-20260925-067
+- **功能**：**自己的右键菜单**，取代 Chromium 的原生菜单（去掉无意义的 Cut/Paste，让 Copy 真的能用）
+- **改动文件**：**新增** `src/ui/chat/html/client/contextMenu.ts`、`src/ui/chat/html/body.ts`、`src/ui/chat/html/client/index.ts`、`src/ui/chat/html/client/boot.ts`、`src/ui/chat/html/styles.ts`、`CUSTOMIZATIONS/*`
+- **来源**：用户反馈「右键菜单 Copy 点了没效果，另外 Cut 和 Paste 在这里应该不需要」
+- **根因（用户观察是对的，而且原因比"坏了"更具体）**：webview 里弹的是 **Chromium 的原生菜单**，
+  它的 `Copy` 复制的是**选区**——右键时通常并没有选中任何文本，所以它看起来可用、实际什么都不做；
+  而 `Cut`/`Paste` 只对可编辑内容有意义，这个面板除了输入框全是只读的。
+- **详细说明**：
+  - `contextmenu` 上 `preventDefault()` **整体接管**（留着原生菜单会得到两个菜单），按上下文给项：
+    `Copy`（选区）/ `Copy message`（整条记录）/ `Copy code`（代码块）/ `Select all`。
+  - **没有 Cut/Paste**；`Copy` 在没有选区时是**禁用**的——**这正是重点**：一个禁用项比一个"点了没反应"的项
+    诚实得多（本次故障的全部体感就是"点了没反应"）。
+  - 复制一律走扩展侧的 `copy` 通道（与代码块的 Copy 按钮同一条路）：webview 里的 `navigator.clipboard`
+    依赖文档焦点，不可靠。
+  - 输入框里**不接管**右键（那里系统的 Cut/Paste 是对的）。
+  - 关闭：任意点击 / Esc / 滚动 / resize / 失焦；位置按光标算并**贴边翻转**，不越出视口。
+  - 菜单项是真 `<button>`（047 的规矩），打开时焦点落到第一个可用项 ⇒ 键盘可达。
+- **验证方式**：`check-webview-client.mjs`（15 个客户端模块）/ `tsc` / `lint` / `compile` /
+  `check-registry.mjs` 全绿；`npm test` 45 passing。**交互无法自动测**（分界线见 `dev-workflow.md`）。
+  **待用户 F5 复验**：右键对话区 → 只有四项且无 Cut/Paste；选中文字后 `Copy` 可用并真的复制到；
+  没选中时它是灰的；`Copy message` 复制整条；`Select all` 后可直接 Ctrl+C；输入框里右键仍弹系统菜单。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-26 - CUSTOM-20260925-066
+- **功能**：**工具输出按 markdown 显示**（此前是纯文本，字面的 ``` 围栏直接显示出来）
+- **改动文件**：`src/ui/chat/html/client/toolCallView.ts`、`src/ui/chat/html/client/transcriptView.ts`、`src/ui/chat/html/client/boot.ts`、`src/ui/chat/protocol.ts`、`src/ui/chat/ChatPanelHost.ts`、`CUSTOMIZATIONS/*`
+- **来源**：用户问「Run 执行命令里的信息是 markdown 格式的文本？需要按 markdown 显示」
+- **证据（不是推测）**：抓包夹具里 **12 处工具结果文本块带 ``` 围栏**（例如 ` ```console\ntotal 36099\n… `）
+  ——Claude Code 的 Bash 结果**本身就是 markdown 包装的**，而我们按纯文本渲染，于是围栏变成了字面字符，
+  也拿不到代码块的样式与 Copy 按钮。
+- **详细说明**：
+  - **复用助手气泡那条 markdown 往返**，而不是在本端写第二个更弱的渲染器：文本仍由宿主侧 `SafeMarkdown`
+    渲染、客户端 `sanitize` 再兜一层，两边**同一套策略**。
+  - 工具内容项此前没有身份，无法与 HTML 对应 ⇒ 给它一个稳定 key：`entryId + '#' + 项下标`（下标在同一调用内稳定）。
+  - 协议：`renderMarkdown` 的 item 与 `markdownRendered` 的 item 各加一个可选 `key`；
+    **带 key 的项宿主不做 `transcripts.patch`**（它不是记录，没有可打补丁的对象），HTML 原样回给请求它的元素。
+  - 客户端两份缓存（`mdCache` / `mdPending`），**按会话清空**（`transcriptView.reset()` 里调 `resetMarkdown()`）：
+    工具 body 在 `bodySignature` 变化时会整块重建，缓存是让已渲染的 HTML 挺过重建的关键。
+  - **顺手收敛了一处重复**：`post` / `postNow` / `send` 三个签名里各写了一遍 `markdownRendered` 的内联类型，
+    加一个字段就要改三处（漏一处就是静默不匹配）⇒ 统一改用 `protocol.ts` 的 `MarkdownRendered`。
+  - **防御**：拿不到 entryId 时（没有唯一 key）**回落到纯文本**——key 撞车会把一条记录的 HTML 喂给另一条。
+- **验证方式**：`check-webview-client.mjs` / `tsc` / `lint` / `compile` / `check-registry.mjs` 全绿；
+  `npm test` 45 passing。**待用户 F5 复验**：工具卡里的命令输出应显示为**代码块**（有语言标签与 Copy 按钮），
+  不再出现字面的 ```；diff 与 terminal chip 行为不变。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-26 - CUSTOM-20260925-065
+- **功能**：**时间信息**——hover 看完整时刻、工具卡显示耗时、头部「Times」开关显示每条 HH:MM
+- **改动文件**：`src/ui/chat/content/toolCalls.ts`、`src/ui/chat/html/client/dom.ts`、`src/ui/chat/html/client/transcriptView.ts`、`src/ui/chat/html/client/toolCallView.ts`、`src/ui/chat/html/client/boot.ts`、`src/ui/chat/html/body.ts`、`src/ui/chat/html/styles.ts`、`CUSTOMIZATIONS/*`
+- **来源**：用户问「每条记录有执行的时间信息吗，想把时间信息显示出来，有什么好的方案」
+- **事实（先回答这个）**：**每条记录都已经带 `at` 时间戳**（`TranscriptStore` 在 append 时打的），只是从来没显示过；
+  Thought 显示的 `Thought for Ns` 是**耗时**不是时刻；工具**早已有** `startedAt`/`endedAt`，只是没下发到视图模型。
+- **详细说明（三个层次，按"噪声从低到高"）**：
+  - **hover**：每条记录设 `title` 为完整时刻（HH:MM:SS）——零成本、零噪声，任何时候都能查。
+  - **工具耗时**：`ToolCallView` 新增 `elapsedMs`（宿主侧用 `endedAt - startedAt` 算，**不下发两个时间戳**——
+    已完成的时长不需要客户端时钟；仍在跑的不显示：`status` 的脉动就已经说明"进行中"，实时计时器意味着每帧重渲染）。
+    卡头显示 `1.2s` / `420ms` / `2m 5s`，与 `Thought for Ns` 是**同一类信息**，所以常显、不设开关。
+  - **头部「Times」开关**：打开后每条记录前显示 HH:MM。`.rec-time` 元素**始终在 DOM 里**，可见性由
+    `#messages` 上的一个类决定（与「Sub-agents」开关同一套机制）⇒ **切换开关不需要重渲染任何东西**，
+    且状态经 `persistUi` 持久化。
+  - 时长的格式化放进 `NS.dom.duration`（最底层模块）：`toolCallView` 与记录层都要用它，而模块加载顺序
+    **只允许依赖指向前方**——放在 `transcriptView` 里 `toolCallView` 用不到，抄第二份又会漂（pitfalls #19）。
+- **验证方式**：`check-webview-client.mjs`（15 个客户端模块）/ `tsc` / `lint` / `compile` /
+  `check-registry.mjs` 全绿；`npm test` 45 passing。**待用户 F5 复验**：hover 任意记录看到完整时刻；
+  工具卡头在跑完后出现时长；点「Times」后每条前面出现 HH:MM、再点关闭；重启面板后开关状态还在。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-26 - CUSTOM-20260925-064
+- **功能**：修「**多行用户消息也不折叠**」——折叠的触发判据只认逻辑换行，漏了「视觉折行」
+- **改动文件**：`src/ui/chat/html/client/transcriptView.ts`、`src/ui/chat/html/styles.ts`、`CUSTOMIZATIONS/*`
+- **来源**：用户 F5 复验 061 时的反馈（"我刚看到的是多行也没现实和折叠"）
+- **定位方式（值得记下来）**：读代码怎么看都对（多行确实会走 details 分支），于是写了个**桩 DOM** 把客户端那段逻辑
+  **真跑一遍**，三种输入一次就定性：单行短消息 → 不折（对）；**逻辑多行（有 `\n`）→ 折叠（对）**；
+  **长单行（视觉折行）→ 不折（错）**。
+- **根因**：`buildUserBubble` 用 `text.indexOf('\n')` 判断"是不是多行"。但"多行"有**两种**含义——
+  **逻辑换行**与**长句子视觉折行**，而后者**一个换行符都没有**。用户看到的长消息正是后者 ⇒ 不给折叠。
+- **详细说明**：
+  - 触发条件改成 `有逻辑换行` **或** `长度超过约 160 字`（后者是启发式：约一个面板宽；切分点本身是看不见的实现细节）。
+  - 切分点：优先取逻辑换行；否则取 160 字内**最后一个空格**（展开后从那里接下去，切到词中间会被看见）。
+  - **折叠态** summary 占**恰好一行**并省略号截断（`.user-fold:not([open]) > summary`）——**只在折叠态**：
+    展开时若还是 nowrap，第一段会被截成"半句话加省略号"，看起来像内容丢了。
+  - **展开态 body 是 inline**：切分点只是实现细节，用块级 body 会在半句话处凭空多一处换行。
+- **验证方式**：新增的 `src/test/chat-client.test.ts`（068）**四条用例**钉住它，其中一条正是
+  「长单行也给折叠」；`npm test` **45 passing**；`check-webview-client.mjs` / `tsc` / `lint` / `compile` /
+  `check-registry.mjs` 全绿。**待用户 F5 复验**：长消息（无换行）也出现折叠三角；折叠态是一行加省略号；
+  展开后文字**连续、无重复、无多余换行**；单行短消息仍然没有三角。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-25 - CUSTOM-20260925-063
+- **功能**：标签栏加「后台会话有新输出」提示——把 `.tab-dot.attention` 这条闲置 CSS 接上线
+- **改动文件**：`src/ui/chat/ChatPanelHost.ts`、`src/ui/chat/protocol.ts`、`src/ui/chat/html/client/tabs.ts`、`src/ui/chat/html/styles.ts`、`src/test/chat-panel.test.ts`、`CUSTOMIZATIONS/*`
+- **来源**：用户要求"总体盘一下"时发现 `.tab-dot.attention` 从未被任何 JS 使用（052 已登记为"设计预留"）。
+  用户此前决定**不做后台权限卡**，所以给了它一个**更轻**的用途。
+- **详细说明**：
+  - **状态放宿主**：只有宿主同时知道"哪个会话产生了输出"与"当前聚焦的是哪个"。
+    `ChatPanelHost` 新增 `unread: Set<sessionId>`；`toSummary()` 带上 `unread`。
+  - **只在一个咽喉点标记**：所有带记录的下行消息都经过 `post()`，所以在那里按
+    `type ∈ {append, revise, toolUpdate}` 且 `focused.sessionId !== sessionId` 打标。
+    **刻意不在每条 append 调用点各写一遍**——那迟早会漏掉一条路径（判据同 040 那次
+    "两条路径各写一遍 body 构建"的教训）。
+  - **签名必须跟着加**：`refreshSessions()` 的签名字符串现在含 `title|loading|running`，
+    加上 `unread` 才算完整。**漏加的表现是"标签永远不刷新"**（022 的签名去重是双刃剑）。
+    同时在**新标记产生**与**聚焦清除**两处各调一次 `refreshSessions()`：有些 append 路径
+    （notice / 终端输出）本来就不会自己刷新，靠别的调用点顺带刷是不可靠的。
+  - **优先级**：`loading` > `running` > `unread` > 普通。正在流式的标签本来就在脉动，
+    两个信号表示一件事只会更乱。
+  - **它只是提示**：不弹窗、不抢焦点——与"不做后台权限卡"的决定不冲突。
+  - 顺带把 `.tab-dot.attention` 上方那段"设计预留、从未接线、**看到它没生效别当 bug 修**"的
+    注释改成了真描述（它现在有接线了，旧注释会误导下一个人）。
+- **验证方式**：`npm test` **41 passing**（新增 2 条：后台会话的输出 → 其 summary 的 `unread` 为 true
+  且 **`sessionsChanged` 真的发出了带 unread 的载荷**（这条同时守住"签名漏加"那个坑）；
+  聚焦后为 false；聚焦会话自己的输出永远不为 true）。
+  **待用户 F5 复验**：开两个会话 → 在 A 里发消息 → 切到 B → A 的标签点变蓝（不脉动）；点回 A → 蓝点消失；
+  A 仍在流式时是脉动的 running 点而不是蓝点。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-25 - CUSTOM-20260925-062
+- **功能**：修三处可测性/语义缺陷——宽表格横向撑破气泡、"当前位置"与键盘焦点同色、引导条圆点难点中
+- **改动文件**：`src/ui/chat/html/client/links.ts`、`src/ui/chat/html/client/transcriptView.ts`、`src/ui/chat/html/styles.ts`、`CUSTOMIZATIONS/*`
+- **来源**：用户要求"总体盘一下"时的评审结果，三处都有代码证据（不是主观意见）
+- **详细说明**：
+  1. **宽 markdown 表格横向撑破气泡**：`.bubble pre` 有 `overflow-x: auto`，而 `.bubble table`
+     只有 `border-collapse` ⇒ 列多的表格把气泡（进而整个面板）撑宽，而不是在内部滚动。
+     修法**复用一个通道**：`links.ts` 的 `decorateCodeBlocks()` 旁边加 `decorateTables()`，
+     再由新的 `decorateScrollables()` 一次调用两者（**一个入口**，将来新增块类型不会只记得一处）。
+     `transcriptView` 的调用点跟着改；`.table-wrap { overflow-x: auto; max-width: 100% }`。
+     **为什么用包装元素而不是给 `.bubble` 加 `overflow-x`**：后者会改变气泡自身的溢出语义，
+     而包装元素让"两种可横向滚动的块"处理方式**一致**。
+  2. **引导条"当前位置"的环与键盘焦点环同色**：`.rail-dot.active` 用 `--vscode-focusBorder` 画外环，
+     而 047 刚把同一个变量定义成**键盘焦点**的语义（全局 `:focus-visible`）⇒ **一个颜色两种意思**，
+     用户分不清"我在哪"与"焦点在哪"。改为**不依赖颜色**的区分：`.rail-dot.active { transform: scale(1.4) }`
+     （`scale` 以中心为基准，所以不影响 061 的圆心对齐）。**刻意不用环**——环在这个面板里已经等于"焦点"。
+  3. **引导条圆点只有 7px，鼠标几乎点不中**：加一层透明的 `.rail-dot::after { inset: -5px }`，
+     命中区约 17px 而**外观完全不变**（伪元素不参与布局）。
+- **验证方式**：`check-registry.mjs` 六节全绿；`check-webview-client.mjs` / `tsc` / `lint` / `compile`
+  均通过；`npm test` 41 passing（本轮改动集中在 CSS/DOM，**不在自动测试覆盖范围内**）。
+  **待用户 F5 复验**：宽表格在气泡内部横向滚动 / 当前圆点"变大"而不是出现焦点色环且键盘焦点环仍可辨 /
+  小圆点明显更容易点中。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-25 - CUSTOM-20260925-061
+- **功能**：对话区三处——引导条圆点对齐、Thought 折叠三角位置、**用户消息支持折叠**
+- **改动文件**：`src/ui/chat/html/client/rail.ts`、`src/ui/chat/html/client/transcriptView.ts`、`src/ui/chat/html/styles.ts`、`CUSTOMIZATIONS/*`
+- **来源**：用户 F5 复验时的三条反馈（截图：圆点比区块偏上；三角在图标左侧；用户消息不能折叠）
+- **详细说明**：
+  1. **圆点对齐：把魔法偏移换成"按构造对齐"**。`rail.measure()` 原本是 `dot.style.top = (y + 6)`，
+     而 CSS 用 `margin-top: -半高` 抵消尺寸 ⇒ `top` 就是**圆心**，于是圆心被钉死在"条目顶边 + 6px"。
+     但各条目首行中心并不在那儿（工具卡 3px 内边距 ≈ 12px、用户气泡 6px ≈ 15px），**统一偏上 6–9px**。
+     修法：锚到条目里的**类型图标**——`icons.attach()` 本来就把它放在该条目的首行上，
+     所以它的几何中心**就是**要对的中心，不需要任何常量。`points[]` 里 `y`（条目顶边，供 `syncActive`
+     的二分查找用）与 `centre`（圆心）分开存；`rail-line` 的两端改用 `centre`，于是竖线恰好落在首末圆点上。
+  2. **Thought 三角移到图标右侧**：三角是 `summary::before`，而**伪元素永远画在内容之前**，
+     图标（prepend 到 summary）排它后面 ⇒ 顺序成了「▸ 图标 标签」。改成**真元素** `.fold-caret`：
+     buildThought 先建三角、图标再 prepend ⇒ 天然是「图标 ▸ 标签」。三角是空的，字形与方向仍由 CSS
+     依 `details[open]` 驱动，**切换不需要 JS**。
+     **同时改了 `patch()` 里那次 summary 重写**：它原本只保留 `.rec-icon`，会把新三角一起清掉；
+     改成**保留所有元素子节点、只丢弃文本与 `.thought-spin`**——"保留元素"不会像名字清单那样漏掉新挂件。
+  3. **用户消息折叠（与 Thought 同一形态）**：多行用户消息包成 `<details class="user-fold" open>`，
+     **首行在 summary、其余行在 body**——刻意**不**把全文再放一遍（否则展开时文字重复两遍）。
+     单行消息**不出现三角**：没有可折的东西，凭空多个三角只是噪声。
+     **默认展开**：刚发出的消息不该默认藏起来（Thought 那次自动收起是因为推理是辅助信息，消息不是）。
+     气泡观感挂在 details 上（背景/内边距/圆角），summary 抹平自身的背景与内边距 ⇒ 展开时仍是**一个连续气泡**。
+- **验证方式**：`check-registry.mjs` 六节全绿；`check-webview-client.mjs`（14 个客户端模块）/ `tsc` /
+  `lint` / `compile` 均通过；`npm test` 41 passing（本项改动全在客户端，**布局与交互无法自动测**）。
+  **待用户 F5 复验**：逐个核对工具卡/Thought/用户气泡的圆点是否落在**首行图标中心**上、竖线两端是否恰好在首末圆点；
+  Thought 收束那次重写后三角不丢；多行消息可折叠且首行不重复、单行消息无三角；折叠态默认展开。
+- **基于上游版本**：0.2.0（commit e7371659）
+
 ### 2026-09-25 - CUSTOM-20260925-060
 - **功能**：再次拆分模块文档（方案 A）；并合并 changelog / pitfalls 里"同一个问题分多次修"的记录
 - **改动文件**：`CUSTOMIZATIONS/docs/arch/chat-panel.md`（488 → 385 行）、**新增** `CUSTOMIZATIONS/docs/arch/chat-panel-sessions.md`、`CUSTOMIZATIONS/docs/changelog.md`（1161 → 990 行，59 → 42 条）、`CUSTOMIZATIONS/docs/pitfalls.md`（694 → 667 行）、`CUSTOMIZATIONS/architecture.md`、`CUSTOMIZATIONS/registry.md`

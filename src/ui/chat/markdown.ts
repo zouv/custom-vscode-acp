@@ -52,6 +52,22 @@ const renderer: RendererObject = {
     return `<code>${escapeHtml(text)}</code>`;
   },
 
+  // [CUSTOM-20260926-072] GFM task-list marker.
+  //
+  // marked's default emits `<input type="checkbox" disabled>`; the webview
+  // allowlist (html/client/dom.ts) has no INPUT, so the sanitizer UNWRAPPED it —
+  // "- [x] shipped" rendered with no mark at all, and done/not-done became visually
+  // identical. Rendering the state as a glyph fixes it without widening the
+  // allowlist to form controls (an input in agent-authored HTML is exactly the kind
+  // of thing that allowlist exists to keep out).
+  //
+  // Overriding `checkbox` rather than `listitem` is deliberate: the default
+  // listitem already knows how to splice the marker in for both tight and loose
+  // lists, and reproducing that placement by hand is how the two drift apart.
+  checkbox({ checked }: Tokens.Checkbox) {
+    return `<span class="task-box">${checked ? '☑' : '☐'}</span>`;
+  },
+
   link(this: { parser: { parseInline(tokens: unknown): string } }, { href, title, tokens }: Tokens.Link) {
     const label = this.parser.parseInline(tokens);
     const raw = String(href ?? '');

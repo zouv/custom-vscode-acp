@@ -18,6 +18,7 @@ import { directoryMenuClient } from './directoryMenu';
 import { railClient } from './rail';
 import { tabsClient } from './tabs';
 import { composerClient } from './composer';
+import { contextMenuClient } from './contextMenu';
 import { bootClient } from './boot';
 
 const MODULES: ReadonlyArray<string> = [
@@ -40,6 +41,8 @@ const MODULES: ReadonlyArray<string> = [
   railClient,
   tabsClient,
   composerClient,
+  // [CUSTOM-20260925-067] Takes the context menu over from Chromium's native one.
+  contextMenuClient,
   bootClient,
 ];
 

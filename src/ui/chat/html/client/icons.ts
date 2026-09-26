@@ -147,7 +147,10 @@ export const iconsClient = `
   NS.icons = {
     attach: attach,
     toolIcon: toolIcon,
-    historyIcon: historyIcon
+    historyIcon: historyIcon,
+    // [CUSTOM-20260926-076] 大纲侧栏要按 kind 独立取图标（不再挂到记录气泡里），
+    // 把私有的 iconEl 暴露出来。参数与 attach 里的一致：kind + 包装 class。
+    icon: iconEl
   };
 })(window.__acpc = window.__acpc || {});
 `;
