@@ -29,8 +29,21 @@ export interface ToolCallView {
   status: ToolCallStatus;
   /** Command line, when the raw input carries one (`execute` tools). */
   command: string | null;
+  // [CUSTOM-20260926-074] The agent's OWN name for the tool ("Bash" / "Read" /
+  // "Edit"), when it publishes one in `_meta`. `kind` is ACP's coarse vocabulary
+  // ("Run" / "Read"), so this is what tells two "Run" cards apart at a glance.
+  toolName?: string;
   locations: ToolLocationView[];
   items: ToolContentItem[];
+  /**
+   * [CUSTOM-20260925-065] How long the call took, when it has finished.
+   *
+   * Computed HERE rather than shipping both timestamps: a finished duration needs
+   * no clock on the client. A call that is still running reports nothing — a live
+   * counter would mean a ticking re-render, and the pulsing status glyph already
+   * says "in progress".
+   */
+  elapsedMs?: number;
   /** Nesting parent, when a NestingStrategy inferred one (Phase 4). */
   parentId?: string;
   inferredParent?: boolean;
@@ -54,11 +67,32 @@ export function toToolCallView(inv: ToolInvocation): ToolCallView {
     })),
     items: toToolContentItems(inv.content),
   };
+  if (inv.endedAt !== undefined) { view.elapsedMs = Math.max(0, inv.endedAt - inv.startedAt); }
+  const toolName = extractToolName(inv.meta);
+  if (toolName) { view.toolName = toolName; }
   if (inv.parentId) {
     view.parentId = inv.parentId;
     view.inferredParent = inv.inferredParent;
   }
   return view;
+}
+
+/**
+ * [CUSTOM-20260926-074] The agent's own tool name out of `_meta`, if it published
+ * one.
+ *
+ * `_meta` is vendor-specific by definition (ACP types it `unknown`), so this reads
+ * exactly one known shape and stays silent for anything else — guessing at a
+ * second vendor's key would be the "inferred, not reported" mistake that §5.6 of
+ * chat-panel.md warns about. Every tool call in the captured Claude Code replay
+ * carries `_meta.claudeCode.toolName`.
+ */
+function extractToolName(meta: unknown): string | undefined {
+  if (!meta || typeof meta !== 'object') { return undefined; }
+  const claudeCode = (meta as { claudeCode?: unknown }).claudeCode;
+  if (!claudeCode || typeof claudeCode !== 'object') { return undefined; }
+  const name = (claudeCode as { toolName?: unknown }).toolName;
+  return typeof name === 'string' && name.length > 0 ? name : undefined;
 }
 
 function toToolContentItems(content: unknown[]): ToolContentItem[] {

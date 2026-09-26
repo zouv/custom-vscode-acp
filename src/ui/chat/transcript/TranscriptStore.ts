@@ -236,6 +236,11 @@ export class TranscriptStore {
     if (!merges && isBlankText(text)) { return null; }
     if (merges) {
       last.text = clampText(last.text + text);
+      // [CUSTOM-20260926-072] Drop any rendered markdown with the text it was
+      // rendered FROM. The assistant branch has always done this; without it here,
+      // every subsequent chunk shipped the html of an older prefix (the append
+      // message serializes the live entry), so the body froze or oscillated.
+      last.html = undefined;
       t.touched = ++this.clock;
       return last;
     }
@@ -287,6 +292,11 @@ export class TranscriptStore {
       if (patch.streaming !== undefined) { entry.streaming = patch.streaming; }
     } else if (entry.kind === 'thought') {
       if (patch.text !== undefined) { entry.text = clampText(patch.text); }
+      // [CUSTOM-20260926-072] Thoughts render markdown too. Without this line the
+      // host's own patch (handleRenderMarkdown) was a silent no-op: the round trip
+      // succeeded, the client got its html, and the store kept nothing — so a
+      // session switch re-hydrated the thought as raw text again.
+      if (patch.html !== undefined) { entry.html = patch.html; }
       if (patch.streaming !== undefined) { entry.streaming = patch.streaming; }
       if (patch.elapsedMs !== undefined) { entry.elapsedMs = patch.elapsedMs; }
     } else if (entry.kind === 'plan') {

@@ -105,8 +105,26 @@ export const domClient = `
   }
   // [CUSTOM-END] CUSTOM-20260924-021
 
+  /**
+   * [CUSTOM-20260925-065] Human duration: 420ms / 1.2s / 12s / 2m 5s.
+   *
+   * Lives here (the lowest-level client module) because both toolCallView and the
+   * record layer want it, and the module load order only allows dependencies to
+   * point FORWARD — a helper living in transcriptView could not be used by
+   * toolCallView, and a second copy of it would drift (see pitfalls #19).
+   */
+  function duration(ms) {
+    if (typeof ms !== 'number' || ms < 0 || !isFinite(ms)) { return ''; }
+    if (ms < 1000) { return Math.round(ms) + 'ms'; }
+    var seconds = ms / 1000;
+    if (seconds < 60) { return (seconds < 10 ? seconds.toFixed(1) : String(Math.round(seconds))) + 's'; }
+    var minutes = Math.floor(seconds / 60);
+    return minutes + 'm ' + Math.round(seconds - minutes * 60) + 's';
+  }
+
   NS.dom = {
     sanitize: sanitize,
+    duration: duration,
     el: el,
     clear: clear,
     setSanitizedHtml: setSanitizedHtml,

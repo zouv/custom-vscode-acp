@@ -7,6 +7,7 @@
 > **体量铁律**：超过 ~400 行即拆分——保留 §0 / §0.5 / §1，各模块细节拆到 `docs/arch/<module>.md`。
 > 已拆出：[`docs/arch/chat-panel.md`](./docs/arch/chat-panel.md)（原 §5，2026-09-25）、
 > [`docs/arch/chat-panel-sessions.md`](./docs/arch/chat-panel-sessions.md)（§5.13–§5.15：会话目录与重开路径）。
+> [`docs/arch/chat-panel-records.md`](./docs/arch/chat-panel-records.md)（§5.16+：记录区的折叠 / 时间 / 渲染 / 右键菜单）。
 > **拆出后 `§5.x` 的编号不变**，所以各处「§5.10」之类的引用只需换文件名，不要重编号。
 >
 > **配套**：历史坑点见 [`docs/pitfalls.md`](./docs/pitfalls.md)；改动账本见 [`registry.md`](./registry.md)。
@@ -102,7 +103,7 @@ webpack + ts-loader（不是 esbuild）；ESLint flat config；`@vscode/test-cli
 | `src/handlers/PermissionBridge.ts` | **权限请求的唯一出口**（020 新增）：面板卡片 vs 弹框的判定、并发请求 FIFO 队列、`cancelSession`/`cancelAll` 保证每个请求恰好被回答一次。不 import vscode UI 类型 | 权限策略 / 超时 / 队列行为 |
 | `src/handlers/SessionUpdateHandler.ts` | `session/update` 通知的监听器扇出（try/catch 隔离单个订阅者） | 流式更新丢事件 |
 | `src/ui/ChatWebviewProvider.ts` | **legacy 面板（单会话、未改造）**：webview 视图 + 内联 HTML 字符串（`getHtmlContent()`，CSP+nonce）；webview↔扩展 postMessage 协议；`marked` 渲染 markdown。CUSTOM-20260923-011 起由 `LegacyPanelAdapter` 用 **facade** 包装后接入路由层，**本文件零改动** | 仅在必须跟上游同步时动；旧缺陷不在此文件里修 |
-| `src/ui/chat/` | **新 Chat 面板子系统**（CUSTOM-20260923-011，30 个模块）。入口 `index.ts` 只导出 `ChatRouterProvider`。细节见 [`docs/arch/chat-panel.md`](./docs/arch/chat-panel.md)（原 §5，按模块拆出） | 聊天 UI / 面板路由 / 多会话 |
+| `src/ui/chat/` | **新 Chat 面板子系统**（CUSTOM-20260923-011，30+ 个模块）。入口 `index.ts` 只导出 `ChatRouterProvider`。细节见 [`docs/arch/chat-panel.md`](./docs/arch/chat-panel.md)（原 §5，按模块拆出）；记录区（折叠 / markdown / 时间 / 右键 / 切换提示）见 [`docs/arch/chat-panel-records.md`](./docs/arch/chat-panel-records.md) | 聊天 UI / 面板路由 / 多会话 |
 | `src/ui/SessionTreeProvider.ts` | 两层树 `AgentNode`/`ChildNode`：`AgentTreeItem`/`SessionTreeItem`/`InfoTreeItem`（loading/empty/unsupported/error/auth-required/load-more） | 树结构 / 右键菜单行为 |
 | `src/ui/StatusBarManager.ts` | 状态栏 `$(hubot) ACP: <status>`，订阅 5 个 SessionManager 事件；点击触发 `acpc.connectAgent` | 状态显示 |
 | `src/config/AgentConfig.ts` | 读 `acpc.agents` 设置，导出 `getAgentConfigs`/`getAgentNames`/`getAgentConfig` | agent 列表读取逻辑 |

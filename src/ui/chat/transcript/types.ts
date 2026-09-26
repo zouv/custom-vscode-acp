@@ -36,6 +36,15 @@ export interface AssistantEntry extends EntryBase {
 export interface ThoughtEntry extends EntryBase {
   kind: 'thought';
   text: string;
+  /**
+   * [CUSTOM-20260926-072] Rendered markdown, populated lazily via the same
+   * `renderMarkdown` round-trip as an assistant bubble.
+   *
+   * Thoughts used to render as raw text, so the agent's own backticks and "- "
+   * list markers showed up literally. Only set once the block has SETTLED: html
+   * for a still-streaming block would freeze a prefix of the text.
+   */
+  html?: string;
   messageId?: string;
   streaming: boolean;
   /** Wall-clock duration, filled in when the thought block is finalized. */
@@ -65,7 +74,13 @@ export interface ContentEntry extends EntryBase {
 
 export interface NoticeEntry extends EntryBase {
   kind: 'notice';
-  level: 'info' | 'warn' | 'error';
+  /**
+   * [CUSTOM-20260926-073] 'switch' is a *presentation* level, not a severity: it
+   * marks the centered divider-style line used for "Switched to <model>" (the
+   * shape Claude's own panel uses for a model/mode change). It sits with info/warn/
+   * error so the level stays the single field the client renders from.
+   */
+  level: 'info' | 'warn' | 'error' | 'switch';
   text: string;
 }
 

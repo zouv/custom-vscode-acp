@@ -37,6 +37,7 @@
 | `panelContract.ts` | `IChatPanel` / `PanelContext` / `PanelId` + **`MODERN_AGENTS` / `isModernAgent()`**（019 从 router 移来，供 host 与编辑区面板共用，避免循环依赖） | 面板接口 / agent 策略变更 |
 | `protocol.ts` | postMessage 判别联合（`ExtToChat` / `ChatToExt`）+ `verifySession` 纪律 | 增删消息类型 |
 | `markdown.ts` | `SafeMarkdown`：覆盖 `marked` 的 `html`/`link`/`image` 三个渲染钩子。**必须用 `new Marked()`**（旧面板改的是全局单例） | markdown 安全策略变更 |
+| `sessionChoices.ts` | **073 新增**。切换状态（mode + config options）的**快照 / 按通知载荷打补丁 / 算差异 → 人类可读的一句话**。纯函数，宿主只做缓存与发帖（去重靠"缓存由宿主独占"，见 §5.22） | 改切换提示的表述、或改"两条上报路径怎么去重" |
 | `transcript/types.ts` | transcript 记录模型（`user`/`assistant`/`thought`/`tool`/`plan`/**`content`**/`notice` 七类，`content` 承载非文本消息块）+ `ToolInvocation` | 记录结构变更 |
 | `transcript/TranscriptStore.ts` | 按会话存记录；三重上限（500 条 / 24 会话 LRU / 64KB 每条）；活跃会话豁免 LRU。`finalizeStreaming` 带 `only` 过滤（**不要**在正文 chunk 上调用无参形式，那会把一次回复碎成 N 个气泡） | 容量策略 / 新记录类型 |
 | `transcript/ToolInvocationStore.ts` | 工具调用索引，严格实现 ACP 的 **replace-collection** 语义 | 工具调用字段变更 |
@@ -211,10 +212,11 @@ pending ──用户点按钮──► selected        （回答 optionId）
 
 **非目标**：权限超时（落点：`PermissionBridge.request`）。
 
-### 5.9 会话大纲（CUSTOM-20260924-021）
+### 5.9 会话大纲（CUSTOM-20260924-021，076 加钉住式右侧栏，077 二次优化）
 
 **纯客户端**：不动协议、不加命令、不改 `package.json`。锚点来自 `transcriptView.ordered()`，
 **不是** `Object.keys(objects)` —— 后者的顺序保证只覆盖整数样式的键，错了的表现是"跳转到不相干的消息"。
+076 起锚点从「只收 `user`」扩到「`user` + `assistant`」（其它 kind 仍排除），每项带类型图标 + hover 全文。
 
 | 关注点 | 规则 |
 |---|---|
@@ -227,6 +229,22 @@ pending ──用户点按钮──► selected        （回答 optionId）
 
 **`invalidate()` 的调用点**在 `boot.ts` 的 `append` / `revise` / `focus` / `boot` / `sessionClosed` / `error`
 分支里——**不要**放进 `meta` / `attachments`，那会让抽屉在流式期间被反复重建。
+
+**钉住式右侧栏（CUSTOM-20260926-076，077 二次优化）**：下拉与侧栏两种形态并存，`mode ∈ {popup, sidebar}`
++ 瞬态 `isOpen`。下拉头部「固定到右侧」并进 `.outline-head`（"N messages" 同一行，`#outlinePin` 是
+`.outline-head-info` 计数容器的兄弟、静态），把大纲钉成常驻右栏（`#outlineSidebar`，`#messages` 的 flex
+兄弟、定宽，宽度由 JS 写 inline）。
+
+| 关注点 | 规则 |
+|---|---|
+| 持久化 | `mode` / `width`（180px~50%）走**宿主 `globalState`**（077）：`setUiPref`（webview→ext）存 `acpc.outlinePrefs.v1`，`uiPrefs`（ext→webview）随 boot 带回、`applyPrefs()` 恢复——跨窗口重载/编辑器面板重开存活（webview 本地 `vscode.setState` 只活在同一实例 reload） |
+| 跳转 | 侧栏模式**不关**（常驻导航）；下拉模式维持「跳完收起」 |
+| `close()` 语义 | **只关下拉**：`boot.ts` 会话切换调 `close()`，侧栏模式 no-op——否则刚恢复的侧栏会被 boot 的 close 关掉 |
+| 点击外部 | 只关下拉；侧栏是常驻面板，在 transcript 里点来点去不关 |
+| 调宽 | `#outlineResize` pointer 事件：`width = clamp(start - dx, 180, area*0.5)`（拖左变宽）；`pointerup` 持久化 + `NS.rail.reflow()`（`#messages` 变窄改折行 → 左 rail 圆点重对齐） |
+| 图标着色 | `NS.icons.icon(kind, 'outline-kind outline-kind-<kind>')`；`.outline-kind-user` 蓝（`--vscode-button-background`）、`.outline-kind-assistant` 灰（`--vscode-descriptionForeground`），与 transcript 气泡同色系 |
+| 时间 | 移到每项最右（正文 `flex:1` 占满左侧），`HH:MM:SS` |
+| 计数 | `transcriptView.messageAnchorCount()`（user+assistant，O(1)）驱动 ☰ 显隐 |
 
 ### 5.10 长会话性能：outbox / 增量文本 / rAF / 滚动记忆（CUSTOM-20260924-022）
 
@@ -277,8 +295,13 @@ pending ──用户点按钮──► selected        （回答 optionId）
 |---|---|
 | DOM 位置 | `#rail`/`#railTrack` 是 `.message-area` 的**兄弟节点**（`#messages` 之外）。**不要**放进 `#messages`：那里的三档间距阶梯（`.messages > * + *` 的 `margin-top`）会位移它，它也会被当成一个"条目"参与 flex 排版 |
 | 随内容滚动 | track 做 `translateY(-scrollTop)`（同一个 rAF tick 里，且值未变则不写） |
-| 布局读取分档 | **`invalidate()`**（条目集合/状态变化）先比标记签名，签名没动就**不读布局**——流式 chunk 走的就是这条；**`reflow()`**（markdown 回填、resize）只测量不重建。500 个标记全量测 `offsetTop` 是毫秒级的，分档就是为了避开它 |
-| 点尺寸 | 尺寸与左偏移在 CSS（`.rail-dot.turn/.step`），用 `margin-top: -半高` 抵消，JS 只写 `top = y + 6`（即圆心） |
+| 布局读取分档 | **`invalidate()`**（条目集合/状态变化）先比标记签名，签名没动就**不读布局**——流式 chunk 走的就是这条；**`reflow()`**（布局变化、resize）只测量不重建。500 个标记全量测 `offsetTop` 是毫秒级的，分档就是为了避开它 |
+| **布局变化后重对齐（070）** | **不枚举触发事件，而是观察布局本身**：一个 `ResizeObserver` 观察**每条记录节点**（`watch()`，由 `transcriptView` 在"节点进 `#messages`"与"节点被替换"的**全部 6 处**调用——漏一处 = 那条记录的圆点从此不再动，且完全静默），回调 → `reflow()`。此前只有"标记集变化 / window resize / markdown 回填"三个时机，`<details>` 展开、工具卡正文展开（`links.toggleBody` 改的是 `hidden` 属性，**没有任何事件**）、图片加载完都不在其中 ⇒ 展开后圆点停在旧高度。**回调跳过 `streaming` 的记录**：流式条目每个 chunk 都在长，测量它们会毁掉上面那条"流式期间零布局读取"（streaming 条目的首行不可能移动，圆点本来就对）。**只观察记录节点**，观察 rail/track 自己就是观察自己的输出（回环）。不做 `toggle` 兜底——它只覆盖 `<details>`，是"半个修复且没有信号"（完整教训见 `pitfalls.md` #27）。`reset()` 要 `resetNodes()`：ResizeObserver **强引用**被观察元素 |
+| 隐藏面板 | `measure()` 在 `#messages` 高度为 0 时**直接返回并保留 `needMeasure`**：否则每个点都被钉到 `top: 0`、而且这个错误位置会被当成真相缓存下来（后台编辑器组、还没 reveal 的 webview 都会碰上）。恢复可见时 ResizeObserver 会重新报尺寸，测量自然发生 |
+| 点尺寸 | 尺寸与左偏移在 CSS（`.rail-dot.turn/.step`），用 `margin-top: -半高` 抵消，**所以 JS 写的 `top` 是圆心**（读 JS 时别以为它是顶边——这一条曾经让"对齐"修错方向） |
+| **圆心怎么定（061）** | **锚到条目里的类型图标**：`node.querySelector('.rec-icon, .tool-icon')`，它的几何中心就是要对的中心（`icons.attach()` 本来就把它放在首行上）——**按构造对齐，没有常量、不按类型分支**。此前的 `top = y + 6` 是量出来的常量，而工具卡（3px 内边距）与用户气泡（6px）的首行中心不在一处，**统一偏上 6–9px**。`points[]` 里 `y`（条目顶边，供 `syncActive` 二分）与 `centre`（圆心）**必须分开**；`rail-line` 的两端用 `centre` |
+| 命中区（062） | `.rail-dot::after { inset: -5px }` 把可点范围扩到约 17px（`step` 只有 7px），**外观不变**、不参与布局 |
+| **当前项指示（062）** | **刻意不用环**：环在这个面板里已经是**键盘焦点**的语义（047 的全局 `:focus-visible`），再用 `--vscode-focusBorder` 画环就是"一个颜色两种意思"。改用**尺寸**：`.rail-dot.active { transform: scale(1.4) }`（scale 以中心为基准，所以不影响上面的圆心对齐） |
 | 状态着色 | `running`（工具 `in_progress`/`pending`、文本 `streaming`、待决权限卡）蓝 / `failed` 红 / 其余灰 |
 | 工具状态来源 | `transcriptView.updateTool` 会把新 view model 存回 `objects[]`——**`status` 不在 `PATCH_KEYS` 里**，不存回工具跑完了点还是蓝的 |
 | 点击穿透 | `.rail` 整体 `pointer-events: none`（别挡住左侧文字选区），只有 `.rail-dot` 是 `auto` |
@@ -385,3 +408,7 @@ pending ──用户点按钮──► selected        （回答 optionId）
 > 消息纪律（§5.4）、安全约定（§5.5）、子 agent 分组推断（§5.6）、双 surface（§5.7）、
 > 权限卡（§5.8）、会话大纲（§5.9）、长会话性能与 INV-A..F（§5.10）、引导条（§5.11）、
 > 面板审计结论表（§5.12）。
+
+> **记录区（§5.16 起）另见 [`chat-panel-records.md`](./chat-panel-records.md)**：折叠与 INV-J、
+> 每条记录的时间显示、工具输出的 markdown 渲染、思考块的 markdown（§5.21）、切换模型/模式的提示（§5.22）、
+> 自定义右键菜单、以及客户端逻辑测试的边界。

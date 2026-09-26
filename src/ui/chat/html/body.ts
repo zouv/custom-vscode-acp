@@ -19,8 +19,6 @@ export function body(surface: SurfaceKey = 'view'): string {
   </div>
 
   <div id="sessionHeader" class="session-header">
-    <button id="outlineBtn" class="outline-btn" hidden
-            title="Conversation outline" aria-label="Conversation outline">☰</button>
     <button id="historyBtn" class="outline-btn"
             title="Open a previous session" aria-label="Open a previous session">↺</button>
     <!-- [CUSTOM-20260925-058] 这一格以前是 <span>，只显示 cwd 纯文本。现在它是真按钮
@@ -28,10 +26,20 @@ export function body(surface: SurfaceKey = 'view'): string {
          "这个会话将建在哪个目录"，已发出消息的会话上则是只读展示 + "在别处新建"。 -->
     <button id="cwdBtn" class="session-title" title="Working directory" aria-label="Working directory"></button>
     <span id="usageBar" class="usage-bar" hidden></span>
+    <button id="timeToggle" class="nest-toggle"
+            title="Show the wall-clock time of each record">Times</button>
     <button id="nestToggle" class="nest-toggle" hidden
             title="Group sub-agent tool calls under their parent (links are inferred)">Sub-agents</button>
+    <button id="outlineBtn" class="outline-btn" hidden
+            title="Conversation outline" aria-label="Conversation outline">☰</button>
     <div id="outline" class="outline" hidden>
-      <div class="outline-head"></div>
+      <!-- [CUSTOM-20260926-077] 钉住按钮并进 .outline-head（"N messages" 同一行）：
+           .outline-head-info 是动态计数容器（render 只清它），钉住按钮是它的兄弟、静态。 -->
+      <div class="outline-head">
+        <span class="outline-head-info"></span>
+        <button id="outlinePin" class="outline-btn"
+                title="Pin to the right side" aria-label="Pin to the right side">⇥</button>
+      </div>
       <div class="outline-list"></div>
     </div>
     <div id="history" class="outline" hidden>
@@ -54,6 +62,18 @@ export function body(surface: SurfaceKey = 'view'): string {
          existing node from being re-announced. -->
     <div id="messages" class="messages" role="log" aria-live="polite"
          aria-relevant="additions" aria-busy="false"></div>
+    <!-- [CUSTOM-20260926-076] 右侧常驻大纲栏：钉住模式下显示，是 #messages 的 flex 兄弟。
+         .outline-head（计数行）与 .outline-list（列表）与下拉共用同一套渲染逻辑。 -->
+    <div id="outlineSidebar" class="outline-sidebar" hidden>
+      <div class="outline-sidebar-head">
+        <span class="outline-sidebar-title">Outline</span>
+        <button id="outlineUnpin" class="outline-btn"
+                title="Close outline" aria-label="Close outline">✕</button>
+      </div>
+      <div class="outline-head"></div>
+      <div class="outline-list"></div>
+      <div id="outlineResize" class="outline-resize" aria-hidden="true"></div>
+    </div>
     <button id="jumpToLatest" class="jump-latest" hidden>↓ Jump to latest</button>
     <div id="emptyState" class="empty-state">
       <p class="empty-title">No session yet</p>
@@ -71,6 +91,9 @@ export function body(surface: SurfaceKey = 'view'): string {
       <button id="sendStopBtn" class="send-stop send" disabled>Send</button>
     </div>
   </div>
+
+  <!-- [CUSTOM-20260925-067] 自定义右键菜单；项由 JS 按上下文生成（见 client/contextMenu.ts）。 -->
+  <div id="ctxMenu" class="ctx-menu" hidden><div class="ctx-items"></div></div>
 
   <div id="loadOverlay" class="load-overlay" hidden>
     <div class="load-box"><span class="spinner"></span><span>Loading session history…</span></div>

@@ -119,7 +119,11 @@ export const tabsClient = `
 
   function dotClass(summary) {
     if (summary.loading) { return 'tab-dot loading'; }
+    // running wins over unread: a streaming tab is already pulsing, and two signals
+    // for one thing is worse than one (see CUSTOM-20260925-063).
     if (summary.running) { return 'tab-dot running'; }
+    // [CUSTOM-20260925-063] Output arrived while this tab was in the background.
+    if (summary.unread) { return 'tab-dot attention'; }
     return 'tab-dot';
   }
 

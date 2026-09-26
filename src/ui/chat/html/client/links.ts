@@ -36,6 +36,38 @@ export const linksClient = `
     }
   }
 
+  /**
+   * [CUSTOM-20260925-062] Give a wide markdown TABLE its own horizontal scroller.
+   *
+   * '.bubble pre' already had 'overflow-x: auto', but '.bubble table' only had
+   * 'border-collapse' — so a table with many columns pushed the bubble (and with
+   * it the whole panel) wider instead of scrolling inside itself.
+   *
+   * A wrapper rather than 'overflow-x' on the bubble itself, so the two scrollable
+   * block types are handled the SAME way (see decorateCodeBlocks above) and the
+   * bubble keeps its own overflow semantics.
+   */
+  function decorateTables(root) {
+    if (!root || !root.querySelectorAll) { return; }
+    var tables = root.querySelectorAll('table');
+    for (var i = 0; i < tables.length; i++) {
+      var table = tables[i];
+      if (table.parentNode && String(table.parentNode.className).indexOf('table-wrap') === 0) { continue; }
+      var wrap = NS.dom.el('div', 'table-wrap');
+      table.parentNode.insertBefore(wrap, table);
+      wrap.appendChild(table);
+    }
+  }
+
+  /**
+   * Everything that needs a scroll container around it, in one call — so a future
+   * block type cannot be remembered in one place and forgotten in another.
+   */
+  function decorateScrollables(root) {
+    decorateCodeBlocks(root);
+    decorateTables(root);
+  }
+
   function closestWithAttr(node, attr) {
     var current = node;
     while (current && current !== document) {
@@ -135,7 +167,7 @@ export const linksClient = `
   }
 
   NS.links = {
-    decorateCodeBlocks: decorateCodeBlocks,
+    decorateScrollables: decorateScrollables,
     installDelegatedHandlers: installDelegatedHandlers
   };
 })(window.__acpc = window.__acpc || {});

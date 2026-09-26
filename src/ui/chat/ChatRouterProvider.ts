@@ -43,8 +43,10 @@ export class ChatRouterProvider implements vscode.WebviewViewProvider {
     // [CUSTOM-BEGIN] CUSTOM-20260924-020 - 透传给 ChatPanelHost（它注册为 PermissionPresenter）
     permissionBridge?: PermissionBridge,
     // [CUSTOM-END] CUSTOM-20260924-020
+    // [CUSTOM-20260926-077] 透传给 ChatPanelHost，持久化大纲钉住/宽度偏好。
+    globalState?: vscode.Memento,
   ) {
-    this.modern = new ChatPanelHost(extensionUri, sessionManager, sessionUpdateHandler, permissionBridge);
+    this.modern = new ChatPanelHost(extensionUri, sessionManager, sessionUpdateHandler, permissionBridge, globalState);
     this.legacy = new LegacyPanelAdapter(
       new ChatWebviewProvider(extensionUri, sessionManager, sessionUpdateHandler),
     );

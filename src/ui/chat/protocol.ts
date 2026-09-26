@@ -21,6 +21,12 @@ export interface SessionSummary {
   loading: boolean;
   /** A prompt turn is running. */
   running: boolean;
+  /**
+   * [CUSTOM-20260925-063] The session produced output while it was NOT the
+   * focused one — drives the tab-strip attention dot. A hint, never a
+   * notification: nothing pops up and focus is never stolen.
+   */
+  unread: boolean;
 }
 
 /** Everything the panel needs to render one session's header + composer. */
@@ -47,6 +53,13 @@ export interface Attachment {
   name: string;
 }
 
+/** Webview UI prefs that must survive webview disposal (window reload / editor-panel
+ *  recreation). Persisted in the extension host's `globalState`. */
+export interface UiPrefs {
+  outlineMode: 'popup' | 'sidebar';
+  outlineWidth: number;
+}
+
 /**
  * A transcript entry as sent over the wire. Tool entries carry no payload of
  * their own (the transcript only knows the `toolCallId`), so the extension
@@ -68,6 +81,8 @@ export type ExtToChat =
   | { type: 'boot'; focused: SessionSummary | null; sessions: SessionSummary[]; snapshot: TranscriptSnapshotWire | null; meta: SessionMeta | null }
   | { type: 'focus'; summary: SessionSummary | null; snapshot: TranscriptSnapshotWire | null; meta: SessionMeta | null }
   | { type: 'sessionsChanged'; sessions: SessionSummary[] }
+  // [CUSTOM-20260926-077] 大纲钉住/宽度偏好，随 boot 一起带回（跨窗口重载存活）。
+  | { type: 'uiPrefs'; outlineMode: 'popup' | 'sidebar'; outlineWidth: number }
   // [CUSTOM-BEGIN] CUSTOM-20260925-033 - 历史会话列表（回复 `listHistory`）。
   // `source` 说明这份列表从哪来：agent 侧 `session/list`，还是本地 workspaceState 缓存
   // （未连接时不去 spawn agent，见 ChatPanelHost.handleListHistory）。
@@ -102,6 +117,8 @@ export interface TranscriptSnapshotWire {
 /** webview → extension */
 export type ChatToExt =
   | { type: 'ready' }
+  // [CUSTOM-20260926-077] 大纲钉住/宽度偏好：非会话作用域，宿主存 globalState。
+  | { type: 'setUiPref'; outlineMode: 'popup' | 'sidebar'; outlineWidth: number }
   | { type: 'sendPrompt'; sessionId: string; text: string }
   | { type: 'cancelTurn'; sessionId: string }
   | { type: 'newSession'; agentName: string }
@@ -129,7 +146,7 @@ export type ChatToExt =
   | { type: 'setMode'; sessionId: string; modeId: string }
   | { type: 'setModel'; sessionId: string; modelId: string }
   | { type: 'setConfigOption'; sessionId: string; configId: string; value: string }
-  | { type: 'renderMarkdown'; items: Array<{ entryId: string; sessionId: string; text: string }> }
+  | { type: 'renderMarkdown'; items: Array<{ entryId: string; sessionId: string; text: string; key?: string }> }
   | { type: 'openLink'; href: string }
   | { type: 'openFile'; sessionId: string; path: string; line?: number }
   | { type: 'openTerminal'; sessionId: string; terminalId: string }
@@ -157,7 +174,7 @@ export type ChatToExt =
 /** extension → webview reply to `renderMarkdown`. */
 export interface MarkdownRendered {
   type: 'markdownRendered';
-  items: Array<{ entryId: string; sessionId: string; html: string }>;
+  items: Array<{ entryId: string; sessionId: string; html: string; key?: string }>;
 }
 
 /** Anything the extension may post to the webview. */

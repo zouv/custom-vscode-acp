@@ -124,11 +124,10 @@ export function styles(): string {
   }
   .tab-dot.running { background: var(--vscode-progressBar-background); animation: pulse 1.2s ease-in-out infinite; }
   .tab-dot.loading { background: var(--vscode-charts-yellow); }
-  /* [CUSTOM-20260925-052] 设计预留、**从未接线**：没有任何 JS 会给标签加 attention
-     类（全仓库 grep 只命中这一行）。它的本意是"后台会话在等你"（比如那边有待决的权限
-     请求）——而那件事目前由窗口级弹框承担，面板内不做提示（用户 2026-09-25 明确决定）。
-     留着是为了将来接线时不用重新想配色。**看到它没生效别当 bug 修**：先确认要不要做
-     那个功能，而不是去找"为什么类没加上"。 */
+  /* [CUSTOM-20260925-063] 后台会话在你离开后有了新输出 —— 由宿主侧的 unread 集合驱动
+     （062 之前这里一直没接线，注释写的是"设计预留"）。优先级低于 running：
+     正在流式的标签本来就在脉动，两个信号表示一件事只会更乱。
+     **它只是提示**：不弹窗、不抢焦点——与"不做后台权限卡"的决定不冲突。 */
   .tab-dot.attention { background: var(--vscode-charts-blue); }
   .tab-close {
     border: none; background: transparent; color: inherit; cursor: pointer;
@@ -190,6 +189,24 @@ export function styles(): string {
     background: inherit;
   }
   .outline-more { margin-left: auto; }
+  /* --- 时间显示（CUSTOM-20260925-065）------------------------------------
+     每条记录的时刻。元素**始终在 DOM 里**，可见性由 #messages 上的一个类决定
+     （与 flat-tools 同一套机制）⇒ 切换开关**不需要重渲染任何东西**，纯样式翻转。
+     默认隐藏；鼠标悬停在整条上另有一个完整时刻（见 transcriptView.place 设的 title）。 */
+  .rec-time {
+    display: none;
+    font-size: 0.78em; color: var(--vscode-descriptionForeground);
+    font-variant-numeric: tabular-nums;
+  }
+  .messages.show-times .rec-time { display: block; }
+  /* 用户气泡是右对齐的，它上面那行时刻也跟着右对齐，否则会飘在左边。 */
+  .entry-user .rec-time { text-align: right; }
+  /* 工具耗时常显（与 Thought 的 "Thought for Ns" 同类信息，不需要开关）。 */
+  .tool-time {
+    flex: 0 0 auto; font-size: 0.78em;
+    color: var(--vscode-descriptionForeground);
+    font-variant-numeric: tabular-nums;
+  }
   /* [CUSTOM-20260925-058] 目录抽屉里的分组标题 / 说明行。观感沿用 .picker-group，
      因为它俩都是"同一类浮层里的分组头"。 */
   .outline-group {
@@ -226,6 +243,47 @@ export function styles(): string {
     text-overflow: ellipsis; white-space: nowrap;
     font-size: 0.82em; color: var(--vscode-descriptionForeground);
   }
+  /* [CUSTOM-20260926-077] 钉住按钮并进 .outline-head（"N messages" 同一行）。
+     .outline-head-info 是 render() 清空并回填的计数容器；钉住按钮是它的兄弟、静态。 */
+  .outline-head-info {
+    display: flex; align-items: center; gap: 8px;
+    flex: 1; min-width: 0;
+  }
+  /* 大纲项里的类型图标（user/assistant）。挂 .outline-kind 而不是 .rec-icon：后者是
+     "贴在记录气泡里"的语义（icons.attach 用），这里是列表项里独立的一格。 */
+  .outline-kind { flex: none; display: inline-flex; align-items: center; align-self: center; opacity: 0.7; }
+  .outline-kind svg { display: block; }
+  .outline-item.active .outline-kind { opacity: 1; }
+  /* [CUSTOM-20260926-077] 按类型着色：user 与 transcript 用户气泡同色（蓝），
+     assistant 用中性灰。SVG 是 stroke=currentColor，改 color 即可区分。 */
+  .outline-kind-user { color: var(--vscode-button-background); }
+  .outline-kind-assistant { color: var(--vscode-descriptionForeground); }
+
+  /* --- 右侧常驻大纲栏（CUSTOM-20260926-076）----------------------------- */
+  /* 是 #messages 的 flex 兄弟、定宽（JS 拖拽后写 inline width 覆盖这里的默认 240px）。
+     绝对定位的调宽手柄因此要 relative 锚定；注意别加 overflow，否则 left:-3px 的手柄被裁。 */
+  .outline-sidebar {
+    flex: 0 0 auto; width: 240px;
+    display: flex; flex-direction: column;
+    border-left: 1px solid var(--vscode-panel-border);
+    background: var(--vscode-sideBar-background);
+    position: relative;
+  }
+  .outline-sidebar-head {
+    display: flex; align-items: center; gap: 6px;
+    padding: 3px 8px; border-bottom: 1px solid var(--vscode-panel-border);
+  }
+  .outline-sidebar-title {
+    flex: 1; font-size: 0.8em; color: var(--vscode-descriptionForeground);
+    text-transform: uppercase; letter-spacing: .04em;
+  }
+  /* 列表独立滚动，不跟着 #messages 走。 */
+  .outline-sidebar .outline-list { flex: 1; overflow-y: auto; scrollbar-width: thin; }
+  /* 调宽手柄：钉在侧栏左缘（跨过 1px 边框各留 3px 命中区）。 */
+  .outline-resize {
+    position: absolute; left: -3px; top: 0; bottom: 0; width: 6px;
+    cursor: col-resize; z-index: 4;
+  }
   .usage-bar { flex: 0 0 auto; font-variant-numeric: tabular-nums; }
   .usage-track {
     display: inline-block; width: 60px; height: 6px; border-radius: 3px;
@@ -257,6 +315,12 @@ export function styles(): string {
     position: absolute; border-radius: 50%; box-sizing: border-box;
     pointer-events: auto; cursor: pointer;
   }
+  /* [CUSTOM-20260925-062] 命中区扩展：'step' 只有 7px，鼠标几乎点不中。
+     用一层透明的 ::after 把可点范围撑到约 17px——**外观完全不变**（inset 为负，
+     伪元素不参与布局，也不影响 #1 的圆心对齐）。 */
+  .rail-dot::after {
+    content: ''; position: absolute; inset: -5px; border-radius: 50%;
+  }
   /* 两级：轮次点更大且实心，步骤点小且空心。margin-top 取负的一半尺寸，
      这样 JS 只需写 top = 中心 y（绝对定位元素的 margin 会参与位移，这里正好要用）。 */
   .rail-dot.turn {
@@ -278,15 +342,21 @@ export function styles(): string {
     border-color: var(--vscode-charts-red, #f14c4c);
     background: var(--vscode-charts-red, #f14c4c);
   }
+  /* [CUSTOM-20260925-062] 「当前视口在哪」的指示器**刻意不用环**：这个面板里
+     「环」已经被 047 定义成**键盘焦点**的语义（全局 :focus-visible 规则），
+     再用 --vscode-focusBorder 画一个环，一个颜色就有了两种意思，用户分不清
+     "我在哪" 与 "焦点在哪"。改用**尺寸**——scale 以中心为基准，所以不影响 #1 的圆心对齐。 */
   .rail-dot.active {
     opacity: 1;
-    box-shadow: 0 0 0 2px var(--vscode-focusBorder);
+    transform: scale(1.4);
   }
   .messages {
     flex: 1;
     overflow-y: auto;
-    /* padding-left 给左侧引导条留出通道（.rail 是绝对定位的兄弟节点，覆盖在这条空隙上） */
-    padding: 8px 10px 4px 19px;
+    /* padding-left 给左侧引导条留出通道（.rail 是绝对定位的兄弟节点，覆盖在这条空隙上）。
+       [CUSTOM-20260926-069] 底部 4px → 24px：最后一条记录贴着输入框的上边框时，
+       读者会以为"下面还有内容、没滚到底"（用户反馈）。留白本身就是"到头了"的信号。 */
+    padding: 8px 10px 24px 19px;
     display: flex;
     flex-direction: column;
     /* 间距交给下面的阶梯控制。统一 gap 会让「同属一组的连续推理」和「跨类型的独立块」
@@ -347,10 +417,32 @@ export function styles(): string {
 
   .entry { display: flex; flex-direction: column; gap: 4px; max-width: 100%; }
   .entry-user { align-self: flex-end; max-width: 88%; }
-  .entry-user .bubble {
+  /* [CUSTOM-20260925-061] 气泡观感同时挂在「单行气泡」与「多行折叠的 details」上，
+     所以展开时背景与圆角是**连续的一整块**，不会出现两条气泡。 */
+  .entry-user .bubble,
+  .entry-user .user-fold {
     background: var(--vscode-button-background);
     color: var(--vscode-button-foreground);
     padding: 6px 10px; border-radius: 8px 8px 2px 8px;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  /* 折叠时背景与内边距在 details 上，summary 只是它的第一行——必须抹掉，
+     否则会出现两层内边距 / 两层背景。 */
+  .entry-user .user-fold > summary {
+    cursor: pointer; user-select: none; list-style: none;
+    background: transparent; padding: 0; border-radius: 0; color: inherit;
+  }
+  .entry-user .user-fold > summary::-webkit-details-marker { display: none; }
+  /* [CUSTOM-20260925-064] 折叠态：summary 占**恰好一行**并以省略号截断。
+     **只在折叠态生效**——展开时若还是 nowrap，第一段会被截成"半句话加省略号"，
+     看起来像内容丢了（而且它本来就不该影响展开态）。 */
+  .entry-user .user-fold:not([open]) > summary {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  /* 展开态：body 是 **inline**，从切分点接着往下流。切分点只是实现细节
+     （长单行消息没有换行可切），用块级 body 会在半句话处多出一处换行。 */
+  .entry-user .user-fold .fold-body {
+    display: inline;
     white-space: pre-wrap; word-break: break-word;
   }
   .entry-assistant { align-self: stretch; }
@@ -420,6 +512,22 @@ export function styles(): string {
   /* Non-text message content (image / resource chips) */
   .entry-content { align-self: stretch; gap: 2px; }
   .entry-notice.info { color: var(--vscode-descriptionForeground); }
+  /* [CUSTOM-20260926-073] 切换提示（模型 / 模式 / 配置项）：居中的分隔式一行，参照
+     Claude 官方插件的「Switched to …」。它不是一条内容气泡，而是时间线上的一处标记，
+     所以左右各引一条虚线把它与两侧内容分开，并且**占满整行**。
+     必须显式写 flex-direction: row —— .entry 是 column，只覆盖 display 会让两条虚线
+     上下堆叠（分隔线跑到文字上方和下方，看起来像一条空记录）。 */
+  .entry-notice.switch {
+    align-self: stretch;
+    display: flex; flex-direction: row; align-items: center; gap: 10px;
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.88em;
+  }
+  .entry-notice.switch::before,
+  .entry-notice.switch::after {
+    content: ''; flex: 1 1 auto; min-width: 12px;
+    border-top: 1px dashed var(--vscode-panel-border);
+  }
   .entry-notice.warn { color: var(--vscode-editorWarning-foreground, var(--vscode-foreground)); }
   .entry-notice.error {
     color: var(--vscode-inputValidation-errorForeground);
@@ -427,32 +535,44 @@ export function styles(): string {
     border: 1px solid var(--vscode-inputValidation-errorBorder);
   }
 
-  /* Markdown */
-  .bubble p { margin: 0 0 6px; }
-  .bubble p:last-child { margin-bottom: 0; }
-  .bubble h1, .bubble h2, .bubble h3, .bubble h4, .bubble h5, .bubble h6 { margin: 8px 0 4px; line-height: 1.3; }
-  .bubble ul, .bubble ol { margin: 4px 0; padding-left: 20px; }
-  .bubble pre {
+  /* Markdown
+     [CUSTOM-20260926-072] 作用域是 .bubble **和** .md：助手气泡（.bubble.md）与
+     思考块正文（.thought-body.md）走的是同一条 markdown 往返，排版规则必须共用——
+     各写一套就是「同一份知识存两份」（pitfalls #19）。 */
+  .bubble p, .md p { margin: 0 0 6px; }
+  .bubble p:last-child, .md p:last-child { margin-bottom: 0; }
+  .bubble h1, .bubble h2, .bubble h3, .bubble h4, .bubble h5, .bubble h6,
+  .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin: 8px 0 4px; line-height: 1.3; }
+  .bubble ul, .bubble ol, .md ul, .md ol { margin: 4px 0; padding-left: 20px; }
+  .bubble pre, .md pre {
     background: var(--vscode-textCodeBlock-background);
     border-radius: 4px; padding: 8px; overflow-x: auto; margin: 6px 0;
   }
-  .bubble code {
+  .bubble code, .md code {
     font-family: var(--vscode-editor-font-family);
     font-size: var(--vscode-editor-font-size, 0.95em);
   }
-  .bubble :not(pre) > code {
+  .bubble :not(pre) > code, .md :not(pre) > code {
     background: var(--vscode-textCodeBlock-background);
     border-radius: 3px; padding: 0 3px;
   }
-  .bubble blockquote {
+  .bubble blockquote, .md blockquote {
     margin: 6px 0; padding-left: 10px;
     border-left: 3px solid var(--vscode-panel-border);
     color: var(--vscode-descriptionForeground);
   }
-  .bubble table { border-collapse: collapse; margin: 6px 0; }
-  .bubble th, .bubble td { border: 1px solid var(--vscode-panel-border); padding: 2px 6px; }
-  .bubble a { color: var(--vscode-textLink-foreground); text-decoration: none; cursor: pointer; }
-  .bubble a:hover { text-decoration: underline; }
+  .bubble table, .md table { border-collapse: collapse; margin: 6px 0; }
+  /* [CUSTOM-20260925-062] 宽表格自己的横向滚动容器（由 links.decorateScrollables 套上）。
+     与 .bubble pre 同一个套路：滚动发生在块内部，气泡本身不被撑宽。
+     min-width:0 让它在 flex/宽度受限的父级里真的能收缩，否则 overflow 不会生效。 */
+  .table-wrap { overflow-x: auto; max-width: 100%; }
+  .table-wrap > table { margin: 6px 0; }
+  .bubble th, .bubble td, .md th, .md td { border: 1px solid var(--vscode-panel-border); padding: 2px 6px; }
+  .bubble a, .md a { color: var(--vscode-textLink-foreground); text-decoration: none; cursor: pointer; }
+  .bubble a:hover, .md a:hover { text-decoration: underline; }
+  /* GFM 任务列表的勾选态（CUSTOM-20260926-072）：由宿主侧 markdown.ts 的 checkbox
+     钩子渲染，白名单里因此不需要 INPUT。 */
+  .task-box { font-family: var(--vscode-editor-font-family); opacity: .85; }
   .link-blocked {
     color: var(--vscode-descriptionForeground);
     text-decoration: line-through;
@@ -523,12 +643,14 @@ export function styles(): string {
     border-radius: 3px;
   }
   .thought > summary::-webkit-details-marker { display: none; }
-  /* 自定义折叠标记：原生三角太小且样式不可控（Chromium 下基本没法调） */
-  .thought > summary::before {
-    content: '▸';
-    display: inline-block; width: 12px; opacity: .7;
-  }
-  .thought[open] > summary::before { content: '▾'; }
+  /* --- 折叠三角（CUSTOM-20260925-061）----------------------------------
+     它是**真元素**（.fold-caret），不是 summary::before —— 伪元素永远画在内容之前，
+     而类型图标（icons.attach 会 prepend 到 summary）必须排在三角**前面**，
+     否则顺序会变成「▸ 图标 标签」而不是「图标 ▸ 标签」。
+     三角本身是空元素：字形与方向由 CSS 依 details[open] 驱动，所以切换不需要 JS。 */
+  .fold-caret { display: inline-block; flex: none; width: 12px; opacity: .7; }
+  .fold-caret::before { content: '▸'; }
+  details[open] > summary .fold-caret::before { content: '▾'; }
   .thought[open] {
     background: var(--vscode-textCodeBlock-background);
     border: 1px solid var(--vscode-panel-border);
@@ -541,6 +663,14 @@ export function styles(): string {
     margin-top: 3px; padding-left: 14px;
     font-style: italic; opacity: 0.85;
   }
+  /* [CUSTOM-20260926-072] 渲染成 markdown 的推理正文（宿主侧 SafeMarkdown → .md）。
+     两处必须覆盖：
+       · white-space —— pre-wrap 会把 marked 输出里的换行**再加一倍**（每个 <p> 之间
+         多出一整行空行），所以 md 态回到 normal，与 .entry-assistant .bubble.md 同理；
+       · font-style —— 正文保持斜体（那是「这是推理」的视觉身份），但代码块与表格里
+         的斜体很难读，就地重置为非斜体。 */
+  .thought-body.md { white-space: normal; }
+  .thought-body.md pre, .thought-body.md code, .thought-body.md table { font-style: normal; }
   .thought-spin {
     display: inline-block; width: 8px; height: 8px; border-radius: 50%;
     background: var(--vscode-progressBar-background); margin-right: 5px;
@@ -572,6 +702,14 @@ export function styles(): string {
     border: 1px solid var(--vscode-panel-border); border-radius: 3px; padding: 0 3px;
   }
   .tool-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* [CUSTOM-20260926-074] 工具自己的名字（Bash / Read / Edit …），来自 agent 的 _meta。
+     与左侧的 kind 标签（Run / Read）并列：kind 是 ACP 的粗粒度词表，名字是具体工具，
+     两张 "Run" 卡靠它才分得开。 */
+  .tool-name {
+    flex: 0 0 auto; font-size: 0.82em; padding: 0 4px; border-radius: 3px;
+    color: var(--vscode-descriptionForeground);
+    background: var(--vscode-textCodeBlock-background);
+  }
   .tool-inferred {
     flex: 0 0 auto; font-size: 0.8em; color: var(--vscode-descriptionForeground);
     cursor: help;
@@ -734,6 +872,31 @@ export function styles(): string {
   .slash-item.active { background: var(--vscode-editorSuggestWidget-selectedBackground, var(--vscode-list-activeSelectionBackground)); }
   .slash-name { font-family: var(--vscode-editor-font-family); }
   .slash-desc { color: var(--vscode-descriptionForeground); font-size: 0.88em; margin-left: 8px; }
+
+  /* --- 自定义右键菜单（CUSTOM-20260925-067）------------------------------
+     取代 Chromium 的原生菜单：它提供的 Cut/Paste 在这里没有意义，而 Copy 复制的是
+     **选区**（右键时通常没有选区）⇒ 表现为"点了没反应"。位置由 JS 按光标与视口边界算。 */
+  .ctx-menu {
+    position: fixed; z-index: 60;
+    min-width: 150px; padding: 3px 0;
+    background: var(--vscode-menu-background, var(--vscode-dropdown-background));
+    color: var(--vscode-menu-foreground, var(--vscode-dropdown-foreground));
+    border: 1px solid var(--vscode-menu-border, var(--vscode-dropdown-border));
+    border-radius: 4px;
+    box-shadow: 0 3px 12px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.35));
+  }
+  .ctx-item {
+    display: block; width: 100%; text-align: left;
+    padding: 3px 12px; cursor: pointer;
+    background: transparent; border: none; color: inherit;
+    font-family: inherit; font-size: inherit;
+  }
+  .ctx-item:hover:not(:disabled) {
+    background: var(--vscode-menu-selectionBackground, var(--vscode-list-hoverBackground));
+    color: var(--vscode-menu-selectionForeground, inherit);
+  }
+  /* 禁用态是有意义的："Copy" 在没有选区时禁用，而不是点了什么都不发生。 */
+  .ctx-item:disabled { opacity: 0.5; cursor: default; }
 
   /* Load overlay */
   .load-overlay {
