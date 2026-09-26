@@ -1162,9 +1162,16 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
             .filter(s => !live.has(String((s as { sessionId?: unknown }).sessionId ?? '')))
             .map(s => {
               const info = s as { sessionId?: unknown; title?: unknown; cwd?: unknown; updatedAt?: unknown };
+              const sessionId = String(info.sessionId ?? '');
+              // [CUSTOM-BEGIN] CUSTOM-20260926-078 - 历史列表 agent 侧缺 title 时回退本地缓存的 title/firstPrompt。
+              const stored = this.sessionManager.getHistoryStore()?.get(agent, sessionId);
+              const title = typeof info.title === 'string'
+                ? info.title
+                : (stored?.title ?? stored?.firstPrompt ?? null);
+              // [CUSTOM-END] CUSTOM-20260926-078
               return {
-                sessionId: String(info.sessionId ?? ''),
-                title: typeof info.title === 'string' ? info.title : null,
+                sessionId,
+                title,
                 cwd: typeof info.cwd === 'string' ? info.cwd : undefined,
                 updatedAt: typeof info.updatedAt === 'string' ? info.updatedAt : undefined,
               };
