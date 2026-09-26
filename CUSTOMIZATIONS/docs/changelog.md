@@ -17,6 +17,17 @@
 
 ---
 
+### 2026-09-26 - CUSTOM-20260926-078
+- **功能**：历史会话列表的标题兜底——agent 侧 `session/list` 缺 title 时回退本地缓存的 title/firstPrompt，与 tab 标题兜底链对齐
+- **改动文件**：`src/ui/chat/ChatPanelHost.ts`、`CUSTOMIZATIONS/*`
+- **来源**：用户反馈 History 面板条目名与打开会话后的 tab 标题不一致（tab 标题准确）
+- **详细说明**：
+  - **现象**：History 面板（↺ 抽屉）里条目显示成 sessionId 前 8 位十六进制，而打开后 tab 标题是准确的会话标题。根因是两条链路读不同字段：tab 标题用 `session.title`（`session_info_update` 推送、实时更新，`toSummary` 的 `session.title ?? stored?.firstPrompt`），History 面板在已连接且 agent 支持 `session/list`（Claude Code 正是如此）时走 agent 侧路径，只认 `session/list` 返回的 `title`，缺了直接填 `null`，客户端 `sessionMenu.labelOf` 就退化成 sessionId 前缀。
+  - **修法**：`handleListHistory` 的 agent 侧映射里，`title` 为空的条目回退到本地历史缓存的 `title`/`firstPrompt`（`getHistoryStore()?.get(agent, sessionId)`），与 tab 标题兜底链对齐。本地缓存来源（未连接/不支持 list）本就带 `e.title ?? e.firstPrompt`，无需改。
+  - **刻意不改**：tab 那套「自动标题优先、firstPrompt 兜底」的优先级保持不变——首条消息虽是记忆锚点，但含糊首句/粘贴日志时 agent 自动标题更可读（与用户讨论后确认）。
+- **验证方式**：`check-registry` / `lint` / `compile` 全绿。**待用户 F5 复验**：History 面板里此前显示 sessionId 前缀的条目现在显示标题或首条消息。
+- **基于上游版本**：0.2.0（commit e7371659）
+
 ### 2026-09-26 - CUSTOM-20260926-077
 - **功能**：会话大纲二次优化——图标按类型着色、时间右移并显示秒级、钉住状态宿主级持久化、钉住按钮并入计数行
 - **改动文件**：`src/ui/chat/html/client/outline.ts`、`src/ui/chat/html/body.ts`、`src/ui/chat/html/styles.ts`、`src/ui/chat/html/client/boot.ts`、`src/ui/chat/protocol.ts`、`src/ui/chat/ChatPanelHost.ts`、`src/ui/chat/ChatRouterProvider.ts`、`src/extension.ts`、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/*`
