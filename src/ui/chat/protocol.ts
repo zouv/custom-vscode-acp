@@ -6,6 +6,7 @@ import type { SessionConfigOption, SessionModeState, SessionModelState } from '@
 
 import type { EntryPatch, TranscriptEntry, TranscriptSnapshot } from './transcript/types';
 import type { ToolCallView } from './content/toolCalls';
+import type { HistoryDirOption } from './historyDirs';
 
 /** Why a session left the live set (mirrors SessionManager.SessionCloseReason). */
 export type CloseReason = 'user' | 'agent-disconnected';
@@ -51,6 +52,12 @@ export type { EntryPatch };
 export interface Attachment {
   path: string;
   name: string;
+  // [CUSTOM-BEGIN] CUSTOM-20260928-096 - 输入框图片：image 附件把字节留在宿主内存，
+  // 只有 `path`（合成 id）+ `kind`/`mimeType` 走协议；base64 绝不进 meta（否则每次
+  // boot/focus 都重发整张图）。
+  kind?: 'file' | 'image';
+  mimeType?: string;
+  // [CUSTOM-END] CUSTOM-20260928-096
 }
 
 /** Webview UI prefs that must survive webview disposal (window reload / editor-panel
@@ -72,22 +79,55 @@ export interface HistorySessionSummary {
   sessionId: string;
   title?: string | null;
   cwd?: string;
+  /**
+   * [CUSTOM-20260926-079] Normalized identity of `cwd` (see historyDirs.directoryKey).
+   * Computed by the HOST because the identity depends on the platform (Windows and
+   * macOS fold case, Linux does not) — the client only ever compares two keys, so
+   * "are these the same folder" is answered in exactly one place.
+   */
+  dirKey?: string;
   /** ISO timestamp of the last activity, when the source reports one. */
   updatedAt?: string;
+  /**
+   * [CUSTOM-20260927-092] True for a row that came from the LOCAL CACHE alone — the
+   * agent's `session/list` did not mention it (it omits sessions still open elsewhere,
+   * measured). Rendered as an honest hint: such a row may no longer exist agent-side.
+   */
+  fromCache?: boolean;
+  /**
+   * [CUSTOM-20260927-094] True for a row recovered from the agent's OWN transcript
+   * directory (Claude Code storage) — the agent's `session/list` did not report it, which
+   * is exactly what the official panel reads instead. Same honesty rule as `fromCache`:
+   * say where it came from, because it may still be open elsewhere.
+   */
+  fromDisk?: boolean;
 }
 
 /** extension → webview */
 export type ExtToChat =
-  | { type: 'boot'; focused: SessionSummary | null; sessions: SessionSummary[]; snapshot: TranscriptSnapshotWire | null; meta: SessionMeta | null }
-  | { type: 'focus'; summary: SessionSummary | null; snapshot: TranscriptSnapshotWire | null; meta: SessionMeta | null }
-  | { type: 'sessionsChanged'; sessions: SessionSummary[] }
+  // [CUSTOM-20260927-090] `agentConnected` drives the empty state's copy (and whether
+  // its button is "Connect Claude Code" or "New session"): a sessionless panel can have
+  // a live agent process — closing the last session does not stop it. Optional so an
+  // older surface simply keeps the old copy.
+  | { type: 'boot'; focused: SessionSummary | null; sessions: SessionSummary[]; snapshot: TranscriptSnapshotWire | null; meta: SessionMeta | null; agentConnected?: boolean }
+  | { type: 'focus'; summary: SessionSummary | null; snapshot: TranscriptSnapshotWire | null; meta: SessionMeta | null; agentConnected?: boolean }
+  | { type: 'sessionsChanged'; sessions: SessionSummary[]; agentConnected?: boolean }
   // [CUSTOM-20260926-077] 大纲钉住/宽度偏好，随 boot 一起带回（跨窗口重载存活）。
   | { type: 'uiPrefs'; outlineMode: 'popup' | 'sidebar'; outlineWidth: number }
   // [CUSTOM-BEGIN] CUSTOM-20260925-033 - 历史会话列表（回复 `listHistory`）。
   // `source` 说明这份列表从哪来：agent 侧 `session/list`，还是本地 workspaceState 缓存
   // （未连接时不去 spawn agent，见 ChatPanelHost.handleListHistory）。
-  | { type: 'history'; agentName: string; sessions: HistorySessionSummary[]; source: 'agent' | 'local'; error?: string }
+  // [CUSTOM-20260926-079] `directories` 是过滤器的候选目录（宿主按列表算出来的，
+  // **只含列表里真实出现过的目录 + 当前会话的目录**）。客户端据此渲染 header 的 chip，
+  // 并在本地按 `dirKey` 过滤——列表本来就在客户端，换目录不该再问一次 agent。
+  // 其中 `current: true` 的那条就是"开启过滤时的默认目录"，所以不需要另开一个字段。
+  | { type: 'history'; agentName: string; sessions: HistorySessionSummary[]; source: 'agent' | 'local' | 'merged'; directories?: HistoryDirOption[]; error?: string }
   // [CUSTOM-END] CUSTOM-20260925-033
+  // [CUSTOM-BEGIN] CUSTOM-20260928-095 - 磁盘补充的增量应答（回复 `supplementHistory`）。
+  // 客户端按 sessionId 合并进已有列表，不触发 setHistory 的全量替换（那会把 filterKey
+  // 重置回 current 目录）。只回发起过滤的那个目录的磁盘会话。
+  | { type: 'historySupplement'; agentName: string; cwd: string; sessions: HistorySessionSummary[] }
+  // [CUSTOM-END] CUSTOM-20260928-095
   // [CUSTOM-BEGIN] CUSTOM-20260925-058 - 草稿页与目录选择的应答。
   // 四条都**定向**发给发起请求的那个面（`post(msg, to)` 会绕开合帧队列），
   // 因为它们是"某个文档正在编辑的东西"，广播会让另一个面也长出同一个草稿。
@@ -127,7 +167,16 @@ export type ChatToExt =
   // 因此必须在 verifySession 守卫**之前**处理。
   | { type: 'connectAgent'; agentName?: string }
   | { type: 'listHistory'; agentName?: string }
-  | { type: 'openHistorySession'; agentName: string; sessionId: string; cwd?: string }
+  // [CUSTOM-BEGIN] CUSTOM-20260928-095 - 按过滤目录补扫磁盘转录目录。094 的磁盘补充只扫
+  // workspaceFolders[0]，多根/跨目录场景下扫错目录。客户端过滤到具体目录时请求，宿主
+  // 扫该目录并增量返回（非会话作用域，在 verifySession 守卫之前处理）。
+  | { type: 'supplementHistory'; agentName?: string; cwd: string }
+  // [CUSTOM-END] CUSTOM-20260928-095
+  // [CUSTOM-20260928-098/100] `title` rides along so the tab matches the list
+  // immediately; `fromDraft` says the CLIENT was on a draft page (the host's
+  // `focused` then names some other session, and it is the draft that must step
+  // aside — a draft is client-local, 058).
+  | { type: 'openHistorySession'; agentName: string; sessionId: string; cwd?: string; title?: string; fromDraft?: boolean }
   // [CUSTOM-END] CUSTOM-20260925-032/033
   // [CUSTOM-BEGIN] CUSTOM-20260925-058 - 草稿页与目录选择。
   // 三条都**不是**会话作用域：草稿按定义还没有 sessionId（那正是它存在的意义），
@@ -143,6 +192,11 @@ export type ChatToExt =
   // [CUSTOM-20260925-049] Files dropped onto / pasted into the panel. Session
   // scoped, so it MUST be handled after the `verifySession` guard (§5.4 rule 1).
   | { type: 'attachPath'; sessionId: string; paths: string[] }
+  // [CUSTOM-BEGIN] CUSTOM-20260928-096 - 输入框图片：粘贴/拖入的位图无路径，只能把
+  // base64 带上。会话作用域（verifySession 守卫之后，同 attachPath）。`id` 由客户端
+  // 生成（合成附件 id），宿主用它作附件 `path` 并把字节存进 imageData。
+  | { type: 'attachImage'; sessionId: string; id: string; name: string; mimeType: string; dataUrl: string }
+  // [CUSTOM-END] CUSTOM-20260928-096
   | { type: 'setMode'; sessionId: string; modeId: string }
   | { type: 'setModel'; sessionId: string; modelId: string }
   | { type: 'setConfigOption'; sessionId: string; configId: string; value: string }
@@ -161,6 +215,17 @@ export type ChatToExt =
   // 必须走 verifySession 守卫（在它**之后**处理），否则会被静默丢弃。
   // `optionId` 缺省表示取消/关闭。
   | { type: 'permissionAnswer'; sessionId: string; promptId: string; optionId?: string }
+// [CUSTOM-20260929-119] 表单（elicitation）的回答。同样是**会话作用域**，必须放在 verifySession
+// 守卫之后处理（放前面会被静默丢弃，那是 permission 踩过的坑）。
+// `accept` 带收集到的字段值；`decline` = 用户跳过（轮次继续）；`cancel` = 放弃（工具调用中止）。
+// 字段值的类型与 ACP 的 `ElicitationContentValue` 一致。
+| {
+    type: 'elicitationAnswer';
+    sessionId: string;
+    promptId: string;
+    action: 'accept' | 'decline' | 'cancel';
+    content?: Record<string, string | number | boolean | string[]>;
+  }
   // [CUSTOM-END] CUSTOM-20260924-020
   // [CUSTOM-BEGIN] CUSTOM-20260924-027 - 客户端报告「这张工具卡没有 view model」，
   // 扩展侧收到后重发一次视图模型。会话作用域（走 verifySession 守卫之后）。

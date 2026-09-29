@@ -60,7 +60,26 @@ export const iconsClient = `
     history: [
       ['circle', { cx: 6, cy: 6.2, r: 3.9 }],
       ['path', { d: 'M6 3.9v2.4l1.7 1' }]
+    ],
+    // [CUSTOM-20260926-079] 目录过滤 chip：折角文件夹（纯直线，画不歪）。
+    folder: [
+      ['path', { d: 'M1.8 3.2h2.6l1.1 1.2h4.7v4.6H1.8Z' }]
+    ],
+    // [CUSTOM-BEGIN] CUSTOM-20260928-096 - 输入区图标化：发送（向上箭头）/ 停止（方块）
+    // 与图片附件的回退图标（相框，缩略图缺失时用）。
+    send: [
+      ['path', { d: 'M6 9.6V3.4' }],
+      ['path', { d: 'M3.4 5.6 6 3l2.6 2.6' }]
+    ],
+    stop: [
+      ['path', { d: 'M3.2 3.2h5.6v5.6H3.2Z' }]
+    ],
+    image: [
+      ['path', { d: 'M2.5 3.2h7v5.6h-7Z' }],
+      ['circle', { cx: 4.6, cy: 5.1, r: 0.8 }],
+      ['path', { d: 'M3.2 8.2 5.4 6l1.6 1.6L9 5.4' }]
     ]
+    // [CUSTOM-END] CUSTOM-20260928-096
   };
 
   /** Build the SVG element for a record kind, or null when there is no icon. */
@@ -112,7 +131,10 @@ export const iconsClient = `
   // instead, so no layout change is needed at all.
   var HOST = {
     user: '.bubble',
-    assistant: '.bubble',
+    // [CUSTOM-20260929-114] The assistant record became a <details> whose summary is a
+    // small header row; the icon belongs there (beside the caret), not in the body -
+    // the body is the markdown host and gets rewritten on every chunk.
+    assistant: '.msg-head',
     thought: 'summary',
     plan: '.plan-title',
     notice: ''

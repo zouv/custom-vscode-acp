@@ -142,8 +142,11 @@ export class SessionHistoryStore {
   upsertNew(agentName: string, cwd: string, sessionId: string): void {
     const existing = this.get(agentName, sessionId);
     if (existing) {
-      // Refresh lastActiveAt so it floats to the top on re-render.
+      // Refresh lastActiveAt so it floats to the top on re-render, and the cwd —
+      // the caller (session/new OR reopening an existing session) knows the
+      // authoritative directory, so a stale one must not stick (CUSTOM-20260928-097).
       existing.lastActiveAt = new Date().toISOString();
+      existing.cwd = cwd;
       this.persist();
       return;
     }

@@ -5,9 +5,13 @@
 // [CUSTOM-BEGIN] CUSTOM-20260924-026
 import { isBlankText } from '../content/contentBlocks';
 // [CUSTOM-END] CUSTOM-20260924-026
+// [CUSTOM-BEGIN] CUSTOM-20260929-119 - 表单卡类型（见 appendElicitation）。
+import type { ElicitationState } from '../../../handlers/ElicitationBridge';
+// [CUSTOM-END] CUSTOM-20260929-119
 import type {
   AssistantEntry,
   ContentEntry,
+  ElicitationEntry,
   EntryPatch,
   NoticeEntry,
   PermissionEntry,
@@ -19,6 +23,7 @@ import type {
   TranscriptSnapshot,
   UserEntry,
 } from './types';
+import type { ContentBlockView } from '../content/contentBlocks';
 
 const MAX_ENTRIES_PER_SESSION = 500;
 const MAX_SESSIONS = 24;
@@ -118,12 +123,14 @@ export class TranscriptStore {
 
   // --- Appends -------------------------------------------------------------
 
-  appendUser(sessionId: string, text: string): UserEntry | null {
+  appendUser(sessionId: string, text: string, attachments?: ContentBlockView[]): UserEntry | null {
     return this.append<UserEntry>(sessionId, t => ({
       id: this.nextEntryId(t),
       kind: 'user',
       at: Date.now(),
       text: clampText(text),
+      // [CUSTOM-20260928-108] 发送时带的图片附件（chip 视图模型）。
+      ...(attachments && attachments.length > 0 ? { attachments } : {}),
     }));
   }
 
@@ -178,6 +185,28 @@ export class TranscriptStore {
     }));
   }
   // [CUSTOM-END] CUSTOM-20260924-020
+
+  // [CUSTOM-BEGIN] CUSTOM-20260929-119 - 表单卡：一个 promptId 一条记录（同权限卡）。
+  appendElicitation(sessionId: string, elicitation: ElicitationState): ElicitationEntry | null {
+    const t = this.sessions.get(sessionId);
+    if (t) {
+      const existing = t.entries.find(
+        e => e.kind === 'elicitation' && (e as ElicitationEntry).elicitation.promptId === elicitation.promptId,
+      );
+      if (existing) {
+        (existing as ElicitationEntry).elicitation = elicitation;
+        t.touched = ++this.clock;
+        return existing as ElicitationEntry;
+      }
+    }
+    return this.append<ElicitationEntry>(sessionId, s => ({
+      id: this.nextEntryId(s),
+      kind: 'elicitation',
+      at: Date.now(),
+      elicitation,
+    }));
+  }
+  // [CUSTOM-END] CUSTOM-20260929-119
 
   appendTool(sessionId: string, toolCallId: string): ToolEntry | null {    // One transcript row per tool call, even if the agent re-announces it.
     const t = this.sessions.get(sessionId);

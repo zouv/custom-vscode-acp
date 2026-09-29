@@ -9,6 +9,8 @@ import { FileSystemHandler } from '../handlers/FileSystemHandler';
 import { TerminalHandler } from '../handlers/TerminalHandler';
 import { PermissionHandler } from '../handlers/PermissionHandler';
 import type { PermissionBridge } from '../handlers/PermissionBridge';
+import type { ElicitationBridge } from '../handlers/ElicitationBridge';
+import { ElicitationHandler } from '../handlers/ElicitationHandler';
 import { SessionUpdateHandler } from '../handlers/SessionUpdateHandler';
 import { log, logError, logTraffic } from '../utils/Logger';
 import { version as extensionVersion } from '../../package.json';
@@ -39,6 +41,8 @@ export class ConnectionManager {
     // 桥是唯一的出口（面板卡片 / 弹框），因此在构造连接时一并传下去。
     private readonly permissionBridge?: PermissionBridge,
     // [CUSTOM-END] CUSTOM-20260924-020
+    // [CUSTOM-20260929-119] elicitation 桥同理：一个连接一个 handler，桥是全局唯一出口。
+    private readonly elicitationBridge?: ElicitationBridge,
   ) {}
 
   /**
@@ -65,6 +69,10 @@ export class ConnectionManager {
     const fsHandler = new FileSystemHandler();
     const terminalHandler = new TerminalHandler();
     const permissionHandler = new PermissionHandler(this.permissionBridge);
+    // [CUSTOM-20260929-119] The elicitation handler needs no configuration: the form
+    // arrives turnkey from the agent, so the only decision is panel-vs-dialog and that
+    // lives in the bridge.
+    const elicitationHandler = new ElicitationHandler(this.elicitationBridge);
 
     // Create client implementation
     const client = new AcpClientImpl(
@@ -72,6 +80,7 @@ export class ConnectionManager {
       terminalHandler,
       permissionHandler,
       this.sessionUpdateHandler,
+      elicitationHandler,
     );
 
     // Create connection — toClient factory receives the Agent proxy
@@ -97,6 +106,15 @@ export class ConnectionManager {
           writeTextFile: true,
         },
         terminal: true,
+        // [CUSTOM-20260929-119] Form elicitation. This is what makes AskUserQuestion
+        // reachable AT ALL: the Claude Code adapter renders it as an ACP form only for
+        // clients that declare this, and **disables the tool outright** for clients
+        // that do not (`disallowedTools = ["AskUserQuestion"]`). Declaring it also
+        // means MCP-server elicitations and the refusal-fallback consent prompt arrive
+        // here — all three are the same form, so one implementation covers them.
+        // `url` mode is deliberately NOT declared: we never render a URL prompt,
+        // and agents fail closed on undeclared modes.
+        elicitation: { form: {} },
       },
     });
 

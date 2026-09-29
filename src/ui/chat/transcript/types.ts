@@ -9,7 +9,9 @@ import type { PermissionOptionKind, PlanEntry, ToolCallStatus, ToolKind } from '
 import type { ContentBlockView } from '../content/contentBlocks';
 
 /** Why a plan/tool entry exists in the transcript. */
-export type TranscriptEntryKind = 'user' | 'assistant' | 'thought' | 'tool' | 'plan' | 'content' | 'notice' | 'permission';
+// [CUSTOM-BEGIN] CUSTOM-20260929-119 - `elicitation`：ACP 表单请求（AskUserQuestion 等）。
+export type TranscriptEntryKind = 'user' | 'assistant' | 'thought' | 'tool' | 'plan' | 'content' | 'notice' | 'permission' | 'elicitation';
+// [CUSTOM-END] CUSTOM-20260929-119
 
 interface EntryBase {
   /** Stable id, unique within a session. Assigned by TranscriptStore. */
@@ -21,6 +23,14 @@ interface EntryBase {
 export interface UserEntry extends EntryBase {
   kind: 'user';
   text: string;
+  /**
+   * [CUSTOM-20260928-108] 发送时带的图片附件（chip 视图模型）。
+   * 不进 ACP 协议——它是宿主从 `handleSendPrompt` 传下来的渲染视图；
+   * `attachments` 与 `imageData` 在发送后清空，气泡里的图片因此只存在 transcript 里。
+   * Replay 路径不重建（`user_message_chunk` 的文本与非文本块分成两条 chunk 到达，
+   * 而条目模型没有 messageId 可以把它关联回去；重建需要第二来源的关联，见 §5.25）。
+   */
+  attachments?: ContentBlockView[];
 }
 
 export interface AssistantEntry extends EntryBase {
@@ -79,8 +89,12 @@ export interface NoticeEntry extends EntryBase {
    * marks the centered divider-style line used for "Switched to <model>" (the
    * shape Claude's own panel uses for a model/mode change). It sits with info/warn/
    * error so the level stays the single field the client renders from.
+   *
+   * [CUSTOM-20260928-109] 'meta' marks a host-injected block that arrived as a
+   * user chunk but is NOT user input (e.g. <task-notification>, <system-reminder>).
+   * Rendered as a small centered gray line — no bubble, no icon, no blue.
    */
-  level: 'info' | 'warn' | 'error' | 'switch';
+  level: 'info' | 'warn' | 'error' | 'switch' | 'meta';
   text: string;
 }
 
@@ -120,6 +134,14 @@ export interface PermissionEntry extends EntryBase {
   permission: PermissionState;
 }
 // [CUSTOM-END] CUSTOM-20260924-020
+// [CUSTOM-BEGIN] CUSTOM-20260929-119 - 表单卡（elicitation）。
+// 与权限卡同一形态：一条 promptId 一条记录，状态由宿主推进；
+// 客户端按 `fields` 渲染控件、把值收集起来回传（见 html/client/elicitationView.ts）。
+export interface ElicitationEntry extends EntryBase {
+  kind: 'elicitation';
+  elicitation: import('../../../handlers/ElicitationBridge').ElicitationState;
+}
+// [CUSTOM-END] CUSTOM-20260929-119
 
 export type TranscriptEntry =
   | UserEntry
@@ -129,7 +151,8 @@ export type TranscriptEntry =
   | PlanEntryRecord
   | ContentEntry
   | NoticeEntry
-  | PermissionEntry;
+  | PermissionEntry
+  | ElicitationEntry;
 
 /** Full snapshot of one session's transcript, sent on focus/boot. */
 export interface TranscriptSnapshot {
@@ -160,6 +183,8 @@ export interface EntryPatch {
   blocks?: ContentBlockView[];
   /** Replacement permission state (CUSTOM-20260924-020). */
   permission?: PermissionState;
+  // [CUSTOM-20260929-119] 表单卡的补丁键（键名必须与记录字段名逐字相同，见 PATCH_KEYS 的教训）。
+  elicitation?: import('../../../handlers/ElicitationBridge').ElicitationState;
 }
 
 /**
@@ -177,6 +202,19 @@ export interface ToolInvocation {
   locations: Array<{ path: string; line?: number | null }>;
   rawInput: unknown;
   rawOutput: unknown;
+  /**
+   * [CUSTOM-20260929-117] The agent's human-written description of the call
+   * ("List files in the working directory"), latched by the store as soon as any
+   * update carries one.
+   *
+   * Latched rather than read on demand, because the two places it travels do not
+   * both survive: `rawInput` keeps the field across updates (a missing key leaves
+   * the old value alone), but `_meta` is REPLACED wholesale on every update, so
+   * `_meta.claudeCode.title` exists only in the one update that carries it —
+   * reading it live would make the card title flicker back to the command line on
+   * the next chunk.
+   */
+  description?: string;
   /**
    * ACP `_meta` for this tool call. Vendor-specific and typed `unknown`, but
    * it is one of the few places an agent could put an explicit parent link —

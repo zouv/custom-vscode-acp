@@ -413,6 +413,7 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run package",
+    "precompile": "node CUSTOMIZATIONS/scripts/check-webview-client.mjs",
     "compile": "webpack",
     "watch": "webpack --watch",
     "dev:host": "node CUSTOMIZATIONS/scripts/dev-host.mjs",

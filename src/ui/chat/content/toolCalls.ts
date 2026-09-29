@@ -29,6 +29,25 @@ export interface ToolCallView {
   status: ToolCallStatus;
   /** Command line, when the raw input carries one (`execute` tools). */
   command: string | null;
+  // [CUSTOM-20260929-117] The agent's OWN description of the call ("List files in
+  // the working directory"), which is what the card head shows in place of the
+  // command line — the shape the official Claude Code panel uses. Latched by
+  // `ToolInvocationStore`; absent for tools that carry none (e.g. Read), where the
+  // client falls back to `title`.
+  description?: string;
+  /**
+   * [CUSTOM-20260929-118] The tool's raw output text, as a fallback for the OUT
+   * section when `items` carries nothing renderable.
+   *
+   * `rawOutput` is set by the agent on EVERY tool result (the captured replay has it
+   * on all six calls) while `items` depends on how the agent chose to format the
+   * result — for a Bash call the current adapter sends the output as a ```console
+   * text block when the client does not advertise terminal output, but the streamed
+   * `tool_call_update`s for the same call carry the DESCRIPTION as their content. So
+   * "no visible item, but an output string" is a state that really occurs, and
+   * without this field the reader gets an empty box.
+   */
+  output?: string;
   // [CUSTOM-20260926-074] The agent's OWN name for the tool ("Bash" / "Read" /
   // "Edit"), when it publishes one in `_meta`. `kind` is ACP's coarse vocabulary
   // ("Run" / "Read"), so this is what tells two "Run" cards apart at a glance.
@@ -68,6 +87,8 @@ export function toToolCallView(inv: ToolInvocation): ToolCallView {
     items: toToolContentItems(inv.content),
   };
   if (inv.endedAt !== undefined) { view.elapsedMs = Math.max(0, inv.endedAt - inv.startedAt); }
+  if (inv.description) { view.description = inv.description; }
+  if (typeof inv.rawOutput === 'string' && inv.rawOutput.trim().length > 0) { view.output = inv.rawOutput; }
   const toolName = extractToolName(inv.meta);
   if (toolName) { view.toolName = toolName; }
   if (inv.parentId) {

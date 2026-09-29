@@ -79,9 +79,10 @@ webpack + ts-loader（不是 esbuild）；ESLint flat config；`@vscode/test-cli
 | 编辑区面板（第二个 surface / 双面同步 / 显隐与前置） | `src/ui/chat/ChatSurface.ts` + `ChatEditorPanel.ts` + `ChatPanelHost.attachSurface/post` | 旧面板 | arch/chat-panel.md §5.7 |
 | 聊天 UI（旧面板，仅非 Claude Code agent 走这条） | `ChatWebviewProvider.ts`（**只读 `getHtmlContent()` 对应片段，勿整读 87KB**） | 新面板 | §2.5 |
 | 侧边栏树 / 未连接态 / 会话列表分页 | `SessionTreeProvider.ts` | webview | §2.6 |
-| 文件读写 / 终端 / 权限弹窗 | `handlers/` | core | §2.7 |
+| 文件读写 / 终端 / 权限弹窗 / **表单请求（AskUserQuestion）** | `handlers/`（表单：`Elicitation*.ts` + 客户端 `elicitationView.ts`） | core | §2.7 |
 | agent 默认列表 / 设置项 schema | `package.json(contributes.configuration)` + `AgentConfig.ts` | 全部业务代码 | §2.8 |
 | 打包 / 发布 | `CUSTOMIZATIONS/scripts/*`、`.vscodeignore`、`package.json(scripts)` | 全部业务代码 | §2.9 |
+| **记录区布局 / 观感**（折叠形状、占几行、有没有重复内容） | `CUSTOMIZATIONS/scripts/preview-records.mjs`（真 Chromium 无头截图，**自己看，别推理**）＋ `html/styles.ts` | core、tree、全部协议代码 | pitfalls #31 |
 
 > 定位优先级：**函数名 grep > 本表**。表过期时以代码为准并顺手订正本表。
 
@@ -100,6 +101,8 @@ webpack + ts-loader（不是 esbuild）；ESLint flat config；`@vscode/test-cli
 | `src/handlers/FileSystemHandler.ts` | `fs/read_text_file`（**优先返回未保存的编辑器缓冲区**，支持 `line`/`limit`）、`fs/write_text_file`（建父目录 + 打开预览） | 文件读写异常 |
 | `src/handlers/TerminalHandler.ts` | `terminal/*`：托管终端 Map、1MB 输出上限（UTF-8 安全截断）、100ms 缓冲刷写、SIGTERM 终止 | 终端输出卡住 / 乱码 / 泄漏 |
 | `src/handlers/PermissionHandler.ts` | `session/request_permission` → 读 `acpc.autoApprovePermissions` 自动批准；否则交给 `PermissionBridge`（面板卡片 / 退回 `quickPick`） | 权限弹窗行为 |
+| `src/handlers/ElicitationBridge.ts` | **表单请求（ACP elicitation / AskUserQuestion）的唯一出口**（119 新增）：与 `PermissionBridge` 同构（FIFO / 幂等 / 降级），三态 accept/decline/cancel；`fieldsOf()` 把 JSON Schema 扁平化成五种字段 | 表单行为 / schema 形状 / 生命周期 |
+| `src/handlers/ElicitationHandler.ts` | 表单的策略层 + **弹框兜底**（逐字段 QuickPick/InputBox）；只认 form + sessionId 作用域 | 弹框兜底行为 |
 | `src/handlers/PermissionBridge.ts` | **权限请求的唯一出口**（020 新增）：面板卡片 vs 弹框的判定、并发请求 FIFO 队列、`cancelSession`/`cancelAll` 保证每个请求恰好被回答一次。不 import vscode UI 类型 | 权限策略 / 超时 / 队列行为 |
 | `src/handlers/SessionUpdateHandler.ts` | `session/update` 通知的监听器扇出（try/catch 隔离单个订阅者） | 流式更新丢事件 |
 | `src/ui/ChatWebviewProvider.ts` | **legacy 面板（单会话、未改造）**：webview 视图 + 内联 HTML 字符串（`getHtmlContent()`，CSP+nonce）；webview↔扩展 postMessage 协议；`marked` 渲染 markdown。CUSTOM-20260923-011 起由 `LegacyPanelAdapter` 用 **facade** 包装后接入路由层，**本文件零改动** | 仅在必须跟上游同步时动；旧缺陷不在此文件里修 |
@@ -153,14 +156,14 @@ webview→扩展消息类型（**按"要不要带 sessionId"分组——这正�
 - **会话作用域**（带 `sessionId`，在 `verifySession` 守卫**之后**处理）：
   `sendPrompt` / `cancelTurn` / `closeSession` / `focusSession` / `detachFile` / `setMode` / `setModel` /
   `setConfigOption` / `openFile` / `openTerminal` / `permissionAnswer`(020) / `needToolView`(027) /
-  `attachPath`(049)。
+  `attachPath`(049) / `attachImage`(096)。
 - **非会话作用域**（按设计**不带** `sessionId`，必须在守卫**之前**处理，否则被静默丢弃）：
   `ready` / `newSession` / `focusAgent` / `renderMarkdown` / `copy` / `openLink` / `executeCommand`、
   `connectAgent` / `listHistory` / `openHistorySession`(032/033)、`clientLog`(029)、
-  `listDirectoryChoices` / `pickDirectory` / `createDraftAndSend`(058)。
+  `listDirectoryChoices` / `pickDirectory` / `createDraftAndSend`(058)、`supplementHistory`(095)。
 
 扩展→webview 消息类型：`boot`/`focus`/`sessionsChanged`/`sessionClosed`/`append`/`revise`/`toolUpdate`/
-`markdownRendered`/`meta`/`attachments`/`error`/`history`(033)/`directoryChoices`/`directoryPicked`/
+`markdownRendered`/`meta`/`attachments`/`error`/`history`(033)/`historySupplement`(095)/`directoryChoices`/`directoryPicked`/
 `draftResolved`/`draftFailed`(058)。**定向 vs 广播**：`boot` 与 058 那四条**定向**（只回发起请求的那个面，
 058 的是"某个文档正在编辑的草稿"），其余广播——见 §5.7。
 

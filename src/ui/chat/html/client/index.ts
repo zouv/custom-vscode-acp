@@ -10,6 +10,9 @@ import { iconsClient } from './icons';
 import { scrollClient } from './scroll';
 import { linksClient } from './links';
 import { permissionViewClient } from './permissionView';
+// [CUSTOM-20260929-119] Form cards (ACP elicitation / AskUserQuestion) — the permission
+// card's sibling, so it loads next to it.
+import { elicitationViewClient } from './elicitationView';
 import { toolCallViewClient } from './toolCallView';
 import { transcriptViewClient } from './transcriptView';
 import { outlineClient } from './outline';
@@ -19,6 +22,8 @@ import { railClient } from './rail';
 import { tabsClient } from './tabs';
 import { composerClient } from './composer';
 import { contextMenuClient } from './contextMenu';
+import { lightboxClient } from './lightbox';
+import { stickyUserClient } from './stickyUser';
 import { bootClient } from './boot';
 
 const MODULES: ReadonlyArray<string> = [
@@ -31,6 +36,7 @@ const MODULES: ReadonlyArray<string> = [
   // Must precede transcriptView: build() dispatches on entry kind at runtime,
   // which only works once every view module has been registered.
   permissionViewClient,
+  elicitationViewClient,
   toolCallViewClient,
   transcriptViewClient,
   outlineClient,
@@ -43,6 +49,10 @@ const MODULES: ReadonlyArray<string> = [
   composerClient,
   // [CUSTOM-20260925-067] Takes the context menu over from Chromium's native one.
   contextMenuClient,
+  // [CUSTOM-20260928-097] 图片点击放大（lightbox），独立模块、boot 里 install。
+  lightboxClient,
+  // [CUSTOM-20260928-102] 最近一条已滚出视口的用户消息，克隆到消息区顶部。
+  stickyUserClient,
   bootClient,
 ];
 

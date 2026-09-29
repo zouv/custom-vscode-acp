@@ -22,6 +22,21 @@ export function isModernAgent(agentName: string | null | undefined): boolean {
   return !!agentName && MODERN_AGENTS.has(agentName);
 }
 
+/**
+ * [CUSTOM-20260927-086] Which panel renders for a focused agent.
+ *
+ * "Nothing focused" must route to the MODERN panel, not legacy. Legacy is the untouched
+ * upstream panel, and attaching it REPLACES the sidebar document (`webview.html`), which
+ * throws away everything client-local — a draft page and its typed text (058) — and makes
+ * the modern empty state ("No session yet" + Connect) unreachable: it exists precisely for
+ * the sessionless panel, which used to route to legacy instead. Only a KNOWN non-modern
+ * agent goes to legacy.
+ */
+export function panelIdForAgent(agentName: string | null | undefined): 'modern' | 'legacy' {
+  if (!agentName) { return 'modern'; }
+  return isModernAgent(agentName) ? 'modern' : 'legacy';
+}
+
 /** Focused agent + session, as understood by the router. */
 export interface PanelContext {
   agentName: string | null;

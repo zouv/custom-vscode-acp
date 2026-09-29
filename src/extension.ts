@@ -17,6 +17,7 @@ import { StatusBarManager } from './ui/StatusBarManager';
 import { ChatRouterProvider } from './ui/chat';
 // [CUSTOM-BEGIN] CUSTOM-20260924-020
 import { PermissionBridge } from './handlers/PermissionBridge';
+import { ElicitationBridge } from './handlers/ElicitationBridge';
 // [CUSTOM-END] CUSTOM-20260924-020
 import { getAgentNames } from './config/AgentConfig';
 import { fetchRegistry } from './config/RegistryClient';
@@ -36,7 +37,9 @@ export function activate(context: vscode.ExtensionContext): void {
   // [CUSTOM-BEGIN] CUSTOM-20260924-020 - 权限桥：构造顺序必须是 bridge → ConnectionManager
   // （每个连接都要拿到它）。构造早于 ChatPanelHost，后者在自己的构造函数里注册为 presenter。
   const permissionBridge = new PermissionBridge();
-  const connectionManager = new ConnectionManager(sessionUpdateHandler, permissionBridge);
+  // [CUSTOM-20260929-119] elicitation 桥：构造顺序 bridge → ConnectionManager → host。
+  const elicitationBridge = new ElicitationBridge();
+  const connectionManager = new ConnectionManager(sessionUpdateHandler, permissionBridge, elicitationBridge);
   // [CUSTOM-END] CUSTOM-20260924-020
   const sessionManager = new SessionManager(
     agentManager,
@@ -55,6 +58,11 @@ export function activate(context: vscode.ExtensionContext): void {
   //   · setSessionLookup 让退回弹框时能标明「哪个会话在请求」（并发请求不再无法区分）；
   //   · session-closed 把该会话所有待决请求按 ACP 契约回答成 cancelled，否则 agent 永久挂起。
   sessionManager.setPermissionBridge(permissionBridge);
+  sessionManager.setElicitationBridge(elicitationBridge);
+  elicitationBridge.setSessionLookup(sessionId => {
+    const session = sessionManager.getSession(sessionId);
+    return session ? { title: session.title, agentName: session.agentName } : undefined;
+  });
   permissionBridge.setSessionLookup(sessionId => {
     const session = sessionManager.getSession(sessionId);
     return session ? { title: session.title, agentName: session.agentName } : undefined;
@@ -77,6 +85,7 @@ export function activate(context: vscode.ExtensionContext): void {
     sessionUpdateHandler,
     permissionBridge,
     context.globalState,
+    elicitationBridge,
   );
   const chatViewRegistration = vscode.window.registerWebviewViewProvider(
     ChatRouterProvider.viewType,
@@ -381,8 +390,13 @@ export function activate(context: vscode.ExtensionContext): void {
       return;
     }
 
-    // No-op if it is already the active session.
+    // [CUSTOM-20260927-087] An explicit request must be ANSWERED even when this session
+    // is already the host's active one: the panel may be showing a client-local DRAFT
+    // (058) while the host's focus already names this session, and the old early return
+    // made the click do nothing at all (the same defect as 080, third call site).
+    // 'force' is the manager's own idiom for a user-visible focus action.
     if (sessionManager.getActiveSessionId() === sessionId) {
+      sessionManager.focusSession(sessionId, { force: true });
       vscode.commands.executeCommand('acpc-chat.focus');
       return;
     }
@@ -576,8 +590,11 @@ export function activate(context: vscode.ExtensionContext): void {
         sessionUpdateHandler.dispose();
         // [CUSTOM-20260924-020] 先回答掉所有待决权限请求，再拆面板。
         permissionBridge.cancelAll();
+        // [CUSTOM-20260929-119] 表单请求同样不能挂着：先回答掉再拆面板。
+        elicitationBridge.cancelAll();
         chatRouter.dispose();
         permissionBridge.dispose();
+        elicitationBridge.dispose();
         sessionTreeProvider.dispose();
         disposeChannels();
       },

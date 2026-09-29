@@ -82,10 +82,17 @@ export const scrollClient = `
    * the end re-pins correctly. Without this, an append landing between the
    * click and the scroll event would yank the viewport back down — the exact
    * "I jumped up and it dragged me back" complaint the outline exists to fix.
+   *
+   * [CUSTOM-20260928-104] 'clearance' lands the node that many pixels BELOW the scrollport
+   * top instead of exactly on it. The pinned-question bar takes a message over as soon as its
+   * top reaches that edge, so landing exactly on it would hand the message straight back to
+   * the bar and the click would look like it did nothing — the caller passes the bar's own
+   * inset. Default 0 keeps every existing caller exact.
    */
-  function jumpTo(node) {
+  function jumpTo(node, clearance) {
     if (!container || !node) { return; }
-    var top = node.offsetTop - container.offsetTop;
+    var top = node.offsetTop - container.offsetTop - (clearance || 0);
+    if (top < 0) { top = 0; }
     pinned = false;
     showJump();
     container.scrollTop = top;

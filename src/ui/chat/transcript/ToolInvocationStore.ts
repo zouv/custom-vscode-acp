@@ -51,6 +51,7 @@ export class ToolInvocationStore {
     if ('rawInput' in call) { inv.rawInput = call.rawInput; }
     if ('rawOutput' in call) { inv.rawOutput = call.rawOutput; }
     if (call._meta !== undefined) { inv.meta = call._meta; }
+    latchDescription(inv);
     if (isTerminalStatus(inv.status) && inv.endedAt === undefined) { inv.endedAt = now; }
 
     this.put(sessionId, inv);
@@ -75,6 +76,7 @@ export class ToolInvocationStore {
     if ('rawInput' in update) { inv.rawInput = update.rawInput; }
     if ('rawOutput' in update) { inv.rawOutput = update.rawOutput; }
     if (update._meta !== undefined) { inv.meta = update._meta; }
+    latchDescription(inv);
 
     this.put(sessionId, inv);
     return inv;
@@ -122,4 +124,43 @@ function normalizeLocations(
 ): Array<{ path: string; line?: number | null }> {
   if (!locations) { return []; }
   return locations.map(l => ({ path: l.path, line: l.line ?? undefined }));
+}
+
+/**
+ * [CUSTOM-20260929-117] Pick up the agent's human-written description of the call,
+ * if this payload carries one, and keep the first one seen.
+ *
+ * Two shapes are recognised, both in Claude Code's `_meta`/`rawInput` namespace
+ * (the captured replay carries all three Bash calls with `rawInput.description`,
+ * and the same string mirrored at `_meta.claudeCode.title`):
+ *
+ *   · `rawInput.description` — the durable one: a later update that omits the
+ *     `rawInput` key leaves the field in place.
+ *   · `_meta.claudeCode.title` — present in ONE update only (`_meta` is replaced
+ *     wholesale), which is why this is a latch and not a property read.
+ *
+ * Written **only when a value is found**, so an update without either shape can
+ * never erase a description we already have. Silent about anything else: `_meta`
+ * is vendor-specific by definition, and guessing at a second vendor's key is the
+ * "inferred, not reported" mistake the panel docs warn about (same rule as
+ * `extractToolName`, CUSTOM-20260926-074).
+ */
+function latchDescription(inv: ToolInvocation): void {
+  if (inv.description) { return; }
+  const found = descriptionOf(inv.rawInput) ?? metaTitleOf(inv.meta);
+  if (found) { inv.description = found; }
+}
+
+function descriptionOf(rawInput: unknown): string | undefined {
+  if (!rawInput || typeof rawInput !== 'object') { return undefined; }
+  const value = (rawInput as { description?: unknown }).description;
+  return typeof value === 'string' && value.trim().length > 0 ? value : undefined;
+}
+
+function metaTitleOf(meta: unknown): string | undefined {
+  if (!meta || typeof meta !== 'object') { return undefined; }
+  const claudeCode = (meta as { claudeCode?: unknown }).claudeCode;
+  if (!claudeCode || typeof claudeCode !== 'object') { return undefined; }
+  const value = (claudeCode as { title?: unknown }).title;
+  return typeof value === 'string' && value.trim().length > 0 ? value : undefined;
 }

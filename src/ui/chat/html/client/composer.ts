@@ -17,6 +17,10 @@ export const composerClient = `
   var slashPopup = null;
   var attachmentsEl = null;
   var pickersEl = null;
+  var contextMeter = null;
+  // [CUSTOM-20260928-096] 图片附件的缩略图（id → dataUrl）。客户端本地缓存、随 reload 丢，
+  // 纯展示用——宿主内存仍持有全图供发送，丢了这个只是 chip 缩略图回退成图标。
+  var imageThumbs = {};
 
   var state = {
     sessionId: null,
@@ -40,11 +44,25 @@ export const composerClient = `
   // [CUSTOM-20260925-050] Per-session drafts. Switching sessions used to clear
   // the textarea outright, so checking another tab lost whatever you had typed.
   // Persisted through the same webview-local state as the scroll memory.
+  // [CUSTOM-20260927-085] …and per-DRAFT: a draft has no sessionId, which is exactly
+  // how its text went missing (see ownerKey).
   var drafts = {};
   var draftTimer = null;
 
+  /**
+   * Who owns what is in the textarea right now: the focused draft, or the focused
+   * session. A DRAFT HAS NO sessionId — keying the store by sessionId alone meant
+   * 'stashDraft' silently did nothing while a draft was focused, so leaving a draft
+   * discarded the typed text, and entering another draft showed the previous one's
+   * text (nothing restored it either).
+   */
+  function ownerKey() {
+    return state.draft ? state.draft.draftId : state.sessionId;
+  }
+
   function stashDraft() {
-    if (state.sessionId) { drafts[state.sessionId] = input.value; }
+    var key = ownerKey();
+    if (key) { drafts[key] = input.value; }
   }
 
   function persistDraftsSoon() {
@@ -74,6 +92,7 @@ export const composerClient = `
     slashPopup = NS.dom.qs('slashPopup');
     attachmentsEl = NS.dom.qs('attachments');
     pickersEl = NS.dom.qs('configPickers');
+    contextMeter = NS.dom.qs('contextMeter');
 
     input.addEventListener('keydown', onKeyDown);
     input.addEventListener('input', function () {
@@ -105,19 +124,27 @@ export const composerClient = `
     return (!!state.sessionId || !!state.draft) && !state.loading;
   }
 
+  // [CUSTOM-20260928-096] Send/Stop 图标化：文字换成内联 SVG，语义保留在 title/aria-label。
+  function setSendIcon(running) {
+    NS.dom.clear(sendBtn);
+    sendBtn.appendChild(NS.icons.icon(running ? 'stop' : 'send', 'send-icon'));
+    sendBtn.title = running ? 'Stop' : 'Send';
+    sendBtn.setAttribute('aria-label', running ? 'Stop' : 'Send');
+  }
+
   function refreshControls() {
     var enabled = canCompose();
     input.disabled = !enabled;
     sendBtn.disabled = !enabled && !state.running;
     sendBtn.className = 'send-stop ' + (state.running ? 'stop' : 'send');
-    sendBtn.textContent = state.running ? '\\u25a0 Stop' : 'Send';
     if (state.draftPending) {
       // A create-then-send is in flight: the button must not accept a second one.
       sendBtn.disabled = true;
-      sendBtn.textContent = 'Creating\\u2026';
+      setSendIcon(false);
       input.placeholder = 'Creating this session\\u2026';
       return;
     }
+    setSendIcon(state.running);
     if (state.draft) {
       // Say why the tab says "New session": the first message is what creates it.
       input.placeholder = 'Your first message creates this session\\u2026';
@@ -135,7 +162,8 @@ export const composerClient = `
     // prompt, and clearing the textarea first would lose the user's draft.
     if (state.running) { return; }
     var text = input.value;
-    if (!text || text.trim().length === 0) { return; }
+    // [CUSTOM-20260928-096] 有附件（图片/文件）时允许空文字发送；纯文字则要求非空。
+    if ((!text || text.trim().length === 0) && state.attachments.length === 0) { return; }
 
     if (state.draft) {
       // [CUSTOM-20260925-058] A draft has no session yet, so the host creates it
@@ -382,6 +410,28 @@ export const composerClient = `
     return item;
   }
 
+  // --- Context meter (CUSTOM-20260928-096) --------------------------------
+  // Claude Code 风格的上下文用量：细进度条 + 百分比。数据来自 meta.usage（宿主
+  // 已从 usage_update / PromptResponse.usage 填充），无需新增协议消息。
+
+  function renderContext(usage) {
+    if (!usage || !usage.size) {
+      contextMeter.hidden = true;
+      return;
+    }
+    var pct = Math.max(0, Math.min(1, usage.used / usage.size));
+    contextMeter.hidden = false;
+    contextMeter.title = Math.round(usage.used / 1000) + 'k / ' + Math.round(usage.size / 1000) + 'k tokens';
+    NS.dom.clear(contextMeter);
+    var fillClass = 'usage-fill' + (pct > 0.9 ? ' hot' : (pct > 0.7 ? ' warn' : ''));
+    var track = NS.dom.el('span', 'usage-track');
+    var fill = NS.dom.el('span', fillClass);
+    fill.style.width = Math.round(pct * 100) + '%';
+    track.appendChild(fill);
+    contextMeter.appendChild(track);
+    contextMeter.appendChild(document.createTextNode(Math.round(pct * 100) + '%'));
+  }
+
   // --- Attachments ---------------------------------------------------------
 
   function renderAttachments() {
@@ -394,6 +444,18 @@ export const composerClient = `
     for (var i = 0; i < state.attachments.length; i++) {
       (function (attachment) {
         var chip = NS.dom.el('span', 'attachment');
+        // [CUSTOM-20260928-096] 图片附件：缩略图优先（本地缓存，无则回退成相框图标）。
+        if (attachment.kind === 'image') {
+          var thumb = imageThumbs[attachment.path];
+          if (thumb) {
+            var img = NS.dom.el('img', 'attachment-thumb');
+            img.setAttribute('src', thumb);
+            img.setAttribute('alt', attachment.name);
+            chip.appendChild(img);
+          } else {
+            chip.appendChild(NS.icons.icon('image', 'attachment-thumb-icon'));
+          }
+        }
         chip.appendChild(NS.dom.el('span', 'attachment-name', attachment.name));
         var remove = NS.dom.el('button', 'attachment-x', '\\u00d7');
         remove.title = 'Remove attachment';
@@ -410,8 +472,9 @@ export const composerClient = `
 
   /** Switch the composer into draft mode: enabled, but bound to no session yet. */
   function setDraft(draft) {
-    // Leaving a real session: keep its typed text under its own id.
-    if (state.sessionId) { stashDraft(); }
+    // [CUSTOM-20260927-085] Stash BEFORE the state changes — the outgoing owner may be
+    // another DRAFT, and losing its text is what this fix is about.
+    stashDraft();
     state.sessionId = null;
     state.agentName = null;
     state.running = false;
@@ -427,6 +490,9 @@ export const composerClient = `
     renderPickers();
     renderAttachments();
     refreshControls();
+    // …and hand back what THIS draft had. Without it, switching drafts carried the
+    // previous draft's text across (and a discarded-then-reopened draft came back empty).
+    restoreDraft(state.draft ? state.draft.draftId : null);
     autoGrow();
   }
 
@@ -459,12 +525,15 @@ export const composerClient = `
     // [CUSTOM-20260925-058] Draft mode and session mode are mutually exclusive —
     // 'send()' branches on 'state.draft', so a stale one would misroute a send.
     var wasDraft = !!state.draft;
-    state.draft = null;
-    state.draftPending = false;
     var changed = wasDraft || !state.sessionId || !summary || summary.sessionId !== state.sessionId;
     // [CUSTOM-20260925-050] Stash BEFORE the id changes, so the outgoing
     // session's draft is filed under its own id rather than the incoming one.
+    // [CUSTOM-20260927-085] …and before 'state.draft' is cleared: a draft's text is
+    // filed under the draft's id, so clearing it first would make ownerKey() null and
+    // drop the text (which is exactly the reported data loss).
     if (changed) { stashDraft(); }
+    state.draft = null;
+    state.draftPending = false;
     state.sessionId = summary ? summary.sessionId : null;
     state.agentName = summary ? summary.agentName : null;
     state.running = summary ? !!summary.running : false;
@@ -487,6 +556,7 @@ export const composerClient = `
     }
     renderPickers();
     renderAttachments();
+    renderContext(meta && meta.usage);
     refreshControls();
     autoGrow();
   }
@@ -500,11 +570,18 @@ export const composerClient = `
     state.commands = meta.availableCommands || [];
     state.configOptions = meta.configOptions || [];
     renderPickers();
+    renderContext(meta.usage);
     refreshControls();
   }
 
   function setAttachments(list) {
     state.attachments = list || [];
+    renderAttachments();
+  }
+
+  // [CUSTOM-20260928-096] 客户端记录图片缩略图（boot.ts 读取剪贴板位图后调用）。
+  function rememberImage(id, dataUrl) {
+    imageThumbs[id] = dataUrl;
     renderAttachments();
   }
 
@@ -524,6 +601,7 @@ export const composerClient = `
     setRunning: setRunning,
     setMeta: setMeta,
     setAttachments: setAttachments,
+    rememberImage: rememberImage,
     setLoading: setLoading,
     focusInput: focusInput,
     isComposable: isComposable,
