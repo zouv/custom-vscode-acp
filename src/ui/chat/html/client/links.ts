@@ -130,6 +130,19 @@ export const linksClient = `
       }
       // [CUSTOM-END] CUSTOM-20260924-020
 
+      // [CUSTOM-BEGIN] CUSTOM-20260929-119 - 表单卡的三态按钮（Submit / Skip / Cancel）。
+      // 放在权限按钮之后、其余委托之前：它同样是 session 作用域的消息，且按钮上带
+      // data-elic-action 与 data-elic-id。收集字段值的活留在 elicitationView（它owner表单结构）。
+      var elicBtn = closestWithAttr(target, 'data-elic-action');
+      if (elicBtn) {
+        event.preventDefault();
+        if (elicBtn.disabled) { return; }
+        var elicCard = target.closest ? target.closest('.elic') : null;
+        NS.elicitationView.answer(elicCard, elicBtn.getAttribute('data-elic-action'));
+        return;
+      }
+      // [CUSTOM-END] CUSTOM-20260929-119
+
       var diffHead = closestWithAttr(target, 'data-diff-toggle');
       if (diffHead) { event.preventDefault(); toggleBody(diffHead, '.diff-body'); return; }
 

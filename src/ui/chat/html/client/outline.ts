@@ -84,12 +84,29 @@ export const outlineClient = `
     return out;
   }
 
+  /**
+   * [CUSTOM-20260926-081] "Is there anything to navigate?" — the precondition for
+   * EVERY form of this outline.
+   *
+   * 045 applied it to the ☰ button only. That was fine while the popup was the only
+   * form: with no button there was no outline. 076 made the outline pinnable, and the
+   * docked column never learned the rule — so a panel with **no session at all** (or a
+   * fresh session) showed a docked "OUTLINE / No messages yet" column beside the empty
+   * state, squeezing it out of the middle of the panel.
+   *
+   * Cached rather than read per call: renderVisibility() runs on show/hide/pin/unpin
+   * and must not walk the transcript. syncButton() (called from invalidate, i.e. on
+   * every transcript change) is the only writer.
+   */
+  var anchorsPresent = false;
+
   /** The ☰ button only makes sense once there is something to navigate. */
   function syncButton() {
-    if (!button) { return; }
     // [CUSTOM-20260925-045 / 075] O(1)：计数由 transcriptView 维护（messageAnchorCount
     // 覆盖 user+assistant），不要在每次 append 上全量走 anchors()。
-    button.hidden = NS.transcriptView.messageAnchorCount() === 0;
+    anchorsPresent = NS.transcriptView.messageAnchorCount() > 0;
+    if (button) { button.hidden = !anchorsPresent; }
+    renderVisibility();
   }
 
   function renderInto(head, list) {
@@ -134,11 +151,15 @@ export const outlineClient = `
     else { renderInto(drawerHead, drawerList); }
   }
 
-  /** Sync .hidden and the button's .on state to isOpen/mode. */
+  /** Sync .hidden and the button's .on state to isOpen/mode/有没有可导航的东西。 */
   function renderVisibility() {
-    if (drawer) { drawer.hidden = !(isOpen && mode === 'popup'); }
-    if (sidebar) { sidebar.hidden = !(isOpen && mode === 'sidebar'); }
-    if (button) { button.classList.toggle('on', isOpen); }
+    // [CUSTOM-20260926-081] Nothing to navigate ⇒ no form of this outline is shown,
+    // whichever it is (see anchorsPresent). The MODE is a preference and survives —
+    // the pinned column comes back by itself with the first message.
+    var live = isOpen && anchorsPresent;
+    if (drawer) { drawer.hidden = !(live && mode === 'popup'); }
+    if (sidebar) { sidebar.hidden = !(live && mode === 'sidebar'); }
+    if (button) { button.classList.toggle('on', live); }
   }
 
   /** Measure each anchor's position. Only ever called from the rAF pass. */
@@ -165,12 +186,53 @@ export const outlineClient = `
   function setActive(id) {
     setActiveIn(drawerList, id);
     setActiveIn(sideList, id);
+    revealActive();
+  }
+
+  /**
+   * [CUSTOM-20260928-102] Keep the highlighted row inside its own scroll view.
+   *
+   * Reported: scrolling the conversation to the bottom highlighted the right row but
+   * the list never followed it, so the mark sat off-screen and the outline looked
+   * stuck. Only the outline's OWN scroll container is touched — 'scrollIntoView'
+   * would walk up and scroll '#messages' too, yanking the conversation under the
+   * reader. The move is the minimum needed (only when the row is out of view), so a
+   * row the user just CLICKED never re-centres the list under the cursor.
+   *
+   * The two forms scroll different elements: the popup scrolls the drawer itself
+   * ('.outline' carries the overflow), the pinned column scrolls its list
+   * ('.outline-sidebar .outline-list' is the 'flex: 1; overflow-y: auto' box).
+   */
+  function revealActive() {
+    var container = mode === 'sidebar' ? sideList : drawer;
+    if (!container || !container.querySelector) { return; }
+    var active = container.querySelector('.outline-item.active');
+    if (!active || !active.getBoundingClientRect) { return; }
+    var box = container.getBoundingClientRect();
+    var row = active.getBoundingClientRect();
+    if (row.top < box.top) {
+      container.scrollTop -= box.top - row.top;
+    } else if (row.bottom > box.bottom) {
+      container.scrollTop += row.bottom - box.bottom;
+    }
   }
 
   /** Highlight the anchor the viewport is currently inside (binary search). */
   function syncActive() {
     if (tops === null) { measure(); }
     if (!tops || tops.length === 0) { setActive(null); return; }
+    // [CUSTOM-20260928-100] Scrolled to the very bottom ⇒ the LAST anchor is the
+    // one being read. Reported: "我已经拉到底了，右侧选中的是倒数第二个" — the
+    // top-of-viewport rule below stops at the second-to-last row whenever the last
+    // message is shorter than the viewport (its top is above the fold, so the row
+    // whose top is nearest the viewport top IS the second-to-last one).
+    // 'clientHeight > 0' guards the un-measurable case (a hidden panel reports 0
+    // for both, which would otherwise read as "at the bottom").
+    if (messagesEl.clientHeight > 0
+      && messagesEl.scrollTop + messagesEl.clientHeight >= messagesEl.scrollHeight - 4) {
+      setActive(tops[tops.length - 1].id);
+      return;
+    }
     var y = messagesEl.scrollTop + 8;
     var lo = 0;
     var hi = tops.length - 1;

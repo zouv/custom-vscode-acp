@@ -63,6 +63,27 @@ export const bootClient = `
     emptyState.style.display = show ? '' : 'none';
   }
 
+  // [CUSTOM-20260927-090] Whether the panel's agent is up, as last told by the host
+  // (boot / focus / sessionsChanged). It decides what the empty state SAYS: a sessionless
+  // panel can still have a live agent process, and telling the user to connect one that
+  // is already running is simply wrong.
+  var agentConnected = false;
+  // One writer for this label: it belongs to the empty state, which boot owns. The
+  // sessionMenu's click handler stays where it is — it does the right action in both
+  // states (start a draft, ask the host to make sure the agent is up).
+  var CONNECT_LABEL = 'Connect Claude Code';
+  var CONNECTED_LABEL = 'New session';
+
+  function applyEmptyState(connected) {
+    if (connected !== undefined) { agentConnected = connected === true; }
+    var off = NS.dom.qs('emptyHintDisconnected');
+    var on = NS.dom.qs('emptyHintConnected');
+    var btn = NS.dom.qs('emptyConnect');
+    if (off) { off.hidden = agentConnected; }
+    if (on) { on.hidden = !agentConnected; }
+    if (btn) { btn.textContent = agentConnected ? CONNECTED_LABEL : CONNECT_LABEL; }
+  }
+
   function setLoading(loading) {
     loadOverlay.hidden = !loading;
     NS.composer.setLoading(loading);
@@ -85,6 +106,16 @@ export const bootClient = `
 
     if (!summary) {
       NS.transcriptView.reset();
+      // [CUSTOM-20260926-081] The outline goes with the transcript — including the
+      // PINNED one. This early return used to skip both calls, so a pinned sidebar
+      // kept showing "No messages yet" in a panel that has no session at all, and the
+      // empty state was pushed out of the middle. invalidate() is what re-runs the
+      // "is there anything to navigate" check that now governs every outline form.
+      NS.outline.close();
+      NS.outline.invalidate();
+      // [CUSTOM-20260928-102] …and the pinned "last question", for the same reason:
+      // it is a copy of a node that no longer exists.
+      if (NS.stickyUser) { NS.stickyUser.reset(); }
       showEmpty(true);
       setLoading(false);
       return;
@@ -107,6 +138,14 @@ export const bootClient = `
     NS.outline.invalidate();
     // [CUSTOM-20260924-023] The rail is rebuilt for the same reason.
     NS.rail.invalidate();
+    // [CUSTOM-20260928-102] The pinned user message is a CLONE of a node that was just
+    // replaced; reset, then re-decide once the restored scroll position is in place
+    // (restore writes scrollTop, which fires a scroll event — this makes sure the very
+    // first frame after a switch is right even if it does not).
+    if (NS.stickyUser) {
+      NS.stickyUser.reset();
+      NS.dom.schedule(function () { NS.stickyUser.sync(); });
+    }
     // [CUSTOM-20260925-033] The history list belongs to the previous agent.
     NS.sessionMenu.reset();
     // [CUSTOM-20260925-058] The directory drawer belonged to the previous
@@ -142,7 +181,9 @@ export const bootClient = `
     var pending = NS.transcriptView.pendingMarkdown();
     // [CUSTOM-20260925-066] Tool text blocks queue on the same round-trip.
     if (NS.toolCallView && NS.toolCallView.pendingMarkdownItems) {
-      pending = pending.concat(NS.toolCallView.pendingMarkdownItems());
+      // [CUSTOM-20260929-120] The tool items have no session of their own — stamp the
+      // focused one on them here, or the host drops them (see pendingMarkdownItems).
+      pending = pending.concat(NS.toolCallView.pendingMarkdownItems(currentSessionId));
     }
     if (pending.length === 0) { return; }
     NS.bridge.post({ type: 'renderMarkdown', items: pending });
@@ -232,12 +273,23 @@ export const bootClient = `
 
     focusedDraftId = null;
     var neighbour = drafts[index] || drafts[index - 1] || null;
-    if (neighbour) { focusDraft(neighbour.draftId); return; }
+    if (neighbour) {
+      focusDraft(neighbour.draftId);
+      // [CUSTOM-20260927-085] Only after the composer has moved off it: the discard
+      // may not leave the dropped draft's text behind (its id is never reused).
+      NS.composer.forgetDraft(draftId);
+      return;
+    }
     // Nothing local left: fall back to a live session, else to the empty state.
-    if (NS.tabs.focusFirstSession && NS.tabs.focusFirstSession()) { renderDrafts(); return; }
+    if (NS.tabs.focusFirstSession && NS.tabs.focusFirstSession()) {
+      NS.composer.forgetDraft(draftId);
+      renderDrafts();
+      return;
+    }
     currentSessionId = null;
     NS.tabs.setFocus(null);
     NS.composer.setFocus(null, null);
+    NS.composer.forgetDraft(draftId);
     NS.transcriptView.reset();
     showEmpty(true);
     renderDrafts();
@@ -270,7 +322,15 @@ export const bootClient = `
     // [CUSTOM-20260925-058] Read-only accessor for the directory drawer: it
     // keeps only the draft id and reads the cwd from here, so there is exactly
     // one copy of "which directory will this draft use" (pitfalls #19).
-    get: draftById
+    get: draftById,
+    // [CUSTOM-20260928-100] Which draft is on screen, or null. The history picker
+    // needs it: opening a session while on a draft page must retire THAT draft,
+    // not the session the host still has focused.
+    focusedId: function () { return focusedDraftId; },
+    // Retire a draft that was consumed by something other than its own first
+    // message (here: a history pick). Same shape as resolveDraft — no fallback to
+    // another tab, because the caller is about to focus a real session.
+    resolve: resolveDraft
   };
 
   /**
@@ -311,6 +371,10 @@ export const bootClient = `
       if (on) { messages.classList.add('show-times'); } else { messages.classList.remove('show-times'); }
     }
     if (toggle) { toggle.className = on ? 'nest-toggle' : 'nest-toggle off'; }
+    // [CUSTOM-20260928-103] The pinned copy is a clone outside '#messages', so it carries
+    // its own copy of this class (stickyUser.render mirrors it). Re-render it here: the
+    // class alone would not reach a copy that is already on screen.
+    if (NS.stickyUser) { NS.stickyUser.refresh(); }
   }
 
   function onMessage(event) {
@@ -320,6 +384,7 @@ export const bootClient = `
     switch (message.type) {
       case 'boot':
         NS.tabs.setSessions(message.sessions || []);
+        applyEmptyState(message.agentConnected);
         applyFocus(message.focused, message.snapshot, message.meta);
         syncFocusedState(message.sessions || []);
         break;
@@ -331,10 +396,12 @@ export const bootClient = `
 
       case 'sessionsChanged':
         NS.tabs.setSessions(message.sessions || []);
+        applyEmptyState(message.agentConnected);
         syncFocusedState(message.sessions || []);
         break;
 
       case 'focus':
+        applyEmptyState(message.agentConnected);
         applyFocus(message.summary, message.snapshot, message.meta);
         break;
 
@@ -420,6 +487,11 @@ export const bootClient = `
       // [CUSTOM-20260925-033] Reply to the history picker (listHistory).
       case 'history':
         NS.sessionMenu.setHistory(message);
+        break;
+
+      // [CUSTOM-20260928-095] Per-directory disk supplement (incremental merge).
+      case 'historySupplement':
+        NS.sessionMenu.applySupplement(message);
         break;
 
       // [CUSTOM-20260925-058] Draft page: directory candidates, the native
@@ -562,21 +634,42 @@ export const bootClient = `
 
   function installImagePaste(input) {
     if (!input) { return; }
-    // A pasted image is a Blob with no filesystem path. Writing those bytes
-    // somewhere is a separate feature (it needs a managed attachment directory
-    // and a cleanup policy), so this says so instead of doing nothing.
+    // [CUSTOM-20260928-096] 剪贴板里的位图是无路径的 Blob，读成 data URL 交给宿主；
+    // 有路径的文件粘贴仍走 attachPaths（现状）。
     input.addEventListener('paste', function (event) {
       var dt = event.clipboardData;
       if (!dt || !dt.files || dt.files.length === 0) { return; }
       var paths = pathsFromTransfer(dt);
       if (paths.length === 0) {
+        var file = dt.files[0];
+        if (file && typeof FileReader !== 'undefined' && (!file.type || file.type.indexOf('image/') === 0)) {
+          event.preventDefault();
+          var reader = new FileReader();
+          reader.onload = function () {
+            attachImage(file.name || 'pasted-image.png', file.type || 'image/png', String(reader.result));
+          };
+          reader.readAsDataURL(file);
+          return;
+        }
         event.preventDefault();
-        NS.bridge.post({ type: 'error', message: 'Pasting images is not supported yet - drop the file into the panel, or use ACP (Custom): Attach File.' });
+        NS.bridge.post({ type: 'error', message: 'Could not read the pasted file. Drop it into the panel, or use ACP (Custom): Attach File.' });
         return;
       }
       event.preventDefault();
       attachPaths(paths);
     });
+  }
+
+  // [CUSTOM-20260928-096] 把剪贴板位图作为 image 附件发到宿主。缩略图留客户端本地缓存，
+  // 全图 base64 交给宿主（宿主内存持有、发送时拼进 image ContentBlock）。
+  function attachImage(name, mimeType, dataUrl) {
+    if (!currentSessionId) {
+      NS.bridge.post({ type: 'error', message: 'Attach Image: no session is focused.' });
+      return;
+    }
+    var id = 'img-' + Date.now() + '-' + Math.floor(Math.random() * 100000);
+    if (NS.composer && NS.composer.rememberImage) { NS.composer.rememberImage(id, dataUrl); }
+    NS.bridge.postForSession({ type: 'attachImage', id: id, name: name, mimeType: mimeType, dataUrl: dataUrl });
   }
 
   function init() {
@@ -598,6 +691,10 @@ export const bootClient = `
     NS.links.installDelegatedHandlers(document.body);
     // [CUSTOM-20260925-067] Menu with context-appropriate items (no Cut/Paste).
     NS.contextMenu.install();
+    // [CUSTOM-20260928-097] 图片点击放大（lightbox）。
+    if (NS.lightbox) { NS.lightbox.install(); }
+    // [CUSTOM-20260928-102] 最近一条用户消息悬浮置顶。
+    if (NS.stickyUser) { NS.stickyUser.init(); }
     // [CUSTOM-20260925-049]
     installFileDrop(document.body);
     installImagePaste(NS.dom.qs('promptInput'));

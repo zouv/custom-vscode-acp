@@ -24,17 +24,43 @@
 |---|---|
 | 折叠三角 | **真元素 `.fold-caret`，不是 `summary::before`**——伪元素永远画在内容之前，而类型图标是 `prepend` 到 `summary` 的，用伪元素会把三角挤到图标**左边**。正确顺序 `[图标][三角][标签]` 靠"先建三角、图标再 prepend"**按构造**得到。三角本身是空的：字形与方向由 CSS 依 `details[open]` 驱动 ⇒ **切换不需要 JS** |
 | 重写 summary 时 | **保留所有元素子节点**（只丢文本与 `.thought-spin`）。按名字逐个列（旧写法只列 `.rec-icon`）会在新增挂件时**静默丢掉它** |
-| 用户消息的切分 | **首行在 `summary`、其余在 `body`**（**不**重复全文，否则展开时文字两遍）；**单行消息不给折叠控件**（没有可折的东西）；**默认展开**（刚发的消息不该被藏起来） |
-| **触发条件（071，取代 064）** | 判据是**实测渲染行数**，不是任何字符特征：先建出真正会渲染的 `<details>`（caret 与图标都在，宽度才对）、插入 DOM，再用 `Range.getClientRects()` **只框住文本节点**数行盒（`height > 0` 的矩形个数；行长边界会多出一个零高矩形），多于一行才保留折叠、只有一行就**退回普通气泡**。**064 的"`有 \n` 或 `长度 > 160`"已经删掉**——阈值与换行都是**代理信号**，两次都不够用（窄侧边栏里 100 字无换行的消息视觉上三行却不折叠，见 pitfalls #25 的第二次复发）。旧判据只保留为**量不出来时**的回退档 |
+| 用户消息的切分 | **首行在 `summary`、其余在 `body`**（**不**重复全文，否则展开时文字两遍）；**默认展开**（刚发的消息不该被藏起来）；**折叠控件每条都有（113）**——单行消息不是"没有可折的东西"：它在更窄的宽度下会折行，而折叠态的 summary 不折行，那时折叠是真的动作。单行时 body 为空 ⇒ **不生成 `.fold-body`**（见下） |
+| **触发条件（071，取代 064；113 去掉"单行退回气泡"）** | 判据是**实测渲染行数**，不是任何字符特征：先建出真正会渲染的 `<details>`（caret 与图标都在，宽度才对）、插入 DOM，再用 `Range.getClientRects()` **只框住文本节点**数行盒（`height > 0` 的矩形个数；行长边界会多出一个零高矩形），多于一行才**切分**；只有一行就把**全文留在 summary**、body 为空（**控件保留**，这是 113：单行消息在更窄的宽度下会折行，那时折叠是真实动作）。**064 的"`有 \n` 或 `长度 > 160`"已经删掉**——阈值与换行都是**代理信号**，两次都不够用（窄侧边栏里 100 字无换行的消息视觉上三行却不折叠，见 pitfalls #25 的第二次复发）。旧判据只保留为**量不出来时**的回退档 |
+| **`.fold-body` 在不在是有含义的（113）** | 它 = "caret 后面还藏着东西"：单行消息的 body 为空 ⇒ **不生成这个元素**。置顶条的收缩按钮正是按它判断的（按 `.user-fold` 判断会变成"每条消息都配一个没反应的按钮"，那正是 104 拒绝过的）。`settleUserFold` 的"先清空旧 body 再重判"因此要按需重加，不能无条件 append 一个空 span |
 | 切分点 | 有 `\n` 且其后还有可见内容 ⇒ **按 `\n` 切**（精确答案）；否则二分找**第一行末尾** → 回退到最近空格 → 不切断代理对。切在 `\n` 上时**那个换行符被丢弃**：summary 与 body 的块边界本身就渲染成一次换行，留着会多出一整行空行 |
 | 量不出来时（隐藏面板 / 无 `createRange` / 超 2000 字） | 回退 064 的判据，并把节点标成 `data-fold="heuristic"`；等它第一次拿到真实尺寸（`rail` 的 ResizeObserver 正好报这个事件）**只重判一次**，两个方向都要能改（折→不折、不折→折）。**不要每次 resize 都重判**——那会与引导条互相打架 |
 | 折叠态 | summary 占**恰好一行**并省略号截断（`.user-fold:not([open]) > summary`）——**只在折叠态**：展开时若还是 `nowrap`，第一段会被截成"半句话加省略号"，看起来像内容丢了 |
 | 展开态 | body 是 **inline**：切分点只是实现细节，块级 body 会在半句话处凭空多一处换行 |
+| **用户消息的宽度（105）** | `.entry-user { align-self: stretch }`——**靠左、铺满内容盒**。原先是 `flex-end` + `max-width:88%`，气泡宽度 = 内容宽度；于是**折叠后只剩首行、宽度跟着缩短**，面板在折/展时自己变窄（用户报"体验不好"）。宽度现在是常量，折与不折只影响高度。连带：正文与时刻同一起点（`.rec-time` 的右对齐已删）、圆角四角一致（原来的 `8/8/2/8` 缺口指向右下，靠左之后方向反了）。**置顶卡片里的克隆体吃的是同一套规则**，所以"铺满"也决定了卡片里没有空档（收缩按钮因此挪到卡片外，见 §5.25） |
+| **正文从第二行开始（108）** | summary 第一行只放图标/caret（+图片 chip），正文包进 `.bubble-body`（`display:block`）另起一行。`textNodeOf` 改为在 `.bubble-body` 里找文本节点（图标/caret/chip 都在外面）。`unfoldUser` 重建气泡时把 chip 一并迁过去。折叠态的截断从整个 summary 改到 `.bubble-body` 自己（否则图片 chip 会被一起截掉） |
+| **图片附件进用户气泡（108）** | `UserEntry` 加 `attachments?: ContentBlockView[]`；`handleSendPrompt` 把图片的 `toContentView` 循环提前到 `appendUser` 之前、把 views 一并传入，删掉独立 `content` 条目的 append。**Replay 路径（111）**：replay 把文本与图片分成两条 chunk（100 的教训），气泡里没有可合并的东西——改为在 replay 开始前读转录（`readTranscriptUserImages`），按 `uuid` 建 `messageId → 图片视图` 表，`user_message_chunk` 的文本分支据此并入 `appendUser`，随后的图片 chunk 丢弃。任何失败退化为"没有图片" |
+| **注入块分流（109）** | `<task-notification>`、`<system-reminder>` 等注入块走 `user_message_chunk` 通道，被无条件渲染成蓝色用户气泡。改为**前缀判据**（`isInjectedChunk`），两条入口（replay 分支、`handleSendPrompt`）共用同一个判据，分流成 `notice` 的 `meta` 级别（居中、灰色、小字、无气泡、无图标）。发送路径仍然真的发出去（agent 期待收到），只是不再产生用户气泡 |
 
 **INV-J（破了不会有自动检查报错；`src/test/chat-client.test.ts` 是它的守卫）**：
 ①三角在图标**之后**；②summary 重写后**图标与三角都还在**；③用户消息折叠**不重复全文**、
-单行不给控件、默认展开；④**触发判据是"屏幕上几行"**——两个方向都要测：只折行无换行的消息**必须**折叠，
-一行放得下的长文本**必须**不折叠（只测前者说明不了它是测量而不是"更宽的阈值"）。
+默认展开、**每条消息都有控件**（113）——单行时 body 为空且**不生成 `.fold-body`**（那个元素
+就是"后面还有东西"的标记，置顶条的收缩按钮按它判断）；④**触发判据是"屏幕上几行"**——
+两个方向都要测：只折行无换行的消息**必须切分**（有 `.fold-body`），
+一行放得下的长文本**必须不切分**（无 `.fold-body`）；只测前者说明不了它是测量而不是"更宽的阈值"。
+
+### 5.16.1 助手消息的折叠（114；折叠态一行 115→116）
+
+`agent_message_chunk`（助手气泡）与用户消息**共用同一套折叠控件**：真三角 `.fold-caret`、
+`<details>` 原生开关（切换不需要 JS）、**默认展开**（刚到的回答不该被藏起来）。
+**思考块本来就能折叠**（§5.16 的 `.thought`），所以 114 只补助手这一类。
+
+| 关注点 | 规则 |
+|---|---|
+| 结构 | `details.msg-fold[open] > summary.msg-head([icon][caret][.msg-preview])` ＋ `div.bubble-body`（summary 的**兄弟**） |
+| **正文为什么不在 summary 里** | 用户气泡里是惰性文本，整行当点击区没问题；**助手正文是 markdown HTML**（链接、代码 Copy、图片 chip），而且**在 `<summary>` 里划选文本 == 点它** —— 读者选中一段回答就会把它折起来。所以切换区只有那一行 [图标][三角]，正文在外面 |
+| 折叠怎么实现 | **首行预览**：一段预览文本放在 summary 里（`.msg-preview`，真文本节点），折叠时显示、展开时由 CSS 藏掉。**"更聪明"的两条路都试过并否掉了**：按测量切开正文（渲染后的 markdown 里"切在第几个字符"没有意义）、给正文加行钳制（**`details` 折叠时对非 summary 子节点的隐藏，作者样式抢不过**——115 用 `display` 覆盖，结果折叠后正文干脆不可见，用户看到的正是"折叠后文字没了"） |
+| **折叠后占几行（115→116）** | **一行**：`[图标][三角][正文首行]`，与用户消息一致（用户要求）。115 想用 flex 把正文的首行挪到标题行上——**没用**：`display:flex` 挂在 `details` 上并不产生"两个 flex 项目"的布局（实测首行跑到图标行、其余照旧另起）。116 改成"预览文本"这条唯一可行的路。**这类判断必须靠 `preview-records.mjs` 截图，不要靠推理**（pitfalls #31） |
+| 预览从哪来 | `refreshPreview(record, body)`，在 **`applyAssistant` 末尾**调用——那是正文内容变化仅有的两个入口（首次渲染 / 每次 patch）的汇聚点，所以只有一个同步点。文本取自**渲染后**正文的**首个块元素**（`firstElementChild.textContent`），纯流式文本没有元素子节点时回退到整段文本；只取一行、截到 240 字（`ASSISTANT_PREVIEW_CHARS`）。**取自渲染结果而不是 `entry.text`**，否则 `## 标题` 会原样出现在预览里 |
+| 预览不是"正文的副本"隐患 | 展开时它是 `display:none`：不参与渲染，也不进划选/全选复制（`Copy message` 读 `entry.text`，与 DOM 无关）；折叠时正文被浏览器整块藏起来，屏幕上只有这一份 |
+| 图标挂在哪 | `icons.attach` 的 `HOST.assistant` 从 `.bubble` 改成 `.msg-head`（在 caret 之后 prepend ⇒ 仍是 `[图标][三角]`）。**顺带删掉 `applyAssistant` 里 takeIcon/putIcon 那一对**：图标不再住在被重写的节点里，没有东西能擦掉它 |
+| 外观挂在哪 | `.entry-assistant .msg-fold`（原来是 `.bubble`）——details 现在包住标题行+正文两段。`.md` 类名移到 `.bubble-body`，故 `.entry-assistant .bubble-body.md { white-space: normal }` |
+| 重写路径 | `patch` 里 `node.querySelector('.bubble')` → `.bubble-body`（否则 markdown 永远落不进新结构，且是**静默**的：记录还在、只是不再更新） |
+| 构建顺序 | 标题行里是 `[图标][三角][预览]`（INV-J ① ＋ 预览垫底）。`buildAssistantFold` 必须**先把正文 append 进 details、再调 applyAssistant**——预览刷新顺着 records 找 `.msg-preview`，正文不在树里时那条链是断的（116 的第一版就栽在这，图上是"折叠后一片空白"） |
 
 ### 5.17 每条记录的时间（065）
 
@@ -153,3 +179,23 @@ Webview 默认弹 **Chromium 的原生菜单**，它在这个面板上有两个�
 | 思考块里的非文本内容（075） | `agent_thought_chunk` 带的图片/资源此前直接 `return` 丢掉。现在复用 `postContentNotice`，**但先 `finalizeEntries(only:'thought')`**：记录只并入"最后一条"，不关掉旧思考块的话它会永远停在 `Thinking…`（后续 thought chunk 会另起一条） |
 | **没做**：`available_commands_update` | 斜杠菜单已经消费它，再提示纯属噪声 |
 | **没做**：`usage_update` 的成本数字 / 用户消息里的非文本内容 | 前者令牌条里已有；后者在 replay 路径上从未出现过 |
+
+### 5.26 工具卡的标题与 IN / OUT（CUSTOM-20260929-117）
+
+对齐官方 Claude Code 面板的观感（用户拿它的截图当参照）：卡片标题是**人写的一句话**、正文按
+**IN / OUT** 分段。数据来自真实抓包夹具（`claude-code-session-load.json`），不是推断：
+
+| 关注点 | 规则 |
+|---|---|
+| 标题从哪来 | `rawInput.description`（模型写的描述，如 "List files in the working directory"）→ 回退 ACP 的 `title`。**用户看到的那行"Bash 查看博客目录及父目录现有内容"= 工具名 chip（074 的 `_meta.claudeCode.toolName`）+ 这段描述** |
+| **为什么要在 store 里 latch** | 描述**比首帧晚到**（真夹具里是第 3 条 update），而两处来源的存活方式不同：`rawInput` 是"键在才覆盖"（描述留下了），`_meta` 是**整体替换**（`_meta.claudeCode.title` 只活在那一条 update 里）。任何"要用时再读一遍"的写法都会让标题在下一个 chunk **闪回命令行**，且没有任何报错 ⇒ `ToolInvocation.description` 只在**有值时**写入（`ToolInvocationStore.latchDescription`），`toToolCallView` 直通 |
+| `title` 没被改 | 它仍是 ACP 给的原值：**IN 段显示的就是它**，rail 的 tooltip 也读它（`rail.ts` 用 `view.title`）。客户端只是把 `.tool-title` 这个**节点**的文字换成 `description || title`，悬停仍给 title |
+| **对齐的两条硬规则（122）** | ①OUT 的底色与内边距**挂在内容格上，不能挂在 grid 容器上**——容器的左右内边距会把整个网格（含标签列）推右 6px（实测 IN 内容 x=65 / OUT x=71）；②工具输出里的 `pre` 必须**显式**指定编辑器字体与字号，否则回落到浏览器默认 monospace，字面宽度与左边界都与 IN 不同。修后两侧正文同起于 x=71（`#probe` 读数） |
+| **IN / OUT 的排版（121）** | **左右两栏**（对齐官方插件）：`.tool-seg` 是 `grid-template-columns: 30px minmax(0,1fr)`，段标在左列、内容在右列 ⇒ 一张卡省掉两行（一轮十几张工具卡，这是可观的纵向空间）。**除标签外的每个子节点都要显式 `grid-column: 2`**，否则 auto-placement 把第二个子节点甩回第一列。工具输出里的**围栏语言标签要藏掉**（`.code-lang` + `has-lang` 给 pre 预留的 20px 顶边距）——命令输出显示 "console" 没有信息量，那片空白却很明显 |
+| IN / OUT | 段标只在**有命令行**时出现（`tool.command`）：Bash 这类 execute 调用是"输入 → 输出"，正是官方的样子；Read / Edit / Search 没有输入行，**不套 OUT 标签**——那会是对调用方向的断言，而客户端并不知道。它们的正文布局与 117 之前逐字一致（零回归） |
+| 默认展开还是收起 | **收起**（118 定案）：117 让"有命令行的卡"自动展开，用户否掉了——长会话会变成一堵命令输出墙。所以**每张卡都默认收起**，IN/OUT 一点即开，标题行给的是 agent 的描述，读者知道点开是什么。展开态与 caret/`aria-expanded` 由 `links.toggleBody` 统一维护 |
+| **OUT 空盒子（118）** | 用户报"IN/OUT 出来了但 OUT 没内容"。两个独立的成因，都修了：①**空白文本项**照旧渲染出一个空节点（026 的规矩是空白不可见）⇒ `fillToolBody` 直接跳过它；②`rawOutput` 是 agent 在**每条**结果里都会写的字段，却从未进过视图模型 ⇒ `ToolCallView.output` 兜底渲染（**仅当 items 里没有可见项**，见 `hasVisibleItem`）。`bodySignature` 必须带 `out:`（INV-H） |
+| **工具文本的 markdown 请求曾没人发（118）** | `toolCallView` 的 `mdPending` 队列**只写不读**：全项目只有 `transcriptView.flushPending` 会 `requestMarkdown()`，而它只在 assistant/thought 记录跟踪 markdown 时触发 ⇒ 工具正文的渲染请求**只在恰好后面跟着一次 assistant finalize 时**才发得出去。以工具调用结束的轮次（或 assistant 条目本来就带 html 的 replay）⇒ 工具正文**永远空白**，且没有任何报错。修法：`markdownText` 入队后 `scheduleMarkdown()`（一帧一次，合并多个 item） |
+| 输出限高 | `.tool-seg-out` 复用 `.diff-body` 的 340px + `overflow:auto`（长输出不该把面板顶走，也不再引入第二个魔数） |
+| 测试 | 客户端 4 条（描述回退 / update 路径补上描述 / IN-OUT 分段与默认展开 / 无命令行卡不变）+ 宿主 3 条（latch 跨 `_meta` 替换存活、无描述就是无描述、真夹具 live 流把 description 送到 webview） |
+| 观感证据 | `preview-records.mjs` 的夹具里有两条 Bash（一条带描述、一条没有），真 Chromium 截图即验收（pitfall #31） |

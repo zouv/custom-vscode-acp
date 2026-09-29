@@ -14,12 +14,13 @@ import * as vscode from 'vscode';
 import type { SessionManager } from '../../core/SessionManager';
 import type { SessionUpdateHandler } from '../../handlers/SessionUpdateHandler';
 import type { PermissionBridge } from '../../handlers/PermissionBridge';
+import type { ElicitationBridge } from '../../handlers/ElicitationBridge';
 import { log } from '../../utils/Logger';
 import { ChatPanelHost } from './ChatPanelHost';
 import { LegacyPanelAdapter } from './LegacyPanelAdapter';
 import { ChatWebviewProvider } from '../ChatWebviewProvider';
 import type { IChatPanel, PanelContext, PanelId } from './panelContract';
-import { isModernAgent } from './panelContract';
+import { panelIdForAgent } from './panelContract';
 import { ChatEditorPanel } from './ChatEditorPanel';
 
 const LOG_PREFIX = 'chat-router';
@@ -45,8 +46,12 @@ export class ChatRouterProvider implements vscode.WebviewViewProvider {
     // [CUSTOM-END] CUSTOM-20260924-020
     // [CUSTOM-20260926-077] 透传给 ChatPanelHost，持久化大纲钉住/宽度偏好。
     globalState?: vscode.Memento,
+    // [CUSTOM-20260929-119] 表单桥：同样透传给 ChatPanelHost（它注册为 ElicitationPresenter）。
+    private readonly elicitationBridge?: ElicitationBridge,
   ) {
-    this.modern = new ChatPanelHost(extensionUri, sessionManager, sessionUpdateHandler, permissionBridge, globalState);
+    this.modern = new ChatPanelHost(
+      extensionUri, sessionManager, sessionUpdateHandler, permissionBridge, globalState, elicitationBridge,
+    );
     this.legacy = new LegacyPanelAdapter(
       new ChatWebviewProvider(extensionUri, sessionManager, sessionUpdateHandler),
     );
@@ -140,7 +145,10 @@ export class ChatRouterProvider implements vscode.WebviewViewProvider {
   // --- Routing -------------------------------------------------------------
 
   private panelIdForFocus(): PanelId {
-    return isModernAgent(this.sessionManager.getFocusedAgentName()) ? 'modern' : 'legacy';
+    // [CUSTOM-20260927-086] 'Nothing focused' is MODERN — see panelIdForAgent: routing
+    // it to legacy replaced the sidebar document and destroyed client-local state
+    // (a draft page and its typed text), and made the modern empty state unreachable.
+    return panelIdForAgent(this.sessionManager.getFocusedAgentName());
   }
 
   private context(): PanelContext {

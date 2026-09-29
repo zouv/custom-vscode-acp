@@ -38,6 +38,7 @@
 | `protocol.ts` | postMessage 判别联合（`ExtToChat` / `ChatToExt`）+ `verifySession` 纪律 | 增删消息类型 |
 | `markdown.ts` | `SafeMarkdown`：覆盖 `marked` 的 `html`/`link`/`image` 三个渲染钩子。**必须用 `new Marked()`**（旧面板改的是全局单例） | markdown 安全策略变更 |
 | `sessionChoices.ts` | **073 新增**。切换状态（mode + config options）的**快照 / 按通知载荷打补丁 / 算差异 → 人类可读的一句话**。纯函数，宿主只做缓存与发帖（去重靠"缓存由宿主独占"，见 §5.22） | 改切换提示的表述、或改"两条上报路径怎么去重" |
+| `historyDirs.ts` | **079 新增**。历史选择器的目录过滤器：`directoryKey`（目录同一性：平台大小写规则 + 尾分隔符）/ `directoryOptions`（候选目录与条数）/ `folderName`。纯函数，宿主算 key、客户端只比较（见 §5.24） | 改"两个路径算不算同一个目录"、或改候选目录的来源与排序 |
 | `transcript/types.ts` | transcript 记录模型（`user`/`assistant`/`thought`/`tool`/`plan`/**`content`**/`notice` 七类，`content` 承载非文本消息块）+ `ToolInvocation` | 记录结构变更 |
 | `transcript/TranscriptStore.ts` | 按会话存记录；三重上限（500 条 / 24 会话 LRU / 64KB 每条）；活跃会话豁免 LRU。`finalizeStreaming` 带 `only` 过滤（**不要**在正文 chunk 上调用无参形式，那会把一次回复碎成 N 个气泡） | 容量策略 / 新记录类型 |
 | `transcript/ToolInvocationStore.ts` | 工具调用索引，严格实现 ACP 的 **replace-collection** 语义 | 工具调用字段变更 |
@@ -48,7 +49,7 @@
 | `html/index.ts` | `renderChatHtml(webview, nonce, surface = 'view')`：外壳 + 样式 + 标记 + 脚本。**`surface` 会变成 `<body class="surface-view\|surface-editor">`**（050），供 CSS 区分侧边栏与编辑区底色 | 装配顺序变更 |
 | `html/shell.ts` / `styles.ts` / `body.ts` | CSP 与文档外壳 / 全部 CSS / 静态标记 | UI 外观 |
 | `html/nonce.ts` | CSP nonce 生成 | — |
-| `html/client/*.ts` | webview 内联客户端 JS，**每个模块是一个字符串**，统一挂到 `window.__acpc`。058 新增 `directoryMenu.ts`（草稿页的目录抽屉，形态照抄 `sessionMenu.ts`） | 改前端交互 |
+| `html/client/*.ts` | webview 内联客户端 JS，**每个模块是一个字符串**，统一挂到 `window.__acpc`。058 新增 `directoryMenu.ts`（草稿页的目录抽屉，形态照抄 `sessionMenu.ts`）；097 新增 `lightbox.ts`（图片点击放大）；102 新增 `stickyUser.ts`（置顶最近一条用户消息，判据见 §5.25） | 改前端交互 |
 
 **终端输出通路**（CUSTOM-20260923-012）：ACP 的 `Terminal` 工具内容只是引用（`{terminalId}`），终端归客户端所有。
 链路为：`ConnectionInfo.terminals`（`ConnectionManager` 暴露）→ `TerminalHandler.readOutput(terminalId)`
@@ -68,14 +69,18 @@
    ```
    它把各模块的模板内容抽出、拼接，交给 `new Function()` 做语法校验（只解析不执行）。
    已接入 `check-registry.mjs` **§5**，CI 会跑。
-4. **不要在模板体里写含 `/` 的正则**（CUSTOM-20260925-049 新增）。
+4. **不要在模板体里写含 `/` 的正则**（CUSTOM-20260925-049 新增）；
+   **也不要在字符串里写 `\\'`（转义单引号）**（CUSTOM-20260927-094 新增，同一类坑的第二个形态）。
    上面那个检查器是**按原始模板文本**解析的——**它不还原模板转义**。于是源码里的
    `/^\\/[a-zA-Z]:/`（生成的脚本里是 `/^\/[a-zA-Z]:/`，完全合法）在它眼里是
    「转义的反斜杠 + 未转义的 `/`」⇒ **正则在此提前结束**，后面的 `[a-zA-Z]:` 成了裸代码，
    报出一个位置完全对不上的 `Unexpected token ':'`。
+   同理 `'…agent\\'s…'`（生成脚本里是 `'…agent\'s…'`，合法）在它眼里是
+   「转义的反斜杠 + **字符串结束**」，后面的 `s transcript folder…` 成了裸代码 ⇒ `Unexpected identifier 's'`。
    避开办法：改写成语义等价的**无正则**形式（本次用 `charCodeAt` 判断盘符），或者让正则里
-   不出现 `/`。**字符串**里的转义没有这个问题（`'\\u25b8'` 在原文里也合法），
-   只有**正则字面量**会这样炸。完整经过见 `docs/pitfalls.md` #11 的第四次复发记录。
+   不出现 `/`；字符串则**避免转义引号**——换个不含撇号的措辞，或用双引号包住整串。
+   **字符串**里的其它转义（`\\n` / `\\u2026`）没有这个问题，只有「反斜杠 + 引号」和「正则里的 `/`」会这样炸。
+   完整经过见 `docs/pitfalls.md` #11 的复发记录。
 
 ### 5.3 面板切换与在途状态
 
@@ -226,6 +231,7 @@ pending ──用户点按钮──► selected        （回答 optionId）
 | 跳转 | `scroll.jumpTo(node)` 先置 `pinned = false` 再写 `scrollTop`，随后 scroll 事件按真实距离重算 |
 | Escape | **捕获阶段**监听 + `stopPropagation`：composer 在 textarea 上监听 Escape 取消轮次，不拦会误取消 |
 | 上限 | 200 条锚点，多出的折叠成一行「… N earlier hidden」 |
+| **有没有东西可导航（081）** | **这条判据管所有形态**：没有锚点（无会话 / 新会话 / 全是工具记录）时，☰ 按钮、下拉浮层、**钉住的右侧栏****一律不显示**。045 当年只把它加在 ☰ 按钮上——那时下拉是唯一形态，"没有按钮就没有大纲"成立；076 让它可钉住之后，钉住的那一栏**没走这条判据**，于是空态旁边会摊着一列 "OUTLINE / No messages yet"，把空态挤出面板正中（用户截图）。判据只有一处（`outline.ts` 的 `anchorsPresent`，由 `syncButton()` 唯一写入、`renderVisibility()` 读取），**mode 只是偏好、不决定可不可见**：钉住状态留着，第一条消息一到那栏自己回来。副作用：空对话时没法点 ✕ 取消钉住（等第一条消息即可）——因为此时它本来也没有内容可导航 |
 
 **`invalidate()` 的调用点**在 `boot.ts` 的 `append` / `revise` / `focus` / `boot` / `sessionClosed` / `error`
 分支里——**不要**放进 `meta` / `attachments`，那会让抽屉在流式期间被反复重建。
@@ -393,10 +399,45 @@ pending ──用户点按钮──► selected        （回答 optionId）
 
 
 
+### 5.25 置顶本轮提问（CUSTOM-20260928-102，103 收紧判据并修正排版，104 改成吸顶交棒 + 悬浮卡片 + 收缩，105 对齐/高亮边框/用户消息铺满）
+
+**一句话**：**顶边到达视口顶**的那条用户消息就是"本轮提问"，它被 `cloneNode(true)` 到
+`#stickyUser` 的悬浮卡片里、本体让位；**只要视口里看得到更晚的用户消息就不置顶**。
+
+| 关注点 | 规则 |
+|---|---|
+| 判据（104 的核心） | `node.offsetTop - scrollTop < TOP_GAP`（严格）⇒ 候选，取最后一个；第一条**没进这个窗口**的：在视口里 ⇒ 不置顶，在视口下方 ⇒ 结束遍历返回候选。103 的"完全离开视口"已被它取代 |
+| **为什么能这么早** | 副本落在**本体当时所在的位置**上（窗口就是 `TOP_GAP`，那 8px 同时是卡片的 padding-top），交棒那一帧画面上没有位移。所以"同屏两份"（102/103 等的理由）不再靠"等它走光"解决，而靠**隐藏本体** |
+| 隐藏本体 | `.messages .sticky-source { visibility: hidden }`。**visibility 不是 display**：几何必须保住 —— rail 的逐节点测量、`NS.scroll.jumpTo` 的 `node.offsetTop` 都还依赖它。**前缀 `.messages` 是承重的**：`cloneNode` 连 `class` 一起复制，去掉前缀，副本也会被藏起来（悬浮条"打不开了"，静默）；`render()` 另有一道同因防线（显式摘类）。`markSource()` 每帧幂等重贴（一次引用比较）；user 条目节点不会被 `replaceChild` 换掉（那条路径只走 plan/content/tool），但仍留了这一层，因为漏掉的代价是"本体和副本同屏"这种静默的错 |
+| 代价（写在这里免得被当成 bug） | 悬浮条会**长时间盖住下方内容**，而且"消息滚走"在视觉上不再发生——它变成"消息停住、下方内容从它下面流过"。收缩按钮与 `max-height: 40%` 是两个出口 |
+| 为什么**没有阈值** | 用户选定"露出一像素就算在显示区"。单一阈值 ⇒ 同一画面从不同方向到达结果相同、不会闪；"露出超过 X 才不置顶"是量出来的常量，换面板高度/字号就错位（pitfalls #24/#26）。102 的 8px 容差已在 103 去掉 |
+| 为什么不用**滚动方向** | 判据只依赖当前画面。记住方向会让同一画面从不同来向显示不同结果 |
+| 横向范围 | `#stickyUser` 与 `#messages` 同属 **`.messages-column`**（103 新增的定位容器）。102 时它是 `.message-area` 那一 flex 行的兄弟，而该行还有**定宽可拖拽**的大纲栏 ⇒ 覆盖层横跨两段、右边伸进大纲栏下面。挪进容器后由**构造**保证不越界 |
+| 三层结构（104） | `.sticky-user`＝定位层（透明、`pointer-events:none`，卡片周围的内容与点击都透过去）→ `.sticky-card`＝外观层（底色/圆角/**1px 高亮边框**/阴影）→ `.sticky-body`＝克隆体的 flex 列（`align-self` 必需） |
+| 对齐（105，用户报"还是没对齐"） | 卡片右缘要让开**滚动条**：`.messages` 是滚动容器，`scrollbar-width: thin` 照样占布局宽度 ⇒ 消息的内容盒比消息列窄几像素，而悬浮条不是滚动容器。`sync()` 里用 `offsetWidth - clientWidth` 量出来写进 host 的 `right`（没有滚动条就是 0）。**别换成常量**——它随滚动条出现/消失、随主题与字号变（pitfall #24 的反面：锚真实几何） |
+| 边框为什么是 border | 高亮边框是真 `border`（1px `--vscode-focusBorder`，本面板「当前项」的既有语义，同 `.outline-item.active` / `.filter-chip.on`），host 水平内边距相应由 19/10 改成 **18/9** 把这 1px 还给内容盒。**不能用环**：环在这个面板里已经是键盘焦点（062 的教训）。也别改回 `box-shadow` 环——104 用它只是为了避开布局位移，有了 padding 补偿就不必了 |
+| 用户消息铺满（105） | `.entry-user { align-self: stretch }`（原 `flex-end` + `max-width:88%`）。气泡宽度=内容宽度时，折叠后只剩首行、宽度随之缩短，面板在折/展时会自己变窄；铺满后宽度是常量，折与不折只影响高度。这**同时决定**了卡片里有没有空档给按钮 |
+| 排版一致性 | 用户气泡的宽度=卡片的内容盒宽度，而卡片的内容盒由"`.messages` 的内边距 + 105 的 1px 边框补偿 + 105 的滚动条让位"三者共同决定；水平内边距必须与 `.messages` 相同（左 19 / 右 10），否则克隆体会整体偏移。103 修的是 flex 基准，105 修的是这层横向几何 |
+| 排版一致性 | 用户气泡的右对齐与 88% 宽度来自 `.entry-user{align-self:flex-end; max-width:88%}`，而 **`align-self` 只在 flex 容器里生效**；水平内边距也必须与 `.messages` 相同（左 19 / 右 10），否则 88% 落在两个不同的基数上。103 修的就是这两条 |
+| `TOP_GAP` 只有一个来源 | 它既是布局（JS 写进 host 的 inline `padding-top`）又是交棒窗口。两者必须相等，否则每次交棒都带一段位移 ⇒ 由 JS 写，CSS 不写 padding-top（pitfall #19） |
+| 收缩按钮 | `#stickyToggle` 是**卡片的兄弟**，钉在卡片左侧那条 18px 通道里（`.messages` 给引导条留的 padding-left）。105 之前它嵌在卡片左上角——消息铺满后那里没有空档了，放里面会压住正文。`.collapsed` 收成一行：多行气泡本就是 `details.user-fold`，`summary` 即第一行；**只在克隆体含 `.fold-body` 时显示**（"后面还有东西"才是可收缩的；113 起每条用户消息都是 `details.user-fold`，所以按 `.user-fold` 判断会变成"每条都配一个没反应的按钮"，而单行气泡配个没反应的按钮更糟）。它的点击必须 `stopPropagation`——宿主的点击是"跳回原处" |
+| 点击交还 | `NS.scroll.jumpTo(node, TOP_GAP + 1)`：落在**窗口之外**，否则消息立刻又被条接管、点击看起来"没反应"。该形参默认 0，既有调用点一行未改 |
+| 渲染状态 | 克隆体不在 `#messages` 里，`.messages.show-times` 这类**状态类选择器够不着它** ⇒ `render()` 把 `show-times` 抄到 host，`boot.applyTimes` 之后调 `NS.stickyUser.refresh()` 重渲染。**再加新的"挂在 `#messages` 上的渲染开关"时，别忘了这里也要抄一份** |
+| 成本 | 克隆一个 markdown 气泡是这面板最贵的事之一 ⇒ `shownId` 去抖（只有"钉住的是哪一条"变化才重建）+ 滚动只标记、`NS.dom.schedule` 一帧一次。`refresh()` 故意绕过去抖，因为它服务的是**用户手动开关**，不是滚动 |
+| 维护提示 | 判据依赖 `node.offsetTop` 与 `#messages` 的 `scrollTop` **在同一坐标系**。当前靠"节点与 `#messages` 同处 `.messages-column`"成立——**给 `#messages` 或那条链上新加带 `position` 的祖先时要重新核对**（`NS.scroll.jumpTo` 的 `node.offsetTop - container.offsetTop` 是同一个前提） |
+
+案例钉在 `src/test/chat-client.test.ts`「image chip and pinned question」一组的 11 条用例里。
+**桩要如实建模两件事**，否则这几条会假通过/假失败：`#stickyUser > (#stickyToggle, .sticky-card > #stickyBody)`
+的嵌套，以及 `#messages` 的 `padding-top`（首条记录在 `offsetTop = 8`，正是"停在最上面的提问不被接管"
+那条的判据）。做过四次 RED 验证，每次失败的都正好是应该失败的那几条：退回 103 的判据 ⇒"顶边一到就接管"红；
+`markSource` 改空实现 ⇒ 断言 `sticky-source` 的两条红；去掉 `render()` 里摘类那一行 ⇒"重渲染不得把隐藏类
+克隆进条里"红；去掉 `alignToContent()` ⇒"the bar ends where the messages end"红。
+
 ### 5.13–5.15 已拆出：会话目录与重开路径
 
-> **§5.13（replay 怎么测）、§5.14（每会话工作目录）、§5.15（草稿页与目录选择）**
-> 已移到 **[`chat-panel-sessions.md`](./chat-panel-sessions.md)**（CUSTOM-20260925-060）。
+> **§5.13（replay 怎么测）、§5.14（每会话工作目录）、§5.15（草稿页与目录选择）、
+> §5.24（历史选择器的目录过滤）**
+> 已移到 **[`chat-panel-sessions.md`](./chat-panel-sessions.md)**（CUSTOM-20260925-060、079）。
 >
 > **为什么是这三节一起走**：它们是同一个主题的三面——**会话生命周期**。
 > 建会话时选目录（5.15）、已存在会话的目录从哪来（5.14）、重开会话那条 replay 链怎么测（5.13），
@@ -412,3 +453,25 @@ pending ──用户点按钮──► selected        （回答 optionId）
 > **记录区（§5.16 起）另见 [`chat-panel-records.md`](./chat-panel-records.md)**：折叠与 INV-J、
 > 每条记录的时间显示、工具输出的 markdown 渲染、思考块的 markdown（§5.21）、切换模型/模式的提示（§5.22）、
 > 自定义右键菜单、以及客户端逻辑测试的边界。
+>
+> **编号不连续是正常的**：`§5.24` 在 sessions 文件、`§5.16–§5.23` 在 records 文件、
+> `§5.25`（置顶最近一条用户消息）在本文件——章节号是**稳定的引用地址**，不是阅读顺序。
+
+### 5.27 表单卡：ACP elicitation / AskUserQuestion（CUSTOM-20260929-119）
+
+**为什么需要它**：AskUserQuestion 在 ACP 里走 **elicitation（form 模式）**协议，而 adapter 用
+`clientCapabilities.elicitation.form` 门控——**不声明时连工具本身都被禁用**
+（`disallowedTools = ["AskUserQuestion"]`）。所以"官方插件会弹选项面板、我们的面板只有一个卡住的工具卡"
+不是渲染问题，是**能力声明缺失**。
+
+| 关注点 | 规则 |
+|---|---|
+| 谁能弹 | `canPresent` 与权限卡**共用同一套判据**（聚焦会话 + modern agent + 至少一个 surface，不可见则 `reveal` 不抢焦点） |
+| 通道 | `AcpClientImpl.unstable_createElicitation` → `ElicitationHandler`（策略+弹框兜底）→ `ElicitationBridge`（**与 `PermissionBridge` 同构**：FIFO / `resolved` 幂等位 / `settleWith` 单点 resolve / `cancelSession`·`cancelAll`·`onPresenterLost`） |
+| 三态 | `accept`（带 content）/ `decline`（**跳过**：空答案，轮次继续）/ `cancel`（中止工具调用）。adapter 的 `applyAskElicitationResponse` 就是这么解释的；**轮次被取消时回 cancel 而不是 decline**——空答案会骗到 agent |
+| 作用域 | **只支持 `sessionId`**：ACP 还允许把表单挂在 `requestId` 上（与任何会话无关），那种没有会话可归属 ⇒ 直接 `cancel`，并记日志说明 |
+| 字段扁平化 | `fieldsOf(requestedSchema)` → `select`(oneOf) / `multi`(array+anyOf) / `boolean` / `number` / `text`。**认不出的形状不进表单**（省略字段是合法答案——schema 里没有任何 required；猜一个比不填更糟）。`_meta._askUserQuestionCustomAnswer` 标记的自由文本框会带上 `customFor`，客户端据此把它缩进到对应问题下面 |
+| 记录与回传 | 新记录类型 `kind: 'elicitation'`（`TranscriptStore.appendElicitation`，一个 promptId 一条，同权限卡）+ 客户端 `elicitationView.ts`；回答走 `elicitationAnswer` 消息（**会话作用域，必须放在 `verifySession` 守卫之后**）。**表单卡是 transcript 的记录 ⇒ boot/focus 的全量快照天然把它带回来**，切会话/双 surface/重挂载都不需要新机制 |
+| 半填的草稿 | **只留在 webview 里**（DOM 就是表单状态），不进 transcript——否则每次 revise/快照都会把草稿重发一遍。结算态（accepted/declined/cancelled + summary）才由宿主写进记录 |
+| 兜底弹框 | 无面板时**逐字段**问（VS Code 没有表单对话框）：select/multi → QuickPick、boolean → Yes/No、文本/数字 → InputBox。**取消某一步 = decline（跳过）**；面板里的 Cancel 才是硬中止 |
+| **重开别人的会话不会重抛（实测）** | `session/load` 一个"卡在提问上"的会话时，adapter **只回放工具卡**、不会重新发 elicitation（`probe-elicitation.mjs --no-answer` 造出该状态再 `--reopen` 实测：0 次）。官方插件能弹是因为**那个未决请求在它自己的进程里**；我们重开时是另一个进程，替它回答不了。详见 pitfalls #32 |

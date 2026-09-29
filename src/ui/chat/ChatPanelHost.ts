@@ -37,11 +37,20 @@ import type { IChatPanel, PanelContext } from './panelContract';
 import { isModernAgent, MODERN_AGENTS } from './panelContract';
 import { viewSurface, type ChatSurface, type SurfaceKey } from './ChatSurface';
 import type { PermissionPresenter, PermissionState } from '../../handlers/PermissionBridge';
+// [CUSTOM-20260929-119] 表单（elicitation）presenter —— 与权限卡同构。
+import type {
+  ElicitationPresenter,
+  ElicitationState,
+  ElicitationAction,
+  ElicitationContent,
+} from '../../handlers/ElicitationBridge';
 import { PermissionBridge } from '../../handlers/PermissionBridge';
+import { ElicitationBridge } from '../../handlers/ElicitationBridge';
 import { TranscriptStore } from './transcript/TranscriptStore';
 import { ToolInvocationStore } from './transcript/ToolInvocationStore';
 import { toToolCallView } from './content/toolCalls';
 import { toContentView, hasVisibleContent } from './content/contentBlocks';
+import type { ContentBlockView } from './content/contentBlocks';
 import { resolveNestingStrategy } from './nesting/NestingStrategy';
 import {
   choiceChanges,
@@ -49,6 +58,13 @@ import {
   choiceSnapshotPatched,
   type ChoiceSnapshot,
 } from './sessionChoices';
+// [CUSTOM-20260926-079] The history picker's directory filter: `directoryKey` /
+// `directoryOptions` are pure and unit-tested; `folderName` replaces the local
+// `basename` (same "last path segment" idea the client's folderName implements, and
+// two copies of it here is exactly how they drift — pitfalls #19).
+import { directoryKey, directoryOptions, folderName as basename } from './historyDirs';
+import { CLAUDE_CODE_AGENT, claudeTranscriptDir, readDiskSessions, readTranscriptTimes, readTranscriptUserImages } from './diskSessions';
+import type { HistorySessionSummary } from './protocol';
 
 /** Prefix of the output channel used for panel-level diagnostics. */
 const LOG_PREFIX = 'chat-panel';
@@ -69,7 +85,7 @@ const STRUCTURAL_MESSAGE_TYPES: ReadonlySet<string> = new Set([
 /** [CUSTOM-20260926-077] globalState key for the outline pin/width prefs. */
 const UI_PREFS_KEY = 'acpc.outlinePrefs.v1';
 
-export class ChatPanelHost implements IChatPanel, PermissionPresenter {
+export class ChatPanelHost implements IChatPanel, PermissionPresenter, ElicitationPresenter {
   readonly id = 'modern' as const;
 
   // [CUSTOM-BEGIN] CUSTOM-20260924-019 - 单视图 → 多 surface（侧边栏 + 编辑区）。
@@ -85,6 +101,10 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
 
   /** sessionId → pending attachments (resource_link blocks for the next prompt). */
   private readonly attachments: Map<string, Attachment[]> = new Map();
+  // [CUSTOM-20260928-096] sessionId → attachmentId → image 字节（base64 + mimeType）。
+  // 字节只留宿主内存、不进 meta（否则每次 boot/focus 都重发整张图）；发送时据此拼
+  // ACP `image` ContentBlock。
+  private readonly imageData: Map<string, Map<string, { data: string; mimeType: string }>> = new Map();
   /** sessionId → latest usage numbers, rendered as a token bar. */
   private readonly usage: Map<string, SessionMeta['usage']> = new Map();
   /** `${sessionId}::${toolCallId}` → transcript entry id. */
@@ -107,6 +127,14 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
   // applied the new title by the time our listener runs, so its copy cannot tell us
   // what the OLD one was.
   private readonly sessionTitles: Map<string, string> = new Map();
+  // [CUSTOM-20260928-100] sessionId → (replay messageId → real epoch ms), read from the
+  // agent's transcript BEFORE a replay starts. ACP carries no per-message time, so
+  // without this every record of a reopened conversation is stamped `Date.now()` and
+  // the outline shows one identical second for a conversation spanning an hour.
+  private readonly replayTimes: Map<string, Map<string, number>> = new Map();
+  // [CUSTOM-20260928-111] sessionId → (messageId → 图片视图)。replay 把图片并回用户气泡
+  // （100 的教训：文本与非文本块分成两条 chunk 到达，气泡里没有可合并的东西）。
+  private readonly replayUserImages: Map<string, Map<string, ContentBlockView[]>> = new Map();
 
   private focused: PanelContext = { agentName: null, sessionId: null };
   /** [CUSTOM-20260926-077] Outline pin/width prefs, cached from globalState. */
@@ -133,12 +161,15 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
     private readonly permissionBridge?: PermissionBridge,
     // [CUSTOM-20260926-077] globalState for UI prefs that survive webview disposal.
     private readonly globalState?: vscode.Memento,
+    // [CUSTOM-20260929-119] 表单桥（晚绑定失败时的兜底同权限桥）。
+    private readonly elicitationBridge?: ElicitationBridge,
   ) {
     this.sessionUpdateHandler = sessionUpdateHandler;
     this.uiPrefs = this.globalState?.get<UiPrefs>(UI_PREFS_KEY) ?? null;
     // The host IS the permission presenter for the modern panel: no other
     // object knows whether a surface is on screen and which session is focused.
     this.permissionBridge?.setPresenter(this);
+    this.elicitationBridge?.setPresenter(this);
     // [CUSTOM-20260924-022] One frame of coalescing for order-coupled messages.
     this.outbox = new Outbox({
       send: message => this.postNow(message),
@@ -161,6 +192,9 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
       this.transcripts.drop(sessionId);
       this.tools.drop(sessionId);
       this.attachments.delete(sessionId);
+      this.imageData.delete(sessionId);
+      this.replayTimes.delete(sessionId);
+      this.replayUserImages.delete(sessionId);
       this.usage.delete(sessionId);
       this.planEntryIds.delete(sessionId);
       // [CUSTOM-20260926-073] Session ids are never reused, so a stale switch
@@ -238,7 +272,11 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
     // [CUSTOM-20260924-020] Last surface gone: any permission card still
     // waiting for a click is now unreachable, and the agent is blocked on it.
     // The bridge moves those prompts to the dialog instead of hanging.
-    if (this.attachedCount === 0) { this.permissionBridge?.onPresenterLost(); }
+    if (this.attachedCount === 0) {
+      this.permissionBridge?.onPresenterLost();
+      // [CUSTOM-20260929-119] 表单同理：没有面能画，就退回弹框，别让 agent 干等。
+      this.elicitationBridge?.onPresenterLost();
+    }
     // [CUSTOM-END] CUSTOM-20260924-020
   }
 
@@ -310,6 +348,22 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
     log(`${LOG_PREFIX}: attached ${incoming.length} dropped/pasted file(s) to ${sessionId}`);
   }
 
+  // [CUSTOM-20260928-096] 剪贴板/拖入的位图：剥离 data URL 前缀后把 base64 存进 imageData，
+  // 附件列表里只放轻量 chip（path=合成 id）。发送时由 handleSendPrompt 拼成 image 块。
+  private handleAttachImage(sessionId: string, id: string, name: string, mimeType: string, dataUrl: string): void {
+    if (!id) { return; }
+    const data = stripDataUrlPrefix(dataUrl);
+    if (!data) {
+      log(`${LOG_PREFIX}: attachImage dropped ${id}: no base64 payload`);
+      return;
+    }
+    let map = this.imageData.get(sessionId);
+    if (!map) { map = new Map(); this.imageData.set(sessionId, map); }
+    map.set(id, { data, mimeType });
+    this.addAttachments(sessionId, [{ path: id, name, kind: 'image', mimeType }]);
+    log(`${LOG_PREFIX}: attached image ${id} to ${sessionId}`);
+  }
+
   onMessage(message: unknown, from: SurfaceKey = 'view'): void {
     const msg = message as Partial<ChatToExt> & { type?: string };
     if (!msg || typeof msg.type !== 'string') { return; }
@@ -354,6 +408,15 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
         void this.handleListHistory((msg as { agentName?: string }).agentName);
         return;
       }
+      // [CUSTOM-BEGIN] CUSTOM-20260928-095 - 按过滤目录补扫磁盘（非会话作用域，守卫前）。
+      case 'supplementHistory': {
+        void this.handleSupplementHistory(
+          (msg as { agentName?: string }).agentName,
+          (msg as { cwd?: string }).cwd ?? '',
+        );
+        return;
+      }
+      // [CUSTOM-END] CUSTOM-20260928-095
       case 'openHistorySession': {
         void this.handleOpenHistorySession(
           (msg as { agentName?: string }).agentName ?? '',
@@ -361,6 +424,11 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
           // [CUSTOM-20260925-057] The row carries the session's own directory;
           // see handleOpenHistorySession for why it matters.
           (msg as { cwd?: string }).cwd || undefined,
+          // [CUSTOM-20260928-098] And its title, so the tab matches the list.
+          (msg as { title?: string }).title || undefined,
+          // [CUSTOM-20260928-100] The CLIENT was on a draft page: that draft is what
+          // steps aside, not the session the host still has focused.
+          !!(msg as { fromDraft?: boolean }).fromDraft,
         );
         return;
       }
@@ -453,12 +521,24 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
         return;
       }
       case 'focusSession':
-        this.sessionManager.focusSession(sessionId);
+        // [CUSTOM-20260926-080] `force` — an explicit request from the client must
+        // ALWAYS be answered.
+        //
+        // `SessionManager.focusSession` early-returns when the id is already active
+        // (it emits only on a CHANGE), and the host's `focused` is not what the
+        // client is showing: **drafts are client-local** (058), so the panel can be
+        // sitting on a draft page while our `focused` already names this very
+        // session. Without `force` the click produced no event, hence no `focus`
+        // reply — and the panel stayed on the draft with a tab that "does nothing".
+        // (Same idiom the manager itself uses for the user-visible focus changes of
+        // newConversation / loadSession / resume.)
+        this.sessionManager.focusSession(sessionId, { force: true });
         return;
       case 'detachFile': {
         const path = (msg as { path?: string }).path;
         const list = (this.attachments.get(sessionId) ?? []).filter(a => a.path !== path);
         this.attachments.set(sessionId, list);
+        if (path) { this.imageData.get(sessionId)?.delete(path); }
         this.post({ type: 'attachments', sessionId, attachments: list });
         return;
       }
@@ -467,6 +547,17 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
         this.handleAttachPaths(sessionId, (msg as { paths?: unknown }).paths);
         return;
       // [CUSTOM-END] CUSTOM-20260925-049
+      // [CUSTOM-BEGIN] CUSTOM-20260928-096 - 输入框图片：会话作用域，守卫之后（同 attachPath）。
+      case 'attachImage':
+        this.handleAttachImage(
+          sessionId,
+          (msg as { id?: string }).id ?? '',
+          (msg as { name?: string }).name ?? 'image',
+          (msg as { mimeType?: string }).mimeType ?? 'image/png',
+          (msg as { dataUrl?: string }).dataUrl ?? '',
+        );
+        return;
+      // [CUSTOM-END] CUSTOM-20260928-096
       case 'setMode':
         void this.sessionManager.setMode(sessionId, (msg as { modeId: string }).modeId)
           // [CUSTOM-20260926-073] Announce the switch in the transcript, not just in
@@ -510,6 +601,18 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
         this.handleOpenTerminal(sessionId, (msg as { terminalId?: string }).terminalId ?? '');
         return;
       // [CUSTOM-20260924-020] Session-scoped: it must sit AFTER the guard above.
+      // [CUSTOM-20260929-119] 表单回答：与会话作用域守卫之后的位置要求一致。
+      case 'elicitationAnswer': {
+        const answer = msg as {
+          promptId?: string;
+          action?: ElicitationAction;
+          content?: ElicitationContent;
+        };
+        if (answer.promptId && answer.action) {
+          this.elicitationBridge?.submit(answer.promptId, answer.action, answer.content);
+        }
+        return;
+      }
       case 'permissionAnswer': {
         const promptId = (msg as { promptId?: string }).promptId;
         if (promptId) {
@@ -537,6 +640,7 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
     // setPresenter(null) also cancels every prompt still awaiting an answer:
     // nothing can render or answer them once the host is gone.
     this.permissionBridge?.setPresenter(null);
+    this.elicitationBridge?.setPresenter(null);
   }
 
   // --- Prompt handling -----------------------------------------------------
@@ -545,24 +649,67 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
     const session = sessionOf(this.sessionManager, sessionId);
     if (!session) { return; }
 
+    // [CUSTOM-20260928-109] 注入块（<task-notification> 等）虽然是从输入框发出去的，
+    // 但仍然是注入块——渲染成蓝色用户气泡一样会误导。发送路径与 replay 路径用同一个
+    // 判据（isInjectedChunk）。
+    if (isInjectedChunk(text)) {
+      const preview = firstLineOf(stripInjectionWrapper(text));
+      const entry = this.transcripts.appendNotice(sessionId, 'meta', preview);
+      if (entry) { this.post({ type: 'append', sessionId, entries: [entry] }); }
+      // 仍然要真的发出去（agent 期待收到这条注入），只是不把它当用户消息渲染。
+      // 复用下面的发送逻辑：把 text 原样作为唯一 text block。
+    }
+
     const attachments = this.attachments.get(sessionId) ?? [];
+    const images = this.imageData.get(sessionId) ?? new Map();
 
     // The transcript is the panel's own record; the extension-side store keeps
     // it so the bubble survives a panel switch.
     this.transcripts.ensureSession(sessionId, session.agentName);
     // A new user turn ends any prose the agent was still streaming.
     this.finalizeEntries(sessionId, { only: 'assistant' });
-    const userEntry = this.transcripts.appendUser(sessionId, text);
-    if (userEntry) { this.post({ type: 'append', sessionId, entries: [userEntry] }); }
+    // [CUSTOM-20260928-108] 图片附件进用户气泡（不再独立成行）——它们是这次提问的
+    // 一部分，不是另一条记录。
+    const imageViews: ContentBlockView[] = [];
+    for (const a of attachments) {
+      if (a.kind !== 'image') { continue; }
+      const img = images.get(a.path);
+      if (!img) { continue; }
+      const view = toContentView({ type: 'image', data: img.data, mimeType: img.mimeType });
+      if (view && view.type === 'image') {
+        if (a.name) { view.name = a.name; }
+        imageViews.push(view);
+      }
+    }
+    // [CUSTOM-20260928-096] 空文字 + 图片附件时跳过空的气泡。
+    // [CUSTOM-20260928-109] 注入块已在上面作为 meta notice 落账，这里不再产生用户气泡。
+    if (!isInjectedChunk(text) && text.trim().length > 0) {
+      const userEntry = this.transcripts.appendUser(sessionId, text, imageViews);
+      if (userEntry) { this.post({ type: 'append', sessionId, entries: [userEntry] }); }
+    } else if (imageViews.length > 0) {
+      const entry = this.transcripts.appendContent(sessionId, imageViews);
+      if (entry) { this.post({ type: 'append', sessionId, entries: [entry] }); }
+    }
 
     this.sessionManager.recordFirstPrompt(sessionId, text);
     this.attachments.set(sessionId, []);
+    this.imageData.delete(sessionId);
     this.post({ type: 'attachments', sessionId, attachments: [] });
 
-    const blocks: ContentBlock[] = [{ type: 'text', text }];
+    const blocks: ContentBlock[] = [];
+    if (text.trim().length > 0) { blocks.push({ type: 'text', text }); }
     for (const a of attachments) {
-      // ACP `ResourceLink.uri` is a plain string (file:// URI per convention).
-      blocks.push({ type: 'resource_link', uri: fileUri(a.path).toString(), name: a.name });
+      if (a.kind === 'image') {
+        const img = images.get(a.path);
+        if (!img) {
+          log(`${LOG_PREFIX}: image attachment ${a.path} has no stored bytes`);
+          continue;
+        }
+        blocks.push({ type: 'image', data: img.data, mimeType: img.mimeType });
+      } else {
+        // ACP `ResourceLink.uri` is a plain string (file:// URI per convention).
+        blocks.push({ type: 'resource_link', uri: fileUri(a.path).toString(), name: a.name });
+      }
     }
 
     try {
@@ -735,7 +882,10 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
         // one reply into one bubble per chunk.
         this.finalizeEntries(sessionId, { only: 'thought' });
         const entry = this.transcripts.appendAssistantChunk(sessionId, text, data.messageId ?? undefined);
-        if (entry) { this.post({ type: 'append', sessionId, entries: [entry] }); }
+        if (entry) {
+          this.stampReplayTime(sessionId, entry, data.messageId);
+          this.post({ type: 'append', sessionId, entries: [entry] });
+        }
         // A chunk means a turn is in flight even if we did not start it.
         this.refreshSessions();
         return;
@@ -757,14 +907,40 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
           return;
         }
         const entry = this.transcripts.appendThoughtChunk(sessionId, text, data.messageId ?? undefined);
-        if (entry) { this.post({ type: 'append', sessionId, entries: [entry] }); }
+        if (entry) {
+          this.stampReplayTime(sessionId, entry, data.messageId);
+          this.post({ type: 'append', sessionId, entries: [entry] });
+        }
         return;
       }
 
       case 'user_message_chunk': {
         // Replay path (`session/load`).
         const text = textOf(data.content);
-        if (text.length === 0) { return; }
+        // [CUSTOM-20260928-111] Images of this user message were read from the
+        // transcript BEFORE replay started (preloadTranscriptTimes); merge them
+        // into the bubble. The separate image chunk that follows (100) is dropped
+        // below so it does not become a second row.
+        const images = this.replayImagesFor(sessionId, data.messageId);
+        if (text.length === 0) {
+          // [CUSTOM-20260928-100] Non-text blocks of a USER message were dropped here
+          // (a pasted image, a resource link), so a reopened conversation showed the
+          // prompt without the picture it carried. Same treatment as the thought chunk
+          // below (075): it becomes a content record like any other.
+          // [CUSTOM-20260928-111] …unless the image already rode in on the text chunk.
+          if (images && images.length > 0) { return; }
+          this.postContentNotice(sessionId, data.content);
+          return;
+        }
+        // [CUSTOM-20260928-109] 注入块（<task-notification> 等）不是用户输入，
+        // 却走同一个 user chunk 通道 —— 渲染成蓝色用户气泡会把"agent 的回报"误读成
+        // "我说过这句话"。分流成 meta 提示条，正文截断一行。
+        if (isInjectedChunk(text)) {
+          const preview = firstLineOf(stripInjectionWrapper(text));
+          const entry = this.transcripts.appendNotice(sessionId, 'meta', preview);
+          if (entry) { this.post({ type: 'append', sessionId, entries: [entry] }); }
+          return;
+        }
         // [CUSTOM-20260925-053] A user chunk IS a turn boundary, so it must
         // close any assistant prose still marked as streaming. Nothing else
         // does it on the replay path: `finalizeTurn` only runs for a prompt we
@@ -776,8 +952,11 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
         // turn here too ("finalizes pending assistant turn", its
         // user_message_chunk branch).
         this.finalizeEntries(sessionId, { only: 'assistant' });
-        const entry = this.transcripts.appendUser(sessionId, text);
-        if (entry) { this.post({ type: 'append', sessionId, entries: [entry] }); }
+        const entry = this.transcripts.appendUser(sessionId, text, images);
+        if (entry) {
+          this.stampReplayTime(sessionId, entry, data.messageId);
+          this.post({ type: 'append', sessionId, entries: [entry] });
+        }
         return;
       }
 
@@ -847,9 +1026,18 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
       }
 
       default: {
+        // [CUSTOM-20260928-097] session_info_update must APPLY the title here. The
+        // comment below used to claim SessionManager handled it, but
+        // applySessionInfoUpdate was only ever called from the LEGACY provider — so
+        // in the new panel the tab strip never learned a session's title.
+        if (data.sessionUpdate === 'session_info_update') {
+          this.sessionManager.applySessionInfoUpdate(sessionId, {
+            title: typeof data.title === 'string' ? data.title : (data.title === null ? null : undefined),
+            updatedAt: typeof data.updatedAt === 'string' ? data.updatedAt : undefined,
+          });
+        }
         // available_commands_update / config_option_update / current_mode_update /
-        // session_info_update are handled by SessionManager + the legacy provider's
-        // listener; the host only needs to re-read state after they land.
+        // session_info_update need the host to re-read state after they land.
         if (data.sessionUpdate === 'available_commands_update'
           || data.sessionUpdate === 'config_option_update'
           || data.sessionUpdate === 'current_mode_update'
@@ -877,6 +1065,66 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
         return;
       }
     }
+  }
+
+  /**
+   * [CUSTOM-20260928-100] Read a session's real message times BEFORE replaying it.
+   *
+   * Done up front rather than on `session-load-start` (an event): the replay notifications
+   * arrive synchronously once the agent starts streaming, so a table still being read
+   * would be too late for the first chunks — and those are exactly the rows a reader
+   * scrolls to the top of the outline to find.
+   */
+  private async preloadTranscriptTimes(agent: string, sessionId: string, cwd?: string): Promise<void> {
+    if (agent !== CLAUDE_CODE_AGENT || this.replayTimes.has(sessionId)) { return; }
+    const dirCwd = cwd || this.workspaceCwd();
+    if (!dirCwd) { return; }
+    const dir = claudeTranscriptDir(dirCwd);
+    try {
+      const times = await readTranscriptTimes(dir, sessionId);
+      if (times.size > 0) {
+        this.replayTimes.set(sessionId, times);
+        log(`${LOG_PREFIX}: replayed times available for ${sessionId} (${times.size} messages)`);
+      }
+    } catch (e) {
+      // Best effort: no times means the records keep the host clock, as before.
+      log(`${LOG_PREFIX}: transcript times unavailable (${(e as Error)?.message ?? e})`);
+    }
+    // [CUSTOM-20260928-111] Images of user messages too: the replay delivers them as
+    // separate chunks (100), so the bubble has nothing to merge with unless we read
+    // the transcript. Any failure is "no images", never an error.
+    try {
+      const images = await readTranscriptUserImages(dir, sessionId);
+      if (images.size > 0) {
+        this.replayUserImages.set(sessionId, images);
+        log(`${LOG_PREFIX}: replayed images available for ${sessionId} (${images.size} messages)`);
+      }
+    } catch (e) {
+      log(`${LOG_PREFIX}: transcript images unavailable (${(e as Error)?.message ?? e})`);
+    }
+  }
+
+  /** Real image views for a replayed user chunk, or undefined when there are none. */
+  private replayImagesFor(sessionId: string, messageId: unknown): ContentBlockView[] | undefined {
+    if (typeof messageId !== 'string' || messageId.length === 0) { return undefined; }
+    return this.replayUserImages.get(sessionId)?.get(messageId);
+  }
+
+  /** Real epoch ms for a replay chunk's message, or undefined when the agent gave none. */
+  private replayTimeFor(sessionId: string, messageId: unknown): number | undefined {
+    if (typeof messageId !== 'string' || messageId.length === 0) { return undefined; }
+    return this.replayTimes.get(sessionId)?.get(messageId);
+  }
+
+  /**
+   * Stamp a replay entry with its real time when the transcript knows it. The entry is
+   * the store's OWN object (`append*` returns a live reference), so correcting `at` here
+   * also fixes every later snapshot — the client is handed the same object.
+   */
+  private stampReplayTime(sessionId: string, entry: { at: number } | null, messageId: unknown): void {
+    if (!entry) { return; }
+    const at = this.replayTimeFor(sessionId, messageId);
+    if (at !== undefined) { entry.at = at; }
   }
 
   /**
@@ -1031,7 +1279,11 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
     return true;
   }
 
-  show(state: PermissionState): void {
+  // [CUSTOM-BEGIN] CUSTOM-20260929-119 - PermissionPresenter + ElicitationPresenter 共用
+  // 这一对方法（两个接口的方法名相同，所以实现必须收一个联合类型再按形状分派；
+  // 写两个同名方法在 TS 里是重复实现，编译不过）。canPresent 也共用同一套判据。
+  show(state: PermissionState | ElicitationState): void {
+    if (isElicitationState(state)) { this.showElicitation(state); return; }
     const session = sessionOf(this.sessionManager, state.sessionId);
     if (!session) { return; }
     this.transcripts.ensureSession(state.sessionId, session.agentName);
@@ -1039,13 +1291,33 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
     if (entry) { this.post({ type: 'append', sessionId: state.sessionId, entries: [entry] }); }
   }
 
-  update(state: PermissionState): void {
+  update(state: PermissionState | ElicitationState): void {
+    if (isElicitationState(state)) { this.updateElicitation(state); return; }
     // appendPermission returns the existing entry for this promptId (after
     // applying the new state), so `patch` below only needs to tell the webview.
     const entry = this.transcripts.appendPermission(state.sessionId, state);
     if (!entry) { return; }
     this.post({ type: 'revise', sessionId: state.sessionId, entryId: entry.id, patch: { permission: state } });
   }
+  // [CUSTOM-END] CUSTOM-20260929-119
+
+  // [CUSTOM-BEGIN] CUSTOM-20260929-119 - 表单卡的 presenter。与权限卡逐条同构：
+  // 卡是 transcript 的一条记录（所以 boot/focus 的全量快照天然能把它带回来——重开面板、
+  // 切走再切回、两个 surface 切换都不需要额外机制），回答走 elicitationAnswer 消息。
+  showElicitation(state: ElicitationState): void {
+    const session = sessionOf(this.sessionManager, state.sessionId);
+    if (!session) { return; }
+    this.transcripts.ensureSession(state.sessionId, session.agentName);
+    const entry = this.transcripts.appendElicitation(state.sessionId, state);
+    if (entry) { this.post({ type: 'append', sessionId: state.sessionId, entries: [entry] }); }
+  }
+
+  updateElicitation(state: ElicitationState): void {
+    const entry = this.transcripts.appendElicitation(state.sessionId, state);
+    if (!entry) { return; }
+    this.post({ type: 'revise', sessionId: state.sessionId, entryId: entry.id, patch: { elicitation: state } });
+  }
+  // [CUSTOM-END] CUSTOM-20260929-119
 
   // --- Tool views (CUSTOM-20260924-027) ------------------------------------
 
@@ -1073,6 +1345,20 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
   // --- Panel entry points: connect + history (CUSTOM-20260925-032/033) ------
 
   /** Falls back to the panel's own agent when nothing is focused. */
+  /**
+   * [CUSTOM-20260927-090] Is the panel's agent connected right now?
+   *
+   * The empty state has to know. "No session yet — connect an agent" is WRONG once the
+   * agent is already running: the panel can be sessionless with a live process (closing
+   * the last session keeps the process; only `disconnectAgent` stops it), and its Connect
+   * button then offers to do something that has already been done. Sent with every message
+   * that can change what the empty state shows (boot / focus / sessionsChanged).
+   */
+  private panelAgentConnected(): boolean {
+    const agent = this.panelAgent();
+    return !!agent && this.sessionManager.isAgentConnected(agent);
+  }
+
   private panelAgent(preferred?: string): string | null {
     if (preferred) { return preferred; }
     if (this.focused.agentName) { return this.focused.agentName; }
@@ -1133,77 +1419,210 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
 
     const connected = this.sessionManager.isAgentConnected(agent);
     const caps = this.sessionManager.getCachedCapabilities(agent);
-    const local = () => {
+    const local = (): Array<Omit<HistorySessionSummary, 'dirKey'>> => {
       const entries = this.sessionManager.getHistoryStore()?.list(agent, this.workspaceCwd()) ?? [];
-      const live = new Set(this.sessionManager.getSessionIdsForAgent(agent));
-      return {
-        source: 'local' as const,
-        sessions: entries
-          // Live sessions are already tabs; the picker is for the other ones.
-          .filter(e => !live.has(e.sessionId))
-          .map(e => ({
-            sessionId: e.sessionId,
-            title: e.title ?? e.firstPrompt ?? null,
-            cwd: e.cwd,
-            updatedAt: e.lastActiveAt,
-          })),
-      };
+      // [CUSTOM-20260928-097] Live sessions are no longer hidden — the current
+      // session should appear in the picker too (clicking it just re-focuses).
+      return entries
+        .map(e => ({
+          sessionId: e.sessionId,
+          title: e.title ?? e.firstPrompt ?? null,
+          cwd: e.cwd,
+          updatedAt: e.lastActiveAt,
+          // [CUSTOM-20260927-092] Marked here (the merge no longer invents the mark): a
+          // row only the cache knows about may be gone agent-side, and the client says so.
+          fromCache: true,
+        }));
     };
 
     try {
       if (connected && caps?.list) {
         const response = await this.sessionManager.listSessions(agent);
-        const live = new Set(this.sessionManager.getSessionIdsForAgent(agent));
-        this.post({
-          type: 'history',
-          agentName: agent,
-          source: 'agent',
-          sessions: response.sessions
-            .filter(s => !live.has(String((s as { sessionId?: unknown }).sessionId ?? '')))
-            .map(s => {
-              const info = s as { sessionId?: unknown; title?: unknown; cwd?: unknown; updatedAt?: unknown };
-              const sessionId = String(info.sessionId ?? '');
-              // [CUSTOM-BEGIN] CUSTOM-20260926-078 - 历史列表 agent 侧缺 title 时回退本地缓存的 title/firstPrompt。
-              const stored = this.sessionManager.getHistoryStore()?.get(agent, sessionId);
-              const title = typeof info.title === 'string'
-                ? info.title
-                : (stored?.title ?? stored?.firstPrompt ?? null);
-              // [CUSTOM-END] CUSTOM-20260926-078
-              return {
-                sessionId,
-                title,
-                cwd: typeof info.cwd === 'string' ? info.cwd : undefined,
-                updatedAt: typeof info.updatedAt === 'string' ? info.updatedAt : undefined,
-              };
-            }),
-        });
+        const fromAgent = response.sessions
+          .map(s => {
+            const info = s as { sessionId?: unknown; title?: unknown; cwd?: unknown; updatedAt?: unknown };
+            const sessionId = String(info.sessionId ?? '');
+            // [CUSTOM-BEGIN] CUSTOM-20260926-078 - 历史列表 agent 侧缺 title 时回退本地缓存的 title/firstPrompt。
+            const stored = this.sessionManager.getHistoryStore()?.get(agent, sessionId);
+            const title = typeof info.title === 'string'
+              ? info.title
+              : (stored?.title ?? stored?.firstPrompt ?? null);
+            // [CUSTOM-END] CUSTOM-20260926-078
+            return {
+              sessionId,
+              title,
+              cwd: typeof info.cwd === 'string' ? info.cwd : undefined,
+              updatedAt: typeof info.updatedAt === 'string' ? info.updatedAt : undefined,
+            };
+          });
+        // [CUSTOM-20260927-092] UNION with the local cache instead of replacing it.
+        // The agent's `session/list` is not the whole truth: it omits sessions that are
+        // still OPEN in another Claude Code window (measured — see
+        // CUSTOMIZATIONS/scripts/probe-session-list.mjs: 227 sessions listed, none
+        // without a cwd, and two of this workspace's eight absent). A session this
+        // workspace opened earlier lives in OUR cache regardless, so the union is what
+        // makes "the list I saw before" and "the list I see now" agree.
+        // [CUSTOM-20260927-094] …and with the agent's own transcript directory, which is
+        // the only source that also covers sessions this workspace never opened (the
+        // official Claude Code panel reads exactly that directory).
+        this.postHistory(agent, 'merged', mergeHistoryRows(fromAgent, await this.readDiskHistory(agent), local()));
         return;
       }
-      const fallback = local();
-      this.post({ type: 'history', agentName: agent, ...fallback });
+      // Not connected: the cache plus (for Claude Code) the transcripts on disk.
+      this.postHistory(agent, 'merged', mergeHistoryRows(await this.readDiskHistory(agent), local()));
     } catch (e: any) {
       // An agent-side failure still has the cache as a usable answer.
-      const fallback = local();
-      this.post({
-        type: 'history',
-        agentName: agent,
-        ...fallback,
-        error: `Could not query the agent (${e?.message ?? e}); showing the local cache.`,
-      });
+      this.postHistory(agent, 'local', local(),
+        `Could not query the agent (${e?.message ?? e}); showing the local cache.`);
     }
   }
 
+  /**
+   * [CUSTOM-20260927-094] Rows recovered from the agent's OWN transcript directory.
+   *
+   * Only for Claude Code (that storage is a vendor detail — see diskSessions.ts), only for
+   * the current workspace folder (the same scope the local cache uses), and never fatal:
+   * every failure degrades to "no supplement", because this is an addition to the agent's
+   * list, not a replacement for it.
+   *
+   * [CUSTOM-20260928-095] `cwd` overrides the scan directory — the history picker's
+   * directory filter asks for the folder it is showing, which may be any folder the
+   * agent lists (not just `workspaceFolders[0]`).
+   */
+  private async readDiskHistory(agent: string, cwd?: string): Promise<Array<Omit<HistorySessionSummary, 'dirKey'>>> {
+    if (agent !== CLAUDE_CODE_AGENT) { return []; }
+    const dirCwd = cwd ?? this.workspaceCwd();
+    if (!dirCwd) { return []; }
+    try {
+      const dir = claudeTranscriptDir(dirCwd);
+      const rows = await readDiskSessions(dir, dirCwd);
+      log(`${LOG_PREFIX}: transcript supplement ${rows.length} rows from ${dir}`);
+      return rows
+        // [CUSTOM-20260928-097] Keep live sessions in the list (deduped by the merge);
+        // still drop rows without a cwd — they cannot be filtered or reopened.
+        .filter(r => !!r.cwd)
+        .map(r => ({
+          sessionId: r.sessionId,
+          title: r.title ?? null,
+          cwd: r.cwd,
+          updatedAt: r.updatedAt,
+          fromDisk: true,
+        }));
+    } catch (e) {
+      log(`${LOG_PREFIX}: transcript supplement failed (ignored): ${(e as Error)?.message ?? e}`);
+      return [];
+    }
+  }
+
+  /**
+   * [CUSTOM-20260928-095] Scan the transcript directory of ONE folder the picker's
+   * filter selected, and hand back only the disk rows — as an INCREMENT, so the client
+   * merges them without a full `history` replacement (which would reset the filter).
+   */
+  private async handleSupplementHistory(agentName: string | undefined, cwd: string): Promise<void> {
+    const agent = this.panelAgent(agentName);
+    if (!agent || !cwd) { return; }
+    const rows = await this.readDiskHistory(agent, cwd);
+    if (rows.length === 0) { return; }
+    const sessions: HistorySessionSummary[] = rows.map(s => {
+      const dirKey = directoryKey(s.cwd);
+      return dirKey ? { ...s, dirKey } : s;
+    });
+    this.post({ type: 'historySupplement', agentName: agent, cwd, sessions });
+  }
+
+  /**
+   * [CUSTOM-20260926-079] The ONE place a `history` reply is assembled.
+   *
+   * It exists because a reply now carries derived data as well as the rows: the
+   * directory identity of every row and the filter's candidate directories. Three
+   * reply paths (agent list, local cache, cache-after-error) each building that by
+   * hand is how one of them ends up without a `dirKey` — the failure mode would be
+   * rows that silently vanish from a filtered list.
+   */
+  private postHistory(
+    agent: string,
+    source: 'agent' | 'local' | 'merged',
+    sessions: Array<Omit<HistorySessionSummary, 'dirKey'>>,
+    error?: string,
+  ): void {
+    const rows: HistorySessionSummary[] = sessions.map(s => {
+      const dirKey = directoryKey(s.cwd);
+      return dirKey ? { ...s, dirKey } : s;
+    });
+    this.post({
+      type: 'history',
+      agentName: agent,
+      source,
+      sessions: rows,
+      directories: directoryOptions(rows, this.historyFilterCwd(agent)),
+      ...(error ? { error } : {}),
+    });
+  }
+
+  /**
+   * [CUSTOM-20260926-079] The directory the history filter defaults to.
+   *
+   * The focused session's OWN directory, when that session belongs to the agent
+   * being listed — the picker is per-agent and the focused session may belong to a
+   * different one. Otherwise the first workspace folder. Undefined means "no
+   * default": the client then opens the list unfiltered, which is the honest answer
+   * for a session that has no directory yet (a draft).
+   */
+  private historyFilterCwd(agent: string): string | undefined {
+    const focused = this.focused.sessionId
+      ? sessionOf(this.sessionManager, this.focused.sessionId)
+      : undefined;
+    if (focused && focused.agentName === agent && focused.cwd) { return focused.cwd; }
+    return this.workspaceCwd();
+  }
+
   /** [CUSTOM-20260925-033] Open a session from the picker (load, else resume). */
-  private async handleOpenHistorySession(agentName: string, sessionId: string, cwd?: string): Promise<void> {
+  private async handleOpenHistorySession(
+    agentName: string,
+    sessionId: string,
+    cwd?: string,
+    title?: string,
+    fromDraft = false,
+  ): Promise<void> {
     const agent = this.panelAgent(agentName);
     if (!agent || !sessionId) { return; }
     log(`${LOG_PREFIX}: opening history session ${sessionId} of ${agent}${cwd ? ` (cwd ${cwd})` : ''}`);
     try {
+      // [CUSTOM-20260928-099] Picking from the history list SWITCHES the panel, it does
+      // not pile up another tab: the currently focused session steps aside so the picked
+      // one takes its place. Reported as "每次选历史都多开一个 tab" — the strip grew by
+      // one on every visit, which is not what a history list means.
+      //
+      // Nothing is destroyed by this: the session stepping aside is still in the agent's
+      // own history AND on disk, so the very same list reopens it later (that is the whole
+      // point of §5.14/§5.24). A session that is ALREADY live keeps its tab — there is
+      // nothing to replace, the pick is just a focus change.
+      //
+      // [CUSTOM-20260928-100] `fromDraft`: the CLIENT asked while sitting on a draft page.
+      // That draft is what should step aside — not the focused SESSION, which the host
+      // still holds (a draft is client-local, 058, so the host's `focused` names some
+      // other session). The client discards its draft itself.
+      const alreadyLive = !!this.sessionManager.getSession(sessionId);
+      const current = this.focused.sessionId ? this.sessionManager.getSession(this.focused.sessionId) : undefined;
+      if (!alreadyLive && !fromDraft && current && current.sessionId !== sessionId) {
+        try {
+          await this.sessionManager.closeSession(current.agentName, current.sessionId);
+        } catch (e) {
+          // A failed teardown must not block the session the user asked for.
+          log(`${LOG_PREFIX}: could not close ${current.sessionId} before switch (${String(e)})`);
+        }
+      }
+      // [CUSTOM-20260928-100] Real per-message times, read before the replay starts
+      // (the notifications arrive synchronously once it does).
+      await this.preloadTranscriptTimes(agent, sessionId, cwd);
       // [CUSTOM-20260925-057] Pass the session's OWN directory. The picker shows
       // sessions from other directories (the agent-side list spans them), and
       // without this the agent was told the current workspace instead — so a
       // session belonging elsewhere was reopened as if it lived here.
-      const how = await this.sessionManager.openExistingSession(agent, sessionId, { cwd });
+      // [CUSTOM-20260928-098] The title too: the replay does not always re-send
+      // session_info_update, so without it the tab would show the id prefix.
+      const how = await this.sessionManager.openExistingSession(agent, sessionId, { cwd, title });
       if (how === 'resume') {
         const entry = this.transcripts.appendNotice(sessionId, 'info',
           'Resumed without replaying history (this agent does not support session/load).');
@@ -1398,6 +1817,7 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
       sessions,
       snapshot: focused ? this.snapshotOf(focused.sessionId) : null,
       meta: focused ? this.metaOf(focused.sessionId) : null,
+      agentConnected: this.panelAgentConnected(),
     }, to);
     // [CUSTOM-20260926-077] Bring the outline pin/width prefs along with the boot,
     // so a recreated webview (editor panel reopen / window reload) restores them.
@@ -1416,6 +1836,7 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
       summary,
       snapshot: summary ? this.snapshotOf(sessionId!) : null,
       meta: summary ? this.metaOf(sessionId!) : null,
+      agentConnected: this.panelAgentConnected(),
     });
   }
 
@@ -1438,12 +1859,17 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
     // the signature check each streamed token rebuilt the whole tab strip and
     // agent dropdown on the client. Skipping the no-op case is also what keeps
     // `flushThenPost` from flushing the coalescing queue on every chunk.
-    const signature = sessions
+    // [CUSTOM-20260927-090] The connection flag is part of the signature: an agent
+    // connecting or disconnecting changes what the empty state must say, and a signature
+    // that missed it would never refresh the strip — the same trap 022 documented for
+    // `unread`.
+    const agentConnected = this.panelAgentConnected();
+    const signature = `conn:${agentConnected ? 1 : 0}\n` + sessions
       .map(s => `${s.sessionId}|${s.agentName}|${s.title ?? ''}|${s.loading ? 1 : 0}|${s.running ? 1 : 0}|${s.unread ? 1 : 0}`)
       .join('\n');
     if (signature === this.lastSessionsSignature) { return; }
     this.lastSessionsSignature = signature;
-    this.outbox.flushThenPost({ type: 'sessionsChanged', sessions });
+    this.outbox.flushThenPost({ type: 'sessionsChanged', sessions, agentConnected });
   }
 
   // --- State assembly ------------------------------------------------------
@@ -1466,7 +1892,10 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
     return {
       sessionId: session.sessionId,
       agentName: session.agentName,
-      title: session.title ?? stored?.firstPrompt ?? null,
+      // [CUSTOM-20260928-097] Title first, then the cached title, then the first
+      // prompt — matching the history picker's fallback chain (078), not just
+      // firstPrompt (which left a reopened session showing its id prefix).
+      title: session.title ?? stored?.title ?? stored?.firstPrompt ?? null,
       cwd: session.cwd,
       createdAt: session.createdAt,
       loading: this.sessionManager.isLoading(session.sessionId),
@@ -1550,6 +1979,15 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter {
 
 // --- helpers ---------------------------------------------------------------
 
+/**
+ * [CUSTOM-20260929-119] Which presenter interface this state belongs to. The two
+ * states share `promptId` / `sessionId` / `status` but nothing else: a permission
+ * prompt carries `options`, a form carries `fields`.
+ */
+function isElicitationState(state: PermissionState | ElicitationState): state is ElicitationState {
+  return Array.isArray((state as ElicitationState).fields);
+}
+
 function sessionOf(manager: SessionManager, sessionId: string): SessionInfo | undefined {
   return manager.getSession(sessionId);
 }
@@ -1565,15 +2003,60 @@ function toolKey(sessionId: string, toolCallId: string): string {
   return `${sessionId}::${toolCallId}`;
 }
 
+/**
+ * [CUSTOM-20260927-092] Union the agent's history rows with the local cache's.
+ *
+ * The agent's row wins field by field (it is the authority on what still exists), and a
+ * session only the cache knows about is marked `fromCache` so the client can say where it
+ * came from — such a row may have been deleted agent-side, and pretending otherwise would
+ * make the picker look authoritative when it is not. Sorted newest first, because the
+ * picker's whole point is "the sessions I was just in".
+ */
+function mergeHistoryRows(
+  ...sources: Array<Array<Omit<HistorySessionSummary, 'dirKey'>>>
+): Array<Omit<HistorySessionSummary, 'dirKey'>> {
+  // First source wins per field ('agent' beats 'transcripts' beats 'cache'), and a row
+  // only a later source knows about keeps that source's mark so the client can say where
+  // it came from — such a row may no longer exist agent-side, and pretending otherwise
+  // would make the picker look authoritative when it is not.
+  const byId = new Map<string, Omit<HistorySessionSummary, 'dirKey'>>();
+  for (let i = sources.length - 1; i >= 0; i--) {
+    for (const row of sources[i]) { byId.set(row.sessionId, row); }
+  }
+  return Array.from(byId.values()).sort((a, b) => String(b.updatedAt ?? '').localeCompare(String(a.updatedAt ?? '')));
+}
+
 function textOf(content: unknown): string {
   if (!content || typeof content !== 'object') { return ''; }
   const block = content as { type?: string; text?: unknown };
   return block.type === 'text' && typeof block.text === 'string' ? block.text : '';
 }
 
-function basename(p: string): string {
-  const parts = p.split(/[\\/]/);
-  return parts[parts.length - 1] || p;
+// [CUSTOM-20260928-109] 注入块（<task-notification> 等）不是用户输入，却走同一个
+// user chunk 通道 —— 渲染成蓝色用户气泡会把"agent 的回报"误读成"我说过这句话"。
+// 判据是前缀（与 diskSessions.ts:66 的 <local-command 先例同一类）。
+const INJECTED_PREFIXES = ['<task-notification', '<system-reminder', '<local-command', '<command-name', '<command-message'];
+
+function isInjectedChunk(text: string): boolean {
+  const t = text.trimStart();
+  for (const p of INJECTED_PREFIXES) { if (t.startsWith(p)) { return true; } }
+  return false;
+}
+
+/** 剥掉外层 <tag>…</tag>，取第一行可见内容。 */
+function stripInjectionWrapper(text: string): string {
+  const t = text.trim();
+  const m = t.match(/^<[a-z][\w-]*>/);
+  if (!m) { return t; }
+  const closeTag = '</' + m[0].slice(1);
+  const inner = t.endsWith(closeTag) ? t.slice(m[0].length, -closeTag.length) : t.slice(m[0].length);
+  return inner.trim();
+}
+
+function firstLineOf(text: string): string {
+  const nl = text.indexOf('\n');
+  const line = nl >= 0 ? text.slice(0, nl) : text;
+  return line.trim() || '(no content)';
 }
 
 function fileUri(path: string, cwd?: string): vscode.Uri {
@@ -1583,4 +2066,10 @@ function fileUri(path: string, cwd?: string): vscode.Uri {
   // Relative paths resolve against the session's working directory.
   const base = cwd ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
   return vscode.Uri.file(base ? `${base}/${path}` : path);
+}
+
+/** [CUSTOM-20260928-096] Strip `data:image/png;base64,` from a data URL (ACP `image.data` wants raw base64). */
+function stripDataUrlPrefix(dataUrl: string): string {
+  const comma = dataUrl.indexOf(',');
+  return comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
 }

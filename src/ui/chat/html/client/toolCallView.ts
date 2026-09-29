@@ -4,7 +4,7 @@
 // diff 由客户端自行计算（ACP 的 Diff 只给 path/oldText/newText，没有行号也没有 hunk）：
 // 先裁掉公共前后缀，再对中段跑 LCS；过大时退化为整块替换。
 //
-// 注意：本文件是嵌在模板字符串里的客户端代码，**每个反斜杠都要写成 `\\`**。
+// 注意：本文件是嵌在模板字符串里的客户端代码，**每个反斜杠都要写成 '\\'**。
 // [CUSTOM-END] CUSTOM-20260923-011
 export const toolCallViewClient = `
 (function (NS) {
@@ -198,15 +198,70 @@ export const toolCallViewClient = `
   var mdCache = {};
   var mdPending = {};
 
+  /**
+   * [CUSTOM-20260927-084] The round-trip key must identify the TEXT, not just the slot.
+   *
+   * It used to be 'entryId#itemIndex' — a POSITION. But a tool's output GROWS: the
+   * agent streams a fragment and then sends the final text for the same item (18 of
+   * the 27 'tool_call_update's in the captured replay carry content, and one
+   * toolCallId goes 35 -> 268 characters). With a positional key the first fragment's
+   * HTML was served forever, so the reader saw the beginning of every tool output and
+   * nothing at all until the first round trip came back.
+   *
+   * The host echoes this key back verbatim (it is opaque to it), so folding a
+   * fingerprint of the text into the key ALSO ties every reply to the exact text it
+   * was rendered from — a late reply for an older fragment cannot be mistaken for the
+   * current one.
+   *
+   * A string too large to fingerprint cheaply (fingerprintText bails at 256 KB) is
+   * rendered as plain text instead: caching it would mean trusting a key we cannot
+   * compute.
+   */
+  function markdownKey(slot, text) {
+    var fp = fingerprintText(text);
+    return fp === null ? null : slot + '#' + fp;
+  }
+
   /** Re-render this host from the cache, or queue it for the next round-trip. */
   function markdownText(host, key, entryId, text) {
-    if (Object.prototype.hasOwnProperty.call(mdCache, key)) {
-      applyRendered(host, mdCache[key]);
+    var cacheKey = markdownKey(key, text);
+    if (cacheKey === null) {
+      host.textContent = text;
       return;
     }
-    if (!Object.prototype.hasOwnProperty.call(mdPending, key)) {
-      mdPending[key] = { entryId: entryId, text: text, host: host };
+    if (Object.prototype.hasOwnProperty.call(mdCache, cacheKey)) {
+      applyRendered(host, mdCache[cacheKey]);
+      return;
     }
+    if (!Object.prototype.hasOwnProperty.call(mdPending, cacheKey)) {
+      mdPending[cacheKey] = { entryId: entryId, text: text, host: host };
+      // [CUSTOM-20260929-118] ASK FOR IT. This queue used to be write-only from the
+      // tool side: 'transcriptView.flushPending' only ever fires while an assistant /
+      // thought record tracks its markdown, so a tool body's text was requested **only
+      // if an assistant finalize happened to follow it**. A turn that ends on a tool
+      // call (or a replayed card whose assistant entries already have html) left every
+      // tool body permanently BLANK — an empty OUT box, with no error anywhere.
+      // Coalesced to one frame, which also merges several items into one round-trip.
+      scheduleMarkdown();
+      return;
+    }
+    // The same text asked again (the body was rebuilt): the node is new, the request
+    // is not — point the pending entry at the node that is on screen now.
+    mdPending[cacheKey].host = host;
+  }
+
+  var markdownFlushPending = false;
+
+  /** One request per frame, however many items were queued (see markdownText). */
+  function scheduleMarkdown() {
+    if (markdownFlushPending) { return; }
+    markdownFlushPending = true;
+    NS.dom.schedule(function () {
+      markdownFlushPending = false;
+      if (!NS.boot || !NS.boot.requestMarkdown) { return; }
+      if (pendingMarkdownItems().length === 0) { return; }
+      NS.boot.requestMarkdown();
+    });
   }
 
   function applyRendered(host, html) {
@@ -217,21 +272,36 @@ export const toolCallViewClient = `
   }
 
   /** Items to ask the host for (merged with the assistant bubbles' own batch). */
-  function pendingMarkdownItems() {
+  /**
+   * [CUSTOM-20260929-120] The items to ask the host to render.
+   *
+   * 'sessionId' is NOT optional and not decoration: the host validates every item with
+   * 'verifySession' and **silently skips the ones without one** (protocol.ts declares it
+   * as a required field). The tool items used to omit it while the assistant ones carried
+   * it, so every tool body's markdown request was dropped on arrival — the card kept an
+   * empty .tool-text forever, with no error on either side. The transcript's own items
+   * have always passed it; this list is built inside toolCallView, which does not know
+   * the focused session, so the caller (boot) hands it in.
+   */
+  function pendingMarkdownItems(sessionId) {
     var out = [];
     for (var key in mdPending) {
       if (!Object.prototype.hasOwnProperty.call(mdPending, key)) { continue; }
-      out.push({ entryId: mdPending[key].entryId, key: key, text: mdPending[key].text });
+      out.push({ entryId: mdPending[key].entryId, sessionId: sessionId, key: key, text: mdPending[key].text });
     }
     return out;
   }
 
   /** The host rendered one of them: cache it and, if the node still exists, show it. */
   function applyMarkdown(key, html) {
-    mdCache[key] = html;
     var item = mdPending[key];
+    // The key names the text, so this HTML belongs to that text and no other. A reply
+    // whose request is gone (the text changed meanwhile) has nothing left to attach to
+    // — caching it anyway is exactly how the stale-HTML bug would come back.
+    if (!item) { return; }
+    mdCache[key] = html;
     delete mdPending[key];
-    if (item && item.host && item.host.parentNode) { applyRendered(item.host, html); }
+    if (item.host && item.host.parentNode) { applyRendered(item.host, html); }
   }
 
   /** Session switch: rendered HTML belongs to the previous transcript. */
@@ -268,11 +338,22 @@ export const toolCallViewClient = `
       return textHost;
     }
     if (block.type === 'image') {
-      var img = document.createElement('img');
-      img.className = 'content-image';
-      img.src = block.dataUri;
-      img.alt = block.name || 'image';
-      return img;
+      // [CUSTOM-20260928-102] A compact thumbnail + filename instead of the picture at
+      // full size: 'max-width: 100%' made one 1344x695 screenshot fill the whole panel
+      // and push the rest of the conversation off the screen. Clicking opens the
+      // lightbox (097) — the whole chip is the hit target, not just the thumbnail.
+      var imgChip = el('button', 'content-image-chip');
+      imgChip.type = 'button';
+      imgChip.setAttribute('data-zoom-src', block.dataUri);
+      imgChip.setAttribute('data-zoom-alt', block.name || 'image');
+      imgChip.title = (block.name || 'image') + ' \\u2014 click to enlarge';
+      var thumb = document.createElement('img');
+      thumb.className = 'content-thumb';
+      thumb.src = block.dataUri;
+      thumb.alt = block.name || 'image';
+      imgChip.appendChild(thumb);
+      imgChip.appendChild(el('span', 'content-image-name', block.name || 'image'));
+      return imgChip;
     }
     if (block.type === 'resource_link') {
       // [CUSTOM-20260925-039] 'path' 由扩展侧判定（本地文件，含相对路径）。
@@ -319,12 +400,75 @@ export const toolCallViewClient = `
    * 'NS.dom.clear(body)' removed the ones already there). One builder makes
    * that class of drift impossible.
    */
+  /**
+   * [CUSTOM-20260929-117] What the card head shows as its label.
+   *
+   * The agent's own description when it published one ("List files in the working
+   * directory" — the official panel shows exactly this), otherwise the ACP title
+   * (for an 'execute' call that is the command line, for other tools it is already
+   * a human title like "Read file.txt"). Never empty: the caller falls back to the
+   * toolCallId, as before.
+   *
+   * The title stays available on hover ('title.title' in render/update), so the
+   * command is never MORE than one hover away — it is also printed in the IN
+   * section of the body.
+   */
+  function headLabel(tool) {
+    return tool.description || tool.title || '';
+  }
+
+  /**
+   * [CUSTOM-20260929-117] Put the agent's description in the card head, when it
+   * reported one. Same add/remove/update shape as 'applyToolName' — the
+   * description arrives on a LATER update than the card's first paint (the
+   * captured replay shows the command first, the description two updates in), so
+   * this must be able to patch an existing head.
+   */
+  function applyHeadLabel(head, tool) {
+    var title = head.querySelector('.tool-title');
+    if (!title) { return; }
+    var label = headLabel(tool);
+    if (label) { title.textContent = label; title.title = tool.title || ''; }
+  }
+
+  /**
+   * [CUSTOM-20260929-117] One labelled IN / OUT section.
+   *
+   * The section carries the label; the children are ordinary body nodes (a command
+   * div, a chip row, rendered content items) so nothing about how they render
+   * changes — the markdown round-trip in particular is untouched.
+   */
+  function toolSection(kind, label, children) {
+    var seg = NS.dom.el('div', 'tool-seg tool-seg-' + kind);
+    seg.appendChild(NS.dom.el('span', 'tool-seg-label', label));
+    for (var i = 0; i < children.length; i++) { seg.appendChild(children[i]); }
+    return seg;
+  }
+
+  /**
+   * [CUSTOM-20260929-118] Is there anything in 'items' the reader will actually see?
+   *
+   * A blank text block renders an empty node ([CUSTOM-20260924-026]: blank blocks are
+   * invisible), and a text item whose markdown is still in flight is blank until the
+   * reply lands — so "items exist" is NOT the same as "there is something to show".
+   * That difference decides whether the OUT section needs the raw-output fallback.
+   */
+  function hasVisibleItem(items) {
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      if (item.type === 'diff' || item.type === 'terminal') { return true; }
+      var block = item.block;
+      if (!block) { continue; }
+      if (block.type === 'text' && isBlank(block.text)) { continue; }
+      return true;
+    }
+    return false;
+  }
+
   function fillToolBody(body, tool, entryId) {
     var el = NS.dom.el;
     NS.dom.clear(body);
-    if (tool.command) {
-      body.appendChild(el('div', 'tool-command', tool.command));
-    }
+    var outputs = [];
     var locations = tool.locations || [];
     if (locations.length > 0) {
       var row = el('div', 'chip-row');
@@ -338,16 +482,43 @@ export const toolCallViewClient = `
         chip.title = loc.path + (loc.line ? ':' + loc.line : '');
         row.appendChild(chip);
       }
-      body.appendChild(row);
+      outputs.push(row);
     }
     var items = tool.items || [];
     for (var j = 0; j < items.length; j++) {
+      // [CUSTOM-20260929-118] A blank text item is skipped rather than rendered: it
+      // contributed an empty node, which (now that the body is labelled) showed up as
+      // an OUT box with nothing in it.
+      var item = items[j];
+      if (item.type === 'content' && item.block && item.block.type === 'text' && isBlank(item.block.text)) { continue; }
       // Positional key so a rebuilt diff keeps the user's expansion state.
-      body.appendChild(renderContentItem(items[j], 'i' + j + ':' + (items[j].path || ''), entryId));
+      outputs.push(renderContentItem(item, 'i' + j + ':' + (item.path || ''), entryId));
     }
-    if (!tool.command && locations.length === 0 && items.length === 0) {
+    var commandLine = '' + (tool.command || '');
+    // [CUSTOM-20260929-118] Nothing renderable, but the agent did report output text:
+    // show it. Without this the OUT section can be an empty box on a call whose output
+    // the agent sent in a shape we do not render (see ToolCallView.output).
+    if (!hasVisibleItem(items) && tool.output) {
+      outputs.push(el('pre', 'tool-raw', tool.output));
+    }
+    if (!commandLine && outputs.length === 0) {
       body.appendChild(el('div', 'diff-note', 'No detail reported for this tool call.'));
+      return body;
     }
+    // [CUSTOM-20260929-117] IN / OUT, the shape the official Claude Code panel
+    // uses for a command: what went in, then what came back.
+    //
+    // The labels appear only when there IS a command. A Read / Edit / Search card
+    // has no input line, and calling its content "OUT" would be a claim about the
+    // direction of the call that this client does not actually know — those keep
+    // the unlabelled layout they have always had (no regression for non-execute
+    // tools).
+    if (tool.command) {
+      body.appendChild(toolSection('in', 'IN', [el('div', 'tool-command', tool.command)]));
+      if (outputs.length > 0) { body.appendChild(toolSection('out', 'OUT', outputs)); }
+      return body;
+    }
+    for (var k = 0; k < outputs.length; k++) { body.appendChild(outputs[k]); }
     return body;
   }
 
@@ -433,6 +604,12 @@ export const toolCallViewClient = `
     // [CUSTOM-20260925-044] The leading 'cmd:' is now a HASH, not a length —
     // see fingerprintText for why a length is not a safe change signal.
     var parts = ['cmd:' + command];
+    // [CUSTOM-20260929-118] INV-H: every field the body RENDERS must be in here, or a
+    // change to it leaves the card permanently stale. The raw-output fallback is one of
+    // them; whether it is used depends on the items, which are covered below.
+    var outputFp = fingerprintText(tool.output);
+    if (outputFp === null) { return null; }
+    parts.push('out:' + outputFp);
     var locations = tool.locations || [];
     for (var i = 0; i < locations.length; i++) {
       parts.push('loc:' + locations[i].path + ':' + (locations[i].line || 0));
@@ -490,7 +667,7 @@ export const toolCallViewClient = `
     head.appendChild(el('span', 'tool-kind', KIND_LABEL[tool.kind] || 'Tool'));
     // [CUSTOM-20260926-074] The agent's own tool name, when it reported one.
     applyToolName(head, tool);
-    var title = el('span', 'tool-title', tool.title || tool.toolCallId);
+    var title = el('span', 'tool-title', headLabel(tool) || tool.toolCallId);
     title.title = tool.title || '';
     head.appendChild(title);
     applyDuration(head, tool);
@@ -500,6 +677,11 @@ export const toolCallViewClient = `
     wrap.appendChild(head);
 
     var body = el('div', 'tool-body');
+    // [CUSTOM-20260929-118] Collapsed by default, for EVERY kind — including a
+    // command-line call. 117 opened those automatically (the official panel shows
+    // IN/OUT inline) and the user rejected it: a long session turns into a wall of
+    // command output. IN/OUT is one click away, and the head shows the agent's
+    // description so the reader knows what is behind the caret.
     body.hidden = true;
     fillToolBody(body, tool, entryId);
     var signature = bodySignature(tool);
@@ -596,14 +778,14 @@ export const toolCallViewClient = `
     // a placeholder starts without a tool name and must pick it up on the update
     // that finally carries the view model.
     if (head) { applyToolName(head, tool); }
+    // [CUSTOM-20260929-117] ...and the description, which arrives on a later update
+    // than the first paint (see headLabel). The old inline version overwrote the
+    // label with tool.title only, which would have reverted a described card to the
+    // command line on every subsequent chunk.
+    if (head) { applyHeadLabel(head, tool); }
     // [CUSTOM-20260925-065] The duration only exists once the call has finished,
     // which arrives on an update — so it has to be applied here too.
     if (head) { applyDuration(head, tool); }
-    var title = node.querySelector('.tool-title');
-    if (title && tool.title) {
-      title.textContent = tool.title;
-      title.title = tool.title;
-    }
     var body = node.querySelector('.tool-body');
     if (body) {
       // [CUSTOM-20260925-040] Rebuild through the shared builder (so 'locations'

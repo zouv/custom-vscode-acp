@@ -58,7 +58,8 @@ export const transcriptViewClient = `
   // 于是 patch 落进 entry.plan 而 buildPlan 读 entry.entries —— 更新静默丢弃
   // （patch() 不认识的那个键只是被拷进对象，没有任何报错）。
   // 改这里之前先对照 src/ui/chat/transcript/types.ts 的 EntryPatch。
-  var PATCH_KEYS = ['text', 'html', 'streaming', 'elapsedMs', 'entries', 'blocks', 'permission'];
+  // [CUSTOM-20260929-119] 'elicitation' 与记录字段名逐字相同（表单卡的 patch）。
+  var PATCH_KEYS = ['text', 'html', 'streaming', 'elapsedMs', 'entries', 'blocks', 'permission', 'elicitation'];
 
   function init(container) {
     messagesEl = container;
@@ -238,8 +239,10 @@ export const transcriptViewClient = `
    * whole text is deliberately NOT repeated, which would show it twice while
    * expanded.
    *
-   * A single-line message gets no fold affordance at all: there is nothing to
-   * fold, and a permanent triangle on every short message is pure noise.
+   * A single-line message folds too, with an EMPTY body: the caret is the same on every
+   * message (CUSTOM-20260928-113 - the affordance used to be hidden for one-liners, and a
+   * hidden control per message is what the reader reported), while the thing that used to
+   * gate it - "is there anything to hide" - now gates only the pinned bar's shrink button.
    *
    * Open by default: a message the user just sent must not appear hidden.
    *
@@ -265,15 +268,29 @@ export const transcriptViewClient = `
     var summary = NS.dom.el('summary', 'bubble');
     // Caret before the label, so the prepended icon lands leftmost (see foldCaret).
     summary.appendChild(foldCaret());
-    summary.appendChild(document.createTextNode(entry.text || ''));
+    // [CUSTOM-20260928-112] 图片 chip 进 bubble，**在 caret 之后、正文之前**。
+    var attachments = entry.attachments || [];
+    for (var i = 0; i < attachments.length; i++) {
+      summary.appendChild(NS.toolCallView.renderContentItem(
+        { type: 'content', block: attachments[i] }, 'a' + i, entry.id));
+    }
+    // [CUSTOM-20260928-108] 正文从**第二行**开始：caret 与图标放在第一行，
+    // 正文包一个 .bubble-body（display:block）撑出新行。
+    var body = NS.dom.el('span', 'bubble-body');
+    body.appendChild(document.createTextNode(entry.text || ''));
+    summary.appendChild(body);
     details.appendChild(summary);
     return details;
   }
 
-  /** The text node of a summary, skipping the caret span and the type icon. */
+  /** The text node of a summary, inside the .bubble-body wrapper. */
   function textNodeOf(host) {
-    for (var i = 0; i < host.childNodes.length; i++) {
-      if (host.childNodes[i].nodeType === 3) { return host.childNodes[i]; }
+    if (!host) { return null; }
+    // [CUSTOM-20260928-108] 正文被包进了 .bubble-body，图标/caret/图片 chip 都在外面。
+    var body = host.querySelector ? host.querySelector('.bubble-body') : null;
+    var scope = body || host;
+    for (var i = 0; i < scope.childNodes.length; i++) {
+      if (scope.childNodes[i].nodeType === 3) { return scope.childNodes[i]; }
     }
     return null;
   }
@@ -345,6 +362,8 @@ export const transcriptViewClient = `
   var FOLD_PREVIEW_CHARS = 160;
   /** Above this length the layout probe is skipped in favour of the fallback. */
   var FOLD_MEASURE_LIMIT = 2000;
+  /** [CUSTOM-20260929-116] Cap on the collapsed preview of an assistant message (DOM size). */
+  var ASSISTANT_PREVIEW_CHARS = 240;
 
   /** [CUSTOM-20260925-064] The old proxy judgement, kept for the unmeasurable case. */
   function heuristicFold(text) {
@@ -377,7 +396,13 @@ export const transcriptViewClient = `
     if (textNode) {
       var total = rangeLines(textNode, text.length);
       if (total > 0) {
-        if (total <= 1) { return { plan: null, measured: true }; }
+        // [CUSTOM-20260928-113] It fits on ONE line: the whole text stays in the
+        // summary and nothing goes to the body. The caret is kept anyway - every
+        // message now has the same affordance (the user asked for it), and for a
+        // message that wraps at a narrower width collapsing is a real action: the
+        // collapsed summary does not wrap. tidySplit() cannot express this case,
+        // because it answers 0 for "split at the very end".
+        if (total <= 1) { return { plan: { split: text.length, drop: 0 }, measured: true }; }
         var tidied = tidySplit(text, firstLineEnd(textNode, text));
         if (tidied > 0) { return { plan: { split: tidied, drop: 0 }, measured: true }; }
       }
@@ -387,9 +412,19 @@ export const transcriptViewClient = `
 
   /** Replace a folded record with a plain bubble (measured as one line after all). */
   function unfoldUser(wrapper, details, text) {
-    var bubble = NS.dom.el('div', 'bubble', text);
+    var bubble = NS.dom.el('div', 'bubble');
+    // [CUSTOM-20260928-108] 单行也一样：正文包 .bubble-body、图片 chip 跟着走。
+    var body = NS.dom.el('span', 'bubble-body');
+    body.appendChild(document.createTextNode(text));
+    bubble.appendChild(body);
     var summary = details.querySelector('summary');
     putIcon(bubble, summary ? takeIcon(summary) : null);
+    if (summary) {
+      var chips = summary.querySelectorAll('.content-image-chip');
+      for (var i = 0; i < chips.length; i++) {
+        bubble.insertBefore(chips[i], body);
+      }
+    }
     if (details.parentNode === wrapper) {
       wrapper.insertBefore(bubble, details);
       wrapper.removeChild(details);
@@ -439,7 +474,11 @@ export const transcriptViewClient = `
       return;
     }
     if (textNode) { textNode.data = text.slice(0, decided.plan.split); }
-    details.appendChild(NS.dom.el('span', 'fold-body', text.slice(decided.plan.split + decided.plan.drop)));
+    // [CUSTOM-20260928-113] An empty remainder gets NO .fold-body element: the element
+    // means "there is hidden text behind this caret", and the pinned bar's shrink button
+    // is gated on its presence (a control that does nothing is worse than none).
+    var rest = text.slice(decided.plan.split + decided.plan.drop);
+    if (rest) { details.appendChild(NS.dom.el('span', 'fold-body', rest)); }
   }
 
   /**
@@ -509,10 +548,9 @@ export const transcriptViewClient = `
       return userEntry;
     }
     if (entry.kind === 'assistant') {
+      // [CUSTOM-20260929-114] Foldable, like a user message (see buildAssistantFold).
       var aEntry = NS.dom.el('div', 'entry entry-assistant');
-      var bubble = NS.dom.el('div', 'bubble');
-      applyAssistant(bubble, entry);
-      aEntry.appendChild(bubble);
+      aEntry.appendChild(buildAssistantFold(entry));
       return aEntry;
     }
     if (entry.kind === 'thought') { return buildThought(entry); }
@@ -526,6 +564,13 @@ export const transcriptViewClient = `
       return permWrap;
     }
     // [CUSTOM-END] CUSTOM-20260924-020
+    // [CUSTOM-BEGIN] CUSTOM-20260929-119 - Form card (ACP elicitation / AskUserQuestion).
+    if (entry.kind === 'elicitation') {
+      var elicWrap = NS.dom.el('div', 'entry entry-elicitation');
+      elicWrap.appendChild(NS.elicitationView.render(entry.elicitation || {}));
+      return elicWrap;
+    }
+    // [CUSTOM-END] CUSTOM-20260929-119
     if (entry.kind === 'notice') {
       return NS.dom.el('div', 'entry entry-notice ' + entry.level, entry.text);
     }
@@ -550,25 +595,88 @@ export const transcriptViewClient = `
     if (icon) { host.insertBefore(icon, host.firstChild); }
   }
 
-  function applyAssistant(bubble, entry) {
+  /**
+   * [CUSTOM-20260929-114] An assistant message folds like a user message: the same real
+   * caret, the same "collapsed means one visible line", and OPEN by default - an answer
+   * that just arrived must not be hidden.
+   *
+   * One thing is deliberately NOT the same: the content is not INSIDE the <summary>.
+   * A user bubble holds inert text, so its whole line can be the click target. This
+   * content is markdown HTML (links, code Copy buttons, image chips) and, worse,
+   * selecting text inside a <summary> IS a click on it - a reader highlighting an
+   * answer would collapse it. So the summary stays a small header row ([icon][caret])
+   * and the body is its sibling.
+   *
+   * The collapse itself is a CSS line clamp, not a measured text split: a character
+   * offset means nothing inside rendered markdown (paragraphs, code blocks, tables),
+   * and a preview copy of the first line would put that text in the DOM twice.
+   */
+  function buildAssistantFold(entry) {
+    var details = document.createElement('details');
+    details.className = 'msg-fold';
+    details.open = true;
+    var summary = NS.dom.el('summary', 'msg-head');
+    // Caret before the label, so the prepended icon lands leftmost (see foldCaret).
+    summary.appendChild(foldCaret());
+    // [CUSTOM-20260929-116] The FIRST LINE, for the collapsed state only (CSS hides it while
+    // the record is open). It has to live in the summary: a closed <details> hides every
+    // child but the summary by itself, and that hiding is NOT overridable by author CSS -
+    // 115 tried a display override on the body and the body stayed invisible.
+    summary.appendChild(NS.dom.el('span', 'msg-preview'));
+    details.appendChild(summary);
+    var body = NS.dom.el('div', 'bubble-body');
+    // Appended BEFORE applyAssistant: the preview is refreshed from inside it, and that
+    // lookup needs the body in its tree (see refreshPreview).
+    details.appendChild(body);
+    applyAssistant(body, entry, details);
+    return details;
+  }
+
+  /**
+   * [CUSTOM-20260929-116] Keep the collapsed preview in step with the body.
+   *
+   * Runs at the end of applyAssistant - the ONLY place the body's content changes (first
+   * paint and every patch), so there is exactly one sync point.
+   *
+   * The text comes from the RENDERED body, not from entry.text: a markdown heading would
+   * otherwise preview as "## ...". The first ELEMENT child is used when there is one (that is
+   * the first block of rendered markdown); plain streaming text has none, so it falls back to
+   * the whole text node. One line, capped - the element is a one-line glimpse, and a copy of
+   * a 64KB message would otherwise sit in the DOM a second time.
+   */
+  function refreshPreview(record, body) {
+    var preview = record && record.querySelector ? record.querySelector('.msg-preview') : null;
+    if (!preview) { return; }
+    var first = body.firstElementChild;
+    var text = String((first && first.textContent) || body.textContent || '');
+    var nl = text.indexOf('\\n');
+    if (nl >= 0) { text = text.slice(0, nl); }
+    if (text.length > ASSISTANT_PREVIEW_CHARS) { text = text.slice(0, ASSISTANT_PREVIEW_CHARS); }
+    preview.textContent = text.trim();
+  }
+
+  function applyAssistant(body, entry, record) {
     // [CUSTOM-20260925-036] An EMPTY html string is not a rendered message.
     // markdown.render() can return '' (blank-ish input), and treating that as
     // "we have HTML" turned the bubble into an empty bordered box - one of the
     // two shapes the "blank bars" report showed. Fall back to the raw text.
     var hasHtml = entry.html !== undefined && entry.html !== null && entry.html !== '';
     if (hasHtml) {
-      // The bubble becomes sanitized HTML: any text node we were appending to
-      // is gone, so the delta bookkeeping must go with it.
+      // The host becomes sanitized HTML: any text node we were appending to is gone,
+      // so the delta bookkeeping must go with it.
       delete tails[entry.id];
-      var icon = takeIcon(bubble);
-      bubble.className = 'bubble md';
-      NS.dom.setSanitizedHtml(bubble, entry.html);
-      putIcon(bubble, icon);
-      NS.links.decorateScrollables(bubble);
+      // [CUSTOM-20260929-114] No takeIcon/putIcon dance here any more: the type icon
+      // lives in the summary now (icons.attach targets .msg-head), so rewriting the
+      // body cannot touch it in the first place.
+      body.className = 'bubble-body md';
+      NS.dom.setSanitizedHtml(body, entry.html);
+      NS.links.decorateScrollables(body);
+      refreshPreview(record, body);
       return;
     }
-    bubble.className = 'bubble';
-    setStreamingText(bubble, entry.id, entry.text || '');
+    body.className = 'bubble-body';
+    setStreamingText(body, entry.id, entry.text || '');
+    refreshPreview(record, body);
   }
 
   /**
@@ -769,8 +877,10 @@ export const transcriptViewClient = `
     }
 
     if (entry.kind === 'assistant') {
-      var bubble = node.querySelector('.bubble');
-      if (bubble) { applyAssistant(bubble, entry); }
+      // [CUSTOM-20260929-114] The content host is the body INSIDE the fold, not the
+      // record's bubble (which does not exist any more - the details carries the look).
+      var bodyEl = node.querySelector('.bubble-body');
+      if (bodyEl) { applyAssistant(bodyEl, entry, node); }
       trackMarkdown(entryId, entry, changes);
     } else if (entry.kind === 'thought') {
       var body = node.querySelector('.thought-body');
@@ -818,6 +928,11 @@ export const transcriptViewClient = `
       node.parentNode.replaceChild(rebuiltContent, node);
       nodes[entryId] = rebuiltContent;
       watchNode(rebuiltContent);
+    } else if (entry.kind === 'elicitation') {
+      // [CUSTOM-20260929-119] Patch the existing card in place, like the permission
+      // card: the field the user is aiming at must not be replaced mid-answer.
+      var elicCard = node.querySelector('.elic');
+      if (elicCard) { NS.elicitationView.applyState(elicCard, entry.elicitation || {}); }
     } else if (entry.kind === 'permission') {
       // [CUSTOM-20260924-020] Patch the existing card in place (rather than
       // rebuilding) so the button the user is aiming at never moves/disappears

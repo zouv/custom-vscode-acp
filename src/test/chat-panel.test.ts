@@ -21,6 +21,7 @@
 import * as assert from 'assert';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as os from 'node:os';
 import * as vscode from 'vscode';
 
 import type { SessionNotification } from '@agentclientprotocol/sdk';
@@ -34,6 +35,10 @@ import { SessionManager, pickDefaultCwd, type SessionInfo } from '../core/Sessio
 import { SessionUpdateHandler } from '../handlers/SessionUpdateHandler';
 import { isBlankText } from '../ui/chat/content/contentBlocks';
 import { choiceChanges, choiceSnapshotFromState, choiceSnapshotPatched } from '../ui/chat/sessionChoices';
+import { directoryKey, directoryOptions } from '../ui/chat/historyDirs';
+import { panelIdForAgent } from '../ui/chat/panelContract';
+import { readDiskSessions, readTranscriptTimes } from '../ui/chat/diskSessions';
+import { ToolInvocationStore } from '../ui/chat/transcript/ToolInvocationStore';
 import type { ChatSurface, SurfaceKey } from '../ui/chat/ChatSurface';
 import { ChatPanelHost } from '../ui/chat/ChatPanelHost';
 import type { ExtToChatMessage, TranscriptSnapshotWire } from '../ui/chat/protocol';
@@ -126,6 +131,19 @@ function registerFakeSession(manager: SessionManager, sessionId: string, agentNa
   const ids = internals.agentSessions.get(agentName) ?? new Set<string>();
   ids.add(sessionId);
   internals.agentSessions.set(agentName, ids);
+}
+
+/** Minimal in-memory Memento — touches no real user or workspace settings. */
+class FakeMemento {
+  private readonly store = new Map<string, unknown>();
+  keys(): readonly string[] { return Array.from(this.store.keys()); }
+  get<T>(key: string, fallback?: T): T | undefined {
+    return this.store.has(key) ? (this.store.get(key) as T) : fallback;
+  }
+  update(key: string, value: unknown): Promise<void> {
+    if (value === undefined) { this.store.delete(key); } else { this.store.set(key, value); }
+    return Promise.resolve();
+  }
 }
 
 interface Harness {
@@ -316,19 +334,6 @@ suite('chat panel: default working directory policy', () => {
 });
 
 suite('chat panel: recent directories for the picker', () => {
-  /** Minimal in-memory Memento — touches no real user or workspace settings. */
-  class FakeMemento {
-    private readonly store = new Map<string, unknown>();
-    keys(): readonly string[] { return Array.from(this.store.keys()); }
-    get<T>(key: string, fallback?: T): T | undefined {
-      return this.store.has(key) ? (this.store.get(key) as T) : fallback;
-    }
-    update(key: string, value: unknown): Promise<void> {
-      if (value === undefined) { this.store.delete(key); } else { this.store.set(key, value); }
-      return Promise.resolve();
-    }
-  }
-
   const entry = (agentName: string, cwd: string, sessionId: string, lastActiveAt: string) => ({
     agentName, cwd, sessionId, createdAt: lastActiveAt, lastActiveAt,
   });
@@ -428,13 +433,13 @@ suite('chat panel: history picker carries the session directory', () => {
   /** A recording subclass, not a hand-written double: everything else stays the
    *  real implementation (and returns 'live' so nothing reaches the wire). */
   class RecordingSessionManager extends SessionManager {
-    readonly opened: Array<{ agentName: string; sessionId: string; cwd?: string }> = [];
+    readonly opened: Array<{ agentName: string; sessionId: string; cwd?: string; title?: string }> = [];
     override async openExistingSession(
       agentName: string,
       sessionId: string,
-      opts: { cwd?: string } = {},
+      opts: { cwd?: string; title?: string } = {},
     ): Promise<'live' | 'load' | 'resume'> {
-      this.opened.push({ agentName, sessionId, cwd: opts.cwd });
+      this.opened.push({ agentName, sessionId, cwd: opts.cwd, ...(opts.title ? { title: opts.title } : {}) });
       return 'live';
     }
   }
@@ -448,6 +453,15 @@ suite('chat panel: history picker carries the session directory', () => {
     return { harness, manager };
   }
 
+  /** [CUSTOM-20260928-100] The open is no longer the handler's first await — the host
+   *  reads the transcript timeline before replaying — so a single microtask is not
+   *  enough: wait for the effect instead. */
+  async function waitForOpen(manager: RecordingSessionManager): Promise<void> {
+    for (let i = 0; i < 100 && manager.opened.length === 0; i++) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+  }
+
   test("a session's own directory is passed through to the open call", async function () {
     const { harness, manager } = harnessWithRecorder();
     harness.host.onMessage({
@@ -457,6 +471,7 @@ suite('chat panel: history picker carries the session directory', () => {
       cwd: 'D:\\other\\project',
     });
     await Promise.resolve();
+    await waitForOpen(manager);
     assert.deepStrictEqual(manager.opened, [
       { agentName: 'Claude Code', sessionId: 'other-session', cwd: 'D:\\other\\project' },
     ]);
@@ -465,9 +480,162 @@ suite('chat panel: history picker carries the session directory', () => {
   test('an omitted directory stays undefined, so loadSession can fall back to the cache', async function () {
     const { harness, manager } = harnessWithRecorder();
     harness.host.onMessage({ type: 'openHistorySession', agentName: 'Claude Code', sessionId: 's' });
-    await Promise.resolve();
+    await waitForOpen(manager);
     assert.strictEqual(manager.opened.length, 1);
     assert.strictEqual(manager.opened[0].cwd, undefined);
+  });
+
+  test('the title travels with the open call, so the tab matches the list', async function () {
+    // [CUSTOM-20260928-098] The replay does not always re-send session_info_update,
+    // so the title must ride along with the click — otherwise the tab shows the id
+    // prefix while the picker showed the name.
+    const { harness, manager } = harnessWithRecorder();
+    harness.host.onMessage({
+      type: 'openHistorySession',
+      agentName: 'Claude Code',
+      sessionId: 'other-session',
+      title: 'The session name',
+    });
+    await waitForOpen(manager);
+    assert.strictEqual(manager.opened.length, 1);
+    assert.strictEqual(manager.opened[0].title, 'The session name');
+  });
+
+  test('picking a history session replaces the focused tab instead of adding one', async function () {
+    // [CUSTOM-20260928-099] Reported: every visit to the history list added another
+    // tab ("还是会自动新建并切换到新 session"). A history list is navigation — the
+    // session being left steps aside so the picked one takes its place.
+    class ReplacingManager extends SessionManager {
+      readonly closed: string[] = [];
+      override async closeSession(agentName: string, sessionId: string): Promise<void> {
+        this.closed.push(sessionId);
+        return super.closeSession(agentName, sessionId);
+      }
+      override async openExistingSession(): Promise<'live' | 'load' | 'resume'> { return 'live'; }
+    }
+    let manager!: ReplacingManager;
+    const harness = makeHarness('dummy-session', 'Claude Code', handler => {
+      manager = new ReplacingManager(new AgentManager(), new ConnectionManager(handler), handler);
+      return manager;
+    });
+    harness.host.onMessage({ type: 'openHistorySession', agentName: 'Claude Code', sessionId: 'other-session' });
+
+    for (let i = 0; i < 100 && manager.closed.length === 0; i++) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.deepStrictEqual(manager.closed, ['dummy-session'],
+      'the focused session must step aside so the tab count does not grow');
+  });
+
+  test('a history session that is already a tab is focused, nothing closes', async function () {
+    // The other half: there is nothing to replace when the pick is already live —
+    // closing it would be destroying the tab the user just clicked.
+    class ReplacingManager extends SessionManager {
+      readonly closed: string[] = [];
+      override async closeSession(agentName: string, sessionId: string): Promise<void> {
+        this.closed.push(sessionId);
+        return super.closeSession(agentName, sessionId);
+      }
+      override async openExistingSession(): Promise<'live' | 'load' | 'resume'> { return 'live'; }
+    }
+    let manager!: ReplacingManager;
+    const harness = makeHarness('dummy-session', 'Claude Code', handler => {
+      manager = new ReplacingManager(new AgentManager(), new ConnectionManager(handler), handler);
+      return manager;
+    });
+    registerFakeSession(harness.sessionManager, 'other-session', 'Claude Code');
+    harness.host.onMessage({ type: 'openHistorySession', agentName: 'Claude Code', sessionId: 'other-session' });
+
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.deepStrictEqual(manager.closed, [], 'an already-live pick must not close anything');
+  });
+});
+
+suite('chat panel: opening a history session while disconnected', () => {
+  // [CUSTOM-20260926-083] Reported: before connecting anything, the history picker
+  // listed sessions ("3 sessions · from the local cache" — by design, the cache is
+  // readable offline) and every click answered
+  //   Agent "Claude Code" does not support loading or resuming sessions.
+  // Capabilities come from the ACP `initialize` handshake, so an agent that was never
+  // connected has NONE — and the old code read that as "unsupported".
+  //
+  // The REAL `openExistingSession` runs here (only the ACP boundary is faked): that is
+  // where the decision lives, and both the panel's picker and the tree's
+  // `acpc.openSession` command go through it.
+
+  /** Records the order of the calls; capabilities appear only after connecting. */
+  class ConnectOnDemandManager extends SessionManager {
+    readonly calls: string[] = [];
+    private connected = false;
+
+    override async ensureConnected(agentName: string): Promise<any> {
+      this.calls.push(`ensureConnected:${agentName}`);
+      this.connected = true;
+      return {} as any;
+    }
+
+    override getCachedCapabilities(): any {
+      return this.connected ? { load: true, resume: true } : undefined;
+    }
+
+    override async loadSession(agentName: string, sessionId: string, requestedCwd?: string): Promise<any> {
+      this.calls.push(`loadSession:${sessionId}:${requestedCwd ?? ''}`);
+      return {} as any;
+    }
+  }
+
+  async function settle(manager: { calls: string[] }, expected: number): Promise<void> {
+    for (let i = 0; i < 100 && manager.calls.length < expected; i++) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+  }
+
+  test('the click connects first, then loads the session with its own directory', async () => {
+    let manager!: ConnectOnDemandManager;
+    const harness = makeHarness('dummy-session', 'Claude Code', handler => {
+      manager = new ConnectOnDemandManager(new AgentManager(), new ConnectionManager(handler), handler);
+      return manager;
+    });
+    harness.surface.sent.length = 0;
+
+    harness.host.onMessage({
+      type: 'openHistorySession', agentName: 'Claude Code', sessionId: 'old-session', cwd: 'D:\\old',
+    });
+    await settle(manager, 2);
+
+    assert.deepStrictEqual(manager.calls, [
+      'ensureConnected:Claude Code',       // capabilities are unknowable without this
+      'loadSession:old-session:D:\\old',   // and the session's OWN directory is used
+    ]);
+    assert.strictEqual(
+      harness.surface.sent.filter(m => m.type === 'error').length, 0,
+      'no error notice: the agent supports session/load, we just had to ask it',
+    );
+  });
+
+  test('an agent that genuinely cannot replay still reports the error, after connecting', async () => {
+    // The guard that must survive: connecting must not turn a real capability gap into
+    // a silent no-op.
+    class UnsupportedManager extends ConnectOnDemandManager {
+      override getCachedCapabilities(): any { return {}; }
+    }
+    let manager!: UnsupportedManager;
+    const harness = makeHarness('dummy-session', 'Claude Code', handler => {
+      manager = new UnsupportedManager(new AgentManager(), new ConnectionManager(handler), handler);
+      return manager;
+    });
+    harness.surface.sent.length = 0;
+
+    harness.host.onMessage({ type: 'openHistorySession', agentName: 'Claude Code', sessionId: 'old-session' });
+    await settle(manager, 1);
+    for (let i = 0; i < 100 && harness.surface.sent.filter(m => m.type === 'error').length === 0; i++) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+
+    assert.deepStrictEqual(manager.calls, ['ensureConnected:Claude Code'], 'no load was attempted');
+    const errors = harness.surface.sent.filter(m => m.type === 'error') as Array<{ message?: string }>;
+    assert.strictEqual(errors.length, 1);
+    assert.ok(/does not support/.test(errors[0].message ?? ''), errors[0].message);
   });
 });
 
@@ -879,5 +1047,1054 @@ suite('chat panel: switch snapshot diff (model / mode / options)', () => {
       choiceChanges(choiceSnapshotFromState(MODES, CONFIG_OPTIONS), choiceSnapshotFromState(MODES, withValue('model', 'sonnet'))),
       ['Switched to Sonnet'],
     );
+  });
+});
+
+suite('chat panel: focusing a session the host already has', () => {
+  // [CUSTOM-20260926-080] The reported bug: with a client-local **draft page** on
+  // screen (058 — the host does not know drafts exist), clicking the tab of the very
+  // session the host is already focused on did nothing at all. The click posts
+  // `focusSession`; `SessionManager.focusSession` early-returns when the id is already
+  // active (it emits only on a CHANGE), so no `focus` ever came back and the panel
+  // stayed on the draft forever.
+  //
+  // The rule this pins: **an explicit focus request must always be answered.** What the
+  // client is showing is not derivable from the host's state — the client can be on a
+  // draft (or on nothing) while the host's `focused` already names this session.
+
+  test('an explicit focus request is answered even when nothing changed', () => {
+    const harness = makeHarness('session-a', 'Claude Code');
+    // A first click establishes the host's focus (that one emits regardless).
+    harness.host.onMessage({ type: 'focusSession', sessionId: 'session-a' });
+    harness.surface.sent.length = 0;
+
+    // The click that used to be silent: the host is already on 'session-a', and the
+    // panel needs the reply to get back off a draft page.
+    harness.host.onMessage({ type: 'focusSession', sessionId: 'session-a' });
+
+    const focus = harness.surface.sent.filter(m => m.type === 'focus');
+    assert.strictEqual(focus.length, 1, 'the request must be answered, not swallowed');
+    assert.strictEqual((focus[0] as { summary?: { sessionId?: string } }).summary?.sessionId, 'session-a');
+  });
+
+  test('a request for a session the host does not know is still dropped', () => {
+    // The guard that must survive the fix above: answering blindly would push a
+    // snapshot for a session that no longer exists.
+    const harness = makeHarness('session-a', 'Claude Code');
+    harness.surface.sent.length = 0;
+    harness.host.onMessage({ type: 'focusSession', sessionId: 'never-existed' });
+    assert.strictEqual(harness.surface.sent.filter(m => m.type === 'focus').length, 0);
+  });
+});
+
+suite('chat panel: transcript-directory supplement', () => {
+  // [CUSTOM-20260927-094] The agent's `session/list` is not the whole truth — the probe
+  // (CUSTOMIZATIONS/scripts/probe-session-list.mjs) reconciled disk vs agent for this very
+  // project: 8 transcripts on disk, 6 reported, and the two missing ones are the sessions
+  // still open in another window. The official Claude Code panel reads that directory
+  // directly, which is why it shows them.
+
+  test('transcripts are read line by line, and an oversized line does not defeat it', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acpc-disk-'));
+    try {
+      // One huge NON-user record first (a tool result): a character-slice reader would cut
+      // inside it and parse nothing — the first version of the probe did exactly that.
+      fs.writeFileSync(path.join(dir, 'aaaa1111-2222.jsonl'), [
+        JSON.stringify({ type: 'queue-operation', payload: 'x'.repeat(300_000) }),
+        JSON.stringify({ type: 'user', cwd: 'D:\\proj', message: { content: '第一个问题' } }),
+      ].join('\n'));
+      // A session that is being written right now: no cwd/title recorded yet.
+      fs.writeFileSync(path.join(dir, 'bbbb3333-4444.jsonl'),
+        JSON.stringify({ type: 'queue-operation' }) + '\n');
+      fs.writeFileSync(path.join(dir, 'not-a-transcript.txt'), 'ignore me');
+
+      const rows = await readDiskSessions(dir, 'D:\\fallback');
+      assert.strictEqual(rows.length, 2, 'only .jsonl files count');
+      const byId = new Map(rows.map(r => [r.sessionId, r]));
+      assert.strictEqual(byId.get('aaaa1111-2222')!.cwd, 'D:\\proj');
+      assert.strictEqual(byId.get('aaaa1111-2222')!.title, '第一个问题');
+      assert.ok(byId.get('aaaa1111-2222')!.updatedAt, 'the mtime is the activity time');
+      // The head-less one still gets a cwd: the bucket it lives in IS the directory.
+      assert.strictEqual(byId.get('bbbb3333-4444')!.cwd, 'D:\\fallback');
+      assert.strictEqual(byId.get('bbbb3333-4444')!.title, undefined);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a missing directory is "no supplement", never an error', async () => {
+    const rows = await readDiskSessions(path.join(os.tmpdir(), 'acpc-does-not-exist-' + Date.now()));
+    assert.deepStrictEqual(rows, []);
+  });
+
+  test('the summary title (ai-title) wins over the first prompt (095)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acpc-aititle-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'cccc1111-2222.jsonl'), [
+        JSON.stringify({ type: 'user', cwd: 'D:\\proj', message: { content: 'a verbose first question about the parser' } }),
+        JSON.stringify({ type: 'ai-title', aiTitle: 'Fix the parser' }),
+      ].join('\n'));
+      const rows = await readDiskSessions(dir, 'D:\\fallback');
+      assert.strictEqual(rows.length, 1);
+      assert.strictEqual(rows[0].title, 'Fix the parser', 'the summary title wins over the first prompt');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('the reply includes sessions only the transcripts know about', async () => {
+    // The supplement is driven by CLAUDE_CONFIG_DIR (the same override Claude Code
+    // honours), so a temp root is all it takes to exercise it end to end.
+    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!cwd) { return; }   // no workspace folder ⇒ there is no transcript bucket to read
+
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'acpc-claude-'));
+    const previous = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = root;
+    try {
+      const bucket = path.join(root, 'projects', cwd.replace(/[^A-Za-z0-9]/g, '-'));
+      fs.mkdirSync(bucket, { recursive: true });
+      fs.writeFileSync(path.join(bucket, 'dddd5555-6666.jsonl'), [
+        JSON.stringify({ type: 'user', cwd, message: { content: 'the session the agent hides' } }),
+      ].join('\n'));
+
+      class EmptyHistoryManager extends SessionManager {
+        override isAgentConnected(): boolean { return true; }
+        override getCachedCapabilities(): any { return { list: true }; }
+        override async listSessions(): Promise<any> { return { sessions: [] }; }
+      }
+      const harness = makeHarness('dummy-session', 'Claude Code', handler =>
+        new EmptyHistoryManager(new AgentManager(), new ConnectionManager(handler), handler));
+      harness.surface.sent.length = 0;
+      harness.host.onMessage({ type: 'listHistory' });
+
+      let reply: any;
+      for (let i = 0; i < 100 && !reply; i++) {
+        reply = harness.surface.sent.find(m => m.type === 'history');
+        if (!reply) { await new Promise(resolve => setTimeout(resolve, 5)); }
+      }
+      assert.ok(reply, 'the host must answer listHistory');
+      const row = (reply.sessions as any[]).find(s => s.sessionId === 'dddd5555-6666');
+      assert.ok(row, 'the transcript-only session is offered');
+      assert.strictEqual(row.fromDisk, true, 'and it says where it came from');
+      assert.strictEqual(row.cwd, cwd);
+      assert.match(String(row.title), /the session the agent hides/);
+      // The agent reported nothing, so every row here came from a local source.
+      assert.strictEqual(reply.source, 'merged');
+    } finally {
+      if (previous === undefined) { delete process.env.CLAUDE_CONFIG_DIR; }
+      else { process.env.CLAUDE_CONFIG_DIR = previous; }
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('the supplement scans the directory the filter selected, not the workspace', async () => {
+    // [CUSTOM-20260928-095] The picker filter may point at any folder the agent lists —
+    // NOT just workspaceFolders[0]. supplementHistory must scan THAT folder's transcripts.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'acpc-supplement-'));
+    const previous = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = root;
+    try {
+      const cwdA = 'D:\\proj-a';
+      const cwdB = 'D:\\proj-b';
+      const bucketA = path.join(root, 'projects', cwdA.replace(/[^A-Za-z0-9]/g, '-'));
+      const bucketB = path.join(root, 'projects', cwdB.replace(/[^A-Za-z0-9]/g, '-'));
+      fs.mkdirSync(bucketA, { recursive: true });
+      fs.mkdirSync(bucketB, { recursive: true });
+      fs.writeFileSync(path.join(bucketA, 'aaaa1111-2222.jsonl'),
+        JSON.stringify({ type: 'user', cwd: cwdA, message: { content: 'in folder a' } }) + '\n');
+      fs.writeFileSync(path.join(bucketB, 'bbbb3333-4444.jsonl'),
+        JSON.stringify({ type: 'user', cwd: cwdB, message: { content: 'in folder b' } }) + '\n');
+
+      class EmptyHistoryManager extends SessionManager {
+        override isAgentConnected(): boolean { return true; }
+        override getCachedCapabilities(): any { return { list: true }; }
+        override async listSessions(): Promise<any> { return { sessions: [] }; }
+      }
+      const harness = makeHarness('dummy-session', 'Claude Code', handler =>
+        new EmptyHistoryManager(new AgentManager(), new ConnectionManager(handler), handler));
+      harness.surface.sent.length = 0;
+      harness.host.onMessage({ type: 'supplementHistory', cwd: cwdB });
+
+      let reply: any;
+      for (let i = 0; i < 100 && !reply; i++) {
+        reply = harness.surface.sent.find(m => m.type === 'historySupplement');
+        if (!reply) { await new Promise(resolve => setTimeout(resolve, 5)); }
+      }
+      assert.ok(reply, 'the host must answer supplementHistory');
+      const ids = (reply.sessions as any[]).map(s => s.sessionId);
+      assert.deepStrictEqual(ids, ['bbbb3333-4444'], 'only the selected folder is scanned');
+      const row = (reply.sessions as any[])[0];
+      assert.strictEqual(row.fromDisk, true, 'and it says where it came from');
+      assert.strictEqual(row.dirKey, directoryKey(cwdB), 'and carries the folder identity');
+    } finally {
+      if (previous === undefined) { delete process.env.CLAUDE_CONFIG_DIR; }
+      else { process.env.CLAUDE_CONFIG_DIR = previous; }
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+suite('chat panel: audit round — routing, close, empty state', () => {
+  // [CUSTOM-20260927-086..090] Four findings from the panel audit, all in the
+  // "client-local state the host cannot see" family the repo keeps paying for.
+
+  test('the reply is the UNION of the agent list and the local cache', async () => {
+    // [CUSTOM-20260927-092] The agent's `session/list` is not the whole truth: it omits
+    // sessions still open in another Claude Code window (measured with
+    // CUSTOMIZATIONS/scripts/probe-session-list.mjs). A session this workspace opened
+    // earlier is in OUR cache regardless, so the union is what keeps "the list I saw
+    // before" and "the list I see now" in agreement.
+    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '/tmp';
+    const memento = new FakeMemento();
+    void memento.update('acp.sessionHistory.v1', {
+      version: 1,
+      entries: [
+        // Shared with the agent's list (the agent's version of it wins).
+        { agentName: 'Claude Code', cwd, sessionId: 'shared', createdAt: '2026-09-20T00:00:00Z', lastActiveAt: '2026-09-20T00:00:00Z', title: 'cached title' },
+        // Cache-only: the agent did not mention it.
+        { agentName: 'Claude Code', cwd, sessionId: 'cache-only', createdAt: '2026-09-19T00:00:00Z', lastActiveAt: '2026-09-19T00:00:00Z', title: 'only in the cache' },
+      ],
+    });
+    const store = new SessionHistoryStore(memento as unknown as vscode.Memento);
+
+    class UnionManager extends SessionManager {
+      override isAgentConnected(): boolean { return true; }
+      override getCachedCapabilities(): any { return { list: true }; }
+      override async listSessions(): Promise<any> {
+        return {
+          sessions: [
+            { sessionId: 'shared', title: 'agent title', cwd, updatedAt: '2026-09-21T00:00:00Z' },
+            { sessionId: 'agent-only', title: 'only from the agent', cwd, updatedAt: '2026-09-22T00:00:00Z' },
+          ],
+        };
+      }
+    }
+
+    const harness = makeHarness('dummy-session', 'Claude Code', handler => {
+      const manager = new UnionManager(new AgentManager(), new ConnectionManager(handler), handler);
+      manager.setHistoryStore(store);
+      return manager;
+    });
+    harness.surface.sent.length = 0;
+    harness.host.onMessage({ type: 'listHistory' });
+
+    let reply: any;
+    for (let i = 0; i < 100 && !reply; i++) {
+      reply = harness.surface.sent.find(m => m.type === 'history');
+      if (!reply) { await new Promise(resolve => setTimeout(resolve, 5)); }
+    }
+    assert.ok(reply, 'the host must answer listHistory');
+    assert.strictEqual(reply.source, 'merged', 'both sources contributed');
+
+    const byId = new Map<string, any>(reply.sessions.map((s: any) => [s.sessionId, s]));
+    assert.deepStrictEqual(Array.from(byId.keys()).sort(), ['agent-only', 'cache-only', 'shared']);
+    assert.strictEqual(byId.get('shared').title, 'agent title', 'the agent wins for a session it knows');
+    assert.strictEqual(byId.get('shared').fromCache, undefined, 'and it is not marked as cache-only');
+    assert.strictEqual(byId.get('cache-only').fromCache, true, 'a cache-only row says so');
+    // Newest first — the picker is for "the session I was just in".
+    assert.deepStrictEqual(reply.sessions.map((s: any) => s.sessionId),
+      ['agent-only', 'shared', 'cache-only']);
+  });
+
+  test('an agent-less panel routes to the MODERN panel, never legacy', () => {
+    // Legacy replaces the sidebar document on attach, so routing "nothing focused" to it
+    // destroyed client-local state (a draft page and its text) and made the modern empty
+    // state unreachable.
+    assert.strictEqual(panelIdForAgent(null), 'modern');
+    assert.strictEqual(panelIdForAgent(undefined), 'modern');
+    assert.strictEqual(panelIdForAgent(''), 'modern');
+    assert.strictEqual(panelIdForAgent('Claude Code'), 'modern');
+    assert.strictEqual(panelIdForAgent('GitHub Copilot'), 'legacy', 'a known non-modern agent still uses the upstream panel');
+  });
+
+  /** Records the cancel; the in-flight state is ours to decide. */
+  class RecordingCloseManager extends SessionManager {
+    readonly cancelled: string[] = [];
+    private readonly busy = new Set<string>();
+    markBusy(sessionId: string): void { this.busy.add(sessionId); }
+    override isTurnInFlight(sessionId: string): boolean { return this.busy.has(sessionId); }
+    override async cancelTurn(sessionId: string): Promise<void> { this.cancelled.push(sessionId); }
+  }
+
+  test('closing a session cancels its in-flight turn first', async () => {
+    // Dropping `inFlightTurns` without a cancel left the agent working on a turn nobody
+    // would see — and, per the ACP contract honoured in cancelTurn, a pending
+    // session/request_permission must be answered 'cancelled' or the agent hangs (pitfall #14).
+    let manager!: RecordingCloseManager;
+    const harness = makeHarness('busy-session', 'Claude Code', handler => {
+      manager = new RecordingCloseManager(new AgentManager(), new ConnectionManager(handler), handler);
+      return manager;
+    });
+    manager.markBusy('busy-session');
+    await manager.closeSession('Claude Code', 'busy-session');
+    assert.deepStrictEqual(manager.cancelled, ['busy-session']);
+    assert.strictEqual(manager.getSession('busy-session'), undefined, 'and it is still closed');
+    assert.strictEqual(harness.sessionManager.getSession('busy-session'), undefined);
+  });
+
+  test('idle sessions are closed without a spurious cancel', async () => {
+    let manager!: RecordingCloseManager;
+    makeHarness('idle-session', 'Claude Code', handler => {
+      manager = new RecordingCloseManager(new AgentManager(), new ConnectionManager(handler), handler);
+      return manager;
+    });
+    await manager.closeSession('Claude Code', 'idle-session');
+    assert.deepStrictEqual(manager.cancelled, [], 'nothing was running');
+  });
+
+  test('every message that can change the empty state carries the connection flag', () => {
+    // A sessionless panel can have a LIVE agent (closing the last session keeps the
+    // process), so the empty state's copy must come from the host rather than assuming
+    // "no session ⇒ not connected".
+    const harness = makeHarness('dummy-session', 'Claude Code');
+    const boot = harness.surface.sent.find(m => m.type === 'boot') as { agentConnected?: unknown };
+    assert.strictEqual(boot.agentConnected, true, 'the harness registers a live agent process');
+
+    harness.sessionManager.emit('active-session-changed', 'dummy-session', 'Claude Code');
+    const focus = harness.surface.sent.filter(m => m.type === 'focus').pop() as { agentConnected?: unknown };
+    assert.strictEqual(focus.agentConnected, true);
+  });
+});
+
+suite('chat panel: history picker directory filter', () => {
+  // [CUSTOM-20260926-079] The picker lists the AGENT's sessions, which span every
+  // directory it has ever been used in (232 of them in the report) — unusable without
+  // a filter. Two halves are covered here:
+  //   · the pure functions that decide "is this the same folder?" and "what is worth
+  //     offering" — the only place platform differences live;
+  //   · the reply the host builds, where EVERY row must carry a `dirKey` (a row
+  //     without one silently disappears from any filtered list).
+  // The client half (chip, menu, placement, Escape layering) is layout/interaction:
+  // it is verified by hand, see dev-workflow.md's split.
+
+  test('directory identity folds case on Windows/macOS, not on Linux', () => {
+    assert.strictEqual(directoryKey('D:\\Git\\Repo\\', 'win32'), 'd:/git/repo');
+    assert.strictEqual(directoryKey('d:/git/repo', 'win32'), 'd:/git/repo');
+    // The case rule is a property of the PLATFORM: on Linux these are two folders.
+    assert.notStrictEqual(directoryKey('/Home/Me', 'linux'), directoryKey('/home/me', 'linux'));
+    assert.strictEqual(directoryKey('/home/me/', 'linux'), '/home/me');
+    // Roots: 'C:\' and 'C:' are the same place, so they must share ONE identity
+    // ('c:'), while POSIX '/' survives because there is nothing to strip.
+    assert.strictEqual(directoryKey('C:\\', 'win32'), 'c:');
+    assert.strictEqual(directoryKey('C:', 'win32'), 'c:');
+    assert.strictEqual(directoryKey('/', 'linux'), '/');
+    // A session with no directory has no identity to compare.
+    assert.strictEqual(directoryKey(undefined), undefined);
+    assert.strictEqual(directoryKey('   '), undefined);
+  });
+
+  test('candidates come from the list; the current folder is always offered', () => {
+    const options = directoryOptions(
+      [
+        { cwd: 'D:\\Git\\alpha' },
+        { cwd: 'D:\\Git\\alpha\\' },   // same folder, different spelling → ONE option
+        { cwd: 'D:\\Git\\beta' },
+        { cwd: undefined },            // nothing to filter by
+      ],
+      'D:/Git/alpha',
+      'win32',
+    );
+    assert.deepStrictEqual(options.map(o => [o.name, o.count, o.current]), [
+      ['alpha', 2, true],   // the current folder leads, with its sessions merged
+      ['beta', 1, false],
+    ]);
+  });
+
+  test('the current folder is offered even with no sessions in it', () => {
+    // Otherwise "the filter defaults to the current folder" would open onto an empty
+    // list with no hint of why — the control would look broken.
+    const options = directoryOptions([{ cwd: '/other' }], '/here');
+    assert.deepStrictEqual(options.map(o => [o.name, o.count, o.current]), [
+      ['here', 0, true],
+      ['other', 1, false],
+    ]);
+    // No current directory (a draft, or a session the agent gave no cwd for): the
+    // client is then told to open unfiltered, which is the honest answer.
+    assert.deepStrictEqual(directoryOptions([{ cwd: '/other' }], undefined).map(o => o.current), [false]);
+    assert.deepStrictEqual(directoryOptions([], undefined), []);
+  });
+
+  test('two candidates with the same folder name are told apart', () => {
+    // The first real list had "UniverseEditor" twice (two checkouts of one repo), and
+    // two identical labels cannot be picked between — so the label grows leftwards.
+    const options = directoryOptions([{ cwd: '/x/git/UniverseEditor' }, { cwd: '/y/zdev/UniverseEditor' }]);
+    assert.deepStrictEqual(options.map(o => [o.name, o.label]), [
+      ['UniverseEditor', 'git/UniverseEditor'],
+      ['UniverseEditor', 'zdev/UniverseEditor'],
+    ]);
+    // A unique name stays as short as it was.
+    assert.deepStrictEqual(
+      directoryOptions([{ cwd: '/a/alpha' }, { cwd: '/a/beta' }]).map(o => o.label),
+      ['alpha', 'beta'],
+    );
+  });
+
+  test('ordering: current, then most sessions, then name', () => {
+    const options = directoryOptions(
+      [{ cwd: '/b' }, { cwd: '/b' }, { cwd: '/a' }, { cwd: '/c' }, { cwd: '/c' }], '/z');
+    assert.deepStrictEqual(options.map(o => o.name), ['z', 'b', 'c', 'a']);
+  });
+
+  /** An agent whose history spans directories — the case the filter exists for. */
+  class MultiDirSessionManager extends SessionManager {
+    override isAgentConnected(): boolean { return true; }
+    override getCachedCapabilities(): any { return { list: true }; }
+    override async listSessions(): Promise<any> {
+      return {
+        sessions: [
+          // The focused session's own directory ('/tmp', from the fake session).
+          { sessionId: 'in-here', title: 'here one', cwd: '/tmp', updatedAt: '2026-09-20T00:00:00Z' },
+          { sessionId: 'elsewhere-a', title: 'a', cwd: 'D:\\Git\\alpha', updatedAt: '2026-09-19T00:00:00Z' },
+          // Same directory as the row above, spelled with a trailing separator: the
+          // fixtures differ only in that way ON PURPOSE, so this test says the same
+          // thing on every platform (case-only differences would not).
+          { sessionId: 'elsewhere-b', title: 'b', cwd: 'D:\\Git\\alpha\\', updatedAt: '2026-09-18T00:00:00Z' },
+          { sessionId: 'no-dir', title: 'c', updatedAt: '2026-09-17T00:00:00Z' },
+        ],
+      };
+    }
+  }
+
+  test('the reply carries a per-row dirKey and the filter candidates', async function () {
+    const harness = makeHarness('dummy-session', 'Claude Code', handler =>
+      new MultiDirSessionManager(new AgentManager(), new ConnectionManager(handler), handler));
+    harness.surface.sent.length = 0;   // drop the attach-time boot noise
+    harness.host.onMessage({ type: 'listHistory' });
+
+    let reply: any;
+    for (let i = 0; i < 100 && !reply; i++) {
+      reply = harness.surface.sent.find(m => m.type === 'history');
+      if (!reply) { await new Promise(resolve => setTimeout(resolve, 5)); }
+    }
+    assert.ok(reply, 'the host must answer listHistory');
+
+    const byId = new Map<string, any>(reply.sessions.map((s: any) => [s.sessionId, s]));
+    assert.strictEqual(byId.get('in-here').dirKey, directoryKey('/tmp'));
+    // Two spellings of one directory share an identity — and the ROWS keep their own
+    // spelling, because that is what gets handed back to the agent on open.
+    assert.strictEqual(byId.get('elsewhere-a').dirKey, byId.get('elsewhere-b').dirKey);
+    assert.strictEqual(byId.get('elsewhere-b').cwd, 'D:\\Git\\alpha\\');
+    // A row with no directory has no key: it can only ever show in an unfiltered list.
+    assert.strictEqual(byId.get('no-dir').dirKey, undefined);
+
+    // The current session's directory ('/tmp') leads, and the two spellings of alpha
+    // are ONE candidate with a count of 2.
+    assert.deepStrictEqual(reply.directories.map((d: any) => [d.name, d.count, d.current]), [
+      ['tmp', 1, true],
+      ['alpha', 2, false],
+    ]);
+  });
+
+  test('the current (live) session is offered in the history list', async function () {
+    // [CUSTOM-20260928-097] Live sessions used to be hidden ("they are already
+    // tabs"), but the current session should still appear — clicking it re-focuses.
+    class LiveListManager extends SessionManager {
+      override isAgentConnected(): boolean { return true; }
+      override getCachedCapabilities(): any { return { list: true }; }
+      override async listSessions(): Promise<any> {
+        return {
+          sessions: [
+            { sessionId: 'dummy-session', title: 'the live one', cwd: '/tmp', updatedAt: '2026-09-20T00:00:00Z' },
+          ],
+        };
+      }
+    }
+    const harness = makeHarness('dummy-session', 'Claude Code', handler =>
+      new LiveListManager(new AgentManager(), new ConnectionManager(handler), handler));
+    harness.surface.sent.length = 0;
+    harness.host.onMessage({ type: 'listHistory' });
+    let reply: any;
+    for (let i = 0; i < 100 && !reply; i++) {
+      reply = harness.surface.sent.find(m => m.type === 'history');
+      if (!reply) { await new Promise(resolve => setTimeout(resolve, 5)); }
+    }
+    assert.ok(reply);
+    assert.ok(reply.sessions.some((s: any) => s.sessionId === 'dummy-session'),
+      'the live session must appear in the history list');
+  });
+});
+
+// [CUSTOM-20260928-096] 输入区图片：宿主把 image 附件转成 ACP `image` ContentBlock、
+// 字节只留宿主内存（不进 meta），file 附件仍转 resource_link，发送后清掉 image 字节。
+suite('chat panel: image attachments (CUSTOM-20260928-096)', () => {
+  class RecordingSendManager extends SessionManager {
+    readonly sent: Array<{ sessionId: string; prompt: unknown }> = [];
+    override async sendPrompt(sessionId: string, prompt: unknown): Promise<PromptResponse> {
+      this.sent.push({ sessionId, prompt });
+      return { stopReason: 'end_turn' } as PromptResponse;
+    }
+  }
+
+  function imageHarness(): { harness: Harness; manager: RecordingSendManager } {
+    let manager!: RecordingSendManager;
+    const harness = makeHarness('image-session', 'Claude Code', handler => {
+      manager = new RecordingSendManager(new AgentManager(), new ConnectionManager(handler), handler);
+      return manager;
+    });
+    harness.surface.sent.length = 0;   // drop the attach-time boot noise
+    return { harness, manager };
+  }
+
+  async function waitFor(predicate: () => boolean, label: string): Promise<void> {
+    for (let i = 0; i < 100; i++) {
+      if (predicate()) { return; }
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.fail(`timed out waiting for ${label}`);
+  }
+
+  function latestAttachments(harness: Harness): Array<Record<string, unknown>> {
+    const msgs = harness.surface.sent.filter(m => m.type === 'attachments') as Array<Record<string, unknown>>;
+    const last = msgs[msgs.length - 1];
+    return (last && (last.attachments as Array<Record<string, unknown>>)) || [];
+  }
+
+  test('an image attachment is broadcast without its bytes on the wire', () => {
+    const { harness } = imageHarness();
+    harness.host.onMessage({
+      type: 'attachImage', sessionId: 'image-session', id: 'img-1',
+      name: 'shot.png', mimeType: 'image/png', dataUrl: 'data:image/png;base64,AAAA',
+    });
+
+    const img = latestAttachments(harness).find(a => a.path === 'img-1');
+    assert.ok(img, 'the image attachment is in the list');
+    assert.strictEqual(img.kind, 'image');
+    assert.strictEqual(img.mimeType, 'image/png');
+    // The base64 lives host-side only — putting it on the wire would re-send the
+    // whole image on every boot/focus.
+    assert.strictEqual(img.dataUrl, undefined);
+  });
+
+  test('send turns an image into an image block and a file into a resource_link', async () => {
+    const { harness, manager } = imageHarness();
+    harness.host.onMessage({ type: 'attachPath', sessionId: 'image-session', paths: ['/tmp/notes.txt'] });
+    harness.host.onMessage({
+      type: 'attachImage', sessionId: 'image-session', id: 'img-1',
+      name: 'shot.png', mimeType: 'image/png', dataUrl: 'data:image/png;base64,AAAA',
+    });
+
+    harness.host.onMessage({ type: 'sendPrompt', sessionId: 'image-session', text: '' });
+    await waitFor(() => manager.sent.length > 0, 'the prompt to be sent');
+
+    const blocks = manager.sent[0].prompt as Array<Record<string, any>>;
+    assert.deepStrictEqual(blocks.find(b => b.type === 'image'),
+      { type: 'image', data: 'AAAA', mimeType: 'image/png' });
+    const link = blocks.find(b => b.type === 'resource_link');
+    assert.ok(link, 'the file attachment is still a resource_link');
+    assert.ok(String(link.uri).indexOf('notes.txt') >= 0, 'the resource_link names the file');
+    // Empty text ⇒ no text block.
+    assert.strictEqual(blocks.find(b => b.type === 'text'), undefined, 'empty text yields no text block');
+  });
+
+  test('a send with text and an image records the image inside the user bubble (108)', async () => {
+    const { harness, manager } = imageHarness();
+    harness.host.onMessage({
+      type: 'attachImage', sessionId: 'image-session', id: 'img-1',
+      name: 'shot.png', mimeType: 'image/png', dataUrl: 'data:image/png;base64,AAAA',
+    });
+    harness.host.onMessage({ type: 'sendPrompt', sessionId: 'image-session', text: '看看这张图' });
+    await waitFor(() => manager.sent.length > 0, 'the prompt to be sent');
+
+    const snap = (harness.host as any).transcripts.snapshot('image-session');
+    assert.ok(snap);
+    const users = snap.entries.filter((e: any) => e.kind === 'user');
+    const contents = snap.entries.filter((e: any) => e.kind === 'content');
+    assert.strictEqual(users.length, 1, 'one user entry');
+    assert.strictEqual(contents.length, 0, 'no separate content entry: the image lives in the bubble');
+    assert.ok(users[0].attachments, 'the user entry carries the attachments field');
+    assert.strictEqual(users[0].attachments!.length, 1);
+    assert.strictEqual(users[0].attachments![0].type, 'image');
+    assert.strictEqual(users[0].attachments![0].name, 'shot.png', 'the attachment name survives');
+  });
+
+  test('an image-only send records a content entry and no empty user bubble', async () => {
+    const { harness, manager } = imageHarness();
+    harness.host.onMessage({
+      type: 'attachImage', sessionId: 'image-session', id: 'img-1',
+      name: 'shot.png', mimeType: 'image/png', dataUrl: 'data:image/png;base64,AAAA',
+    });
+    harness.host.onMessage({ type: 'sendPrompt', sessionId: 'image-session', text: '' });
+    await waitFor(() => manager.sent.length > 0, 'the prompt');
+
+    const state = settle(harness, 'Claude Code', 'image-session');
+    assert.strictEqual(state.entries.filter(e => e.kind === 'content').length, 1,
+      'the image becomes one content entry');
+    assert.strictEqual(state.entries.filter(e => e.kind === 'user').length, 0,
+      'no empty user bubble for an image-only send');
+  });
+});
+
+// [CUSTOM-20260928-097] 会话元数据：tab 标题落地、重开会话记录目录（Recently used）。
+suite('chat panel: session metadata (CUSTOM-20260928-097)', () => {
+  test('a session_info_update applies the title to the tab summary', () => {
+    const harness = makeHarness('dummy-session', 'Claude Code');
+    harness.surface.sent.length = 0;
+    harness.handler.handleUpdate({
+      sessionId: 'dummy-session',
+      update: { sessionUpdate: 'session_info_update', title: 'The session name', updatedAt: '2026-09-20T00:00:00Z' },
+    } as any);
+
+    const changed = harness.surface.sent.filter(m => m.type === 'sessionsChanged');
+    const last = changed[changed.length - 1] as { sessions: Array<{ sessionId: string; title: string | null }> };
+    assert.ok(last, 'a sessionsChanged must be emitted after the title lands');
+    const s = last.sessions.find(x => x.sessionId === 'dummy-session');
+    assert.strictEqual(s?.title, 'The session name');
+  });
+
+  test('upsertNew records the directory, and updates a stale one', () => {
+    const store = new SessionHistoryStore(new FakeMemento());
+    store.upsertNew('Claude Code', '/dir/x', 's1');
+    assert.deepStrictEqual(store.recentDirectories('Claude Code'), ['/dir/x']);
+
+    // Reopening the same session with a corrected directory must update it (the
+    // "opened a session in a directory, then New Session should offer it" case).
+    store.upsertNew('Claude Code', '/dir/y', 's1');
+    assert.deepStrictEqual(store.recentDirectories('Claude Code'), ['/dir/y']);
+    assert.strictEqual(store.get('Claude Code', 's1')?.cwd, '/dir/y');
+  });
+});
+
+
+// [CUSTOM-20260928-100] replay 的三项修复：用户消息里的图片不再丢、记录用转录里的真实
+// 时刻、在草稿页选历史会话时让位的是草稿而不是聚焦会话。
+suite('chat panel: replay fidelity (CUSTOM-20260928-100)', () => {
+  test('an image in a replayed user message becomes a content record', () => {
+    // ACP delivers a multi-part user message as several chunks; the non-text ones
+    // used to be dropped here, so a reopened conversation lost the picture.
+    const harness = makeHarness('img-replay', 'Claude Code');
+    harness.surface.sent.length = 0;
+    harness.handler.handleUpdate({
+      sessionId: 'img-replay',
+      update: {
+        sessionUpdate: 'user_message_chunk',
+        messageId: 'm-image',
+        content: { type: 'image', mimeType: 'image/png', data: 'AAAA' },
+      },
+    } as any);
+
+    const state = settle(harness, 'Claude Code', 'img-replay');
+    const content = state.entries.find(e => e.kind === 'content') as { blocks: Array<{ type: string }> } | undefined;
+    assert.ok(content, 'the image must survive a replay');
+    assert.strictEqual(content!.blocks[0].type, 'image');
+    assert.strictEqual(state.entries.filter(e => e.kind === 'user').length, 0,
+      'an image-only chunk is not an empty user bubble');
+  });
+
+  test('the transcript timeline maps message ids to their real times', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acpc-times-'));
+    try {
+      fs.writeFileSync(path.join(dir, 's1.jsonl'), [
+        // user records are keyed by `uuid`; assistant records by `message.id`.
+        JSON.stringify({ type: 'user', uuid: 'u1', timestamp: '2026-09-25T10:00:00.000Z', message: { role: 'user' } }),
+        JSON.stringify({ type: 'assistant', timestamp: '2026-09-25T10:05:00.000Z', message: { id: 'a1' } }),
+        JSON.stringify({ type: 'assistant', timestamp: '2026-09-25T10:05:30.000Z', message: { id: 'a1' } }),
+        'not json at all',
+      ].join('\n'));
+
+      const times = await readTranscriptTimes(dir, 's1');
+      assert.strictEqual(times.get('u1'), Date.parse('2026-09-25T10:00:00.000Z'));
+      assert.strictEqual(times.get('a1'), Date.parse('2026-09-25T10:05:00.000Z'),
+        'the EARLIEST record wins: one message id spans several records');
+      assert.strictEqual(times.size, 2, 'a malformed line is skipped, not fatal');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a replayed record carries the real time from the transcript', async () => {
+    // End to end: the host reads the timeline before replaying, then stamps the
+    // records the agent streams back. Without it every row of a reopened
+    // conversation showed `Date.now()` — one identical second for the whole thing.
+    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!cwd) { return; }   // no workspace folder ⇒ there is no transcript bucket to read
+
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'acpc-replay-times-'));
+    const previous = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = root;
+    try {
+      const bucket = path.join(root, 'projects', cwd.replace(/[^A-Za-z0-9]/g, '-'));
+      fs.mkdirSync(bucket, { recursive: true });
+      const realTime = '2026-09-25T10:00:00.000Z';
+      fs.writeFileSync(path.join(bucket, 'replayed-session.jsonl'), [
+        JSON.stringify({ type: 'user', cwd, uuid: 'msg-1', timestamp: realTime, message: { role: 'user' } }),
+      ].join('\n'));
+
+      class LiveOpenManager extends SessionManager {
+        readonly closed: string[] = [];
+        override async closeSession(agentName: string, sessionId: string): Promise<void> {
+          this.closed.push(sessionId);
+          return super.closeSession(agentName, sessionId);
+        }
+        override async openExistingSession(): Promise<'live' | 'load' | 'resume'> { return 'live'; }
+      }
+      let manager!: LiveOpenManager;
+      const harness = makeHarness('dummy-session', 'Claude Code', handler => {
+        manager = new LiveOpenManager(new AgentManager(), new ConnectionManager(handler), handler);
+        return manager;
+      });
+      harness.surface.sent.length = 0;
+
+      harness.host.onMessage({
+        type: 'openHistorySession',
+        agentName: 'Claude Code',
+        sessionId: 'replayed-session',
+        cwd,
+      });
+      // The preload happens before the open, so waiting for the open to land is enough.
+      for (let i = 0; i < 100 && manager.closed.length === 0; i++) {
+        await new Promise(resolve => setTimeout(resolve, 5));
+      }
+
+      // Now the replay streams a chunk carrying that message id.
+      registerFakeSession(harness.sessionManager, 'replayed-session', 'Claude Code');
+      harness.handler.handleUpdate({
+        sessionId: 'replayed-session',
+        update: { sessionUpdate: 'user_message_chunk', messageId: 'msg-1', content: { type: 'text', text: 'hello' } },
+      } as any);
+
+      const state = settle(harness, 'Claude Code', 'replayed-session');
+      const user = state.entries.find(e => e.kind === 'user') as { at: number } | undefined;
+      assert.ok(user, 'the replayed user message is in the transcript');
+      assert.strictEqual(user!.at, Date.parse(realTime),
+        'the record carries the time the message was actually sent');
+    } finally {
+      if (previous === undefined) { delete process.env.CLAUDE_CONFIG_DIR; }
+      else { process.env.CLAUDE_CONFIG_DIR = previous; }
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('opening a session while on a draft page leaves the focused session alone', async () => {
+    // [CUSTOM-20260928-100] Reported: picking a history session while on the "New
+    // session" page replaced the FIRST TAB instead, and the draft page never changed.
+    // The draft is client-local, so the host's `focused` names some other session —
+    // `fromDraft` is how the client says "that session is not the one to retire".
+    class RecordingOpenManager extends SessionManager {
+      readonly closed: string[] = [];
+      override async closeSession(agentName: string, sessionId: string): Promise<void> {
+        this.closed.push(sessionId);
+        return super.closeSession(agentName, sessionId);
+      }
+      override async openExistingSession(): Promise<'live' | 'load' | 'resume'> { return 'live'; }
+    }
+    let manager!: RecordingOpenManager;
+    const harness = makeHarness('dummy-session', 'Claude Code', handler => {
+      manager = new RecordingOpenManager(new AgentManager(), new ConnectionManager(handler), handler);
+      return manager;
+    });
+    harness.host.onMessage({
+      type: 'openHistorySession',
+      agentName: 'Claude Code',
+      sessionId: 'other-session',
+      fromDraft: true,
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.deepStrictEqual(manager.closed, [],
+      'the draft steps aside; the focused session must keep its tab');
+  });
+
+  // [CUSTOM-20260928-109] 注入块（<task-notification> 等）走 user_message_chunk 通道，
+  // 但它们不是用户输入。渲染成蓝色用户气泡会把 agent 的回报误读成用户说过的话。
+  test('a task-notification chunk is a meta notice, not a user bubble', () => {
+    const harness = makeHarness('notify', 'Claude Code');
+    harness.surface.sent.length = 0;
+    harness.handler.handleUpdate({
+      sessionId: 'notify',
+      update: {
+        sessionUpdate: 'user_message_chunk',
+        messageId: 'm-notify',
+        content: { type: 'text', text: '<task-notification>\n<status>completed</status>\n<summary>explore done</summary>\n</task-notification>' },
+      },
+    } as any);
+
+    const state = settle(harness, 'Claude Code', 'notify');
+    const userEntries = state.entries.filter(e => e.kind === 'user');
+    const noticeEntries = state.entries.filter(e => e.kind === 'notice');
+    assert.strictEqual(userEntries.length, 0, 'an injected block is NOT a user bubble');
+    assert.strictEqual(noticeEntries.length, 1, 'it becomes a notice');
+    const notice = noticeEntries[0] as { level: string; text: string };
+    assert.strictEqual(notice.level, 'meta');
+    assert.ok(notice.text.includes('completed'), 'the preview keeps the payload');
+  });
+
+  test('a system-reminder chunk is also a meta notice', () => {
+    const harness = makeHarness('reminder', 'Claude Code');
+    harness.surface.sent.length = 0;
+    harness.handler.handleUpdate({
+      sessionId: 'reminder',
+      update: {
+        sessionUpdate: 'user_message_chunk',
+        messageId: 'm-reminder',
+        content: { type: 'text', text: '<system-reminder>Do something.</system-reminder>' },
+      },
+    } as any);
+
+    const state = settle(harness, 'Claude Code', 'reminder');
+    assert.strictEqual(state.entries.filter(e => e.kind === 'user').length, 0);
+    assert.strictEqual(state.entries.filter(e => e.kind === 'notice').length, 1);
+  });
+
+  test('a plain user message is still a user bubble', () => {
+    const harness = makeHarness('plain', 'Claude Code');
+    harness.surface.sent.length = 0;
+    harness.handler.handleUpdate({
+      sessionId: 'plain',
+      update: {
+        sessionUpdate: 'user_message_chunk',
+        messageId: 'm-plain',
+        content: { type: 'text', text: 'hello, this is a real question' },
+      },
+    } as any);
+
+    const state = settle(harness, 'Claude Code', 'plain');
+    assert.strictEqual(state.entries.filter(e => e.kind === 'user').length, 1,
+      'a real user message is not diverted');
+  });
+
+  // [CUSTOM-20260928-111] Replay delivers a user message's text and its images as
+  // separate chunks (100). The bubble has nothing to merge with unless the host reads
+  // the transcript — so the image rides in on the text chunk, and the image chunk that
+  // follows must NOT become a second row.
+  test('a replayed user message carries its images in the bubble, and the image chunk is dropped', async () => {
+    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!cwd) { return; }   // no workspace folder ⇒ no transcript bucket to read
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'acpc-img-replay-'));
+    const previous = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = root;
+    try {
+      const bucket = path.join(root, 'projects', cwd.replace(/[^A-Za-z0-9]/g, '-'));
+      fs.mkdirSync(bucket, { recursive: true });
+      fs.writeFileSync(path.join(bucket, 's-img.jsonl'), [
+        JSON.stringify({
+          type: 'user', uuid: 'u-img', timestamp: '2026-09-25T10:00:00.000Z',
+          message: { role: 'user', content: [
+            { type: 'text', text: 'look at this' },
+            // Claude Code 的转录格式：source:{ type:'base64', media_type, data }
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } },
+          ] },
+        }),
+      ].join('\n'));
+
+      const harness = makeHarness('s-img', 'Claude Code');
+      harness.surface.sent.length = 0;
+      await (harness.host as any).preloadTranscriptTimes('Claude Code', 's-img');
+
+      harness.handler.handleUpdate({
+        sessionId: 's-img',
+        update: { sessionUpdate: 'user_message_chunk', messageId: 'u-img', content: { type: 'text', text: 'look at this' } },
+      } as any);
+      harness.handler.handleUpdate({
+        sessionId: 's-img',
+        update: { sessionUpdate: 'user_message_chunk', messageId: 'u-img', content: { type: 'image', mimeType: 'image/png', data: 'AAAA' } },
+      } as any);
+
+      const state = settle(harness, 'Claude Code', 's-img');
+      const users = state.entries.filter(e => e.kind === 'user');
+      const contents = state.entries.filter(e => e.kind === 'content');
+      assert.strictEqual(users.length, 1, 'one user entry');
+      assert.strictEqual(contents.length, 0, 'the image chunk does not become a second row');
+      const user = users[0] as { attachments?: Array<{ type: string; dataUri: string }> };
+      assert.ok(user.attachments, 'the bubble carries the images');
+      assert.strictEqual(user.attachments!.length, 1);
+      assert.strictEqual(user.attachments![0].type, 'image');
+      assert.ok(user.attachments![0].dataUri.startsWith('data:image/png;base64,'));
+    } finally {
+      if (previous === undefined) { delete process.env.CLAUDE_CONFIG_DIR; }
+      else { process.env.CLAUDE_CONFIG_DIR = previous; }
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// [CUSTOM-20260929-117] 工具卡标题（agent 写的 description）——对齐官方插件的
+// "Bash 查看博客目录及父目录现有内容"。数据来源是抓包夹具里**真实**的 Bash 载荷：
+// `rawInput.description` 与 `_meta.claudeCode.title` 同一个字符串，而 Read 卡两者都没有
+// （用来钉"没有就回退"这一半）。
+//
+// 为什么要 latch：真夹具里 description 出现在**第 3 条 update**，而 `_meta` 是整体替换、
+// 之后那条 toolResponse update 就把 `_meta.claudeCode.title` 抹掉了。任何"要用时再读一遍"
+// 的写法都会让标题在下一个 chunk 闪回命令行——而且**没有任何报错**。
+suite('chat panel: tool card description (CUSTOM-20260929-117)', () => {
+  test('the description is latched: it survives the update that replaces _meta', () => {
+    const store = new ToolInvocationStore();
+    const meta = (extra: Record<string, unknown>) => ({ claudeCode: { toolName: 'Bash', ...extra } });
+    store.upsertCall('s1', {
+      toolCallId: 'c1', title: 'Terminal', kind: 'execute', status: 'pending',
+      content: [], locations: [], rawInput: {}, _meta: meta({}),
+    } as never);
+    store.upsertUpdate('s1', { toolCallId: 'c1', rawInput: { command: 'ls -la' }, _meta: meta({}) } as never);
+    store.upsertUpdate('s1', {
+      toolCallId: 'c1', title: 'ls -la', rawInput: { command: 'ls -la', description: 'List files' },
+      _meta: meta({ title: 'List files' }),
+    } as never);
+    // The shape the real capture ends on: _meta replaced WITHOUT the title, no rawInput key.
+    store.upsertUpdate('s1', { toolCallId: 'c1', _meta: meta({ toolResponse: { stdout: 'x' } }) } as never);
+
+    assert.strictEqual(store.get('s1', 'c1')!.description, 'List files',
+      'the description must survive every later update');
+  });
+
+  test('a call that publishes no description is left without one', () => {
+    const store = new ToolInvocationStore();
+    store.upsertCall('s1', {
+      toolCallId: 'c2', title: 'Read File', kind: 'read', status: 'pending',
+      content: [], locations: [], rawInput: { file_path: 'a.ts' }, _meta: { claudeCode: { toolName: 'Read' } },
+    } as never);
+    assert.strictEqual(store.get('s1', 'c2')!.description, undefined);
+  });
+
+  test('the live replay carries the description through to the webview', () => {
+    if (!fixture?.sessionId) { return; }
+    // The harness session must BE the fixture's session: the host routes every
+    // notification by sessionId and silently drops unknown ones (the first version of
+    // this test used a made-up id and asserted on an empty message list).
+    const harness = makeHarness(fixture.sessionId, 'Claude Code');
+    feed(harness, phaseOf(fixture, 'live'));
+    settle(harness, 'Claude Code', fixture.sessionId);
+
+    // Every path a view model can take to the client: `append` (the card's first
+    // paint) carries it on the entry, `toolUpdate` carries it on its own, and a
+    // snapshot (boot / focus) carries entries too. Which one fires is the host's
+    // business — the assertion is about the view model that reaches the client.
+    const views: Array<{ toolCallId: string; title: string; description?: string; command: string | null }> = [];
+    for (const message of harness.surface.sent as Array<Record<string, unknown>>) {
+      if (message.type === 'toolUpdate') { views.push(message.tool as never); }
+      if (message.type === 'append') {
+        for (const entry of (message.entries as Array<Record<string, unknown>>) ?? []) {
+          if (entry.toolView) { views.push(entry.toolView as never); }
+        }
+      }
+      if (message.type === 'boot' || message.type === 'focus') {
+        const snapshot = message.snapshot as { entries?: Array<Record<string, unknown>> } | null;
+        for (const entry of snapshot?.entries ?? []) {
+          if (entry.toolView) { views.push(entry.toolView as never); }
+        }
+      }
+    }
+    const bash = views.filter(v => v.command === 'ls -la').pop();
+    assert.ok(bash, `the Bash card must have reached the webview (saw ${views.length} views)`);
+    assert.strictEqual(bash!.description, 'List files in the working directory',
+      'the agent-written description travels in the view model');
+    assert.strictEqual(bash!.title, 'ls -la',
+      'the ACP title is untouched — it is the IN line and the rail tooltip');
+    // …and a tool that publishes none is left alone, so the client falls back to title.
+    const read = views.filter(v => (v.command ?? null) === null && v.title.startsWith('Read')).pop();
+    assert.ok(read, 'the Read card must have reached the webview too');
+    assert.strictEqual(read!.description, undefined, 'no invented description');
+  });
+});
+
+// [CUSTOM-20260929-118] 真数据驱动的工具卡回归：`src/test/fixtures/claude-code-bash-tools.json`
+// 是 2026-09-29 用 `capture-acp-replay.mjs` 抓的一次真实 Bash 轮次（两条命令：一条成功、
+// 一条失败）。它存在的理由：工具卡的 OUT 曾经是**空的**，而"空"有两个独立成因
+// （空白文本项 / markdown 请求没人发），只看桩数据发现不了——夹具里那两条更新的形状
+// 就是真机的样子：中段 update 的 content 是**描述**，最后一条才是 ```console 输出块 +
+// rawOutput。判据必须跟着真载荷走。
+const BASH_FIXTURE_PATH = path.resolve(
+  __dirname, '..', '..', 'src', 'test', 'fixtures', 'claude-code-bash-tools.json',
+);
+
+function loadBashFixture(): Fixture | null {
+  if (!fs.existsSync(BASH_FIXTURE_PATH)) { return null; }
+  return JSON.parse(fs.readFileSync(BASH_FIXTURE_PATH, 'utf8')) as Fixture;
+}
+
+// [CUSTOM-20260929-120] 宿主对 renderMarkdown 的**逐项**校验：没有 sessionId 的项被静默跳过。
+// 这条规则一直存在（协议里 sessionId 是必填），而客户端**工具项**曾经不带它 —— 于是工具正文的
+// markdown 请求全部被丢弃、卡上留一个空 .tool-text，两个进程都不报错。这里把规则钉死，
+// 客户端侧的对应断言在 chat-client.test.ts（'the render request carries the session id'）。
+suite('chat panel: renderMarkdown item validation (CUSTOM-20260929-120)', () => {
+  test('an item without a sessionId is dropped; the same item with one is rendered', () => {
+    if (!fixture?.sessionId) { return; }
+    const harness = makeHarness(fixture.sessionId, 'Claude Code');
+    harness.surface.sent.length = 0;
+
+    harness.host.onMessage({
+      type: 'renderMarkdown',
+      items: [
+        { entryId: 'e-nosession', text: 'no session' },
+        { entryId: 'e-ok', sessionId: fixture.sessionId, key: 'slot#1', text: 'hi there' },
+      ],
+    } as never);
+
+    // The reply goes through the Outbox (one frame of coalescing) — flush it the way a
+    // focus change does, or the assertion below sees an empty message list.
+    settle(harness, 'Claude Code', fixture.sessionId);
+    const replies = harness.surface.sent.filter(m => m.type === 'markdownRendered') as Array<{
+      items: Array<{ entryId: string; html: string; key?: string }>;
+    }>;
+    assert.strictEqual(replies.length, 1, 'the host answers what it accepted');
+    const answered = replies[0].items;
+    assert.deepStrictEqual(answered.map(i => i.entryId), ['e-ok'],
+      'the item with no session id never comes back — a silent drop, which is why the client must send it');
+    assert.ok(answered[0].html.includes('hi there'), 'and the accepted one really was rendered');
+  });
+});
+
+suite('chat panel: Bash tool payloads (real capture, CUSTOM-20260929-118)', () => {
+  const bash = loadBashFixture();
+
+  function toolViewsFor(fixture: Fixture, phase: string): Array<Record<string, unknown>> {
+    const harness = makeHarness(fixture.sessionId as string, 'Claude Code');
+    feed(harness, phaseOf(fixture, phase));
+    settle(harness, 'Claude Code', fixture.sessionId as string);
+    const views: Array<Record<string, unknown>> = [];
+    for (const message of harness.surface.sent as Array<Record<string, unknown>>) {
+      if (message.type === 'toolUpdate') { views.push(message.tool as Record<string, unknown>); }
+      if (message.type === 'append') {
+        for (const entry of (message.entries as Array<Record<string, unknown>>) ?? []) {
+          if (entry.toolView) { views.push(entry.toolView as Record<string, unknown>); }
+        }
+      }
+      if (message.type === 'boot' || message.type === 'focus') {
+        const snapshot = message.snapshot as { entries?: Array<Record<string, unknown>> } | null;
+        for (const entry of snapshot?.entries ?? []) {
+          if (entry.toolView) { views.push(entry.toolView as Record<string, unknown>); }
+        }
+      }
+    }
+    return views;
+  }
+
+  /** The text of a view's content items, joined. */
+  function itemText(view: Record<string, unknown>): string {
+    const items = (view.items as Array<{ block?: { text?: string } }>) ?? [];
+    return items.map(i => i.block?.text ?? '').join('\n');
+  }
+
+  test('live: the Bash output reaches the view model as renderable text', function () {
+    if (!bash?.sessionId) { this.skip(); }
+    const views = toolViewsFor(bash, 'live').filter(v => v.command === 'ls -la');
+    assert.ok(views.length > 0, 'the Bash card reached the webview');
+    const last = views[views.length - 1];
+    assert.strictEqual(last.description, 'List files in current directory',
+      'the human description is latched (it arrives mid-stream)');
+    const text = itemText(last);
+    assert.ok(text.includes('total 38147'),
+      `the OUTPUT must be in the items — an empty OUT is the bug this fixture pins. Got: ${JSON.stringify(text.slice(0, 120))}`);
+    assert.ok(typeof last.output === 'string' && (last.output as string).includes('total 38147'),
+      'and rawOutput is exposed too, as the fallback when no item is renderable');
+  });
+
+  test('replay: the same output survives a re-opened session', function () {
+    if (!bash?.sessionId) { this.skip(); }
+    const views = toolViewsFor(bash, 'replay').filter(v => v.command === 'ls -la');
+    assert.ok(views.length > 0, 'the replayed Bash card reached the webview');
+    const last = views[views.length - 1];
+    assert.ok(itemText(last).includes('total 38147'),
+      'a re-opened session shows the same output (the replayed payload carries it)');
+    assert.strictEqual(last.description, 'List files in current directory');
+  });
+
+  test('a failed command keeps its output and its failed status', function () {
+    if (!bash?.sessionId) { this.skip(); }
+    const views = toolViewsFor(bash, 'live').filter(v => v.command === 'git status --short');
+    assert.ok(views.length > 0, 'the failing card reached the webview');
+    const last = views[views.length - 1];
+    assert.strictEqual(last.status, 'failed');
+    assert.ok(itemText(last).includes('not a git repository'),
+      'the error text is what the reader needs here — it must not be dropped');
   });
 });

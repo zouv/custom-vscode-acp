@@ -1,13 +1,15 @@
 # Chat 面板 · 会话目录与重开路径
 
-> **这是什么**：`docs/arch/chat-panel.md` §5.13–§5.15 的**拆出部分**（CUSTOM-20260925-060）。
+> **这是什么**：`docs/arch/chat-panel.md` §5.13–§5.15 的**拆出部分**（CUSTOM-20260925-060），
+> 以及后续长在这里的 §5.24（历史选择器的目录过滤，CUSTOM-20260926-079）。
 > 主文件已到 488 行，超了 `architecture.md` §0 那条「体量铁律」（超过 ~400 行即拆分）。
 >
-> **为什么这三节放在一起**：它们是同一个主题的三面——**会话生命周期**。
-> 建会话时选目录（§5.15）、已存在会话的目录从哪来（§5.14）、以及重开会话时那条 replay 链
-> 怎么测（§5.13）。三者共享同一个前提：**cwd 是会话级属性、且由协议固定在创建时**。
+> **为什么这几节放在一起**：它们是同一个主题的几面——**会话与它的工作目录**。
+> 建会话时选目录（§5.15）、已存在会话的目录从哪来（§5.14）、重开会话时那条 replay 链
+> 怎么测（§5.13）、以及按目录过滤历史列表（§5.24）。它们共享同一个前提：
+> **cwd 是会话级属性、且由协议固定在创建时**。
 >
-> **§5.x 的编号原样保留**（与 `chat-panel.md` 同一套编号），所以各处引用只需换文件名。
+> **§5.x 的编号原样保留**（与 `chat-panel.md` 同一套编号，跨文件连续），所以各处引用只需换文件名。
 >
 > **配套**：面板的整体架构、文件职责、消息纪律、安全约定、权限卡、大纲/引导条、以及面板审计
 > 的结论表，都在 [`chat-panel.md`](./chat-panel.md)（§5.1–§5.12）；任务路由见
@@ -98,8 +100,25 @@ node CUSTOMIZATIONS/scripts/capture-acp-replay.mjs --out src/test/fixtures/claud
 
 **已知边界（本轮不修）**：
 
+- **列表的"全集"由 agent 与它的存储共同决定**：agent 的 `session/list` **不含仍在其他窗口开着的会话**
+  （实测见 `CUSTOMIZATIONS/scripts/probe-session-list.mjs` 的**磁盘 ↔ agent 对账**：本项目 8 个转录文件、
+  agent 只报 6 个、`disk-only = 2`、`agent-only = 0`）。094 起从**转录目录**补这一块，
+  但仍有边界：① **只补当前工作目录那一个 slug**（别的目录的会话仍只能靠 agent 报）；
+  ② **只有 Claude Code**（那是它的私有存储）；③ 转录格式变了就只退化成"没有补充"。
+  **再有人报"列表少了"，先跑那个探针**——它把"agent 没报"和"我们过滤掉了"一次分开。
+- **从转录目录补出来的行可能还在别处开着**：tooltip 里写明"read from the transcript folder — the agent did
+  not list it"。打开它（`session/load`）会与另一个写入方共用同一个转录文件——官方插件同样允许这么做，
+  但这是**有代价的**，所以标记必须保留、不能省成"看起来和别的行一样"。
+
 - **cwd 在会话创建后不可改**（协议只提供 `session/new` / `session/load` 时的 `additionalDirectories`，
   没有"改 cwd"）。所以 UI 上它只能是"新建时选"，已发出消息的会话里它是只读的。
+- **打开历史会话会按需连接（083）**：`openExistingSession` 在**读能力之前**先
+  `await ensureConnected(agentName, opts.cwd)`。原因见 `pitfalls.md` #30：
+  `session/load` / `resume` 的能力来自 ACP 的 `initialize` 握手，**没连接过 ⇒ 缓存里没有 ⇒
+  旧代码把它读成"这个 agent 不支持"**。历史选择器未连接时列的是**本地缓存**（设计如此，
+  计数行写着 "from the local cache"），所以那会儿每一条都点得动、每一条都失败。
+  `opts.cwd` 顺带作为进程启动的偏好 ⇒ 跨目录的会话在它自己的目录里被打开。
+  **已知体验缺口**：连接 + 重放期间没有 loading 反馈（要补的话该给客户端一条状态，别在记录区打印噪声）。
 - **`recentDirectories()` 只在 `workspaceState` 里**，因此只记得**本工作区曾用过**的目录；
   新工作区开局是空的。要跨工作区就得走 agent 侧 `session/list`（下一步 058 会合并两者）。
 - **`session/close` 不会把会话从 agent 历史里移除**（[图1] 里两条我抓包留下的空会话是证据）。
@@ -131,6 +150,47 @@ ACP 没有"改会话 cwd"的请求——cwd 只在 `session/new` / `session/load
 | 已开始的会话 | 目录**只读**（协议固定），抽屉里点候选 = 在那个目录里开一个**新草稿**（不假装能改） |
 | 空态 Connect | 改为 `ensureConnected` + 草稿：只拉进程、**不建会话**（按钮的意义"我这个 agent 起得来吗"靠 `ensureConnected` 仍会抛错来保留）；该 agent 已有会话则聚焦最新那条 |
 | 键盘 | `#cwdBtn` 是真 `<button>`（047 的规矩）；三个抽屉（outline / history / cwd）**互斥**，开一个关掉另外两个 |
+| **切回会话标签（080）** | 点会话标签只发一条 `focusSession`，**渲染完全依赖宿主的 `focus` 应答**；而 `SessionManager.focusSession` 在"**已经是这个会话**"时 early-return（只在**变化**时 emit）。草稿是客户端私有的、宿主不知道它存在 ⇒ 宿主"我这边已经是 A 了"就不回话 ⇒ 面板永远停在草稿页，A 的标签看起来是坏的。修法是宿主侧 `focusSession(sessionId, { force: true })`（manager 自己对 newConversation/loadSession/resume 用的同一条惯用法）。**规矩：客户端显式请求的聚焦，宿主必须回话**——客户端的"我在看什么"不是宿主状态的函数（草稿/空白页就是反例）。守卫不放宽：未知会话照旧丢弃 |
 
 **草稿的固有代价（写进代码注释，不是 bug）**：草稿没有 `sessionId`，所以**模式 / 模型 / 斜杠命令**
 要到建会话之后才有——那些是 agent 在 `session/new` 时下发的。
+
+### 5.24 历史选择器的目录过滤（CUSTOM-20260926-079）
+
+**为什么需要**：这个列表是 **agent 侧的**（跨目录），实测 232 条会话横跨多个仓库——
+没有过滤就得在两百多行里找一条。
+
+**一句话**：header 右侧一个 chip 兼管"开关"与"选目录"（`All folders` / `<目录名>`），
+过滤是**纯客户端的 key 比较**，key 由宿主算好。
+
+| 关注点 | 规则 |
+|---|---|
+| 控件形态 | **一个 chip 兼管两件事**（`📁 All folders ▾` / `📁 <目录名> ▾`）：点开菜单，首项 `All folders` 就是关闭过滤。"开启"与"选一个目录"本来就是同一个动作，拆成"勾选框 + 下拉框"是两步操作 |
+| 何时出现 | 候选 ≥ 2 个目录，**或过滤正生效**（否则用户关不掉它）。用 `hidden` 属性（`.picker-btn` 的 `display` 被全局 `[hidden]{display:none!important}` 压住，这是 pitfall #13 的正确用法） |
+| 候选从哪来 | **只来自列表里真实出现过的目录** + 当前会话的目录（**0 条也在**）。过滤一个列表里没有会话的目录只会得到空列表，所以「浏览…」在这里是死路；而"默认目录不在菜单里"会像一个坏掉的控件。排序：当前 → 条数 → 名称 |
+| 候选怎么显示 | `label` 而不是 `name`：**两个目录同名时标签向左长**（`git/UniverseEditor` vs `zdev/UniverseEditor`）——第一个真实列表里 "UniverseEditor" 就出现了两次（同一仓库的两份检出），两个一模一样的标签根本没法选。唯一的名字保持原样（不长） |
+| **点击落在哪里，要问派发时的路径** | 关闭判定用 `event.composedPath()`，**不是 `drawer.contains(event.target)`**：选中目录会重建菜单行，把正在冒泡的那个按钮摘下来，而 `contains` 对游离节点恒为 false ⇒ 这次点击被判成"点了外面"、**整个列表关掉**（用户复验当场发现的那个 bug）。派发路径在事件派发瞬间就固定了，所以它仍然答得出"这次点击在不在抽屉里"。完整教训见 `pitfalls.md` #28 |
+| 目录同一性 | `historyDirs.directoryKey`：反斜杠→正斜杠、去尾分隔符（`D:\x\` = `D:\x`；`C:\`/`C:`/`C:/` 都折成 `c:`）、**大小写只在 win32/darwin 折叠**（linux 的 `/Home` 与 `/home` 是两个目录）。**刻意不用 `path.normalize`**：它在不同平台上行为不同，会让行为与测试都变成环境相关的 |
+| 谁算 key | **宿主**。客户端只比较两个 key —— 于是"这两个路径算不算同一个目录"只有一个地方需要想清楚。列表本来就在客户端，**换目录不产生任何往返**（那会是一次 `session/list`） |
+| 记忆策略 | **开关持久化**（`vscode.setState`，同 `Times`/`Sub-agents`）；**目录每次打开都回到当前会话的工作目录**。记住目录会在切到别的项目后继续过滤一个已无关的文件夹 |
+| 默认目录 | 聚焦会话**属于本次查询的那个 agent** 时用它的 cwd（picker 是按 agent 查的，聚焦会话可能属于另一个 agent），否则第一个工作区文件夹。取不到 ⇒ 未过滤（草稿、或 agent 没报 cwd），这是诚实的答案 |
+| 计数行 | 未过滤：`232 sessions · from the agent`（不变）；过滤：`12 of 232 sessions · from the agent`——**总数不能省**，只写"12 sessions"会像 agent 丢了两百多条 |
+| **列表来源是并集（092）** | `source: 'agent' \| 'local' \| 'merged'`（`merged` = 有多个来源贡献）。连上 agent 时是 **agent 列表 ∪ 转录目录 ∪ 本地缓存**：靠前者优先（agent 是"会话还在不在"的权威），只有后面来源知道的行带 `fromDisk` / `fromCache` 标记（tooltip 里说明），按 `updatedAt` 倒序。**为什么必须并集**：agent 的 `session/list` **不是全集**——实测（091 的探针）227 条里没有缺 cwd 的，但本项目磁盘上 8 个会话只报了 6 个，少掉的正是**仍在其他窗口开着的**那些 |
+| **第三个来源：转录目录（094）** | Claude Code 把每个工作目录的会话放在 `<CLAUDE_CONFIG_DIR 或 ~/.claude>/projects/<路径里非字母数字都换成 '-' 的 slug>/<sessionId>.jsonl`。**官方插件看到的就是这个目录**，所以这里补上它（`diskSessions.ts`）。三条硬约束：**只对 Claude Code**（`CLAUDE_CODE_AGENT`，与 `MODERN_AGENTS` 分开——那是"用哪个面板"，这是"愿意读谁的私有存储"）；**初始只扫当前工作目录对应的那一个 slug**（与本地缓存同作用域）；**095 起按过滤目录按需补扫**——客户端过滤到具体目录时发 `supplementHistory { cwd }`，宿主 `readDiskHistory(agent, cwd?)` 按该目录扫描并增量返回（`historySupplement`），解决多根/跨目录场景下扫错目录的问题；**任何失败都只是"没有补充"**，绝不影响 agent 的那份列表。读取用**按行流式**、超长行跳过（转录能到几十 MB，且**第一行本身就可能很大**——按字符切一刀会读不到任何记录，探针的第一版就是这么错的） |
+| **没有目录的行（093）** | `dirKey` 为空（agent 没报 cwd）的行**不属于任何候选**——但"不知道它在哪个目录"**不等于**"它在别的目录"，静默丢弃是把猜测当规则。现在：菜单末尾多一个 `Unknown folder (N)` 候选（哨兵 key `~unknown`，真实 key 必含分隔符、撞不了车），选中即筛出这些行；用真实目录过滤时计数行补一句 `· N without a folder` |
+| 空结果 | 一行「No sessions in this folder」+ 一行可点的「Show all folders」（chip 不显眼，不能只靠它） |
+| 挂载位置 | 菜单挂在 `.outline-head` **内部**：它已是定位元素（`position: sticky`），`top: 100%` 正好落在 header 下面——不量高度、没有常量偏移（pitfalls #24）。chip 与菜单是 `.outline-head-info`（`render()` 清空回填的计数容器）的**兄弟**，所以重渲染不会把它们清掉（077 的形态） |
+| **菜单用 `.open` 类，不是 `hidden` 属性** | `.picker-menu` 自带 `display: none`，与 `.open` 的 `display` 是同一层级的竞争。写错的表现是"菜单永远不出现"，而它看起来像 JS 没跑——正是 pitfall #13 的反面 |
+| 选中后菜单**不关闭** | 换目录通常是**连着比几个**（比较两个、或再试下一个），关掉就变成"重开→选→重开→选"。选中后菜单**原地刷新**：计数行、列表、以及菜单里那一项的激活标记都跟着变（这是用户 F5 复验时提的第一条修改）。焦点要还给新激活的那一行——重建会销毁刚点的按钮，焦点掉回文档后下一次 Tab 会从面板顶部重新开始。**点击抽屉里的别处**才收起它（标准下拉行为；chip 自己 stopPropagation，菜单行当然不能收起自己所在的菜单） |
+| Esc | **分层**：菜单开着时只收菜单，再按一次才收抽屉。否则一次 Esc 会把整份列表连同浏览位置一起丢掉 |
+| 宿主回复 | `handleListHistory` 的三条路径（agent / 本地缓存 / 出错回退）合并成一个 `postHistory`——三处各自拼装正是"其中一处漏了 `dirKey`"的写法，而漏掉的表现是**那些行在过滤后凭空消失**。协议只做追加（`dirKey?` / `directories?`），`directories` 里 `current: true` 的那条即默认目录，不需要另开字段 |
+
+**已知边界（本轮不做）**：
+
+- **本地缓存那条路只有本工作区的会话**（`workspaceState` 按工作区分桶，`list(agent, workspaceCwd())`），
+  所以未连接时过滤往往只有"当前目录"一个候选、chip 不出现。跨目录要靠 agent 侧 `session/list`。
+- **别处的 cwd 比较仍然是精确 `===`**（`SessionHistoryStore.list` 的按目录过滤、`recentDirectories` 的去重、
+  文件 chip 的路径）：`D:\x\` 与 `D:\x` 在那几处仍是两个目录。本轮**只给历史过滤器**引入归一化，
+  没有顺手改它们——那会改变会话列表与"最近使用目录"的既有行为，需要单独一轮。
+  `directoryKey` 已经是那个现成的工具（纯函数、已测）。
+

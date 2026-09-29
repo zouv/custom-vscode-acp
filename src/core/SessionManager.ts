@@ -37,6 +37,7 @@ import { SessionUpdateHandler } from '../handlers/SessionUpdateHandler';
 import { SessionHistoryStore } from './SessionHistoryStore';
 // [CUSTOM-BEGIN] CUSTOM-20260924-020
 import type { PermissionBridge } from '../handlers/PermissionBridge';
+import type { ElicitationBridge } from '../handlers/ElicitationBridge';
 // [CUSTOM-END] CUSTOM-20260924-020
 import { getAgentConfigs } from '../config/AgentConfig';
 import { log, logError } from '../utils/Logger';
@@ -235,6 +236,8 @@ export class SessionManager extends EventEmitter {
   // [CUSTOM-BEGIN] CUSTOM-20260924-020
   /** Permission bridge (optional — only used to retire pending prompts on cancel). */
   private permissionBridge: PermissionBridge | null = null;
+  // [CUSTOM-20260929-119] elicitation 桥：同样只用于「取消轮次时把待决的表单回答掉」。
+  private elicitationBridge: ElicitationBridge | null = null;
   // [CUSTOM-END] CUSTOM-20260924-020
 
   constructor(
@@ -277,6 +280,12 @@ export class SessionManager extends EventEmitter {
   // 用途只有一个：取消轮次时必须把待决的权限请求回答掉，见 cancelTurn。
   setPermissionBridge(bridge: PermissionBridge): void {
     this.permissionBridge = bridge;
+  }
+
+  // [CUSTOM-20260929-119] 表单请求是同一个道理：它是 JSON-RPC 请求，SDK 没有超时，
+  // 不回答 agent 就永远等。见 cancelTurn。
+  setElicitationBridge(bridge: ElicitationBridge): void {
+    this.elicitationBridge = bridge;
   }
   // [CUSTOM-END] CUSTOM-20260924-020
 
@@ -569,6 +578,21 @@ export class SessionManager extends EventEmitter {
     const session = this.sessions.get(sessionId);
     if (!session || session.agentName !== agentName) { return; }
 
+    // [CUSTOM-20260927-088] Cancel an in-flight turn FIRST, before any teardown.
+    //
+    // Closing a session used to just drop `inFlightTurns` (removeSession), so the agent
+    // kept working on a turn nobody would ever see — and, per the ACP contract we already
+    // honour in `cancelTurn`, a pending `session/request_permission` has to be answered
+    // 'cancelled' or the agent hangs forever (pitfalls #14). `cancelTurn` is what does
+    // both (it cancels the permission bridge for the session, then sends session/cancel).
+    if (this.isTurnInFlight(sessionId)) {
+      try {
+        await this.cancelTurn(sessionId);
+      } catch (e) {
+        logError(`cancel before close failed for ${sessionId} (closing anyway)`, e);
+      }
+    }
+
     // Best-effort protocol-level close, gated on the advertised capability.
     if (this.capabilities.get(agentName)?.close) {
       const connInfo = this.connectionManager.getConnection(session.agentId);
@@ -831,6 +855,8 @@ export class SessionManager extends EventEmitter {
     // 以 `{ outcome: 'cancelled' }` 结束。少了这一步，agent 会一直卡在等答复上
     // ——旧实现（只有 QuickPick）从来没有解决过这个 promise。
     this.permissionBridge?.cancelSession(sessionId);
+    // [CUSTOM-20260929-119] 表单请求同理（回 cancel：轮次已被取消，空答案会骗到 agent）。
+    this.elicitationBridge?.cancelSession(sessionId);
     // [CUSTOM-END] CUSTOM-20260924-020
 
     const connInfo = this.connectionManager.getConnection(session.agentId);
@@ -1172,27 +1198,45 @@ export class SessionManager extends EventEmitter {
   async openExistingSession(
     agentName: string,
     sessionId: string,
-    opts: { cwd?: string } = {},
+    opts: { cwd?: string; title?: string } = {},
   ): Promise<'live' | 'load' | 'resume'> {
     const existing = this.sessions.get(sessionId);
     if (existing) {
+      // [CUSTOM-20260928-098] Already live: adopt a title we just learned if the
+      // live session does not have one yet (the replay may not have carried it).
+      if (opts.title && !existing.title) { existing.title = opts.title; }
       this.focusSession(sessionId, { force: true });
       return 'live';
     }
+    // [CUSTOM-20260926-083] Connect on demand BEFORE reading capabilities.
+    //
+    // Capabilities come from the ACP `initialize` handshake, so an agent that was
+    // never connected has NO cached caps — and the old code read that as "this agent
+    // cannot load or resume" and threw, for an agent that supports `session/load`
+    // perfectly well. The reported case: the history picker lists sessions from the
+    // LOCAL CACHE while disconnected (by design — the list says "from the local
+    // cache"), so every row was clickable and every click failed.
+    //
+    // Connecting is the work the click implies, not a side effect: the panel's history
+    // picker and the tree's `acpc.openSession` both land here, so this is the one place
+    // to do it (`ensureConnected` is idempotent and collapses concurrent attempts).
+    // `opts.cwd` is passed as the spawn preference — for a session living in another
+    // directory that is also the right directory to start the process in.
+    await this.ensureConnected(agentName, opts.cwd);
     const caps = this.getCachedCapabilities(agentName);
     if (caps?.load) {
-      await this.loadSession(agentName, sessionId, opts.cwd);
+      await this.loadSession(agentName, sessionId, opts.cwd, opts.title);
       return 'load';
     }
     if (caps?.resume) {
-      await this.resumeSession(agentName, sessionId, opts.cwd);
+      await this.resumeSession(agentName, sessionId, opts.cwd, opts.title);
       return 'resume';
     }
     throw new Error(`Agent "${agentName}" does not support loading or resuming sessions.`);
   }
   // [CUSTOM-END] CUSTOM-20260925-033
 
-  async loadSession(agentName: string, sessionId: string, requestedCwd?: string): Promise<SessionInfo> {
+  async loadSession(agentName: string, sessionId: string, requestedCwd?: string, title?: string): Promise<SessionInfo> {
     // Already live? Just focus it.
     const existing = this.sessions.get(sessionId);
     if (existing) {
@@ -1231,6 +1275,9 @@ export class SessionManager extends EventEmitter {
         || conn.initResponse.agentInfo?.name
         || agentName,
       cwd,
+      // [CUSTOM-20260928-098] Provisional title from the picker; the replay's
+      // session_info_update (when present) overwrites it with the authoritative one.
+      ...(title ? { title } : {}),
       createdAt: new Date().toISOString(),
       initResponse: conn.initResponse,
       modes: null,
@@ -1281,8 +1328,10 @@ export class SessionManager extends EventEmitter {
     this.loadingSessionIds.delete(sessionId);
     this.emit('session-load-end', sessionId, agentName, /*ok=*/true);
 
-    // Touch history-store activity timestamp.
-    this.historyStore?.touch(agentName, sessionId);
+    // [CUSTOM-20260928-097] Record the session's directory (not just a timestamp):
+    // `touch` cannot create an entry, so a session opened from another workspace's
+    // history never made it into "Recently used" directories.
+    this.historyStore?.upsertNew(agentName, cwd, sessionId);
     return placeholder;
   }
 
@@ -1291,7 +1340,7 @@ export class SessionManager extends EventEmitter {
    *
    * [CUSTOM-20260923-010] Same single-session eviction removal as loadSession.
    */
-  async resumeSession(agentName: string, sessionId: string, requestedCwd?: string): Promise<SessionInfo> {
+  async resumeSession(agentName: string, sessionId: string, requestedCwd?: string, title?: string): Promise<SessionInfo> {
     const existing = this.sessions.get(sessionId);
     if (existing) {
       this.focusSession(sessionId, { force: true });
@@ -1340,6 +1389,8 @@ export class SessionManager extends EventEmitter {
         || conn.initResponse.agentInfo?.name
         || agentName,
       cwd,
+      // [CUSTOM-20260928-098] Provisional title (see loadSession).
+      ...(title ? { title } : {}),
       createdAt: new Date().toISOString(),
       initResponse: conn.initResponse,
       modes: response?.modes ?? null,
@@ -1353,7 +1404,7 @@ export class SessionManager extends EventEmitter {
     this.emit('session-created', sessionId, agentName);
     this.focusSession(sessionId, { force: true });
 
-    this.historyStore?.touch(agentName, sessionId);
+    this.historyStore?.upsertNew(agentName, cwd, sessionId);
     return sessionInfo;
   }
 

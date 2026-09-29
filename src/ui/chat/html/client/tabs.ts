@@ -188,6 +188,12 @@ export const tabsClient = `
         close.type = 'button';
         close.title = isDraft ? 'Discard this draft' : 'Close this session';
         close.setAttribute('aria-label', (isDraft ? 'Discard ' : 'Close ') + label);
+        // [CUSTOM-20260927-089] OUT of the tab order. The × lives inside the tab button,
+        // so with the default tabindex every session's close button was its own tab stop
+        // — ten sessions meant ten extra stops on the way to the composer, defeating the
+        // roving tabindex the strip is built around (and a stray Enter on the way closed
+        // a session). Delete/Backspace already closes the focused tab.
+        close.tabIndex = -1;
         close.addEventListener('click', function (event) {
           event.stopPropagation();
           closeModel(model);
@@ -229,9 +235,16 @@ export const tabsClient = `
     if (!summary) {
       cwdBtn.textContent = '';
       cwdBtn.title = 'Working directory';
+      // [CUSTOM-20260927-090] Nothing focused: HIDE it. An empty button that still opens
+      // the directory drawer is worse than no button — the drawer then explains that
+      // "this session has already started, so its directory is fixed" about a panel that
+      // has no session at all. (A draft sets its own header via renderDraftHeader, which
+      // shows the button again.)
+      cwdBtn.hidden = true;
       usageBar.hidden = true;
       return;
     }
+    cwdBtn.hidden = false;
     cwdBtn.textContent = summary.cwd || '';
     // The session id stays in the tooltip: it is what you paste into a bug report.
     cwdBtn.title = (summary.cwd || '') + '\\n' + summary.sessionId;
@@ -239,6 +252,9 @@ export const tabsClient = `
 
   /** [CUSTOM-20260925-058] Header for a draft: it shows the directory it WILL use. */
   function renderDraftHeader(draft) {
+    // [CUSTOM-20260927-090] A draft HAS a directory to show (and to pick), so the button
+    // comes back even though there is no session yet.
+    cwdBtn.hidden = false;
     cwdBtn.textContent = draft && draft.cwd ? draft.cwd : 'Default directory';
     cwdBtn.title = 'This session will be created in this directory\\n(not created yet)';
     usageBar.hidden = true;

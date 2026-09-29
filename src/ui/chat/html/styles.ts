@@ -199,8 +199,8 @@ export function styles(): string {
     font-variant-numeric: tabular-nums;
   }
   .messages.show-times .rec-time { display: block; }
-  /* 用户气泡是右对齐的，它上面那行时刻也跟着右对齐，否则会飘在左边。 */
-  .entry-user .rec-time { text-align: right; }
+  /* 105 之前这里有一条 .entry-user .rec-time { text-align: right }（时刻跟着右对齐的气泡走）。
+     用户消息改为靠左铺满后它没有存在理由了——留着会让时刻与正文分居两端。 */
   /* 工具耗时常显（与 Thought 的 "Thought for Ns" 同类信息，不需要开关）。 */
   .tool-time {
     flex: 0 0 auto; font-size: 0.78em;
@@ -297,6 +297,10 @@ export function styles(): string {
 
   /* --- Messages -------------------------------------------------------- */
   .message-area { position: relative; flex: 1; min-height: 0; display: flex; }
+  /* [CUSTOM-20260928-103] 消息列：.message-area 这一行里除它之外只有定宽的大纲栏。
+     置顶副本（.sticky-user）是它的绝对定位子元素，于是"覆盖层不会盖到大纲栏上"是按构造
+     成立的——不用量大纲栏宽度。min-width: 0 与 #messages 当初作为 flex 项时同义。 */
+  .messages-column { position: relative; flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
   /* --- Conversation rail (CUSTOM-20260924-023) ------------------------- */
   /* 左侧引导条：轮次大点 + 步骤小点，随内容滚动（track 由 JS 做 translateY(-scrollTop)）。
      注意本元素**不能**写 display——hidden 属性靠文件顶部的 [hidden]{display:none!important}
@@ -380,6 +384,93 @@ export function styles(): string {
     outline: 2px dashed var(--vscode-focusBorder);
     outline-offset: -4px;
   }
+
+  /* [CUSTOM-20260928-102] 悬浮在消息列顶部的「本轮提问」。不透明背景是必须的——
+     它盖在消息之上，半透明会让下面那行字透出来。
+
+     [CUSTOM-20260928-103] 克隆体要和列表里长得一样，靠的是**把列表那套排布条件照搬过来**，
+     不是给克隆体写一套新样式：
+       · 用户气泡的右对齐与 88% 宽度来自 .entry-user{align-self:flex-end; max-width:88%}，
+         而 align-self **只在 flex 容器里生效**。102 时这里是个普通块容器，于是克隆体左对齐、
+         按块级撑开（用户报的"被拉长、没靠右"）——所以 .sticky-body 是 flex 列。
+       · 水平内边距与 .messages 相同（左 19 给引导条让位、右 10）—— 内容盒宽度与列表逐像素相同，
+         否则 max-width:88% 的 88% 会落在两个不同的基数上。
+
+     [CUSTOM-20260928-104] 改成悬浮卡片。要点是**分成两层**：
+       · 这一层只负责定位与内边距，背景透明、pointer-events: none —— 卡片周围要让内容与点击
+         都透过去（悬浮，不是盖一层膜）。
+       · 卡片（.sticky-card）才画底色/描边/阴影，而且它必须**不占额外布局**：描边用 box-shadow
+         的 0 0 0 1px 而不是 border，否则内容盒会窄 1px，克隆体就对不上原位。
+     padding-top 由 stickyUser.ts 写入（那里的 TOP_GAP）——那 8px 同时是"本体交棒"的阈值，
+     布局与判据必须相等，所以只留一个来源（pitfall #19）。 */
+  .sticky-user {
+    position: absolute; top: 0; left: 0; right: 0; z-index: 6;
+    padding: 0 8px 8px 17px;
+    display: flex; flex-direction: column;
+    pointer-events: none;
+    max-height: 40%; overflow: hidden;
+  }
+  .sticky-user > * { flex: 0 0 auto; pointer-events: auto; }
+  /* [CUSTOM-20260928-105] 高亮边框（用户要求"加些高亮/阴影，跟原消息区分开"）。107 起
+     改成 **2px + --vscode-foreground**：105 用的是 1px --vscode-focusBorder，而气泡底色是
+     --vscode-button-background（蓝）——两者在默认主题里都是蓝的，对比度极低，用户回报
+     "看到了但很不明显"。换成前景色（深色主题近白、浅色主题近黑）压在蓝气泡上，两种主题
+     都清楚。
+     · 语义上仍是 border 不是环：环在这个面板里被定义为键盘焦点（062 的教训）。
+     · 上面 padding 里的 17/8 与列表的 19/10 差 2，就是给这条 2px 边框让位的：
+       卡片的内容盒因此**仍然逐像素等于** .messages 的内容盒（克隆体落在原位上，
+       交棒时看不出接缝）。padding-top 依旧由 JS 写（TOP_GAP）。
+       垂直方向的 2px 不补：边框让克隆体的落点比 TOP_GAP 低 2px，交棒那一帧因此有 2px 的
+       沉降，肉眼不可见；要抹平就得让交棒窗口跟着 +2，那样这个常量就有了第二个来源
+       （pitfall #19），不划算。 */
+  .sticky-card {
+    position: relative;
+    display: flex; flex-direction: column;
+    background: var(--vscode-sideBar-background);
+    border: 2px solid var(--vscode-foreground);
+    border-radius: 8px;
+    box-shadow: 0 4px 10px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.35));
+    overflow: hidden;
+    cursor: pointer;
+  }
+  .surface-editor .sticky-card { background: var(--vscode-editor-background); }
+  /* 同 .messages > *（037）：克隆体在"列 flex + overflow:hidden"里同样不许被压缩。 */
+  .sticky-body { display: flex; flex-direction: column; }
+  .sticky-body > * { flex: 0 0 auto; }
+  /* [CUSTOM-20260928-104] 收缩/展开。105 起用户消息铺满整列，卡片里**没有空档了**，
+     所以按钮挪到卡片左侧那条 18px 通道里（那是 .messages 给左侧引导条留的 padding-left，
+     见 .messages 的注释）——位置固定、永不压到正文，也不占内容盒宽度。 */
+  .sticky-toggle {
+    position: absolute; left: 1px; top: 10px; z-index: 1;
+    width: 15px; height: 16px; padding: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: transparent; border: none; border-radius: 4px;
+    color: var(--vscode-descriptionForeground);
+    font-family: inherit; font-size: 0.8em; line-height: 1;
+    cursor: pointer;
+  }
+  .sticky-toggle:hover {
+    background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
+    color: var(--vscode-foreground);
+  }
+  /* 收缩成一行：多行气泡是 details.user-fold（summary 就是第一行），单行气泡本来就是一行。
+     展开态的那部分（.fold-body）藏掉即可，不用重建节点。 */
+  .sticky-user.collapsed .bubble,
+  .sticky-user.collapsed .user-fold > summary {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .sticky-user.collapsed .fold-body { display: none; }
+  /* [CUSTOM-20260928-103] 时刻的显隐由 .messages.show-times 控制，而克隆体不在 #messages 里
+     —— 不同步这个状态就会出现"列表有时刻、置顶副本没有"。show-times 由 render() 从
+     #messages 抄到 host 上。 */
+  .sticky-user.show-times .rec-time { display: block; }
+  /* [CUSTOM-20260928-104] 本体交棒给悬浮条时隐藏：副本已经站在它原来的位置上，留着就是同屏两份。
+     用 visibility 而不是 display —— 几何保持不变，rail 的测量与 jumpTo 依赖的 offsetTop 都还成立。
+
+     **'.messages' 这个前缀是承重的，不是修饰**：cloneNode 会连 class 一起复制，而副本不在
+     #messages 里 —— 去掉前缀，换成副本看不见（悬浮条"打不开了"，静默）。render() 里另有一道
+     同因的防线（显式摘掉这个类）。 */
+  .messages .sticky-source { visibility: hidden; }
   /* 三档间距阶梯：同类紧 / 跨类松 / 轮次边界最松。
      data-kind 由 transcriptView.place() 打在每条上，这里纯用兄弟选择器实现。 */
   .messages > * + * { margin-top: 10px; }
@@ -388,7 +479,7 @@ export function styles(): string {
   .messages > [data-kind="content"] + [data-kind="content"] { margin-top: 2px; }
   .messages > [data-kind="user"] { margin-top: 16px; }
   .jump-latest {
-    position: absolute; right: 14px; bottom: 12px;
+    position: absolute; left: 50%; transform: translateX(-50%); bottom: 12px;
     padding: 3px 10px; border-radius: 12px; cursor: pointer;
     background: var(--vscode-button-background); color: var(--vscode-button-foreground);
     border: none; font-family: inherit; font-size: 0.9em;
@@ -396,7 +487,17 @@ export function styles(): string {
   }
   .jump-latest:hover { background: var(--vscode-button-hoverBackground); }
 
-  .empty-state { margin: auto; text-align: center; color: var(--vscode-descriptionForeground); padding: 20px; }
+  /* [CUSTOM-20260926-082] 空态居中：它原来是 #messages 的**兄弟**，而 .message-area 是 flex 行、
+     #messages 是 flex: 1 —— 自由空间被它吃光，margin: auto 没有可分配的余量可分，
+     于是空态被顶到最右边（面板越宽越明显；窄侧边栏里看不出来，所以一直没被发现）。
+     改为**覆盖在消息区之上并自我居中**（.message-area 本来就是 position: relative，
+     .jump-latest 早就这么用）。不占布局，也不会与谁重叠：空态出现 ⟺ 没有聚焦会话 ⟺ 没有锚点
+     ⟺ 081 已经把大纲栏与引导条收掉了。 */
+  .empty-state {
+    position: absolute; top: 0; right: 0; bottom: 0; left: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    text-align: center; color: var(--vscode-descriptionForeground); padding: 20px;
+  }
   /* 空态里的「连接」按钮（CUSTOM-20260925-032）：面板自己就能把 agent 拉起来，
      不必先去 Agents 视图。 */
   .empty-connect {
@@ -416,14 +517,19 @@ export function styles(): string {
   }
 
   .entry { display: flex; flex-direction: column; gap: 4px; max-width: 100%; }
-  .entry-user { align-self: flex-end; max-width: 88%; }
+  /* [CUSTOM-20260928-105] 用户消息**靠左铺满**（用户要求）。原来是 align-self:flex-end +
+     max-width:88%，于是气泡宽度=内容宽度(fit-content)：短消息是个小气泡，而折叠后只剩首行、
+     宽度随之缩短 —— 面板在折叠/展开时"会自己变窄"，读起来像布局在跳。铺满之后宽度是常量，
+     折与不折只影响高度。顺带：正文与时刻同一起点，圆角也改成四角一致（原来的 8/8/2/8
+     是"右下收尾"的对话气泡形，靠左之后那个缺口指向反了）。 */
+  .entry-user { align-self: stretch; }
   /* [CUSTOM-20260925-061] 气泡观感同时挂在「单行气泡」与「多行折叠的 details」上，
      所以展开时背景与圆角是**连续的一整块**，不会出现两条气泡。 */
   .entry-user .bubble,
   .entry-user .user-fold {
     background: var(--vscode-button-background);
     color: var(--vscode-button-foreground);
-    padding: 6px 10px; border-radius: 8px 8px 2px 8px;
+    padding: 6px 10px; border-radius: 8px;
     white-space: pre-wrap; word-break: break-word;
   }
   /* 折叠时背景与内边距在 details 上，summary 只是它的第一行——必须抹掉，
@@ -432,12 +538,49 @@ export function styles(): string {
     cursor: pointer; user-select: none; list-style: none;
     background: transparent; padding: 0; border-radius: 0; color: inherit;
   }
-  .entry-user .user-fold > summary::-webkit-details-marker { display: none; }
-  /* [CUSTOM-20260925-064] 折叠态：summary 占**恰好一行**并以省略号截断。
-     **只在折叠态生效**——展开时若还是 nowrap，第一段会被截成"半句话加省略号"，
-     看起来像内容丢了（而且它本来就不该影响展开态）。 */
-  .entry-user .user-fold:not([open]) > summary {
+  /* [CUSTOM-20260928-108] 正文从第二行开始（图标与折叠三角留在第一行）。
+     .bubble-body 是 block，所以 summary 里的文字永远另起一行；折叠态的截断
+     作用在它自己身上（不再是整个 summary，否则图片 chip 也会被截掉）。 */
+  .bubble-body { display: block; }
+  /* [CUSTOM-20260928-110] 折叠时正文提到第一行（用户要求）：
+     图标/caret 与"优化下排版"在同一行，而不是把正文挤到第二行。 */
+  .entry-user .user-fold:not([open]) .bubble-body {
+    display: inline;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  /* [CUSTOM-20260928-108] 图片 chip 在气泡内：第一行、caret 之后、正文之前。
+     图片在 summary 里，气泡内留一点间距。 */
+  /* [CUSTOM-20260928-110] 气泡内的图片 chip 用深色半透明底：chip 的默认底色
+     (--vscode-textCodeBlock-background) 压在蓝气泡上对比度太低，图片名几乎看不见。 */
+  /* [CUSTOM-20260928-112] 带图片的气泡：summary 改为 flex 行，图标/caret/chip 都排在
+     第一行，正文（.bubble-body）用 flex-basis:100% 撑到第二行。
+     **注意**：无图片时 bubble-body 是 block（自然另起一行），不能给所有 summary 都套 flex
+     —— block 在 flex 容器里不会换行，会把正文挤到与图标同一行。 */
+  .entry-user .user-fold > summary:has(.content-image-chip) {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px;
+  }
+  /* [CUSTOM-20260928-113] 折叠时 bubble-body 也是 flex 项（不占满一行），与图标/caret 同行。 */
+  .entry-user .user-fold:not([open]) > summary:has(.content-image-chip) .bubble-body {
+    flex-basis: auto;
+  }
+  .entry-user .user-fold > summary:has(.content-image-chip) .bubble-body {
+    flex-basis: 100%;
+  }
+  .entry-user .content-image-chip {
+    margin: 2px 4px 2px 0;
+    vertical-align: middle;
+    background: rgba(0, 0, 0, 0.25);
+    border-color: rgba(255, 255, 255, 0.15);
+  }
+  .entry-user .user-fold > summary::-webkit-details-marker { display: none; }
+  /* 折叠态：summary 占**恰好一行**并以省略号截断——现在只截正文（.bubble-body），
+     图标与折叠三角留在第一行（[CUSTOM-20260928-108]）。
+     **只在折叠态生效**——展开时若还是 nowrap，第一段会被截成"半句话加省略号"。 */
+  /* 展开态：body 是 **inline**，从切分点接着往下流。切分点只是实现细节
+     （长单行消息没有换行可切），用块级 body 会在半句话处多出一处换行。 */
+  .entry-user .user-fold .fold-body {
+    display: inline;
+    white-space: pre-wrap; word-break: break-word;
   }
   /* 展开态：body 是 **inline**，从切分点接着往下流。切分点只是实现细节
      （长单行消息没有换行可切），用块级 body 会在半句话处多出一处换行。 */
@@ -446,7 +589,9 @@ export function styles(): string {
     white-space: pre-wrap; word-break: break-word;
   }
   .entry-assistant { align-self: stretch; }
-  .entry-assistant .bubble {
+  /* [CUSTOM-20260929-114] 助手消息也是 <details>（与用户消息同一套折叠控件），
+     **外观因此挂在 details 上**——它现在包住「标题行 + 正文」两段，而原来只有一个 .bubble。 */
+  .entry-assistant .msg-fold {
     background: var(--vscode-editor-background);
     border: 1px solid var(--vscode-panel-border);
     border-radius: 8px 8px 8px 2px;
@@ -454,7 +599,24 @@ export function styles(): string {
     word-break: break-word;
     white-space: pre-wrap;
   }
-  .entry-assistant .bubble.md { white-space: normal; }
+  /* 标题行（图标 + 折叠三角 + 折叠时的首行预览）就是切换区。**正文刻意不在 summary 里**：
+     在 <summary> 里划选文本 == 点它，读者选中一段回答就会把它折起来；而 markdown 正文里
+     还有链接 / 代码 Copy / 图片 chip。见 buildAssistantFold 的注释。 */
+  .entry-assistant .msg-head {
+    cursor: pointer; user-select: none; list-style: none; padding: 0;
+  }
+  .entry-assistant .msg-head::-webkit-details-marker { display: none; }
+  /* 展开态：图标行在上、正文在下（正文是 summary 的块级兄弟，天然另起一行）。 */
+  .entry-assistant .bubble-body.md { white-space: normal; }
+  /* [CUSTOM-20260929-116] 折叠态：正文被浏览器整块藏起来（details 的默认行为，作者样式
+     **抢不过**——115 用 display 试过，折叠后正文依旧不可见），所以"首行"由 summary 里的
+     .msg-preview 提供 —— 它是**真文本节点**，随正文内容更新（refreshPreview）。
+     展开时必须藏掉它，否则正文上方会多出一份重复的首行。 */
+  .entry-assistant .msg-fold[open] .msg-preview { display: none; }
+  /* 折叠态那一行不换行、超出省略号（与用户消息折叠后一样只占一行）。 */
+  .entry-assistant .msg-fold:not([open]) > .msg-head {
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
   .entry-notice { align-self: center; font-size: 0.9em; padding: 2px 8px; border-radius: 4px; }
   /* --- Record-type icons (CUSTOM-20260924-028) -------------------------- */
   /* 每类记录左侧一个内联 SVG 图标。用 currentColor 描边，所以自动跟随所在文字的颜色
@@ -466,6 +628,55 @@ export function styles(): string {
   .rec-icon svg { display: block; }
   .tool-icon { flex: 0 0 auto; display: inline-flex; align-items: center; opacity: 0.7; }
   .tool-icon svg { display: block; }
+  /* --- Form card: ACP elicitation / AskUserQuestion (CUSTOM-20260929-119) ----
+     与权限卡同一族观感（它也是**阻塞的**：agent 在等到答复前不会继续），但内容是一张表单，
+     所以用的是 VS Code 的输入控件配色，而不是自造一套。 */
+  .entry-elicitation { align-self: stretch; }
+  .elic {
+    border: 1px solid var(--vscode-inputValidation-infoBorder, var(--vscode-panel-border));
+    border-left-width: 3px;
+    border-radius: 6px;
+    padding: 8px 10px;
+    background: var(--vscode-editor-background);
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .elic.pending { border-left-color: var(--vscode-focusBorder, var(--vscode-charts-blue)); }
+  .elic.deferred { opacity: 0.75; }
+  .elic.accepted, .elic.declined, .elic.cancelled {
+    border-left-color: var(--vscode-panel-border); background: transparent;
+  }
+  .elic-title { font-size: 0.95em; font-weight: 600; word-break: break-word; }
+  .elic-body { display: flex; flex-direction: column; gap: 8px; }
+  .elic-field { display: flex; flex-direction: column; gap: 3px; }
+  /* The "Other" box belongs to the question above it, so it is indented and quiet. */
+  .elic-field.elic-other { margin-left: 14px; opacity: 0.9; }
+  .elic-label { font-size: 0.9em; color: var(--vscode-descriptionForeground); }
+  .elic-help { font-size: 0.92em; word-break: break-word; }
+  .elic-option { display: flex; align-items: baseline; gap: 6px; cursor: pointer; }
+  .elic-option input { flex: none; margin: 0; }
+  .elic-option-label { font-size: 0.95em; }
+  .elic-option-desc { font-size: 0.88em; color: var(--vscode-descriptionForeground); }
+  .elic-input {
+    font-family: inherit; font-size: 0.95em; width: 100%;
+    color: var(--vscode-input-foreground);
+    background: var(--vscode-input-background);
+    border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+    border-radius: 3px; padding: 3px 6px;
+  }
+  .elic-input:focus { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+  .elic-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+  .elic-btn {
+    font-family: inherit; font-size: 0.92em; padding: 3px 10px; border-radius: 3px; cursor: pointer;
+    background: var(--vscode-button-secondaryBackground, var(--vscode-button-background));
+    color: var(--vscode-button-secondaryForeground, var(--vscode-button-foreground));
+    border: 1px solid var(--vscode-button-border, transparent);
+  }
+  .elic-btn.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+  .elic-btn:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
+  .elic-btn:disabled { cursor: default; opacity: 0.5; }
+  .elic-note { font-size: 0.88em; color: var(--vscode-descriptionForeground); }
+  .elic-note:empty { display: none; }
+
   /* --- Permission card (CUSTOM-20260924-020) --------------------------- */
   /* 面板内的权限请求卡：替代窗口级 QuickPick。配色故意用 warn 边框而不是普通卡片，
      因为它是**阻塞的**——agent 在等到答复前不会继续。 */
@@ -529,6 +740,16 @@ export function styles(): string {
     border-top: 1px dashed var(--vscode-panel-border);
   }
   .entry-notice.warn { color: var(--vscode-editorWarning-foreground, var(--vscode-foreground)); }
+  /* [CUSTOM-20260928-109] 注入块（<task-notification> 等）：不是用户输入，也不该是气泡。
+     居中、灰色、小字，不拿 icon（icon 是"谁说的"的记号，而它不是任何一方）。 */
+  .entry-notice.meta {
+    align-self: stretch;
+    text-align: center;
+    font-size: 0.82em;
+    color: var(--vscode-descriptionForeground);
+    opacity: 0.85;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
   .entry-notice.error {
     color: var(--vscode-inputValidation-errorForeground);
     background: var(--vscode-inputValidation-errorBackground);
@@ -583,7 +804,22 @@ export function styles(): string {
     background: var(--vscode-textCodeBlock-background);
     border-radius: 3px; padding: 0 5px; font-size: 0.9em;
   }
-  .content-image { max-width: 100%; border-radius: 4px; margin: 4px 0; }
+  .content-image { max-width: 100%; border-radius: 4px; margin: 4px 0; cursor: zoom-in; }
+  /* [CUSTOM-20260928-102] 图片以「缩略图 + 文件名」的紧凑 chip 呈现（此前按原始尺寸平铺，
+     一张 1344x695 的截图就把整个面板撑满）。点击整块打开放大层（097）。 */
+  .content-image-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    max-width: 100%; padding: 2px 8px 2px 2px;
+    background: var(--vscode-textCodeBlock-background);
+    border: 1px solid var(--vscode-panel-border); border-radius: 3px;
+    cursor: zoom-in; font-family: inherit; font-size: 0.88em; color: inherit;
+  }
+  .content-image-chip:hover { background: var(--vscode-list-hoverBackground); }
+  .content-thumb {
+    display: block; flex: 0 0 auto;
+    width: 24px; height: 24px; object-fit: cover; border-radius: 2px;
+  }
+  .content-image-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   /* [CUSTOM-20260925-050] 编辑区面与编辑器标签同处一列：用侧边栏底色会像"外部面板
      贴在了编辑区里"。类名由 body(surface) 打在 <body> 上（见 html/body.ts）。
@@ -666,7 +902,7 @@ export function styles(): string {
   /* [CUSTOM-20260926-072] 渲染成 markdown 的推理正文（宿主侧 SafeMarkdown → .md）。
      两处必须覆盖：
        · white-space —— pre-wrap 会把 marked 输出里的换行**再加一倍**（每个 <p> 之间
-         多出一整行空行），所以 md 态回到 normal，与 .entry-assistant .bubble.md 同理；
+         多出一整行空行），所以 md 态回到 normal，与 .entry-assistant .bubble-body.md 同理；
        · font-style —— 正文保持斜体（那是「这是推理」的视觉身份），但代码块与表格里
          的斜体很难读，就地重置为非斜体。 */
   .thought-body.md { white-space: normal; }
@@ -734,11 +970,65 @@ export function styles(): string {
     border: none; font-family: inherit; font-size: 0.82em;
   }
   .nest-toggle.off { opacity: 0.5; }
-  .tool-body { padding: 4px 7px 7px; border-top: 1px solid var(--vscode-panel-border); }
+  /* [CUSTOM-20260929-121] 纵向收紧：工具卡一轮十几张，body 的上下留白各收 2px 就有几十像素。 */
+  .tool-body { padding: 3px 7px 5px; border-top: 1px solid var(--vscode-panel-border); }
+  /* [CUSTOM-20260929-121] IN / OUT 段：**左右两栏**（对齐官方插件）——段标在左列、
+     内容在右列。写成两行（标签一行、内容一行）时每张卡要多占两行，而工具卡在一轮里动辄十几张。
+     等宽只给命令本身（IN），不套整段——OUT 里是 markdown 渲染结果，等宽会毁掉它的排版。 */
+  .tool-seg {
+    display: grid;
+    grid-template-columns: 30px minmax(0, 1fr);
+    column-gap: 8px; align-items: start;
+    margin: 0 0 4px;
+  }
+  .tool-seg:last-child { margin-bottom: 0; }
+  .tool-seg-label {
+    grid-column: 1;
+    font-size: 0.72em; letter-spacing: .06em; text-transform: uppercase;
+    color: var(--vscode-descriptionForeground);
+    /* 与右侧首行的文字基线大致对齐（等宽 0.92em 的行盒比标签高一档）。 */
+    padding-top: 3px;
+  }
+  /* 段里除标签外的每个子节点都落在右列（否则 auto-placement 会把第二个子节点甩回第一列）。 */
+  .tool-seg > :not(.tool-seg-label) { grid-column: 2; min-width: 0; }
+  /* [CUSTOM-20260929-122] OUT 是一块内容区：淡背景 + 圆角，并且**限高滚动**——长输出不该把
+     面板顶走（340px 与 .diff-body 同一档，不新增第二个魔数）。
+     **底色与内边距挂在"内容格"上，不挂在网格容器上**：容器带左右内边距会把整个网格（含标签列）
+     往右推 6px，于是 OUT 的内容比 IN 偏右——实测 IN 内容列 x=65、OUT x=71，肉眼就是"没对齐"。
+     这也是为什么这里不用 padding 而用子选择器给每个内容格各自加框。 */
+  .tool-seg-out { background: transparent; padding: 0; border-radius: 0; }
+  .tool-seg-out > :not(.tool-seg-label) {
+    background: var(--vscode-textCodeBlock-background);
+    border-radius: 3px; padding: 2px 6px;
+  }
+  /* [CUSTOM-20260929-121] 工具输出里的代码块不要那两个装饰：围栏语言标签（"console"）对
+     命令输出没有信息量，而 has-lang 会给 pre 预留 20px 顶部内边距——那正是 OUT 框里
+     上方那片空白。assistant 气泡里的代码块照旧保留。 */
+  .tool-seg-out .code-lang { display: none; }
+  .tool-seg-out .code-wrap.has-lang pre { padding-top: 0; }
+  /* [CUSTOM-20260929-122] **字体与字号必须和 IN 的命令行一致**：工具输出里的 pre 落在
+     .tool-text 里（不在 .bubble/.md 作用域内），拿不到那套等宽规则，于是回落到浏览器默认
+     monospace（Windows 上是 Courier）——与 IN 的编辑器字体**字面宽度与左边界都不同**，
+     视觉上就是"IN/OUT 没对齐"，两种等宽并排也显得脏。顺带清掉 UA 给 pre 的 1em 上下边距
+     （盒子的底色与内边距已经由 .tool-seg-out 提供）。 */
+  .tool-seg pre, .tool-seg code {
+    font-family: var(--vscode-editor-font-family);
+    font-size: 0.92em;
+  }
+  .tool-seg-out pre { margin: 0; background: transparent; }
+  .tool-seg-out > .tool-text:first-of-type { margin-top: 0; }
+  .tool-seg-out .chip-row { margin-top: 0; }
+  /* [CUSTOM-20260929-118] 兜底的原始输出（agent 报了 rawOutput、但 content 里没有可渲染的项）：
+     终端文本按等宽渲染，限高与 .tool-seg-out 一致。 */
+  .tool-raw {
+    font-family: var(--vscode-editor-font-family); font-size: 0.9em;
+    white-space: pre-wrap; word-break: break-all; margin: 0;
+  }
+  .tool-body .tool-seg-out { max-height: 340px; overflow: auto; }
   .tool-command {
     font-family: var(--vscode-editor-font-family); font-size: 0.92em;
     background: var(--vscode-textCodeBlock-background);
-    border-radius: 3px; padding: 3px 6px; margin: 0 0 5px;
+    border-radius: 3px; padding: 2px 6px; margin: 0;
     white-space: pre-wrap; word-break: break-all;
   }
   .chip-row { display: flex; flex-wrap: wrap; gap: 4px; margin: 3px 0; }
@@ -799,7 +1089,8 @@ export function styles(): string {
     padding: 4px 6px 6px;
     background: var(--vscode-sideBar-background);
   }
-  .config-pickers { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 4px; }
+  .composer-bar { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+  .config-pickers { display: flex; flex-wrap: wrap; gap: 4px; margin-right: auto; }
   .picker { position: relative; }
   .picker-btn {
     display: inline-flex; align-items: center; gap: 4px;
@@ -824,6 +1115,23 @@ export function styles(): string {
   .picker-item { padding: 3px 8px; cursor: pointer; white-space: nowrap; }
   .picker-item:hover { background: var(--vscode-list-hoverBackground); }
   .picker-item.active { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
+  /* [CUSTOM-20260926-079] 历史列表的目录过滤 chip + 菜单：**复用** composer 那套
+     .picker-btn / .picker-menu / .picker-item（同一个"选一个值"的控件，观感应当一致），
+     只补三件它没有的东西：
+       · .down —— composer 的 picker 在面板底部、菜单向上弹；这个在 header 上、向下弹；
+       · 右对齐 —— chip 在 header 右侧，菜单该从它这一侧展开；
+       · .filter-item / .picker-count —— 行内有"名称 + 条数"，名称要能被省略号截断。 */
+  .picker-menu.down { top: 100%; bottom: auto; left: auto; right: 0; min-width: 240px; }
+  .filter-chip { max-width: 170px; font-size: 0.82em; padding: 0 5px; }
+  /* 过滤生效时给边框上色：与 .outline-item.active 同一套"当前项"语义。**不用环**——
+     环在这个面板里是键盘焦点（062 的教训）。 */
+  .filter-chip.on { border-color: var(--vscode-focusBorder); color: var(--vscode-foreground); }
+  .filter-icon { display: inline-flex; align-items: center; flex: none; opacity: .7; }
+  .filter-icon svg { display: block; }
+  .filter-caret { flex: none; opacity: .7; }
+  .filter-item { display: flex; align-items: center; gap: 8px; }
+  .filter-item-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .picker-count { flex: none; opacity: .7; font-size: 0.9em; }
 
   .attachments { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 4px; }
   .attachment {
@@ -851,13 +1159,26 @@ export function styles(): string {
   .prompt-input:focus { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
   .prompt-input:disabled { opacity: .55; }
   .send-stop {
-    flex: 0 0 auto; padding: 5px 12px; border-radius: 4px; cursor: pointer;
+    flex: 0 0 auto; width: 26px; height: 26px; padding: 0; border-radius: 4px; cursor: pointer;
     border: none; font-family: inherit; font-size: inherit;
+    display: inline-flex; align-items: center; justify-content: center;
     background: var(--vscode-button-background); color: var(--vscode-button-foreground);
   }
   .send-stop:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
   .send-stop:disabled { opacity: .5; cursor: default; }
   .send-stop.stop { background: var(--vscode-inputValidation-errorBorder, #be1100); color: #fff; }
+  .send-stop .send-icon { display: inline-flex; align-items: center; }
+  .send-stop .send-icon svg { display: block; width: 14px; height: 14px; }
+
+  /* [CUSTOM-20260928-096] 置底栏的上下文用量（Claude Code 风格：细条 + 百分比）。 */
+  .context-meter {
+    display: inline-flex; align-items: center; gap: 4px; flex: 0 0 auto;
+    font-size: 0.82em; font-variant-numeric: tabular-nums;
+    color: var(--vscode-descriptionForeground);
+  }
+  .context-meter .usage-track { width: 90px; }
+
+  .attachment-thumb { height: 20px; width: 20px; object-fit: cover; border-radius: 2px; flex: 0 0 auto; cursor: zoom-in; }
 
   /* Slash popup */
   .slash-popup {
@@ -899,8 +1220,11 @@ export function styles(): string {
   .ctx-item:disabled { opacity: 0.5; cursor: default; }
 
   /* Load overlay */
+  /* [CUSTOM-20260928-099] Scoped to the message area (its parent is
+     '.message-area', which is already 'position: relative') — it used to be
+     'position: fixed', which covered the tab strip, header and composer too. */
   .load-overlay {
-    position: fixed; inset: 0; z-index: 40;
+    position: absolute; inset: 0; z-index: 40;
     display: flex; align-items: center; justify-content: center;
     background: var(--vscode-sideBar-background);
     opacity: .92;
@@ -913,5 +1237,26 @@ export function styles(): string {
     animation: spin .8s linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* --- 图片放大查看（CUSTOM-20260928-097）--------------------------------- */
+  /* [hidden] 靠文件顶部的 [hidden]{display:none!important} 生效（pitfall #13）。 */
+  .image-lightbox {
+    position: fixed; inset: 0; z-index: 90;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0, 0, 0, 0.75);
+    cursor: zoom-out;
+  }
+  .image-lightbox-img {
+    max-width: 92%; max-height: 92%;
+    border-radius: 4px; box-shadow: 0 6px 28px rgba(0, 0, 0, 0.55);
+  }
+  .image-lightbox-close {
+    position: absolute; top: 14px; right: 14px;
+    width: 32px; height: 32px; padding: 0;
+    border: none; border-radius: 4px; cursor: pointer;
+    background: rgba(255, 255, 255, 0.16); color: #fff;
+    font-size: 16px; line-height: 1;
+  }
+  .image-lightbox-close:hover { background: rgba(255, 255, 255, 0.32); }
 </style>`;
 }
