@@ -201,6 +201,18 @@ export class ElicitationBridge {
     this.queue.length = 0;
   }
 
+  /**
+   * [CUSTOM-20260930-130] Is this session sitting on an unanswered form?
+   * Same reason as `PermissionBridge.hasPendingFor`: the tab dot tells "nothing moves
+   * until you answer" apart from "the agent is working".
+   */
+  hasPendingFor(sessionId: string): boolean {
+    for (const item of this.pending.values()) {
+      if (!item.resolved && item.prompt.sessionId === sessionId) { return true; }
+    }
+    return false;
+  }
+
   /** Diagnostics: how many forms are still awaiting an answer. */
   get pendingCount(): number {
     return this.pending.size;

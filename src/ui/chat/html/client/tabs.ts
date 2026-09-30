@@ -11,7 +11,7 @@ export const tabsClient = `
   var agentBar = null;
   var agentSelect = null;
   var cwdBtn = null;
-  var usageBar = null;
+
   // [CUSTOM-20260925-058] 'drafts' are LOCAL tabs: a new session that does not
   // exist yet. They are client state on purpose — the host knows nothing about
   // them, so 'sessionsChanged' / 'boot' must never clear this list.
@@ -68,7 +68,6 @@ export const tabsClient = `
     agentBar = NS.dom.qs('agentBar');
     agentSelect = NS.dom.qs('agentSelect');
     cwdBtn = NS.dom.qs('cwdBtn');
-    usageBar = NS.dom.qs('usageBar');
 
     NS.dom.qs('newTab').addEventListener('click', function () {
       // [CUSTOM-20260925-058] '+' opens a LOCAL DRAFT instead of creating a
@@ -77,6 +76,16 @@ export const tabsClient = `
       // close and recreate it — and 'session/close' does NOT remove a session
       // from the agent's history, so every change would leave an empty one
       // behind. The session is created on the first send instead.
+      //
+      // [CUSTOM-20260930-123] …but only once the agent is up. Opening a draft while
+      // offline produced a page whose composer was still disabled (nothing can be sent
+      // without a process), which reads as "I clicked + and cannot type". So an offline
+      // '+' connects first and leaves its intent behind: boot opens the draft when the
+      // connection lands. Already connected = unchanged, immediate draft.
+      if (NS.stateCard && !NS.stateCard.isConnected()) {
+        NS.stateCard.beginConnect(true);
+        return;
+      }
       if (NS.draft) { NS.draft.start(); }
       // [CUSTOM-20260925-047] New session = the user wants to type. (focus() on
       // a disabled textarea is a harmless no-op.)
@@ -118,13 +127,21 @@ export const tabsClient = `
   }
 
   function dotClass(summary) {
-    if (summary.loading) { return 'tab-dot loading'; }
-    // running wins over unread: a streaming tab is already pulsing, and two signals
-    // for one thing is worse than one (see CUSTOM-20260925-063).
-    if (summary.running) { return 'tab-dot running'; }
-    // [CUSTOM-20260925-063] Output arrived while this tab was in the background.
-    if (summary.unread) { return 'tab-dot attention'; }
-    return 'tab-dot';
+    // [CUSTOM-20260930-130] 两个**互相独立**的信号，按分工使用（用户指定）：
+    //   · 圆点的**颜色**说"这个会话处在什么状态"；
+    //   · 圆点外的**圈**说"它正在做事"。
+    // 它们必须独立：一个卡在权限提示上的轮次两件事同时为真（在跑 + 在等人），
+    // 而早先把 running 映射成"颜色 + 整体脉动"时，两件事被挤进了同一个信号里。
+    var cls = 'tab-dot';
+    // 优先级：等人回答 > 轮次在跑 > 载入历史 > 后台有新输出 > 平常。
+    // 「等人回答」排最前是因为只有它**没有任何东西会自己往前走**。
+    if (summary.waiting) { cls += ' waiting'; }
+    else if (summary.running) { cls += ' running'; }
+    else if (summary.loading) { cls += ' loading'; }
+    else if (summary.unread) { cls += ' attention'; }
+    // 外圈：轮次在跑，或正在 replay 载入——都算"这个会话正在做事"。
+    if (summary.running || summary.loading) { cls += ' busy'; }
+    return cls;
   }
 
   /**
@@ -241,7 +258,6 @@ export const tabsClient = `
       // has no session at all. (A draft sets its own header via renderDraftHeader, which
       // shows the button again.)
       cwdBtn.hidden = true;
-      usageBar.hidden = true;
       return;
     }
     cwdBtn.hidden = false;
@@ -257,31 +273,6 @@ export const tabsClient = `
     cwdBtn.hidden = false;
     cwdBtn.textContent = draft && draft.cwd ? draft.cwd : 'Default directory';
     cwdBtn.title = 'This session will be created in this directory\\n(not created yet)';
-    usageBar.hidden = true;
-  }
-
-  function renderUsage(meta) {
-    if (!meta || !meta.usage || !meta.usage.size) {
-      usageBar.hidden = true;
-      return;
-    }
-    var usage = meta.usage;
-    var pct = Math.max(0, Math.min(1, usage.used / usage.size));
-    usageBar.hidden = false;
-    NS.dom.clear(usageBar);
-
-    var fillClass = 'usage-fill' + (pct > 0.9 ? ' hot' : (pct > 0.7 ? ' warn' : ''));
-    var track = NS.dom.el('span', 'usage-track');
-    var fill = NS.dom.el('span', fillClass);
-    fill.style.width = Math.round(pct * 100) + '%';
-    track.appendChild(fill);
-    usageBar.appendChild(track);
-
-    var label = Math.round(usage.used / 1000) + 'k / ' + Math.round(usage.size / 1000) + 'k tokens';
-    if (usage.costAmount !== undefined && usage.costAmount !== null) {
-      label += '  ' + usage.costAmount + ' ' + (usage.costCurrency || '');
-    }
-    usageBar.appendChild(document.createTextNode(label));
   }
 
   function setSessions(sessions) {
@@ -355,8 +346,7 @@ export const tabsClient = `
     setDrafts: setDrafts,
     setDraftFocus: setDraftFocus,
     expectTabFocus: expectTabFocus,
-    focusFirstSession: focusFirstSession,
-    renderUsage: renderUsage
+    focusFirstSession: focusFirstSession
   };
 })(window.__acpc = window.__acpc || {});
 `;

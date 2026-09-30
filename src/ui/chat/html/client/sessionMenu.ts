@@ -1,8 +1,10 @@
 // [CUSTOM-BEGIN] CUSTOM-20260925-032/033 - 面板内的「连接」与「历史会话」入口：新增客户端模块。
-// 两个入口的存在意义相同：**不再依赖侧边栏**。
-//   · 连接按钮：面板空着时（没连接 / 没聚焦会话）一键连上，不必先去 Agents 视图；
-//   · 历史会话：标题栏的 ↺ 拉出该 agent 的历史会话列表（agent 侧 session/list，或本地缓存），
-//     点一条即打开（`session/load` 重放，退化为 resume）。
+// [CUSTOM-20260930-123] 本文件现在只剩「历史会话」那一半：连接按钮（含它的标签、相位与
+// 自动连接开关）已整体移交 client/stateCard.ts。原先"标签归 boot、动作归这里、相位归第三个
+// 地方"是同一份知识的三份拷贝，正是 pitfall #19 描述的那种迟早只改一边的结构。
+//
+// 历史会话：标题栏的 ↺ 拉出该 agent 的历史会话列表（agent 侧 session/list，或本地缓存），
+// 点一条即打开（`session/load` 重放，退化为 resume）。
 //
 // 列表样式复用会话大纲（021）的 `.outline*` 类：两者都是"标题栏下沿的浮层"，外观应当一致。
 //
@@ -21,7 +23,6 @@ export const sessionMenuClient = `
   var drawer = null;
   var headEl = null;
   var listEl = null;
-  var connectBtn = null;
   var open = false;
   var pending = false;
 
@@ -446,7 +447,6 @@ export const sessionMenuClient = `
   function init() {
     button = NS.dom.qs('historyBtn');
     drawer = NS.dom.qs('history');
-    connectBtn = NS.dom.qs('emptyConnect');
     filterChip = NS.dom.qs('historyFilter');
     filterMenu = NS.dom.qs('historyFilterMenu');
     if (drawer) {
@@ -481,24 +481,6 @@ export const sessionMenuClient = `
         button.appendChild(icon);
       }
       button.addEventListener('click', function (event) { event.preventDefault(); toggle(); });
-    }
-    if (connectBtn) {
-      // [CUSTOM-20260927-090] The LABEL is boot's (the empty state owns it, and it
-      // depends on whether the agent is already up) — see applyEmptyState. Writing it
-      // here too would be a second source of truth for the same string.
-      connectBtn.addEventListener('click', function (event) {
-        event.preventDefault();
-        // [CUSTOM-20260925-058] Open a DRAFT straight away, then ask the host to
-        // make sure the process is up. The draft is what gives "nothing to show"
-        // a usable meaning (a page whose directory you can pick and whose first
-        // message creates the session) instead of an empty session created
-        // eagerly — which, since 'session/close' never removes a session from
-        // the agent's history, would pile up a junk entry per click.
-        // If the agent already has sessions the host focuses the newest one; the
-        // draft stays in the strip and the user can come back to it.
-        if (NS.draft) { NS.draft.start(); }
-        NS.bridge.post({ type: 'connectAgent' });
-      });
     }
     document.addEventListener('keydown', function (event) {
       if (event.key === 'Escape' && open) {

@@ -37,7 +37,7 @@
 | `panelContract.ts` | `IChatPanel` / `PanelContext` / `PanelId` + **`MODERN_AGENTS` / `isModernAgent()`**（019 从 router 移来，供 host 与编辑区面板共用，避免循环依赖） | 面板接口 / agent 策略变更 |
 | `protocol.ts` | postMessage 判别联合（`ExtToChat` / `ChatToExt`）+ `verifySession` 纪律 | 增删消息类型 |
 | `markdown.ts` | `SafeMarkdown`：覆盖 `marked` 的 `html`/`link`/`image` 三个渲染钩子。**必须用 `new Marked()`**（旧面板改的是全局单例） | markdown 安全策略变更 |
-| `sessionChoices.ts` | **073 新增**。切换状态（mode + config options）的**快照 / 按通知载荷打补丁 / 算差异 → 人类可读的一句话**。纯函数，宿主只做缓存与发帖（去重靠"缓存由宿主独占"，见 §5.22） | 改切换提示的表述、或改"两条上报路径怎么去重" |
+| `sessionChoices.ts` | **073 新增**。切换状态（mode + config options）的**快照 / 按通知载荷打补丁 / 算差异 → 人类可读的一句话**。纯函数，宿主只做缓存与发帖（去重靠"缓存由宿主独占"，见 §5.22）。**128 起模式以 config option 为权威**：快照的 modeId 由它派生、mode payload 写回该副本——两通道各存一份副本且只写一份时，去重会静默失效（见 §5.22 末与 pitfalls #34） | 改切换提示的表述、或改"两条上报路径怎么去重" |
 | `historyDirs.ts` | **079 新增**。历史选择器的目录过滤器：`directoryKey`（目录同一性：平台大小写规则 + 尾分隔符）/ `directoryOptions`（候选目录与条数）/ `folderName`。纯函数，宿主算 key、客户端只比较（见 §5.24） | 改"两个路径算不算同一个目录"、或改候选目录的来源与排序 |
 | `transcript/types.ts` | transcript 记录模型（`user`/`assistant`/`thought`/`tool`/`plan`/**`content`**/`notice` 七类，`content` 承载非文本消息块）+ `ToolInvocation` | 记录结构变更 |
 | `transcript/TranscriptStore.ts` | 按会话存记录；三重上限（500 条 / 24 会话 LRU / 64KB 每条）；活跃会话豁免 LRU。`finalizeStreaming` 带 `only` 过滤（**不要**在正文 chunk 上调用无参形式，那会把一次回复碎成 N 个气泡） | 容量策略 / 新记录类型 |
@@ -49,7 +49,7 @@
 | `html/index.ts` | `renderChatHtml(webview, nonce, surface = 'view')`：外壳 + 样式 + 标记 + 脚本。**`surface` 会变成 `<body class="surface-view\|surface-editor">`**（050），供 CSS 区分侧边栏与编辑区底色 | 装配顺序变更 |
 | `html/shell.ts` / `styles.ts` / `body.ts` | CSP 与文档外壳 / 全部 CSS / 静态标记 | UI 外观 |
 | `html/nonce.ts` | CSP nonce 生成 | — |
-| `html/client/*.ts` | webview 内联客户端 JS，**每个模块是一个字符串**，统一挂到 `window.__acpc`。058 新增 `directoryMenu.ts`（草稿页的目录抽屉，形态照抄 `sessionMenu.ts`）；097 新增 `lightbox.ts`（图片点击放大）；102 新增 `stickyUser.ts`（置顶最近一条用户消息，判据见 §5.25） | 改前端交互 |
+| `html/client/*.ts` | webview 内联客户端 JS，**每个模块是一个字符串**，统一挂到 `window.__acpc`。058 新增 `directoryMenu.ts`（草稿页的目录抽屉，形态照抄 `sessionMenu.ts`）；097 新增 `lightbox.ts`（图片点击放大）；102 新增 `stickyUser.ts`（置顶最近一条用户消息，判据见 §5.25）；123 新增 `stateCard.ts`（**连接状态卡**：未连接/连接中/已就绪三态 + 自动连接开关，见 §5.28——它同时接管了原先散在 `sessionMenu.ts` 与 `boot.ts` 的空态文案和 Connect 按钮） | 改前端交互 |
 
 **终端输出通路**（CUSTOM-20260923-012）：ACP 的 `Terminal` 工具内容只是引用（`{terminalId}`），终端归客户端所有。
 链路为：`ConnectionInfo.terminals`（`ConnectionManager` 暴露）→ `TerminalHandler.readOutput(terminalId)`
@@ -99,7 +99,9 @@
 
 **规则二：非会话作用域的消息必须在守卫之前处理。**
 `verifySession` 守卫之前的那个 switch 是给**按设计不带 `sessionId`** 的消息用的：
-`ready` / `newSession` / `focusAgent` / `renderMarkdown` / `copy` / `openLink` / `executeCommand`。
+`ready` / `newSession` / `focusAgent` / `renderMarkdown` / `copy` / `openLink` / `executeCommand` /
+`connectAgent` · `listHistory` · `openHistorySession` · `createDraftAndSend`（032/033/058）/
+`setUiPref`（077）/ `setAutoConnect`（125）。
 **把这类消息放到守卫之后 = 它们会被全部丢弃。**
 这不是理论风险：Phase 2 的 `renderMarkdown` 就被放在了守卫之后，导致 markdown 渲染整条链失效
 （助手气泡只显示原始 markdown 文本，代码块/复制按钮/链接全都没有），而所有自动化检查都是绿的——
@@ -299,7 +301,7 @@ pending ──用户点按钮──► selected        （回答 optionId）
 
 | 关注点 | 规则 |
 |---|---|
-| DOM 位置 | `#rail`/`#railTrack` 是 `.message-area` 的**兄弟节点**（`#messages` 之外）。**不要**放进 `#messages`：那里的三档间距阶梯（`.messages > * + *` 的 `margin-top`）会位移它，它也会被当成一个"条目"参与 flex 排版 |
+| DOM 位置 | `#rail`/`#railTrack` 与 `#messages` 同属 **`.messages-column`**（`#messages` 之外）。**不要**放进 `#messages`：那里的三档间距阶梯（`.messages > * + *` 的 `margin-top`）会位移它，它也会被当成一个"条目"参与 flex 排版。**132 起它是该列的绝对定位子元素**（原为 `.message-area` 的兄弟节点）：横向位置全靠 CSS 的 `.rail{left:0}`、JS 只测纵向，所以**锚在哪一层就贴哪条左缘**。137 撤销了消息列的限宽（列恢复满宽，与改动前逐像素一致），搬迁仍然保留 —— 列才是消息内容的定位容器，将来若再限宽也不必重做（见 §5.31）。**别挪回去** |
 | 随内容滚动 | track 做 `translateY(-scrollTop)`（同一个 rAF tick 里，且值未变则不写） |
 | 布局读取分档 | **`invalidate()`**（条目集合/状态变化）先比标记签名，签名没动就**不读布局**——流式 chunk 走的就是这条；**`reflow()`**（布局变化、resize）只测量不重建。500 个标记全量测 `offsetTop` 是毫秒级的，分档就是为了避开它 |
 | **布局变化后重对齐（070）** | **不枚举触发事件，而是观察布局本身**：一个 `ResizeObserver` 观察**每条记录节点**（`watch()`，由 `transcriptView` 在"节点进 `#messages`"与"节点被替换"的**全部 6 处**调用——漏一处 = 那条记录的圆点从此不再动，且完全静默），回调 → `reflow()`。此前只有"标记集变化 / window resize / markdown 回填"三个时机，`<details>` 展开、工具卡正文展开（`links.toggleBody` 改的是 `hidden` 属性，**没有任何事件**）、图片加载完都不在其中 ⇒ 展开后圆点停在旧高度。**回调跳过 `streaming` 的记录**：流式条目每个 chunk 都在长，测量它们会毁掉上面那条"流式期间零布局读取"（streaming 条目的首行不可能移动，圆点本来就对）。**只观察记录节点**，观察 rail/track 自己就是观察自己的输出（回环）。不做 `toggle` 兜底——它只覆盖 `<details>`，是"半个修复且没有信号"（完整教训见 `pitfalls.md` #27）。`reset()` 要 `resetNodes()`：ResizeObserver **强引用**被观察元素 |
@@ -391,7 +393,7 @@ pending ──用户点按钮──► selected        （回答 optionId）
 **其他值得知道的风险**
 
 - `'Claude Code'` 这个字面量出现在 **4 个语义不同的地方**：`panelContract.MODERN_AGENTS`（面板路由）、
-  `NestingStrategy.resolveNestingStrategy`（嵌套策略）、`sessionMenu.ts` 的空态文案（客户端硬编码）、
+  `NestingStrategy.resolveNestingStrategy`（嵌套策略）、`stateCard.ts` 的空态文案（客户端硬编码，123 从 `sessionMenu.ts`/`boot.ts` 收拢到这里）、
   `AgentConfig.getAgentNames`（排序）。新增第二个 modern agent 时要同改四处。
 - `sanitize()` 的 `ATTR_ALLOWLIST` **放行全部 `data-*`**，而点击委托偏偏信任 `data-href` / `data-path` /
   `data-terminal`——这层兜底实际没约束住它最该约束的几个属性。当前不可利用（`SafeMarkdown.html()`
@@ -412,7 +414,7 @@ pending ──用户点按钮──► selected        （回答 optionId）
 | 代价（写在这里免得被当成 bug） | 悬浮条会**长时间盖住下方内容**，而且"消息滚走"在视觉上不再发生——它变成"消息停住、下方内容从它下面流过"。收缩按钮与 `max-height: 40%` 是两个出口 |
 | 为什么**没有阈值** | 用户选定"露出一像素就算在显示区"。单一阈值 ⇒ 同一画面从不同方向到达结果相同、不会闪；"露出超过 X 才不置顶"是量出来的常量，换面板高度/字号就错位（pitfalls #24/#26）。102 的 8px 容差已在 103 去掉 |
 | 为什么不用**滚动方向** | 判据只依赖当前画面。记住方向会让同一画面从不同来向显示不同结果 |
-| 横向范围 | `#stickyUser` 与 `#messages` 同属 **`.messages-column`**（103 新增的定位容器）。102 时它是 `.message-area` 那一 flex 行的兄弟，而该行还有**定宽可拖拽**的大纲栏 ⇒ 覆盖层横跨两段、右边伸进大纲栏下面。挪进容器后由**构造**保证不越界 |
+| 横向范围 | `#stickyUser` 与 `#messages` 同属 **`.messages-column`**（103 新增的定位容器）。102 时它是 `.message-area` 那一 flex 行的兄弟，而该行还有**定宽可拖拽**的大纲栏 ⇒ 覆盖层横跨两段、右边伸进大纲栏下面。挪进容器后由**构造**保证不越界。该列 132 一度限过宽、**137 已撤销**（见 §5.31）：sticky 是列的绝对定位子元素，宽度始终跟着列走；`alignToContent()` 量的仍是滚动条宽（`offsetWidth − clientWidth`，与列宽无关），照旧成立。`#jumpToLatest` 也在 132 搬进了该列 |
 | 三层结构（104） | `.sticky-user`＝定位层（透明、`pointer-events:none`，卡片周围的内容与点击都透过去）→ `.sticky-card`＝外观层（底色/圆角/**1px 高亮边框**/阴影）→ `.sticky-body`＝克隆体的 flex 列（`align-self` 必需） |
 | 对齐（105，用户报"还是没对齐"） | 卡片右缘要让开**滚动条**：`.messages` 是滚动容器，`scrollbar-width: thin` 照样占布局宽度 ⇒ 消息的内容盒比消息列窄几像素，而悬浮条不是滚动容器。`sync()` 里用 `offsetWidth - clientWidth` 量出来写进 host 的 `right`（没有滚动条就是 0）。**别换成常量**——它随滚动条出现/消失、随主题与字号变（pitfall #24 的反面：锚真实几何） |
 | 边框为什么是 border | 高亮边框是真 `border`（1px `--vscode-focusBorder`，本面板「当前项」的既有语义，同 `.outline-item.active` / `.filter-chip.on`），host 水平内边距相应由 19/10 改成 **18/9** 把这 1px 还给内容盒。**不能用环**：环在这个面板里已经是键盘焦点（062 的教训）。也别改回 `box-shadow` 环——104 用它只是为了避开布局位移，有了 padding 补偿就不必了 |
@@ -475,3 +477,92 @@ pending ──用户点按钮──► selected        （回答 optionId）
 | 半填的草稿 | **只留在 webview 里**（DOM 就是表单状态），不进 transcript——否则每次 revise/快照都会把草稿重发一遍。结算态（accepted/declined/cancelled + summary）才由宿主写进记录 |
 | 兜底弹框 | 无面板时**逐字段**问（VS Code 没有表单对话框）：select/multi → QuickPick、boolean → Yes/No、文本/数字 → InputBox。**取消某一步 = decline（跳过）**；面板里的 Cancel 才是硬中止 |
 | **重开别人的会话不会重抛（实测）** | `session/load` 一个"卡在提问上"的会话时，adapter **只回放工具卡**、不会重新发 elicitation（`probe-elicitation.mjs --no-answer` 造出该状态再 `--reopen` 实测：0 次）。官方插件能弹是因为**那个未决请求在它自己的进程里**；我们重开时是另一个进程，替它回答不了。详见 pitfalls #32 |
+
+### 5.28 连接状态卡与自动连接（CUSTOM-20260930-123..126）
+
+**它修的是什么**：点 Connect 之后面板立刻切到草稿页，而真正的 spawn + initialize（首次 `npx` 可能下载几分钟）
+**在界面上完全不可见**；而草稿页中央是空的（`focusDraft` 调 `showEmpty(false)`）。结果是用户反复点按钮，
+连上之后又只看到一片空白。现在这一层是三态卡片（`html/client/stateCard.ts`）。
+
+| 关注点 | 规则 |
+|---|---|
+| 三态 | `phase = connecting ? 'connecting' : (connected ? 'ready' : 'disconnected')`。`connected` 有**两个来源**（`boot`/`focus`/`sessionsChanged` 的 `agentConnected` 说的是"进程还活着/已死"，`connection{state:'connected'}` 说的是"刚连上"），`connecting` 也有两个（本地点击、宿主广播）。 |
+| **`connection` 必须无条件回话** | `refreshSessions` 靠签名去重（`conn:` 位），而 `ensureConnected` 在进程已起时**不发任何事件** ⇒「已连接 + 无会话 + 点 Connect」这条路上宿主原本一句话都不会说，客户端的"连接中"会**永久卡死**（pitfalls #29 的形态：效果上没变化 ≠ 可以不回话）。三种出口（无 agent / 成功 / 失败）各发一次。 |
+| 顺序是承重的 | `handleConnectAgent` 里 `focusSession(newest)` 必须排在 `connection{connected}` **之前**——客户端靠这个顺序决定开不开草稿，反了会在刚打开的会话旁边多出一张空标签。`connection` 因此也进了 `STRUCTURAL_MESSAGE_TYPES`（排进合帧队列就可能反过来）。 |
+| 谁写 `display` | **仍然只有 `boot.showEmpty()`**。卡片模块只写内容（textContent / checked / disabled / 子节点 hidden）。卡片是 `role="status"`，所以文本**先比较再写**——每写一次读屏就播报一次。 |
+| 草稿的时机 | 点 Connect **不再立即开草稿**。`handleConnectAgent` 成功后：**有会话就聚焦最新的那条**，**没有会话就建一个**（131，用户在三方案里选的）。"未连接时输入框禁用"因此自然成立——`composer.ts` 的 `canCompose()` 一个字节没改。**为什么无会话时是"建会话"而不是"开草稿"**：草稿页**永远**做不到"和正常会话一样"——图片要挂在会话上，模式/模型选择器来自 `session/new` 的响应，没有会话就没有（`composer.setDraft` 的注释里写着这条）。代价：连上后不说话就离开会在 agent 历史里留一条空会话（`session/close` 不删历史，058）。 |
+| 相位也是面板级的 | `stateCard.render()` 把相位写到 `body[data-phase]`，header 上的 `Times` 按钮据此隐藏（129 之前它在未连接时也显示）。写在 body 上而不是让每个按钮各自监听：少三处同步，而且**本地点击发起的 `connecting` 也覆盖到了**（那条路径不经过宿主）。 |
+| `stickyUser` 的残留 | `showEmpty(true)` 里补 `NS.stickyUser.reset()`：置顶卡片是 `.messages-column` 的绝对定位子元素，`transcriptView.reset()` 清不掉它，而卡片没有背景 ⇒ 草稿页会让上一个会话的置顶卡**透出来**。 |
+| 无会话的失败 | `case 'error'` 与 `draftFailed` 原先往空 transcript 里 append 通知并 `showEmpty(false)`（卡片被藏起来、中央只剩一行孤零零的报错），现在写进卡片的 `.state-error`。 |
+| 自动连接的前提 | `autoConnect && !agentConnected && !focused`，**延迟 1s**（131 从 500ms 上调：面板刚渲染完就连接，用户还没看清卡片上写着什么）。布防**幂等**（boot 会在同一个文档上投递两次），触发时**再复查一遍**（这一秒里可能已经连上、或用户已经在别的草稿页上打字——判据用 `composer.isComposable()` 这个**直接信号**，不用代理信号）。 |
+| 不谎报失败 | 45s 没回话**不报错**：`ensureConnected` 本身没有超时，首次 `npx` 下载可以几分钟。只把按钮放开（允许重试）并说明原因——谎报失败比慢更糟。 |
+| 设置的读写 | `acpc.autoConnectOnOpen` 经 `PanelPrefsIO` 注入缝读写（默认实现才碰 `vscode.workspace`；测试给桩，**不碰真实 settings.json**）。**写失败时广播的是设置真值而不是请求值**，否则复选框会显示一个 settings.json 里没有的值。宿主只在这一个 key 上挂了 `onDidChangeConfiguration`——面板把这个配置项**渲染成了控件**，控件显示过期值就是在撒谎。 |
+| 开关什么时候在 | 只在**未连接 / 连接中**显示。连上之后卡片是"去下面打字"的路标，不是一个设置表单——开关管的是"下次打开这个面板"（127，用户复验提出）；**连接中仍然保留**，那恰恰是最想关掉它的时刻。隐藏的是整行 `#autoConnectRow` 而不是那个 `<input>`，否则标签文字会留在原地。 |
+| 居中与溢出 | `#emptyState` 用「容器 `flex-start` + 卡片 `margin: auto`」而不是 `justify-content: center`（内容一超高，center 会把顶部裁掉且**滚不到**，pitfall #17 同族）；卡片**不写 `overflow`**（会在 flex 列里被压扁），写 `width: 100%`（否则取 fit-content，窄侧边栏里的行为就只能靠推断，见 pitfalls #31）。实测入口：`preview-records.mjs` 的 `#empty` / `#connecting` / `#ready` / `#narrow`，几何靠 `#probe` + `chrome --dump-dom` 读回来。 |
+
+### 5.29 记录时刻的位置与上下文用量（CUSTOM-20260930-129）
+
+用户在复验 123 时提的三条界面调整。
+
+| 关注点 | 规则 |
+|---|---|
+| 时刻挂在**标题行**里 | `.rec-time` 绝对定位浮在记录右上角，但**DOM 上必须位于标题行之内**（工具卡是 `.tool-head` 的一项，其余进 `summary`）——折叠的 `details` 会隐藏 summary 之外的一切，挂在记录节点上的话折叠态就看不到时刻了。`.messages > *` 因此要有 `position: relative`。工具卡用 `appendChild`（跟在耗时之后 ⇒ `2.2s 11:57`），其余用 `insertBefore(…, summary.firstChild)`（绝对定位下 DOM 顺序无关，这样能保住"正文是 summary 最后一个子节点"这条既有约束） |
+| 顶部进度条已删除 | `#usageBar` / `tabs.renderUsage` / `.usage-bar` `.usage-track` `.usage-fill` 全部删掉；**成本**信息移进底部圆环的 tooltip。上下文用量现在只有一处呈现 |
+| 底部圆环 | 24px 的两圈 SVG。内圈 = 进度（`stroke-dashoffset` 由 JS 按百分比算好，`rotate(-90deg)` 把起点挪到 12 点方向），圆心 = 百分比数字（不带 `%`），配色沿用 0.7 / 0.9 两档。**外圈 = "有轮次在跑"**：一段 1/4 弧缓慢旋转，用 `currentColor`（**不是**进度的蓝色——同色会被读成两根进度条），半径比内圈大 2.5（只差 1.5 时两环贴在一起，读不出是"外圈"）。数据仍是 `meta.usage`；`setRunning` 是外圈的唯一开关，而那条路径拿不到 `meta`，所以 composer 自己留了一份 `lastUsage` |
+| 视觉验收 | `preview-records.mjs` 的 `#times` / `#timescollapsed` / `#gauge`（外加 `#gaugewarn` / `#gaugehot` / `#gaugebusy` / `#gaugebig`）。**圆环的配色与外圈半径都是看图才改对的**——布局与观感不靠推（pitfall #31） |
+
+### 5.30 标签状态点：颜色说状态，外圈说"正在做事"（CUSTOM-20260930-130）
+
+**分工**（用户指定）：圆点的**颜色**表达这个会话处在什么状态，圆点外的**涟漪圈**表达"它正在做事"。
+两者必须独立 —— 一个卡在权限提示上的轮次两件事同时为真（在跑 **+** 在等人），挤进同一个信号就必然丢掉一件。
+
+| 状态 | 颜色 | 外圈 |
+|---|---|---|
+| 等人回答（权限 / 表单） | 橙 `--vscode-charts-orange` | 有（轮次通常还在跑） |
+| 轮次在跑 | 蓝 `--vscode-progressBar-background` | 有 |
+| 载入历史（replay） | 黄 `--vscode-charts-yellow` | 有 |
+| 后台有新输出（unread） | 蓝 `--vscode-charts-blue` | 无 —— 它是关于**过去**的提示，不是当下的活动 |
+| 平常 | 灰 `--vscode-descriptionForeground` | 无 |
+
+- **数据**：`waiting` 从两个桥的 `hasPendingFor(sessionId)` 读 —— **桥才是 pending 的唯一持有者**，
+  宿主不存第二份（pitfalls #19）。
+- **必须计入 `refreshSessions` 的签名**：数据变了而签名没变 ⇒ 标签栏永远不刷新。这条在 022（unread）
+  与 063 上各踩过一次，警告就写在签名旁边。
+- **样式**：颜色走 `color` + `background: currentColor`，外圈的 `border-color` 用同一个 `currentColor` ——
+  颜色只有一个来源，改一处就够。
+- 另：就绪卡的标题是 **`Claude Code is ready`** 而不是 `Connected to Claude Code` —— 后者与
+  `Connect to Claude Code` 只差一个字母，扫读时会被读成"还需要连接"。
+
+### 5.31 底部栏：悬浮输入卡 + 预留功能区（CUSTOM-20260930-132..139）
+
+**症状**：面板一拉开，底部输入框横向铺满整个 webview（一行文字横跨 1400px+），发送按钮离正文很远、不好点。
+
+**先撤销了一半**：132 曾把**消息列与输入区一起**限到 820px 居中；137 按用户要求撤销了**消息列**的限宽（消息要平铺开、读得更宽），只保留底部这一块限宽 —— 两件事的目标本来就不同：消息区要宽，输入条要短。
+
+| 主题 | 结论 |
+|---|---|
+| 底部栏结构（138） | `.composer` 是**两列** flex：`.composer-main`（输入卡）+ `.composer-aside`（预留功能区）。用两列而不是"给左边补一段 padding"的算法，是因为主列宽度天然等于"面板宽 − 预留区宽"，**输入卡的中线与消息列的中线自动重合** —— 少维护一个等式（pitfall #24） |
+| 输入卡宽度（137） | `--acpc-composer-max: 720px`，定义在 `body` 上（输入区是它的后代；`.composer` **不是** `.message-area` 的后代，挂那边够不着）。窄面板自动退化成满宽 |
+| 为什么不用 media / container query | 它们键的是**窗口**（或另一个容器），而这里取决于**面板**宽度 —— 正是 pitfalls #25/#26 说的代理信号。`max-width` 自带退化：窄面板下没有余量可分 |
+| 竖线（138） | `.composer-aside` 的 `border-left` 就是用户要的那根线。它的宽度取自 `--acpc-aside-w`（由 `outline.ts` 的 `applyReserve()` 写入 = 大纲栏宽度，默认 240）⇒ 与**钉住的大纲栏左边界**落在同一条竖线上。两个宽度**同源**，不是对齐到一个常量（pitfall #19） |
+| `.composer` 的左右 padding 必须为 0（138） | 右侧任何 padding 都会让竖线比大纲栏左边界靠左同样的像素数（实测差 8px 就是这么来的）。输入卡自己的边距交给 `.composer-main` 的**对称** padding —— 对称 padding 不改变主列中心，所以卡片与消息列的中线仍然重合（实测 `dxCardVsCol = 0`） |
+| 真悬浮（139 + 140） | 139 去掉通栏的 `border-top`，改由卡片的描边 + `box-shadow` + 8px 圆角 + 四周留白表达"浮在底部"，但它**仍在文档流里** —— 于是底部这一整条（含卡片两侧那两块空白）都不显示消息，用户报"输入框两侧还是会盖住消息内容"。140 改成**真悬浮**：`.composer` 绝对定位（`body` 因此要 `position: relative`）、**背景透明**（有底色就等于把两侧的消息蒙上一块），消息区占满整个高度、卡片浮在上面 |
+| 底部留白（140 + 144） | **一贯存在**：`.messages` 的 `padding-bottom: calc(24px + var(--acpc-composer-h, 0px))` —— 内容永远停在卡片上方、不会被它遮挡（用户明确要求"消息区的触底判断应该保持在输入框上面的位置"）。配套的是 `scroll.ts` 的判据要**减掉这段留白**：用"内容末尾"而不是"可滚动范围的末尾"算 distance，这样"内容末尾进入视口"与"判定为到底"就是同一件事 —— 否则会出现"Jump 还说没到底、下面却已经是空白"的灰色地带（那正是被反复报的那个区间）。⚠️ 中途试过"只在贴底那一刻让位"的条件式（`.pin-bottom` 类）：**方向是错的** —— 未到底的内容会被卡片切断，还要在 scroll.ts 里维护"切类 + 位置补偿"，白白多出三个坑（都实测过，记录见 changelog）。`--acpc-composer-h` 由 `composer.ts` 的 `watchHeight()` 用 ResizeObserver 观察底栏本身写入（pitfall #27）；`#jumpToLatest` 的 `bottom` 用同一个变量补偿。桩 DOM 里 `#composer` / `body.style.setProperty` / `getComputedStyle` 都不存在，三处都判空 |
+| 底栏的两条"隐形"规则（144） | ①**编辑区面不能给底栏刷背景**：`.surface-editor .composer { background: editor-background }` 会把这条浮层变成一块**不透明带** —— 输入卡两侧的消息、右侧大纲栏的底部全被它盖住。而这个面正是用户日常用的：预览脚本默认渲染**侧边栏面**，所以这条一直没被照出来（`#…surfaceeditor` 档就是为它加的，探针读 `composerBg`）。②**底栏空区不吞点击**：`.composer` 通栏但 `pointer-events: none`，只有 `.composer-inner`（卡片与它的弹层）是 `auto` —— 否则输入卡两侧、大纲栏底部那块的点击会被它拦下（实测：大纲最后一条的 `elementFromPoint` 命中的是 composer，而不是那条记录） |
+| 悬浮后的 z-index | 底栏 `z-index: 8`：高于置顶卡片（6）与引导条（3）；消息内容本身不带 z-index。`.picker-menu`（20）与 `.slash-popup`（30）都在底栏的层叠上下文内，所以它们照样盖住消息区 |
+| 默认一行（139） | `autoGrow` 里 60px 的下限已放开，高度就是内容的自然高度；空内容 / JS 未跑时由 `.prompt-input` 的 `min-height: calc(1.4em + 4px)` 保底（与 1.4 的行高同源） |
+| 高度上限是两件事 | `autoGrow` 的 320 是**内容**上限；`--acpc-input-max-h: min(320px, 38vh)` 是**视口**上限。两者并存时浏览器取小的那个，所以 JS 不需要知道视口有多高 |
+| 预留功能区（138 + 143） | 与输入区并列的第二列，宽度与大纲栏同源。**[143] 只在钉住的大纲栏可见时才占宽度**（`applyReserve` 写 0 或侧栏宽）—— 没有大纲就没有那根竖线，输入卡随之在面板里居中；`width` / `border-left` / `padding-left` 三处都用 `min(…, var(--acpc-aside-w, 0px))`，否则宽度归零时那 1px 边框与 8px padding 仍然占着位置。**里面先空着**：用户要求"留着后面设计好方案再谈怎么用"，138 搬进去的上下文圆环 143 已回到按钮栏。`max-width: 40%` 仍是窄面板下的安全阀 |
+| 未连接时不显示底栏（143） | `body[data-phase="disconnected"] .composer, body[data-phase="connecting"] .composer { display: none }` —— 那时输入框本来就是禁用的，露一个"看得见却打不了字"的框只会让人以为它坏了。相位由 `stateCard` 写在 `body[data-phase]` 上（与上面 `Times` 那条同一个机制）。副产品：`display: none` 让 ResizeObserver 把 `--acpc-composer-h` 归零，消息区不再为一条并不存在的底栏留白 |
+| 一体式卡片（133） | `.composer-card` 里装 textarea 与 `.composer-bar`；textarea 去边框、透明底。`.input-row` 这层已删（它唯一的子节点就是 textarea，而原 `flex:1` 在 flex **列**里含义完全不同） |
+| 卡片不许写 overflow | `.picker-menu` 与 `.slash-popup` 都要向上弹；而且 column flex 上的 overflow 会**压扁子项**而不是让容器滚动（pitfalls #17） |
+| 焦点环（134） | 从 textarea 移到卡片（`.composer-card:focus-within { border-color: --vscode-focusBorder }`），只对 `.prompt-input` 抑制 outline。全局 `:focus-visible` 不动 —— **"环 = 键盘焦点"的语义（062）不变** |
+| `.slash-popup` 的 left/right | 从 6px 改成 0：定位祖先已从 `.composer` 换成 `.composer-inner`，0 才对得上卡片的边 |
+| `#rail` 与 `#jumpToLatest`（132） | 搬进了 `.messages-column`（原为 `.message-area` 的子节点）。它们的横坐标来自 CSS 的 `left:0` / `left:50%`，锚错一层就贴错边。137 撤销列限宽后列恢复满宽、与改动前逐像素一致，搬迁**保留** —— 列才是消息内容的定位容器，将来若再限宽也不必重做。**别挪回 `.message-area`** |
+| 消息列的定位意义 | `.messages-column` 不再限宽，但它仍是 `.sticky-user` / `.rail` / `#jumpToLatest` 的定位容器；`alignToContent()` 量的仍是滚动条宽（`offsetWidth − clientWidth`） |
+
+**怎么验收（布局只能量，不能推 —— pitfalls #31）**：`preview-records.mjs` 的 `#composer*` 档**必须显式给宽档**（`shoot()` 的 size 参数）—— 输入卡的限宽在脚本默认的 500 档下不显形。读数输出在 `#composer*probe` 的 `<pre id="probe">` 里，主数字是 **`dxAsideVsOutline`**（预留区左边界 − 大纲栏左边界，138 的核心验收）与 `dxCardVsCol`（输入卡中心 − 消息列中心），配套 `dxRailVsCol` / `dxJumpVsCol` / `inputH` / `slashW` / `cardFocusWithin`；rail 与 jump-latest 平时是 hidden，探针会**临时去掉 hidden 再量**（`display:none` 的 rect 全为 0）。改前 / 改后对比：`--out` 两个目录并排看 `composer-wide.png`（配方写在脚本头部注释里）。
+
+**实测（1440×1000，Chrome 无头）**：钉住 240px 大纲栏时 `dxAsideVsOutline = 0`、`dxCardVsCol = 0`、`dxRailVsCol = 0`、`dxJumpVsCol = 0`、`asideW = 240`、`asideVar = 240px`、`cardW = 720`、`inputH = 27`、`cardRadius = 8px`、`cardOverflow = visible`；未钉住时 `colW = 1424`（消息满宽）、`asideLeft = 1184`；窄档 500 下输入卡随主列收缩且 `dxCardVsCol = 0`；矮窗口 1440×560 下 `inputH` 被 `max-height` 夹在 176.7px。
+
+**[140] 真悬浮**：`#composerbottom` 档（滚到最底）读 `composerPosition = absolute`、`composerBg = rgba(0,0,0,0)`、`messagesPadBottom = 108px`（= 24 + 底栏 84），关键是 **`lastGap = 111 > 底栏高 85`** —— 小于就说明最后一条被卡片压住、而且滚不动。**[141] 目录菜单**：`#historyfilter` 档读 `drawerOverflowY = visible`、`menuH = 260`（= 它自己的 max-height；修好前只露两三行）、`menuBorderColor = rgb(0,120,212)`。**[143]**：`#composerwide`（未钉住）`asideW = 0` 且 `cardCenter = colCenter = 712`（输入卡居中于面板）、`#composeroutline`（钉住）`asideW = 240` 且 `dxAsideVsOutline = 0`、`#phasedisconnected` 档 `composerDisplay = none` 且 `messagesPadBottom` 回落 24px。**[144]**：各档 `messagesPadBottom = 108px`（= 24 + 卡片 84，**一贯存在**），`scroll.ts` 的判据减掉它 ⇒ `#composerjustup`（贴底后上滚 40px）读到 `messagesClasses = messages`（已无切类逻辑，Jump 与留白天然一致）。**编辑区面**（`#…surfaceeditor` 档）：`composerBg = rgba(0, 0, 0, 0)` —— 改之前是 `rgb(31, 31, 31)`，那就是"遮挡"本身。**大纲滚到底**：`topElementAtLastItem` 从 `composer` 让开（底栏空区加了 `pointer-events: none`）。

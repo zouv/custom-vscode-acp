@@ -104,8 +104,12 @@ export function directoryOptions(
       byKey.set(currentKey, { key: currentKey, cwd, name: folderName(cwd), count: 0, current: true });
     }
   }
+  // [CUSTOM-20260930-142] 按名称的字母序（用户要求"目录列表排下序"）。原来是
+  // current 优先 → 会话数降序 → 名称，前两个键把字母序盖住了，看起来就像"没排序"。
+  // 当前目录仍然带 current 标记（客户端据此高亮它），只是不再置顶 —— 字母序是用户要的。
+  // 次键用 cwd：label 是下面才生成的（去重后的显示名），这里还拿不到。
   const ordered = Array.from(byKey.values()).sort((a, b) =>
-    Number(b.current) - Number(a.current) || b.count - a.count || a.name.localeCompare(b.name));
+    a.name.localeCompare(b.name) || a.cwd.localeCompare(b.cwd));
   // Labels last: uniqueness is a property of the whole set, not of one entry.
   return ordered.map(option => ({ ...option, label: uniqueLabel(option, ordered) }));
 }

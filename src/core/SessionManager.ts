@@ -969,6 +969,16 @@ export class SessionManager extends EventEmitter {
       return;
     }
     session.configOptions = options ?? null;
+    // [CUSTOM-20260930-128] The mode option is the AUTHORITATIVE copy of "which mode".
+    // `setMode` early-returns when a session has configOptions (Claude Code does), so
+    // `modes.currentModeId` would otherwise stay frozen at whatever load/new returned —
+    // and it still has consumers (metaOf, the legacy panel). Keep the two in step here,
+    // at the one place configOptions are replaced.
+    const modeOption = (options ?? []).find(o => (o as { category?: unknown }).category === 'mode');
+    const modeValue = (modeOption as { currentValue?: unknown } | undefined)?.currentValue;
+    if (session.modes && modeValue !== undefined && modeValue !== null) {
+      session.modes.currentModeId = String(modeValue);
+    }
     this.emit('config-options-changed', sessionId, session.configOptions);
   }
 

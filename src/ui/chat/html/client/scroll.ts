@@ -42,7 +42,16 @@ export const scrollClient = `
 
   function onScroll() {
     if (!container) { return; }
-    var distance = container.scrollHeight - container.scrollTop - container.clientHeight;
+    // [CUSTOM-20260930-144] distance 用**内容末尾**算（减掉底部那段留白）：留白是给悬浮的输入卡
+    // 让位的，它不是内容。这样"内容末尾进入视口"与"判定为到底"就是同一件事 —— 不会出现
+    // "Jump 还说没到底、下面却已经是空白"的灰色地带（140~143 被反复报的就是那个区间：
+    // 留白 108px 进了可视区，而 32px 的阈值说"还没到底"）。
+    // 留白本身是一贯存在的（见 styles.ts 的 .messages），所以这里不需要任何切类/位置补偿。
+    var pad = 0;
+    if (window.getComputedStyle) {
+      pad = parseFloat(window.getComputedStyle(container).paddingBottom) || 0;
+    }
+    var distance = container.scrollHeight - pad - container.scrollTop - container.clientHeight;
     pinned = distance < PIN_THRESHOLD;
     if (pinned) { hideJump(); } else { showJump(); }
     // 用户接管了视口：放弃待恢复的位置，不要跟他抢。

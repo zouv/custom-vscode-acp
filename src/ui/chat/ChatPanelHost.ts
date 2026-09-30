@@ -80,10 +80,20 @@ const LOG_PREFIX = 'chat-panel';
  */
 const STRUCTURAL_MESSAGE_TYPES: ReadonlySet<string> = new Set([
   'boot', 'focus', 'sessionsChanged', 'sessionClosed', 'meta', 'attachments', 'error',
+  // [CUSTOM-20260930-124] 连接相位必须立即发：它会被 `focus`（连接成功且有会话时紧随其后）
+  // 语义性覆盖，排进合帧队列就可能反过来、让客户端多开一张草稿。
+  'connection',
 ]);
 
 /** [CUSTOM-20260926-077] globalState key for the outline pin/width prefs. */
 const UI_PREFS_KEY = 'acpc.outlinePrefs.v1';
+
+/**
+ * [CUSTOM-20260930-125] The setting behind the start card's auto-connect switch.
+ * Declared in package.json, rendered as a checkbox by the panel — so a change made
+ * in either place has to reach the other (see the configuration listener below).
+ */
+const AUTO_CONNECT_KEY = 'acpc.autoConnectOnOpen';
 
 export class ChatPanelHost implements IChatPanel, PermissionPresenter, ElicitationPresenter {
   readonly id = 'modern' as const;
@@ -163,6 +173,10 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
     private readonly globalState?: vscode.Memento,
     // [CUSTOM-20260929-119] 表单桥（晚绑定失败时的兜底同权限桥）。
     private readonly elicitationBridge?: ElicitationBridge,
+    // [CUSTOM-20260930-125] settings 读写缝。注入而不是直接调 vscode.workspace：
+    // 测试 harness 刻意不碰真实用户设置（见 chat-panel.test.ts 的 FakeMemento 注释），
+    // 而写 ConfigurationTarget.Global 会改掉开发者的 settings.json。
+    private readonly prefs: PanelPrefsIO = vscodePanelPrefs(),
   ) {
     this.sessionUpdateHandler = sessionUpdateHandler;
     this.uiPrefs = this.globalState?.get<UiPrefs>(UI_PREFS_KEY) ?? null;
@@ -232,6 +246,15 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       this.pushFocus();
       this.refreshSessions();
     });
+
+    // [CUSTOM-20260930-125] 本仓库第一次用 onDidChangeConfiguration。理由不是"同步方便"：
+    // 面板把这个配置项**渲染成了一个控件**，控件显示过期值就是在撒谎（与 pitfalls #29 同族）。
+    // 只认一个 key，disposable 进 subscriptions —— dispose() 已经统一释放它们。
+    this.subscriptions.push(
+      vscode.workspace.onDidChangeConfiguration(e => {
+        if (e.affectsConfiguration(AUTO_CONNECT_KEY)) { this.postAutoConnectPref(); }
+      }),
+    );
   }
 
   // --- IChatPanel ----------------------------------------------------------
@@ -485,6 +508,13 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
           outlineWidth: Number.isFinite(outlineWidth) ? outlineWidth : 240,
         };
         this.globalState?.update(UI_PREFS_KEY, this.uiPrefs);
+        return;
+      }
+      // [CUSTOM-20260930-125] The start card's auto-connect switch. NOT session-scoped
+      // (the switch is exactly what you reach for when there is no session), so it is
+      // handled here, before the verifySession guard (§5.4 rule 2).
+      case 'setAutoConnect': {
+        void this.handleSetAutoConnect((msg as { value?: unknown }).value === true);
         return;
       }
       case 'openLink':
@@ -1177,7 +1207,13 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
     const rendered: Array<{ entryId: string; sessionId: string; html: string; key?: string }> = [];
     for (const item of items) {
       const sessionId = verifySession(this.sessionManager, item);
-      if (!sessionId) { continue; }
+      if (!sessionId) {
+        // [CUSTOM-20260930-128] Do not drop it silently: a dropped item means that record
+        // stays raw markdown forever, and this line is the only place that can say so
+        // (pitfall #33's lesson — the 120 bug was invisible for exactly this reason).
+        log(`${LOG_PREFIX}: dropped markdown item ${item.entryId} (unknown session ${item.sessionId})`);
+        continue;
+      }
       const html = this.markdown.render(item.text);
       // [CUSTOM-20260925-066] A KEYED item is a sub-block of a tool card, not a
       // transcript record: there is nothing in the store to patch, the HTML goes
@@ -1283,6 +1319,10 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
   // 这一对方法（两个接口的方法名相同，所以实现必须收一个联合类型再按形状分派；
   // 写两个同名方法在 TS 里是重复实现，编译不过）。canPresent 也共用同一套判据。
   show(state: PermissionState | ElicitationState): void {
+    // [CUSTOM-20260930-130] This session goes from "the agent is working" to "nothing
+    // moves until you answer", and the tab dot has to say so. The bridge has already put
+    // the request in its pending list by the time it calls this (see PermissionBridge.show).
+    this.refreshSessions();
     if (isElicitationState(state)) { this.showElicitation(state); return; }
     const session = sessionOf(this.sessionManager, state.sessionId);
     if (!session) { return; }
@@ -1292,6 +1332,10 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
   }
 
   update(state: PermissionState | ElicitationState): void {
+    // [CUSTOM-20260930-130] …and here it may go back (the bridge removes the request from
+    // its pending list BEFORE calling this — see settleWith). A mere state change on a
+    // card leaves the pending list alone, and the signature check makes this free.
+    this.refreshSessions();
     if (isElicitationState(state)) { this.updateElicitation(state); return; }
     // appendPermission returns the existing entry for this promptId (after
     // applying the new state), so `patch` below only needs to tell the webview.
@@ -1383,22 +1427,75 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
    * because `ensureConnected` still throws when the process will not start.
    *
    * If sessions already exist, the newest is focused (reuse, not pile up).
+   *
+   * [CUSTOM-20260930-124] Every outcome now answers with a `connection` phase.
+   * The client's "Connecting…" is driven by it, and it is the ONLY signal that
+   * can end that phase: `refreshSessions` de-dups on a signature whose `conn:` bit
+   * is already 1 when the process is up, and `ensureConnected` emits nothing in
+   * that case — so a user with a live process and no session would otherwise be
+   * stuck on "Connecting…" forever (pitfall #29).
    */
   private handleConnectAgent(agentName?: string): void {
     const agent = this.panelAgent(agentName);
     if (!agent) {
+      // Answer anyway: without it the client never leaves the connecting phase.
+      this.postConnection('failed', 'No agent available to connect.');
       this.reportError(null, new Error('No agent available to connect.'));
       return;
     }
     log(`${LOG_PREFIX}: connect requested for ${agent}`);
+    this.postConnection('connecting');
     void this.sessionManager.ensureConnected(agent)
-      .then(() => {
+      .then(async () => {
         const ids = this.sessionManager.getSessionIdsForAgent(agent);
         const newest = ids[ids.length - 1];
-        if (newest) { this.sessionManager.focusSession(newest); }
-        // No session to focus: the client's draft page is the right place to be.
+        if (newest) {
+          this.sessionManager.focusSession(newest);
+        } else {
+          // [CUSTOM-20260930-131] No session yet: CREATE one, and do it before reporting
+          // the phase. A draft page can never be "the same as a normal session" — images
+          // need a session to attach to, and the mode/model pickers come from the
+          // `session/new` response, so without a session there is nothing to show. The
+          // cost is a session left in the agent's history if the user connects and walks
+          // away; `session/close` does not remove it from history (058), and that is the
+          // trade the user chose over a half-usable composer.
+          await this.sessionManager.createSession(agent, { focus: true });
+        }
+        // [CUSTOM-20260930-124] 'connected' goes out AFTER the focus/creation above, and the
+        // order is load-bearing: the client opens a draft on 'connected' only when no
+        // session is focused, so an inversion would hand the user a spare tab next to the
+        // session that was just opened.
+        this.postConnection('connected');
       })
-      .catch(e => this.reportError(null, e));
+      .catch(e => {
+        this.postConnection('failed', (e as any)?.message ?? String(e));
+        this.reportError(null, e);
+      });
+  }
+
+  /** [CUSTOM-20260930-124] Broadcast one connection attempt's phase. */
+  private postConnection(state: 'connecting' | 'connected' | 'failed', message?: string): void {
+    this.post(message ? { type: 'connection', state, message } : { type: 'connection', state });
+  }
+
+  /**
+   * [CUSTOM-20260930-125] Persist the start card's switch, then answer with whatever the
+   * setting ACTUALLY holds — including when the write failed. Echoing the requested value
+   * back would leave the checkbox showing something settings.json does not say, which is
+   * the same lie the configuration listener exists to prevent.
+   */
+  private async handleSetAutoConnect(value: boolean): Promise<void> {
+    try {
+      await this.prefs.setAutoConnect(value);
+    } catch (e) {
+      log(`${LOG_PREFIX}: could not write ${AUTO_CONNECT_KEY}: ${String(e)}`);
+    }
+    this.postAutoConnectPref();
+  }
+
+  /** [CUSTOM-20260930-125] Tell every surface what the setting currently says. */
+  private postAutoConnectPref(): void {
+    this.post({ type: 'autoConnectPref', value: this.prefs.getAutoConnect() });
   }
 
   /**
@@ -1818,6 +1915,9 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       snapshot: focused ? this.snapshotOf(focused.sessionId) : null,
       meta: focused ? this.metaOf(focused.sessionId) : null,
       agentConnected: this.panelAgentConnected(),
+      // [CUSTOM-20260930-125] 首屏值随 boot 一起走：客户端的自动连接布防需要
+      // {agentConnected, focused, autoConnect} 三者同时成立。
+      autoConnect: this.prefs.getAutoConnect(),
     }, to);
     // [CUSTOM-20260926-077] Bring the outline pin/width prefs along with the boot,
     // so a recreated webview (editor panel reopen / window reload) restores them.
@@ -1865,7 +1965,7 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
     // `unread`.
     const agentConnected = this.panelAgentConnected();
     const signature = `conn:${agentConnected ? 1 : 0}\n` + sessions
-      .map(s => `${s.sessionId}|${s.agentName}|${s.title ?? ''}|${s.loading ? 1 : 0}|${s.running ? 1 : 0}|${s.unread ? 1 : 0}`)
+      .map(s => `${s.sessionId}|${s.agentName}|${s.title ?? ''}|${s.loading ? 1 : 0}|${s.running ? 1 : 0}|${s.unread ? 1 : 0}|${s.waiting ? 1 : 0}`)
       .join('\n');
     if (signature === this.lastSessionsSignature) { return; }
     this.lastSessionsSignature = signature;
@@ -1904,6 +2004,11 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       // refreshSessions()'s signature string must include it too, or the strip
       // would never be told this changed (022's signature de-dup trap).
       unread: this.unread.has(session.sessionId),
+      // [CUSTOM-20260930-130] A prompt or a form is parked on this session. Read from the
+      // bridges — they own the pending lists, so there is exactly one copy of "who is
+      // waiting" (pitfalls #19).
+      waiting: (this.permissionBridge?.hasPendingFor(session.sessionId) ?? false)
+        || (this.elicitationBridge?.hasPendingFor(session.sessionId) ?? false),
     };
   }
 
@@ -1978,6 +2083,33 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
 }
 
 // --- helpers ---------------------------------------------------------------
+
+/**
+ * [CUSTOM-20260930-125] The one settings interaction this host has, behind an interface
+ * so tests can hand it a stub instead of writing the developer's settings.json.
+ */
+export interface PanelPrefsIO {
+  getAutoConnect(): boolean;
+  setAutoConnect(value: boolean): Promise<void>;
+}
+
+/** [CUSTOM-20260930-125] Default implementation: the real VS Code configuration. */
+export function vscodePanelPrefs(): PanelPrefsIO {
+  const config = () => vscode.workspace.getConfiguration('acpc');
+  return {
+    // Through the resolver: `get<boolean>` is a cast, not a runtime check, and a
+    // hand-edited settings.json must not be able to feed a non-boolean to a checkbox.
+    getAutoConnect: () => resolveAutoConnect(config().get<unknown>('autoConnectOnOpen')),
+    setAutoConnect: async value => {
+      await config().update('autoConnectOnOpen', value, vscode.ConfigurationTarget.Global);
+    },
+  };
+}
+
+/** [CUSTOM-20260930-125] Exported for its table test: only the boolean true is true. */
+export function resolveAutoConnect(raw: unknown): boolean {
+  return raw === true;
+}
 
 /**
  * [CUSTOM-20260929-119] Which presenter interface this state belongs to. The two

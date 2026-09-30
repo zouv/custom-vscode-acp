@@ -39,7 +39,43 @@ export interface ChoiceSnapshot {
   options: Record<string, ChoiceValue>;
 }
 
-/** Snapshot from the live session state (post-change, after a setter resolves). */
+// [CUSTOM-BEGIN] CUSTOM-20260930-128 - 模式在两个通道之间收敛。
+//
+// `session.modes.currentModeId` 与 `configOptions[category='mode'].currentValue` 是**同一事实的
+// 两份副本**，而它们**不会同时被写**：`SessionManager.setMode` 在 configOptions 存在时提前
+// return（Claude Code 正是这种），而 `current_mode_update` 也从不落到 SessionManager。
+// 于是宿主的两条上报路径各自只看到一半：
+//   · 通知路径（用 payload patch）拿到新 modeId，却留着**旧的** mode option；
+//   · setter 路径（读 SessionManager）拿到新 mode option，却读到**冻结**的 currentModeId。
+// 两份快照永不相等 ⇒ "先到的那条提示、后到的那条 diff 为空"这个去重前提失效 ⇒ 同一次切换
+// 被报两次，且第二条是现实中不存在的混合态（实测："Manual mode · Bypass permissions mode"）。
+//
+// 修法是**让 config option 成为权威**（Claude Code 用它表达模式）：快照里的 modeId 由它派生；
+// 收到只带 modeId 的 payload 时把新值写回那份副本。这样两条路径给出同一个快照。
+// [CUSTOM-END] CUSTOM-20260930-128
+
+/** The option that carries the mode, when the agent exposes one. */
+function modeOptionKey(options: Record<string, ChoiceValue>): string | undefined {
+  for (const id of Object.keys(options)) {
+    if (options[id].category === 'mode') { return id; }
+  }
+  return undefined;
+}
+
+/** That option's current value, or undefined when there is no mode option. */
+function modeOptionValue(options: Record<string, ChoiceValue>): string | undefined {
+  const key = modeOptionKey(options);
+  if (!key) { return undefined; }
+  const value = options[key].value;
+  return value === '' ? undefined : value;
+}
+
+/**
+ * Snapshot from the live session state (post-change, after a setter resolves).
+ *
+ * [CUSTOM-20260930-128] `modeId` is derived from the config option when there is one:
+ * `modes.currentModeId` is the copy that goes stale (see the block at the top of file).
+ */
 export function choiceSnapshotFromState(
   modes: SessionModeState | null | undefined,
   configOptions: SessionConfigOption[] | null | undefined,
@@ -48,10 +84,12 @@ export function choiceSnapshotFromState(
   for (const mode of modes?.availableModes ?? []) {
     names[String(mode.id)] = String(mode.name ?? mode.id);
   }
+  const options = snapshotOptions(configOptions);
   return {
     modes: names,
-    modeId: modes?.currentModeId === undefined ? undefined : String(modes.currentModeId),
-    options: snapshotOptions(configOptions),
+    modeId: modeOptionValue(options)
+      ?? (modes?.currentModeId === undefined ? undefined : String(modes.currentModeId)),
+    options,
   };
 }
 
@@ -60,14 +98,30 @@ export function choiceSnapshotPatched(
   previous: ChoiceSnapshot,
   patch: { modeId?: string | null; configOptions?: SessionConfigOption[] | null },
 ): ChoiceSnapshot {
+  const options = patch.configOptions === undefined || patch.configOptions === null
+    ? { ...previous.options }
+    : snapshotOptions(patch.configOptions);
+  const fromPayload = patch.modeId === undefined || patch.modeId === null ? undefined : String(patch.modeId);
+  let modeId: string | undefined;
+  if (fromPayload !== undefined) {
+    modeId = fromPayload;
+    // [CUSTOM-20260930-128] A mode payload carries no option list, so the mode option would
+    // keep its OLD value and the two copies would disagree. Write it through: the next
+    // setter-path snapshot reads the option, and both paths must agree for the diff to
+    // come out empty.
+    const key = modeOptionKey(options);
+    if (key) {
+      options[key] = { ...options[key], value: modeId, valueName: previous.modes[modeId] ?? modeId };
+    }
+  } else {
+    modeId = modeOptionValue(options) ?? previous.modeId;
+  }
   return {
     // A mode payload carries no name: the names map from the previous snapshot is
     // still the best thing we have (the mode list itself rarely changes).
     modes: previous.modes,
-    modeId: patch.modeId === undefined || patch.modeId === null ? previous.modeId : String(patch.modeId),
-    options: patch.configOptions === undefined || patch.configOptions === null
-      ? previous.options
-      : snapshotOptions(patch.configOptions),
+    modeId,
+    options,
   };
 }
 
@@ -100,6 +154,10 @@ export function choiceChanges(before: ChoiceSnapshot, after: ChoiceSnapshot): st
     const now = after.options[id];
     // Known before (not initialization) and actually different.
     if (!was || !now || was.value === now.value) { continue; }
+    // [CUSTOM-20260930-128] The mode option is skipped here: it is the same fact as
+    // `modeId` above, which is where the line comes from. Reporting it twice would print
+    // "Switched to Plan mode · Switched to Plan mode" for one switch.
+    if (now.category === 'mode') { continue; }
     out.push(describeChange(now));
   }
   return out;
@@ -118,10 +176,11 @@ function describeChange(now: ChoiceValue): string {
   // The model case is spelled like the reference implementation ("Switched to
   // deepseek-v4-pro[1M]"), and a bare model name is unambiguous.
   if (now.category === 'model') { return `Switched to ${label}`; }
-  // A mode is a mode whether it arrived as `session.modes` or as a config option
-  // with category 'mode' — both channels exist in the wild (Claude Code uses the
-  // latter), and the reader should not be able to tell which one was used.
-  if (now.category === 'mode') { return `Switched to ${label} mode`; }
+  // [CUSTOM-20260930-128] A `category === 'mode'` option no longer reaches here: it is
+  // the same fact as `modeId`, announced once by choiceChanges' first branch. (The old
+  // wording — "a mode is a mode whether it arrived as session.modes or as a config
+  // option" — described two channels for one fact, which is exactly what made the
+  // switch get announced twice.)
   // Anything else (thought_level, …): naming the option is the only way the line
   // means something — "Switched to High" alone would be a riddle.
   return `${now.name}: ${label}`;

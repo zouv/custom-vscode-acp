@@ -398,6 +398,11 @@
           "default": "ask",
           "description": "Automatically approve agent permission requests. 'ask' always prompts, 'allowAll' approves everything."
         },
+        "acpc.autoConnectOnOpen": {
+          "type": "boolean",
+          "default": true,
+          "description": "Connect the agent automatically 0.5s after the ACP chat panel is opened. The panel's start card shows the same switch; changing either one updates the other."
+        },
         "acpc.defaultWorkingDirectory": {
           "type": "string",
           "default": "",

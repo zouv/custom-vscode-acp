@@ -57,10 +57,23 @@ export function styles(): string {
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    /* [CUSTOM-20260930-140] 底栏（.composer）改成绝对定位、浮在消息区之上 —— 它的定位祖先
+       就是这里，所以 body 必须 positioned。 */
+    position: relative;
     font-family: var(--vscode-font-family);
     font-size: var(--vscode-font-size);
     color: var(--vscode-foreground);
     background: var(--vscode-sideBar-background);
+    /* [CUSTOM-BEGIN] CUSTOM-20260930-137 - 底部栏的尺度，定义在这一层是因为输入区是 body 的
+       后代（.composer 不是 .message-area 的后代，挂那边够不着）。
+       · --acpc-composer-max：输入卡宽度。137 起**消息列不再限宽**（用户要求消息平铺开、
+         读得更宽），只有底部这一块仍限宽 —— 卡片过宽时发送按钮离正文太远、不好点。
+       · --acpc-input-max-h：输入框的**视口**上限。与 autoGrow 里那个 320 是两件事——
+         320 管"内容最多长到多高"，这条管"面板再高也不许高过屏幕的 38%"；两者同时存在时
+         浏览器取更小的那个，所以 composer.ts 不需要知道视口有多高。 */
+    --acpc-composer-max: 720px;
+    --acpc-input-max-h: min(320px, 38vh);
+    /* [CUSTOM-END] CUSTOM-20260930-137 */
   }
 
   /* --- Agent selector ------------------------------------------------- */
@@ -118,17 +131,35 @@ export function styles(): string {
     opacity: 1;
   }
   .tab-label { overflow: hidden; text-overflow: ellipsis; }
-  .tab-dot {
-    width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto;
-    background: var(--vscode-descriptionForeground);
-  }
-  .tab-dot.running { background: var(--vscode-progressBar-background); animation: pulse 1.2s ease-in-out infinite; }
-  .tab-dot.loading { background: var(--vscode-charts-yellow); }
-  /* [CUSTOM-20260925-063] 后台会话在你离开后有了新输出 —— 由宿主侧的 unread 集合驱动
-     （062 之前这里一直没接线，注释写的是"设计预留"）。优先级低于 running：
-     正在流式的标签本来就在脉动，两个信号表示一件事只会更乱。
+  /* [CUSTOM-20260930-130] 圆点有**两个独立的信号**（用户指定）：
+       · 颜色说"这个会话处在什么状态"；
+       · 外面的圈说"它正在做事"。
+     两者必须独立——卡在权限提示上的轮次两件事同时为真。颜色走 color 而不是直接写
+     background，外圈才能用同一个 currentColor 画出来（颜色只有一个来源）。
      **它只是提示**：不弹窗、不抢焦点——与"不做后台权限卡"的决定不冲突。 */
-  .tab-dot.attention { background: var(--vscode-charts-blue); }
+  .tab-dot {
+    position: relative;
+    width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto;
+    color: var(--vscode-descriptionForeground);
+    background: currentColor;
+  }
+  /* 优先级：等人回答 > 轮次在跑 > 载入历史 > 后台有新输出 > 平常。 */
+  .tab-dot.waiting { color: var(--vscode-charts-orange, var(--vscode-charts-yellow)); }
+  .tab-dot.running { color: var(--vscode-progressBar-background); }
+  .tab-dot.loading { color: var(--vscode-charts-yellow); }
+  /* [CUSTOM-20260925-063] 后台会话在你离开后有了新输出 —— 由宿主侧的 unread 集合驱动。 */
+  .tab-dot.attention { color: var(--vscode-charts-blue); }
+  /* 外圈：一圈向外扩散的涟漪，只在"正在做事"（轮次在跑 / 正在载入）时出现。
+     早先把 running 做成圆点自身的脉动，那样两个信号就挤在同一个像素上了。 */
+  .tab-dot.busy::after {
+    content: ''; position: absolute; inset: -1px; border-radius: 50%;
+    border: 1px solid currentColor;
+    animation: tab-ring 1.4s ease-out infinite;
+  }
+  @keyframes tab-ring {
+    0% { transform: scale(0.7); opacity: 0.9; }
+    100% { transform: scale(1.9); opacity: 0; }
+  }
   .tab-close {
     border: none; background: transparent; color: inherit; cursor: pointer;
     padding: 0 2px; line-height: 1; opacity: 0.6; font-size: 11px;
@@ -189,16 +220,44 @@ export function styles(): string {
     background: inherit;
   }
   .outline-more { margin-left: auto; }
+  /* [CUSTOM-20260930-141] 历史浮层里的目录过滤菜单要能**溢出**浮层本身。
+     因果链：菜单是绝对定位，它的包含块是 .outline-head（sticky ⇒ positioned），而 head 在
+     #history 内部 ⇒ #history 的 overflow-y: auto **会把它裁掉**（可见高度 = head 底边到
+     #history 底边的距离；历史列表越短它越矮，实测只剩几行）。把滚动从容器下移到 .outline-list：
+     #history 不再裁剪任何后代，菜单高度交回它自己的 max-height 单独控制。
+     只写在 #history 上、不动 .outline 的通用规则 —— #outline / #cwdMenu 里没有这种嵌套菜单。
+     head 的 background: inherit 与 sticky 都保留（后者仍是菜单的定位锚）。 */
+  #history { display: flex; flex-direction: column; overflow: visible; }
+  #history .outline-head { flex: none; }
+  #history .outline-list { flex: 1; min-height: 0; overflow-y: auto; }
   /* --- 时间显示（CUSTOM-20260925-065）------------------------------------
      每条记录的时刻。元素**始终在 DOM 里**，可见性由 #messages 上的一个类决定
      （与 flat-tools 同一套机制）⇒ 切换开关**不需要重渲染任何东西**，纯样式翻转。
      默认隐藏；鼠标悬停在整条上另有一个完整时刻（见 transcriptView.place 设的 title）。 */
+  /* [CUSTOM-20260930-129] 打开 Times 时，时刻**跟着记录的标题行走**，不再单独占一行：
+     非工具卡的记录浮在自己节点的右上角（下面那条 .messages > * 提供定位上下文），工具卡则作为
+     .tool-head 里的一项参与 flex 排版、排在耗时之后 ⇒ 标题行右侧读作 "2.2s 11:57"。 */
   .rec-time {
     display: none;
+    position: absolute; top: 0; right: 0;
     font-size: 0.78em; color: var(--vscode-descriptionForeground);
     font-variant-numeric: tabular-nums;
+    /* 它只是文本：既不接点击，也不该挡住底下那行的 hover（整条记录的完整时刻在 node.title 上）。 */
+    pointer-events: none;
   }
-  .messages.show-times .rec-time { display: block; }
+  /* [CUSTOM-20260930-146] 时刻**只在工具卡上显示**（用户定的）：ACP 里只有工具调用带耗时
+     （elapsedMs），普通消息与 Thought 根本没有"耗时"这个量 —— 给它们单独挂一个时刻，读起来
+     像是缺了一半的信息，齐不齐也都靠排版去凑。所以开关只对工具卡生效：
+       关 = 3ms（耗时，常显）；开 = 3ms 18:32（耗时 + 时刻，见下）。
+     非工具记录的 .rec-time 仍然在 DOM 里（transcriptView 一律插入），只是这条选择器不再放它出来。 */
+  .messages.show-times .tool-head .rec-time { display: block; }
+  /* 记录节点当定位上下文，时刻才浮得住。position: relative 不改变布局（只建立上下文），
+     所以对既有排版（rail 的测量、置顶克隆）没有影响。 */
+  .messages > * { position: relative; }
+  /* 工具卡：时刻是标题行里的一项，静态排版、跟在 .tool-time 后面 ⇒ 整行读作 "3ms 18:32"。
+     [CUSTOM-20260930-146] 145 曾把它改成"也浮到右上角"来跟其它记录对齐 —— 那会挤掉标题行的
+     宽度（要靠 padding-right 硬留槽位），工具卡本来就工整的一行反而散了，**已回退**。 */
+  .tool-head .rec-time { position: static; }
   /* 105 之前这里有一条 .entry-user .rec-time { text-align: right }（时刻跟着右对齐的气泡走）。
      用户消息改为靠左铺满后它没有存在理由了——留着会让时刻与正文分居两端。 */
   /* 工具耗时常显（与 Thought 的 "Thought for Ns" 同类信息，不需要开关）。 */
@@ -284,23 +343,30 @@ export function styles(): string {
     position: absolute; left: -3px; top: 0; bottom: 0; width: 6px;
     cursor: col-resize; z-index: 4;
   }
-  .usage-bar { flex: 0 0 auto; font-variant-numeric: tabular-nums; }
-  .usage-track {
-    display: inline-block; width: 60px; height: 6px; border-radius: 3px;
-    background: var(--vscode-editorWidget-background);
-    border: 1px solid var(--vscode-panel-border);
-    vertical-align: middle; margin: 0 4px; overflow: hidden;
-  }
-  .usage-fill { display: block; height: 100%; background: var(--vscode-progressBar-background); }
-  .usage-fill.warn { background: var(--vscode-charts-yellow); }
-  .usage-fill.hot { background: var(--vscode-charts-red); }
+  /* [CUSTOM-20260930-129] 这里原有 .usage-bar / .usage-track / .usage-fill——顶部那条进度条
+     整个删掉了，底部改画圆环（.gauge-* 见下），三条规则一起成了死 CSS，一并清掉。 */
+
+  /* [CUSTOM-20260930-131] 未连接（含正在连接）时，header 只留历史按钮和地址：
+     Times 在没有记录的界面上没有意义。相位由 stateCard 写在 body 的 data-phase 上，
+     所以这里不需要任何 JS。 */
+  body[data-phase="disconnected"] #timeToggle,
+  body[data-phase="connecting"] #timeToggle { display: none; }
 
   /* --- Messages -------------------------------------------------------- */
   .message-area { position: relative; flex: 1; min-height: 0; display: flex; }
   /* [CUSTOM-20260928-103] 消息列：.message-area 这一行里除它之外只有定宽的大纲栏。
      置顶副本（.sticky-user）是它的绝对定位子元素，于是"覆盖层不会盖到大纲栏上"是按构造
      成立的——不用量大纲栏宽度。min-width: 0 与 #messages 当初作为 flex 项时同义。 */
-  .messages-column { position: relative; flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+  /* [CUSTOM-BEGIN] CUSTOM-20260930-137 - 消息列**不限宽**。132 一度给它加过版心（max-width +
+     auto margin 居中），本轮按用户要求撤销：消息要平铺开、读得更宽；限宽只保留在底部输入卡上
+     （卡片太宽时发送按钮离正文太远，那是另一个问题）。
+     这一层的定位意义不变 —— 置顶卡片（.sticky-user）、引导条（.rail）与 Jump to latest 都是
+     它的绝对定位子元素，所以 132 把后两者搬进来的改动**保留**：列满宽时它们与内容的位置关系
+     与改动前逐像素一致，将来若再限宽也不必重做。 */
+  .messages-column {
+    position: relative; flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column;
+  }
+  /* [CUSTOM-END] CUSTOM-20260930-137 */
   /* --- Conversation rail (CUSTOM-20260924-023) ------------------------- */
   /* 左侧引导条：轮次大点 + 步骤小点，随内容滚动（track 由 JS 做 translateY(-scrollTop)）。
      注意本元素**不能**写 display——hidden 属性靠文件顶部的 [hidden]{display:none!important}
@@ -357,10 +423,20 @@ export function styles(): string {
   .messages {
     flex: 1;
     overflow-y: auto;
-    /* padding-left 给左侧引导条留出通道（.rail 是绝对定位的兄弟节点，覆盖在这条空隙上）。
+    /* padding-left 给左侧引导条留出通道（.rail 是绝对定位的、与 #messages 同属
+       .messages-column 的兄弟节点，覆盖在这条空隙上）。[CUSTOM-20260930-132] rail 原来挂在
+       .message-area 上，随版心一起搬进了列 —— 通道必须跟着列走：它靠 .rail 的 left:0 定位，
+       锚在面板上就会在列居中之后与内容脱开。
        [CUSTOM-20260926-069] 底部 4px → 24px：最后一条记录贴着输入框的上边框时，
        读者会以为"下面还有内容、没滚到底"（用户反馈）。留白本身就是"到头了"的信号。 */
     padding: 8px 10px 24px 19px;
+    /* [CUSTOM-20260930-144] 留白**一贯存在**（069 的 24px + 悬浮输入卡的高度）：内容永远停在
+       卡片上方、不会被它遮挡 —— 用户明确要求"消息区的触底判断应该保持在输入框上面的位置"。
+       （中途试过"只在贴底那一刻让位"的条件式，那会让未到底的内容被卡片切断 —— 方向是错的，
+       而且它还要在 scroll.ts 里维护"切类 + 位置补偿"，白白多出三个坑。）
+       高度随输入框在 1 行与多行之间变化，由 composer.ts 的 ResizeObserver 写进
+       --acpc-composer-h（pitfall #27：别去列"什么会让它变高"）。 */
+    padding-bottom: calc(24px + var(--acpc-composer-h, 0px));
     display: flex;
     flex-direction: column;
     /* 间距交给下面的阶梯控制。统一 gap 会让「同属一组的连续推理」和「跨类型的独立块」
@@ -462,8 +538,11 @@ export function styles(): string {
   .sticky-user.collapsed .fold-body { display: none; }
   /* [CUSTOM-20260928-103] 时刻的显隐由 .messages.show-times 控制，而克隆体不在 #messages 里
      —— 不同步这个状态就会出现"列表有时刻、置顶副本没有"。show-times 由 render() 从
-     #messages 抄到 host 上。 */
-  .sticky-user.show-times .rec-time { display: block; }
+     #messages 抄到 host 上。
+     [CUSTOM-20260930-146] 但这条规则现在**不再需要**：时刻只留给工具卡（见 .rec-time 那段），
+     而置顶条里永远是用户消息 ⇒ 克隆体上不该出现时刻。留着它反而会让"开关一开，置顶那份
+     凭空多个时刻"。 */
+  .sticky-user.show-times .rec-time { display: none; }
   /* [CUSTOM-20260928-104] 本体交棒给悬浮条时隐藏：副本已经站在它原来的位置上，留着就是同屏两份。
      用 visibility 而不是 display —— 几何保持不变，rail 的测量与 jumpTo 依赖的 offsetTop 都还成立。
 
@@ -479,7 +558,9 @@ export function styles(): string {
   .messages > [data-kind="content"] + [data-kind="content"] { margin-top: 2px; }
   .messages > [data-kind="user"] { margin-top: 16px; }
   .jump-latest {
-    position: absolute; left: 50%; transform: translateX(-50%); bottom: 12px;
+    /* [CUSTOM-20260930-140] 底栏浮在面板底部，这个按钮要跟着抬起来，否则会被输入卡盖住。 */
+    position: absolute; left: 50%; transform: translateX(-50%);
+    bottom: calc(12px + var(--acpc-composer-h, 0px));
     padding: 3px 10px; border-radius: 12px; cursor: pointer;
     background: var(--vscode-button-background); color: var(--vscode-button-foreground);
     border: none; font-family: inherit; font-size: 0.9em;
@@ -493,28 +574,67 @@ export function styles(): string {
      改为**覆盖在消息区之上并自我居中**（.message-area 本来就是 position: relative，
      .jump-latest 早就这么用）。不占布局，也不会与谁重叠：空态出现 ⟺ 没有聚焦会话 ⟺ 没有锚点
      ⟺ 081 已经把大纲栏与引导条收掉了。 */
+  /* [CUSTOM-BEGIN] CUSTOM-20260930-123 - 状态卡（取代 090 的空态排版）。
+     居中的方式很关键：**不用** 'justify-content: center' + 容器滚动——内容一旦比消息区高，
+     center 会把顶部裁掉且**滚不到**（pitfall #17 同族）。改成
+     「容器 flex-start + 卡片 margin: auto」：有富余空间时两轴居中，超高时可完整滚动。
+     这一层的 display 唯一写者是 boot.showEmpty()，所以这里可以放心写 flex。 */
   .empty-state {
     position: absolute; top: 0; right: 0; bottom: 0; left: 0;
-    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    display: flex; flex-direction: column; align-items: center;
+    justify-content: flex-start; overflow-y: auto;
     text-align: center; color: var(--vscode-descriptionForeground); padding: 20px;
   }
-  /* 空态里的「连接」按钮（CUSTOM-20260925-032）：面板自己就能把 agent 拉起来，
-     不必先去 Agents 视图。 */
-  .empty-connect {
-    margin-top: 10px; padding: 4px 14px; border-radius: 4px; cursor: pointer;
+  .state-card {
+    /* 'margin: auto' 是上面那条居中的另一半，不要删。
+       'width: 100%' 让卡片跟随容器收缩（上限 max-width）。卡片是纵向 flex 的子项，交叉轴
+       不会被拉伸，宽度只能靠 width 显式约束 —— 否则它取 fit-content，在窄侧边栏里会不会
+       自己收下去就成了"关于浏览器行为的推断"（pitfall #31）。
+       实测（preview-records 的 #emptynarrow，把消息区钉死 260px）：cardW=220、居中偏差 0、无裁切。 */
+    width: 100%;
+    margin: auto;
+    display: flex; flex-direction: column; align-items: center; gap: 6px;
+    max-width: 420px; padding: 18px 20px;
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: 6px;
+    background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+    box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.28));
+    /* ⚠️ 这里**绝不能**写 overflow：卡片是 flex 列的子项，overflow 非 visible 会把它的
+       自动最小尺寸变成 0，卡片会被压扁（pitfall #17）。 */
+  }
+  /* 转圈槽位：固定最小高度，连接中之外空着也不让标题上下跳。
+     #stateBusy 只由 hidden 切换——**不要**给它写 display，否则它会永远可见（pitfall #13）。 */
+  .state-head { display: flex; align-items: center; justify-content: center; min-height: 16px; }
+  .state-title { margin: 0; font-weight: 600; color: var(--vscode-foreground); }
+  .state-hint { margin: 0; font-size: 0.92em; }
+  .state-error {
+    margin: 0; max-width: 100%; text-align: left; font-size: 0.92em;
+    padding: 4px 8px; border-radius: 3px; word-break: break-word;
+    color: var(--vscode-inputValidation-errorForeground, var(--vscode-foreground));
+    background: var(--vscode-inputValidation-errorBackground, transparent);
+    border: 1px solid var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground));
+  }
+  .state-actions { display: flex; gap: 6px; margin-top: 4px; }
+  .state-connect {
+    padding: 4px 14px; border-radius: 4px; cursor: pointer;
     font-family: inherit; font-size: 0.95em;
     background: var(--vscode-button-background); color: var(--vscode-button-foreground);
     border: 1px solid var(--vscode-button-border, transparent);
   }
-  .empty-connect:hover { background: var(--vscode-button-hoverBackground); }
-  .empty-title { font-weight: 600; margin: 0 0 6px; }
-  .empty-hint { margin: 0; font-size: 0.92em; }
-  kbd {
-    background: var(--vscode-textCodeBlock-background);
-    border: 1px solid var(--vscode-panel-border);
-    border-radius: 3px; padding: 0 4px;
-    font-family: var(--vscode-editor-font-family); font-size: 0.9em;
+  .state-connect:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
+  /* 连接中 = 不可点：用 secondary 配色而不是压暗前景色，明暗主题下都可读。 */
+  .state-connect:disabled {
+    cursor: default; opacity: 0.65;
+    background: var(--vscode-button-secondaryBackground, var(--vscode-button-background));
+    color: var(--vscode-button-secondaryForeground, var(--vscode-button-foreground));
   }
+  .state-opt {
+    display: flex; align-items: center; gap: 6px; cursor: pointer;
+    margin-top: 2px; font-size: 0.88em;
+  }
+  /* 选择器限定在本卡片内：写成全局 input[type=checkbox] 会连带改掉表单卡（119）的复选框。 */
+  .state-opt input { flex: none; margin: 0; accent-color: var(--vscode-button-background); }
+  /* [CUSTOM-END] CUSTOM-20260930-123 */
 
   .entry { display: flex; flex-direction: column; gap: 4px; max-width: 100%; }
   /* [CUSTOM-20260928-105] 用户消息**靠左铺满**（用户要求）。原来是 align-self:flex-end +
@@ -827,7 +947,11 @@ export function styles(): string {
   .surface-editor {
     background: var(--vscode-editor-background);
   }
-  .surface-editor .composer,
+  /* [CUSTOM-20260930-144] 这里原来还有 .composer。底栏从 140 起是**浮在消息之上的透明层**
+     （见 .composer 那段），给它刷 editor-background 就等于把整条底栏变成一块不透明带：输入卡
+     两侧的消息、右侧大纲栏的底部全被盖住 —— 用户报的"还是遮挡"就是这个，而且它**只在编辑区
+     面出现**（本脚本的预览默认渲染侧边栏面，所以一直没照出来）。
+     编辑区面的底色差异现在只由 .load-overlay 承担（它本来就是不透明遮罩）。 */
   .surface-editor .load-overlay {
     background: var(--vscode-editor-background);
   }
@@ -1083,11 +1207,74 @@ export function styles(): string {
   .plan-mark { flex: 0 0 auto; width: 14px; }
 
   /* --- Composer -------------------------------------------------------- */
+  /* [CUSTOM-20260930-138] 底部栏 = **两列**：主列（输入卡）+ 预留功能区。用 flex 两列而不是
+     135 那种"给左边补一段 padding"的算法，是因为主列的宽度天然等于"面板宽 − 预留区宽"，
+     于是输入卡的中线与消息列的中线**自动**重合 —— 少维护一个等式（pitfall #24 的正解）。 */
   .composer {
-    position: relative;
-    border-top: 1px solid var(--vscode-panel-border);
-    padding: 4px 6px 6px;
-    background: var(--vscode-sideBar-background);
+    display: flex; align-items: stretch;
+    /* [CUSTOM-20260930-140] **真悬浮**：脱离文档流、盖在消息区之上。139 时它还在文档流里，
+       于是底部这一整条（含卡片两侧那两块空白）都不显示消息 —— 用户报"输入框两侧还是会盖住
+       消息内容"。现在消息区占满整个高度、卡片浮在上面，内容也不会被压住：#messages 的
+       padding-bottom 留出了 --acpc-composer-h（composer.ts 的观察器写），滚到底时最后一条
+       正好停在卡片上方。
+       **背景必须透明** —— 有底色就等于把那两侧的消息蒙上一块。
+       z-index 8：高于置顶卡片（6）与引导条（3）；消息内容本身不带 z-index。 */
+    position: absolute; left: 0; right: 0; bottom: 0; z-index: 8;
+    /* [CUSTOM-20260930-144] 空区不吞鼠标：底栏通栏，但**只有卡片那一块**该接事件 ——
+       否则输入卡两侧、以及右侧大纲栏底部那块透明区域会把点击拦下来（实测大纲最后一条的
+       elementFromPoint 命中的是 composer，而不是那条记录）。可见的部件各自把 events 打开。 */
+    pointer-events: none;
+    /* [CUSTOM-20260930-139] 悬浮观感：卡片自己的描边 + 阴影 + 四周留白（底部这 10px 就是它
+       不贴着面板下缘的那点距离）。
+       [CUSTOM-20260930-138] **左右 padding 必须是 0**：右侧任何 padding 都会让预留区的
+       border-left（那根竖线）比钉住的大纲栏左边界靠左同样的像素数（实测 8px 就是这么来的）。
+       输入卡自己的边距交给 .composer-main 的**对称** padding —— 对称的 padding 不改变主列的
+       中心，所以卡片与消息列的中线仍然重合（实测 dxCardVsCol = 0）。 */
+    padding: 6px 0 10px;
+  }
+  /* [CUSTOM-20260930-143] 没连上 agent 之前不显示底栏：那时输入框本来就是禁用的，露一个
+     "看得见却打不了字"的框只会让人以为它坏了（用户反馈）。相位由 stateCard 写在
+     body[data-phase] 上，与上面 Times 那条用的是同一个机制（disconnected / connecting）。
+     顺带的好处：display: none 会让 ResizeObserver 把 --acpc-composer-h 归零，消息区于是不再
+     为一条并不存在的底栏留出底部空白。 */
+  body[data-phase="disconnected"] .composer,
+  body[data-phase="connecting"] .composer { display: none; }
+  .composer-main { flex: 1; min-width: 0; display: flex; justify-content: center; padding-inline: 8px; }
+  /* [CUSTOM-20260930-132] 限宽只加在这里（外墙照旧通栏），窄面板自动退化成满宽。
+     它同时是 .slash-popup 的定位上下文 —— 弹层按输入卡对齐而不是按面板算
+     （后者会在宽屏下横跨整屏）。 */
+  /* [CUSTOM-20260930-144] 卡片与它的弹层要收事件（父级 .composer 关掉了 pointer-events）。 */
+  .composer-inner {
+    position: relative; width: 100%; max-width: var(--acpc-composer-max); pointer-events: auto;
+  }
+  /* [CUSTOM-20260930-138] 右下角的预留功能区。宽度与大纲栏**同源**（JS 写的 --acpc-aside-w，
+     见 outline.ts 的 applyReserve）⇒ 可见时它的左边界与钉住的大纲栏左边界落在同一条竖线上，
+     而那根竖线就是这里的 border-left。
+     [143] **默认 0**：没有钉住的大纲栏就没有那根竖线，输入卡随之在面板里居中（用户要求）。
+     下面几个 min() 是让"宽度为 0"这件事**彻底**：不然 border-left 会留一条 1px 的孤线、
+     padding 也会撑出 8px —— 那时元素虽然宽 0，却仍然占着位置。
+     max-width 是安全阀：面板窄到放不下时不让它把输入区挤没（那种宽度下竖线不再严格对齐，
+     但那时也没有谁拿它当参照——大纲栏自己同样受 50% 上限约束）。 */
+  .composer-aside {
+    flex: 0 0 auto;
+    width: var(--acpc-aside-w, 0px); max-width: 40%;
+    border-left: min(1px, var(--acpc-aside-w, 0px)) solid var(--vscode-panel-border);
+    display: flex; align-items: center; justify-content: center;
+    padding-left: min(8px, var(--acpc-aside-w, 0px));
+  }
+  /* [CUSTOM-20260930-133] 一体式输入卡：textarea 与按钮栏共用一层描边（原来是"带边框的
+     textarea + 卡外一行按钮"，中间隔一条缝，看着像两个孤立控件）。
+     这一层**绝不能写 overflow**：.picker-menu 与 .slash-popup 都向上弹出、会被裁掉；而且
+     column flex 容器上的 overflow 会压缩子项而不是让容器滚动（pitfalls #17）。 */
+  .composer-card {
+    display: flex; flex-direction: column;
+    background: var(--vscode-input-background);
+    border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+    border-radius: 8px;
+    padding: 4px 8px 6px;
+    /* [CUSTOM-20260930-139] 悬浮感来自这层阴影（与 .state-card / .picker-menu 同一档），
+       配合上面去掉的通栏分隔线与四周留白。 */
+    box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.3));
   }
   .composer-bar { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
   .config-pickers { display: flex; flex-wrap: wrap; gap: 4px; margin-right: auto; }
@@ -1126,6 +1313,11 @@ export function styles(): string {
   /* 过滤生效时给边框上色：与 .outline-item.active 同一套"当前项"语义。**不用环**——
      环在这个面板里是键盘焦点（062 的教训）。 */
   .filter-chip.on { border-color: var(--vscode-focusBorder); color: var(--vscode-foreground); }
+  /* [CUSTOM-20260930-141] 目录过滤菜单与历史列表的底色/边框/圆角几乎同值（两者都吃
+     --vscode-dropdown-* 那套 token），叠在一起分不清哪个是哪个 —— 用户要求区分开。
+     借 .filter-chip.on 已有的那套语义（--vscode-focusBorder 表示"当前项"）：**不是画环**
+     （环在这个面板里是键盘焦点，062 的教训），只是把边框换成高亮色。 */
+  .filter-menu { border-color: var(--vscode-focusBorder); }
   .filter-icon { display: inline-flex; align-items: center; flex: none; opacity: .7; }
   .filter-icon svg { display: block; }
   .filter-caret { flex: none; opacity: .7; }
@@ -1147,17 +1339,30 @@ export function styles(): string {
   }
   .attachment-x:hover { opacity: 1; color: var(--vscode-errorForeground); }
 
-  .input-row { display: flex; gap: 4px; align-items: flex-end; }
+  /* [CUSTOM-20260930-133] .input-row 这一层删掉了：它唯一的子节点就是 textarea，而 133 起
+     textarea 是 .composer-card（flex 列）的子项 —— 那层 flex 行不再有任何作用，原文里的
+     flex:1 在纵轴上的含义也完全不同（下面是 width:100%）。 */
   .prompt-input {
-    flex: 1; min-width: 0; resize: none; overflow-y: auto;
-    background: var(--vscode-input-background);
+    width: 100%; box-sizing: border-box; resize: none; overflow-y: auto;
+    background: transparent;
     color: var(--vscode-input-foreground);
-    border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
-    border-radius: 4px; padding: 4px 6px;
+    border: none; border-radius: 0; padding: 4px 0 0;
     font-family: inherit; font-size: inherit; line-height: 1.4;
+    /* [CUSTOM-20260930-139] 默认只占**一行**：autoGrow 里那个 60px 的下限已放开，正常情况
+       下高度就是内容的自然高度；这条 min-height 是"JS 还没跑 / 内容为空"时的保底，
+       数字与上面那条 1.4 的行高同源（再算上 padding-top 的 4px）。 */
+    min-height: calc(1.4em + 4px);
+    /* [CUSTOM-20260930-134] 视口上限；内容上限仍是 autoGrow 的 320，两者取小。 */
+    max-height: var(--acpc-input-max-h);
   }
-  .prompt-input:focus { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+  /* [CUSTOM-20260930-134] 焦点环改由卡片承担（见下面的 :focus-within）。只抑制这一个元素的
+     outline，全局的 :focus-visible 不动 —— "环 = 键盘焦点"的语义（062）不变。 */
+  .prompt-input:focus, .prompt-input:focus-visible { outline: none; }
   .prompt-input:disabled { opacity: .55; }
+  .composer-card:focus-within { border-color: var(--vscode-focusBorder); }
+  /* 禁用态让整张卡片跟着退场，否则是"鲜活的框里一行灰字"。:has() 需 Chromium ≥105
+     （VS Code 1.85+ / Electron 25 起满足）；删掉也只损失一点观感。 */
+  .composer-card:has(.prompt-input:disabled) { opacity: .7; }
   .send-stop {
     flex: 0 0 auto; width: 26px; height: 26px; padding: 0; border-radius: 4px; cursor: pointer;
     border: none; font-family: inherit; font-size: inherit;
@@ -1170,19 +1375,55 @@ export function styles(): string {
   .send-stop .send-icon { display: inline-flex; align-items: center; }
   .send-stop .send-icon svg { display: block; width: 14px; height: 14px; }
 
-  /* [CUSTOM-20260928-096] 置底栏的上下文用量（Claude Code 风格：细条 + 百分比）。 */
+  /* [CUSTOM-20260930-129] 置底栏的上下文用量：**圆环 + 圆心数字**（取代 096 的细条 + 百分比）。
+     选圆环的理由是按钮栏里横向空间稀缺；顺带它多挂得下一个"正在跑"的外圈。
+     数据与阈值都没变，仍然是 meta.usage 与 0.7 / 0.9 两档。 */
   .context-meter {
-    display: inline-flex; align-items: center; gap: 4px; flex: 0 0 auto;
-    font-size: 0.82em; font-variant-numeric: tabular-nums;
-    color: var(--vscode-descriptionForeground);
+    position: relative; flex: 0 0 auto;
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 24px; height: 24px;
+    color: var(--vscode-descriptionForeground); cursor: default;
   }
-  .context-meter .usage-track { width: 90px; }
+  .context-meter svg { display: block; }
+  .gauge-track { fill: none; stroke: var(--vscode-panel-border); stroke-width: 2.5; }
+  .gauge-fill {
+    fill: none; stroke: var(--vscode-progressBar-background); stroke-width: 2.5;
+    stroke-linecap: round;
+    /* 起点从 3 点方向挪到 12 点方向，否则进度看起来是"从右边开始长"的。 */
+    transform: rotate(-90deg); transform-origin: 50% 50%;
+  }
+  .context-meter.warn .gauge-fill { stroke: var(--vscode-charts-yellow); }
+  .context-meter.hot .gauge-fill { stroke: var(--vscode-charts-red); }
+  .gauge-text {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 8.5px; font-variant-numeric: tabular-nums;
+    color: var(--vscode-foreground); pointer-events: none;
+  }
+  /* 外圈：一段 1/4 弧。只在**有轮次在跑**时出现并绕圈转——"它在干活"。
+     半径比进度环大 2.5，两环之间才留得出缝（贴在一起时外弧读不出是"另一圈"）。
+     周长 2π×11.5 ≈ 72.3，所以 dasharray 的 18.1 + 54.2 恰好绕满一圈。
+     减少动效偏好由文件末尾那条全局规则兜住（animation: none !important）。 */
+  .gauge-spin {
+    /* currentColor (= the .context-meter's descriptionForeground), NOT the progress blue:
+       same colour as the progress ring made the two read as two different progress bars.
+       A neutral arc says "activity", and the blue ring keeps saying "how much". */
+    fill: none; stroke: currentColor; stroke-width: 1.5;
+    stroke-linecap: round; stroke-dasharray: 18.1 54.2;
+    opacity: 0; transform-origin: 50% 50%;
+  }
+  .context-meter.running .gauge-spin { opacity: .9; animation: gauge-spin 1.5s linear infinite; }
+  @keyframes gauge-spin { to { transform: rotate(360deg); } }
 
   .attachment-thumb { height: 20px; width: 20px; object-fit: cover; border-radius: 2px; flex: 0 0 auto; cursor: zoom-in; }
 
   /* Slash popup */
   .slash-popup {
-    position: absolute; bottom: 100%; left: 6px; right: 6px; z-index: 30;
+    /* [CUSTOM-20260930-132] left/right 从 6px 改成 0：定位祖先已从 .composer 换成
+       .composer-inner —— 那 6px 原本是抵消 .composer 的左右内边距、让弹层与 textarea 的
+       边框盒对齐；现在祖先本身就是版心，0 就是卡片的那条边。留着 6px 会缩进一圈，
+       而如果把它放在 .composer 里，宽屏下它会横跨整屏（与 820 的版心错位）。 */
+    position: absolute; bottom: 100%; left: 0; right: 0; z-index: 30;
     max-height: 220px; overflow-y: auto;
     background: var(--vscode-editorSuggestWidget-background, var(--vscode-dropdown-background));
     border: 1px solid var(--vscode-editorSuggestWidget-border, var(--vscode-dropdown-border));
