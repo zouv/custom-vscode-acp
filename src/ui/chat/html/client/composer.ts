@@ -18,6 +18,10 @@ export const composerClient = `
   var attachmentsEl = null;
   var pickersEl = null;
   var contextMeter = null;
+  // [CUSTOM-20260930-129] The last usage we were given. The ring's "a turn is running"
+  // outer arc is driven by setRunning, and that path never sees 'meta' — so the numbers
+  // are kept here and redrawn from them.
+  var lastUsage = null;
   // [CUSTOM-20260928-096] 图片附件的缩略图（id → dataUrl）。客户端本地缓存、随 reload 丢，
   // 纯展示用——宿主内存仍持有全图供发送，丢了这个只是 chip 缩略图回退成图标。
   var imageThumbs = {};
@@ -112,6 +116,8 @@ export const composerClient = `
     document.addEventListener('click', function (event) {
       if (!pickersEl.contains(event.target)) { closeMenus(); }
     });
+    // [CUSTOM-20260930-140] 底栏浮起来了，消息区要靠这个高度才知道该留多少底部空间。
+    watchHeight();
   }
 
   function target() {
@@ -225,8 +231,39 @@ export const composerClient = `
   /** Grow the textarea with its content, between sane bounds. */
   function autoGrow() {
     input.style.height = 'auto';
-    var next = Math.max(60, Math.min(320, input.scrollHeight));
+    // [CUSTOM-20260930-139] 下限从 60px 放开：默认就占**一行**，随内容长高。
+    // 空内容 / JS 未跑时的保底高度交给 CSS 的 min-height（.prompt-input）；
+    // 上限仍是 320，而"面板再高也不许超过屏幕 38%"那条由 CSS 的 max-height 夹 ——
+    // 两者同时存在时浏览器取小的那个，所以这里不需要知道视口有多高。
+    var next = Math.min(320, input.scrollHeight);
     input.style.height = next + 'px';
+  }
+
+  /**
+   * [CUSTOM-20260930-140] 把底栏**此刻的高度**写给 CSS（--acpc-composer-h）。
+   *
+   * 底栏是绝对定位、浮在消息之上的（styles.ts 的 .composer），占位得靠留白补回来：
+   * #messages 的 padding-bottom 与 #jumpToLatest 的 bottom 都用这个变量。高度随输入框在
+   * 1 行与多行之间变化，所以只能量 —— 用 ResizeObserver 观察底栏本身，而不是去列"哪些事件
+   * 会改变它的高度"（pitfall #27：那种清单必然落后）。
+   */
+  function watchHeight() {
+    var composerEl = NS.dom.qs('composer');
+    // 桩 DOM（src/test/chat-client.test.ts）没有 #composer，它的 body.style 也没有
+    // setProperty ⇒ 判空跳过，别让这条新代码把客户端逻辑测试打红。
+    if (!composerEl || !document.body || !document.body.style || !document.body.style.setProperty) { return; }
+    function apply() {
+      document.body.style.setProperty('--acpc-composer-h', composerEl.offsetHeight + 'px');
+    }
+    apply();
+    if (typeof window.ResizeObserver === 'function') {
+      var observer = new window.ResizeObserver(apply);
+      observer.observe(composerEl);
+    } else {
+      // 与 rail.ts 的 onResize 同一个态度：没有 ResizeObserver 时说一声，而不是静默错位。
+      window.addEventListener('resize', apply);
+      console.warn('[acpc] ResizeObserver unavailable: the composer will not make room when it grows');
+    }
   }
 
   // --- Slash commands ------------------------------------------------------
@@ -410,26 +447,69 @@ export const composerClient = `
     return item;
   }
 
-  // --- Context meter (CUSTOM-20260928-096) --------------------------------
-  // Claude Code 风格的上下文用量：细进度条 + 百分比。数据来自 meta.usage（宿主
-  // 已从 usage_update / PromptResponse.usage 填充），无需新增协议消息。
+  // --- Context meter (CUSTOM-20260928-096, 129 改圆环) ---------------------
+  // Claude Code 风格的上下文用量。数据来自 meta.usage（宿主已从 usage_update /
+  // PromptResponse.usage 填充），无需新增协议消息。
+  //
+  // [CUSTOM-20260930-129] 从"细条 + 百分比"改成**圆环 + 圆心数字**：底部按钮栏里横向空间
+  // 是稀缺的，而圆环在同样的高度下多给了一个"正在跑"的外圈动效（见 setRunning）。
+  var GAUGE_NS = 'http://www.w3.org/2000/svg';
+  var GAUGE_HALF = 13;          // viewBox is 26x26; every circle is centred here
+  var GAUGE_R = 9;              // the progress ring
+  var GAUGE_SPIN_R = 11.5;      // the "a turn is running" ring, well outside it
+  var GAUGE_C = 2 * Math.PI * GAUGE_R;
+
+  function gaugeCircle(className, radius) {
+    var circle = document.createElementNS(GAUGE_NS, 'circle');
+    circle.setAttribute('class', className);
+    circle.setAttribute('cx', String(GAUGE_HALF));
+    circle.setAttribute('cy', String(GAUGE_HALF));
+    circle.setAttribute('r', String(radius));
+    return circle;
+  }
+
+  /** A 26x26 pair of rings: the inner one is the progress, the outer one only shows up
+   *  while a turn is running (CSS spins it). The gap between them is deliberate — with a
+   *  smaller one the two rings touch and the outer arc stops reading as a separate ring. */
+  function buildGauge(pct) {
+    var root = document.createElementNS(GAUGE_NS, 'svg');
+    root.setAttribute('viewBox', '0 0 26 26');
+    root.setAttribute('width', '24');
+    root.setAttribute('height', '24');
+    root.setAttribute('aria-hidden', 'true');
+    root.appendChild(gaugeCircle('gauge-track', GAUGE_R));
+    var fill = gaugeCircle('gauge-fill', GAUGE_R);
+    // dasharray is the whole circumference and dashoffset hides the part not yet reached.
+    // SVG attributes cannot do calc(), so both numbers are computed here rather than in CSS.
+    fill.setAttribute('stroke-dasharray', String(GAUGE_C));
+    fill.setAttribute('stroke-dashoffset', String(GAUGE_C * (1 - pct)));
+    root.appendChild(fill);
+    root.appendChild(gaugeCircle('gauge-spin', GAUGE_SPIN_R));
+    return root;
+  }
 
   function renderContext(usage) {
-    if (!usage || !usage.size) {
+    lastUsage = usage || null;
+    if (!lastUsage || !lastUsage.size) {
       contextMeter.hidden = true;
       return;
     }
-    var pct = Math.max(0, Math.min(1, usage.used / usage.size));
+    var pct = Math.max(0, Math.min(1, lastUsage.used / lastUsage.size));
+    var percent = Math.round(pct * 100);
+    var label = Math.round(lastUsage.used / 1000) + 'k / ' + Math.round(lastUsage.size / 1000) + 'k tokens';
+    // The cost line used to live in the header bar; that bar is gone, so it rides in the
+    // tooltip rather than being dropped.
+    if (lastUsage.costAmount !== undefined && lastUsage.costAmount !== null) {
+      label += '  ' + lastUsage.costAmount + ' ' + (lastUsage.costCurrency || '');
+    }
     contextMeter.hidden = false;
-    contextMeter.title = Math.round(usage.used / 1000) + 'k / ' + Math.round(usage.size / 1000) + 'k tokens';
+    contextMeter.title = percent + '%  ·  ' + label;
+    contextMeter.className = 'context-meter'
+      + (pct > 0.9 ? ' hot' : (pct > 0.7 ? ' warn' : ''))
+      + (state.running ? ' running' : '');
     NS.dom.clear(contextMeter);
-    var fillClass = 'usage-fill' + (pct > 0.9 ? ' hot' : (pct > 0.7 ? ' warn' : ''));
-    var track = NS.dom.el('span', 'usage-track');
-    var fill = NS.dom.el('span', fillClass);
-    fill.style.width = Math.round(pct * 100) + '%';
-    track.appendChild(fill);
-    contextMeter.appendChild(track);
-    contextMeter.appendChild(document.createTextNode(Math.round(pct * 100) + '%'));
+    contextMeter.appendChild(buildGauge(pct));
+    contextMeter.appendChild(NS.dom.el('span', 'gauge-text', String(percent)));
   }
 
   // --- Attachments ---------------------------------------------------------
@@ -564,6 +644,9 @@ export const composerClient = `
   function setRunning(running) {
     state.running = running;
     refreshControls();
+    // [CUSTOM-20260930-129] The ring's outer arc says "a turn is running", and this path
+    // has no meta of its own — redraw from the numbers we kept.
+    renderContext(lastUsage);
   }
 
   function setMeta(meta) {

@@ -60,6 +60,10 @@ export const bootClient = `
   NS.bridge.postForSession = postForSession;
 
   function showEmpty(show) {
+    // [CUSTOM-20260930-123] 状态卡接管消息区时，置顶副本必须让位：它是
+    // .messages-column 的绝对定位子元素，transcriptView.reset() 清不掉它，而卡片
+    // 没有背景 ⇒ 上一个会话的置顶卡会**透出来**。这里是它唯一的写者，别在别处再写。
+    if (show && NS.stickyUser) { NS.stickyUser.reset(); }
     emptyState.style.display = show ? '' : 'none';
   }
 
@@ -67,21 +71,11 @@ export const bootClient = `
   // (boot / focus / sessionsChanged). It decides what the empty state SAYS: a sessionless
   // panel can still have a live agent process, and telling the user to connect one that
   // is already running is simply wrong.
-  var agentConnected = false;
-  // One writer for this label: it belongs to the empty state, which boot owns. The
-  // sessionMenu's click handler stays where it is — it does the right action in both
-  // states (start a draft, ask the host to make sure the agent is up).
-  var CONNECT_LABEL = 'Connect Claude Code';
-  var CONNECTED_LABEL = 'New session';
-
+  // [CUSTOM-20260930-123] The status card owns the wording now (client/stateCard.ts holds
+  // the single copy of it); this function is only the channel that carries the flag over.
   function applyEmptyState(connected) {
-    if (connected !== undefined) { agentConnected = connected === true; }
-    var off = NS.dom.qs('emptyHintDisconnected');
-    var on = NS.dom.qs('emptyHintConnected');
-    var btn = NS.dom.qs('emptyConnect');
-    if (off) { off.hidden = agentConnected; }
-    if (on) { on.hidden = !agentConnected; }
-    if (btn) { btn.textContent = agentConnected ? CONNECTED_LABEL : CONNECT_LABEL; }
+    if (connected === undefined) { return; }
+    if (NS.stateCard) { NS.stateCard.setConnected(connected === true); }
   }
 
   function setLoading(loading) {
@@ -100,7 +94,8 @@ export const bootClient = `
     currentSessionId = summary ? summary.sessionId : null;
     NS.tabs.setFocus(summary);
     NS.composer.setFocus(summary, meta);
-    NS.tabs.renderUsage(meta);
+    // [CUSTOM-20260930-129] 这里原有一行 NS.tabs.renderUsage(meta)（顶部那条进度条）。
+    // 顶部进度条已删除，上下文用量只由底部的圆环呈现（composer.setFocus 里画）。
     // Attachments ride along on meta so they survive a session switch.
     NS.composer.setAttachments((meta && meta.attachments) || []);
 
@@ -177,16 +172,26 @@ export const bootClient = `
    * allows the nonce'd inline script).
    */
   function requestMarkdown() {
-    if (!currentSessionId) { return; }
+    // [CUSTOM-20260930-147] 这里原来有一条 if (!currentSessionId) { return; }：聚焦会话为空
+    // 时整批请求都发不出去。而 transcriptView 的 item **自带 sessionId**（请求方就是它），
+    // 不需要借 boot 的聚焦状态 —— 那道守卫只会让"正文刚落地、聚焦还没同步好"的那一帧白白丢掉
+    // 一次请求（pending 不清空，但下一次触发可能永远不会来，见 128）。
     var pending = NS.transcriptView.pendingMarkdown();
     // [CUSTOM-20260925-066] Tool text blocks queue on the same round-trip.
     if (NS.toolCallView && NS.toolCallView.pendingMarkdownItems) {
       // [CUSTOM-20260929-120] The tool items have no session of their own — stamp the
       // focused one on them here, or the host drops them (see pendingMarkdownItems).
-      pending = pending.concat(NS.toolCallView.pendingMarkdownItems(currentSessionId));
+      // 只有这些 item 依赖聚焦会话，所以守卫挪到了这里。
+      if (currentSessionId) {
+        pending = pending.concat(NS.toolCallView.pendingMarkdownItems(currentSessionId));
+      }
     }
     if (pending.length === 0) { return; }
     NS.bridge.post({ type: 'renderMarkdown', items: pending });
+    // [CUSTOM-20260930-147] 临时诊断（定位"最后一条不渲染"后可以删）：请求这一侧到底发没发、
+    // 带的是哪条记录。与下面 markdownRendered / patch dropped 两条日志合起来能一次定位断点。
+    console.warn('[acpc] renderMarkdown asked: ' + pending.length + ' item(s) ['
+      + pending.map(function (it) { return it.entryId; }).join(',') + ']');
   }
 
   // Exposed so transcriptView can ask for rendering when a stream finalizes.
@@ -242,7 +247,9 @@ export const bootClient = `
     NS.tabs.setDraftFocus(draft);
     NS.composer.setDraft(draft);
     NS.transcriptView.reset();
-    showEmpty(false);
+    // [CUSTOM-20260930-123] 卡片留在中央，不再让位给一片空白：草稿页的「页面」就是它
+    // （未连接时是提示、已连接时是引导）。这正是用户报的「连接成功后中间一片空白」。
+    showEmpty(true);
     setLoading(false);
     NS.outline.close();
     NS.outline.invalidate();
@@ -309,8 +316,11 @@ export const bootClient = `
   /** Creating the session failed: keep the draft AND the typed text. */
   function failDraft(draftId, message) {
     NS.composer.failDraft();
-    NS.transcriptView.append(noticeNode('error', message));
-    showEmpty(false);
+    // [CUSTOM-20260930-123] The draft page's "page" is the status card. Appending a notice
+    // to an empty transcript would be hidden behind the card (and showEmpty(false) hid the
+    // card outright), so the failure goes where the user is actually looking.
+    if (NS.stateCard) { NS.stateCard.setError(message); }
+    showEmpty(true);
     console.warn('[acpc] draft failed:', draftId, message);
   }
 
@@ -380,11 +390,30 @@ export const bootClient = `
   function onMessage(event) {
     var message = event.data;
     if (!message || !message.type) { return; }
+    // [CUSTOM-20260930-149] 带记录的消息（append / revise / toolUpdate）都自带 sessionId ——
+    // 用它把客户端的会话身份**校正**回来。原因见 transcriptView.setSessionId：reset() 会清空它，
+    // 而只有快照（hydrate）会设回来，于是"重开面板 / 切会话之后新到的记录"整段时间里它是 null，
+    // markdown 请求带着 null 发出去、被宿主静默丢弃（Output: dropped markdown item … unknown
+    // session null），界面上就是"最后一条停在原文"。
+    if (message.sessionId && (message.entries || message.entryId)
+      && NS.transcriptView.setSessionId) {
+      NS.transcriptView.setSessionId(message.sessionId);
+    }
 
     switch (message.type) {
       case 'boot':
         NS.tabs.setSessions(message.sessions || []);
         applyEmptyState(message.agentConnected);
+        // [CUSTOM-20260930-123] Arm the auto-connect timer here: this is the only place
+        // that knows all three inputs at once (agentConnected + focused + the setting).
+        // noteBoot is idempotent — boot is delivered twice per document.
+        if (NS.stateCard) {
+          NS.stateCard.noteBoot({
+            agentConnected: message.agentConnected === true,
+            autoConnect: message.autoConnect,
+            focused: !!message.focused
+          });
+        }
         applyFocus(message.focused, message.snapshot, message.meta);
         syncFocusedState(message.sessions || []);
         break;
@@ -392,6 +421,12 @@ export const bootClient = `
       // [CUSTOM-20260926-077] Outline pin/width prefs come back with boot.
       case 'uiPrefs':
         NS.outline.applyPrefs(message);
+        break;
+
+      // [CUSTOM-20260930-125] The auto-connect setting's live value: changed on the other
+      // surface, or in the Settings UI. The boot-time value rides along with 'boot'.
+      case 'autoConnectPref':
+        if (NS.stateCard) { NS.stateCard.setAutoConnect(message.value === true); }
         break;
 
       case 'sessionsChanged':
@@ -455,10 +490,15 @@ export const bootClient = `
 
       case 'markdownRendered': {
         var items = message.items || [];
+        // [CUSTOM-20260930-147] 临时诊断：宿主回填到了哪几条。
+        console.warn('[acpc] markdownRendered: ' + items.length + ' item(s) ['
+          + items.map(function (it) { return it.entryId; }).join(',') + ']');
         for (var j = 0; j < items.length; j++) {
-          if (items[j].sessionId !== currentSessionId) { continue; }
-          // [CUSTOM-20260925-066] A keyed item is a sub-block of a tool card, not
-          // a transcript record: there is no entry to patch, there is an element.
+          // [CUSTOM-20260930-147] **不再**拿 item.sessionId 跟 currentSessionId 比：两端的来源不同
+          // （这里是 boot 的聚焦会话，item 带的是请求方 transcriptView 的），不一致时会把回填
+          // **静默丢掉** —— 那条记录于是一直停在原文。而宿主其实已经把 html 写进 store 了，
+          // 所以"重开会话就正常"（重开走快照，不经过这里）。
+          // entryId 在 store 里是全局唯一的，按它回填本来就串不了台（找不到就 patch 忽略）。
           if (items[j].key) { NS.toolCallView.applyMarkdown(items[j].key, items[j].html); }
           else { NS.transcriptView.patch(items[j].entryId, { html: items[j].html }); }
         }
@@ -474,7 +514,6 @@ export const bootClient = `
       case 'meta':
         if (message.sessionId === currentSessionId) {
           NS.composer.setMeta(message.meta);
-          NS.tabs.renderUsage(message.meta);
         }
         break;
 
@@ -517,6 +556,15 @@ export const bootClient = `
         // transcript. The extension already recorded it in the store, so the
         // only job here is to show it when it belongs to the focused session.
         if (message.sessionId && message.sessionId !== currentSessionId) { break; }
+        // [CUSTOM-20260930-123] With no session (and no draft) the failure belongs to the
+        // status card: appending to an empty transcript AND hiding the card would leave the
+        // user with a stray line in the middle of nothing — the look this change removes.
+        if (!currentSessionId && !focusedDraftId) {
+          if (NS.stateCard) { NS.stateCard.setError(message.message); }
+          NS.composer.setRunning(false);
+          setLoading(false);
+          break;
+        }
         NS.transcriptView.append(noticeNode('error', message.message));
         showEmpty(false);
         NS.composer.setRunning(false);
@@ -524,6 +572,24 @@ export const bootClient = `
         NS.outline.invalidate();
         NS.rail.invalidate();
         break;
+
+      // [CUSTOM-20260930-123] One connection attempt's phase. The host answers on every
+      // path (see protocol.ts): without that, a panel whose agent process is already up
+      // would sit on "Connecting…" forever, because nothing else would ever speak.
+      case 'connection': {
+        if (NS.stateCard) { NS.stateCard.onConnection(message); }
+        if (message.state === 'connected') {
+          // The requirement behind this change: once connected, the composer must accept
+          // input. With no session the draft page IS that state — its first message is what
+          // creates the session (058). When the host focused a session instead, do not add
+          // a spare tab next to it.
+          // A '+' pressed while offline is honoured unconditionally: it asked for a NEW
+          // draft, not for whichever session happens to be newest.
+          var wanted = NS.stateCard ? NS.stateCard.takeDraftIntent() : false;
+          if (wanted || (!focusedDraftId && !currentSessionId)) { startDraft(); }
+        }
+        break;
+      }
 
       default:
         break;
@@ -682,6 +748,8 @@ export const bootClient = `
     NS.outline.init(NS.dom.qs('messages'), NS.dom.qs('outline'), NS.dom.qs('outlineBtn'));
     // [CUSTOM-20260924-023]
     NS.rail.init(NS.dom.qs('messages'), NS.dom.qs('rail'), NS.dom.qs('railTrack'));
+    // [CUSTOM-20260930-123] 连接状态卡（取代 sessionMenu 里的空态按钮）。
+    if (NS.stateCard) { NS.stateCard.init(); }
     // [CUSTOM-20260925-032/033] Connect button (empty state) + history picker.
     NS.sessionMenu.init();
     // [CUSTOM-20260925-058] Directory drawer for the draft page.

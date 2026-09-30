@@ -200,6 +200,21 @@ export class PermissionBridge {
   }
 
   /** Diagnostics: how many prompts are still awaiting an answer. */
+  /**
+   * [CUSTOM-20260930-130] Is this session waiting on the USER for anything?
+   *
+   * The tab strip's dot says what a session is doing; "waiting for an answer" is the one
+   * state where nothing will move until the reader acts, so it gets its own colour rather
+   * than being folded into "running" (both are often true at once: a turn is in flight and
+   * parked on a permission prompt).
+   */
+  hasPendingFor(sessionId: string): boolean {
+    for (const item of this.pending.values()) {
+      if (!item.resolved && item.prompt.sessionId === sessionId) { return true; }
+    }
+    return false;
+  }
+
   get pendingCount(): number {
     return this.pending.size;
   }

@@ -27,6 +27,10 @@ import { toolCallViewClient } from '../ui/chat/html/client/toolCallView';
 import { transcriptViewClient } from '../ui/chat/html/client/transcriptView';
 import { outlineClient } from '../ui/chat/html/client/outline';
 import { stickyUserClient } from '../ui/chat/html/client/stickyUser';
+// [CUSTOM-20260930-123] The start card (connect phases + the auto-connect switch).
+import { stateCardClient } from '../ui/chat/html/client/stateCard';
+// [CUSTOM-20260930-132] 面板静态标记：版心的承重结构断言（下面那个 suite）。
+import { body as chatPanelMarkup } from '../ui/chat/html/body';
 
 // --- 最小桩 DOM -------------------------------------------------------------
 // Only what the exercised paths touch. Deliberately NOT a general DOM: a fuller
@@ -39,6 +43,8 @@ class StubNode {
   /** [CUSTOM-20260929-114] The <details> open state the client writes (and reads back on re-decide). */
   open = false;
   disabled = false;
+  /** [CUSTOM-20260930-123] The start card's auto-connect switch is a checkbox. */
+  checked = false;
   title = '';
   /** [CUSTOM-20260927-085] The composer's textarea and buttons are plain fields. */
   value = '';
@@ -119,7 +125,14 @@ class StubNode {
   }
   get lastChild(): StubNode | null { return this.childNodes[this.childNodes.length - 1] ?? null; }
 
-  setAttribute(name: string, value: string): void { this.attributes[name] = value; }
+  setAttribute(name: string, value: string): void {
+    this.attributes[name] = value;
+    // [CUSTOM-20260930-129] Real elements reflect 'class' onto .className, and CSS
+    // selectors match the ATTRIBUTE. The SVG builders have to use setAttribute (an SVG
+    // element's .className is a read-only SVGAnimatedString), so without this reflection
+    // the stub could not find anything they built.
+    if (name === 'class') { this.className = value; }
+  }
   getAttribute(name: string): string | null { return this.attributes[name] ?? null; }
   removeAttribute(name: string): void { delete this.attributes[name]; }
 
@@ -249,14 +262,28 @@ function loadClient(
   // a 200-character message fit on one line).
   const metrics = { charsPerLine: 20 };
   const docListeners: Record<string, Array<(event: any) => void>> = {};
+  // [CUSTOM-20260930-123] Timers are RECORDED, not run: the start card's auto-connect is
+  // "wait 500ms, then re-check", and a test has to be able to look at what was asked for
+  // (delay + callback) and decide when it fires. Running them on the spot would erase the
+  // very property under test. clearTimeout really removes, so the card's own
+  // cancel-the-watchdog paths are exercised too.
+  const timers: Array<{ id: number; fn: () => void; delay: number }> = [];
+  let timerSeq = 0;
   const win: Record<string, any> = {
     __acpc: {},
     // [CUSTOM-20260928-100] `syncFrames` runs scheduled callbacks immediately, so a
     // test can drive a path that defers its layout reads to the next frame (the
     // outline's scroll pass) without a real animation frame.
     requestAnimationFrame: opts.syncFrames ? (fn: () => void) => { fn(); return 0; } : () => 0,
-    setTimeout: () => 0,
-    clearTimeout: () => {},
+    setTimeout: (fn: () => void, delay?: number) => {
+      const id = ++timerSeq;
+      timers.push({ id, fn, delay: delay ?? 0 });
+      return id;
+    },
+    clearTimeout: (id: number) => {
+      const at = timers.findIndex(t => t.id === id);
+      if (at >= 0) { timers.splice(at, 1); }
+    },
     getSelection: () => null,
     innerHeight: 800,
     innerWidth: 600,
@@ -309,10 +336,10 @@ function loadClient(
   // [CUSTOM-20260926-079] `sessionMenu` joined the list for its own suite: unlike
   // boot, its IIFE runs nothing at load time (init() is called by boot, and here by
   // the test), so loading it costs the record-layer tests nothing.
-  for (const source of [domClient, iconsClient, linksClient, toolCallViewClient, transcriptViewClient, outlineClient, sessionMenuClient, composerClient, tabsClient, stickyUserClient, elicitationViewClient]) {
+  for (const source of [domClient, iconsClient, linksClient, toolCallViewClient, transcriptViewClient, outlineClient, sessionMenuClient, composerClient, tabsClient, stickyUserClient, elicitationViewClient, stateCardClient]) {
     new Function('window', 'document', source)(win, doc);
   }
-  return { NS, metrics, doc, docListeners, jumps };
+  return { NS, metrics, doc, docListeners, jumps, timers };
 }
 
 /**
@@ -378,6 +405,35 @@ function shapeOf(NS: Record<string, any>, entry: Record<string, unknown>): {
   };
 }
 
+/**
+ * The record's OWN text, with the always-present timestamp span left out.
+ *
+ * [CUSTOM-20260930-129] The stamp now lives inside the summary, so a plain `textContent`
+ * concatenates the message with its clock ("第一行12:20") — and textContent does not care
+ * that the span is display:none (pitfall #16).
+ */
+function ownText(node: StubNode): string {
+  return Array.from(node.childNodes)
+    .filter(child => child.nodeType !== 1 || !child.className.split(/\s+/).includes('rec-time'))
+    .map(child => child.textContent)
+    .join('');
+}
+
+/**
+ * A summary's children in DOM order, as class names ('text' for text nodes) — with the
+ * floating timestamp filtered out.
+ *
+ * [CUSTOM-20260930-129] The stamp is absolutely positioned, i.e. out of flow, so it must
+ * not take part in "what comes after what" assertions: the reader sees the caret right
+ * after the icon even though the stamp sits between them in the DOM.
+ */
+function summaryOrder(summary: StubNode): string {
+  return summary.childNodes
+    .filter(child => child.nodeType !== 1 || !child.className.split(/\s+/).includes('rec-time'))
+    .map(child => (child.nodeType === 1 ? child.className : 'text'))
+    .join(',');
+}
+
 suite('chat client logic: record DOM shape (stub DOM)', () => {
   // [CUSTOM-20260928-113] The caret is on EVERY user record now. It used to be withheld
   // from one-liners ("nothing to fold"), but the reader reported the missing button
@@ -388,7 +444,7 @@ suite('chat client logic: record DOM shape (stub DOM)', () => {
     const { NS } = loadClient();
     const { isFold, summary, root } = shapeOf(NS, { id: 'u1', kind: 'user', at: Date.now(), text: '跑全部闸门。' });
     assert.strictEqual(isFold, true, 'the fold affordance is on every message');
-    assert.strictEqual(summary!.textContent, '跑全部闸门。', 'the whole text stays in the summary');
+    assert.strictEqual(ownText(summary!), '跑全部闸门。', 'the whole text stays in the summary');
     assert.strictEqual(root.querySelector('.fold-body'), null, 'and nothing claims to be hidden');
     assert.strictEqual(root.getAttribute('data-fold'), 'done', 'the answer came from layout');
   });
@@ -437,10 +493,10 @@ suite('chat client logic: record DOM shape (stub DOM)', () => {
     // between <summary> and the body already renders as a line break (keeping the
     // '\n' as well showed one blank line too many once expanded).
     const original = '第一行\n第二行\n第三行';
-    assert.ok(original.startsWith(summary!.textContent), `summary must be a prefix: ${summary!.textContent}`);
+    assert.ok(original.startsWith(ownText(summary!)), `summary must be a prefix: ${ownText(summary!)}`);
     assert.ok(original.endsWith(body!.textContent), `body must be a suffix: ${body!.textContent}`);
     assert.ok(
-      summary!.textContent.length + body!.textContent.length >= original.length - 1,
+      ownText(summary!).length + body!.textContent.length >= original.length - 1,
       'only the boundary newline may be dropped',
     );
   });
@@ -455,7 +511,7 @@ suite('chat client logic: record DOM shape (stub DOM)', () => {
     assert.ok(text.length < 160, 'the fixture must be under the old threshold to mean anything');
     const { isFold, summary, body } = shapeOf(NS, { id: 'u3', kind: 'user', at: Date.now(), text });
     assert.strictEqual(isFold, true, 'a wrapped line IS multi-line — that is what the reader sees');
-    assert.strictEqual(summary!.textContent + body!.textContent, text, 'nothing lost, nothing repeated');
+    assert.strictEqual(ownText(summary!) + body!.textContent, text, 'nothing lost, nothing repeated');
   });
 
   test('a message that fits on ONE line keeps its caret, and folds to that one line', () => {
@@ -467,7 +523,7 @@ suite('chat client logic: record DOM shape (stub DOM)', () => {
     const text = 'x'.repeat(200);
     const { isFold, summary, body } = shapeOf(NS, { id: 'u4', kind: 'user', at: Date.now(), text });
     assert.strictEqual(isFold, true, 'a single-line message folds to its one line (113)');
-    assert.strictEqual(summary!.textContent, text, 'the summary carries the whole text');
+    assert.strictEqual(ownText(summary!), text, 'the summary carries the whole text');
     assert.strictEqual(body, null, 'and there is no body, so nothing is hidden');
   });
 
@@ -502,12 +558,12 @@ suite('chat client logic: record DOM shape (stub DOM)', () => {
     const root = renderEntry(NS, container, { id: 't1', kind: 'thought', at: Date.now(), text: '想一下', streaming: true });
     const details = root.querySelector('[data-kind]') as StubNode;
     const summary = details.querySelector('summary')!;
-    const order = summary.childNodes.map(c => (c.nodeType === 1 ? c.className : 'text')).join(',');
+    const order = summaryOrder(summary);
     assert.ok(order.startsWith('rec-icon,fold-caret'), `caret must follow the icon, got: ${order}`);
 
     // The finalize rewrite replaces the label; it must not take the decorations with it.
     NS.transcriptView.patch('t1', { streaming: false, elapsedMs: 1200 });
-    const after = summary.childNodes.map(c => (c.nodeType === 1 ? c.className : 'text')).join(',');
+    const after = summaryOrder(summary);
     assert.ok(after.includes('rec-icon'), `icon lost on finalize: ${after}`);
     assert.ok(after.includes('fold-caret'), `caret lost on finalize: ${after}`);
     assert.ok(after.includes('text'), 'the new label must be there');
@@ -544,7 +600,7 @@ suite('chat client logic: assistant message fold (stub DOM)', () => {
     assert.ok(details, 'the record is a foldable <details>');
     assert.strictEqual(details.open, true, 'open by default — an answer that just arrived must not be hidden');
     // INV-J ①: the caret is a real element and it comes AFTER the type icon.
-    const order = summary.childNodes.map(c => (c.nodeType === 1 ? c.className : 'text')).join(',');
+    const order = summaryOrder(summary);
     assert.ok(order.startsWith('rec-icon,fold-caret'), `caret must follow the icon, got: ${order}`);
     // The content must NOT be inside the summary: selecting text in a summary toggles it.
     assert.strictEqual(summary.querySelector('.bubble-body'), null, 'the body is not inside the summary');
@@ -566,7 +622,7 @@ suite('chat client logic: assistant message fold (stub DOM)', () => {
     assert.ok(details.querySelector('.bubble-body') === body, 'the body is the same node, still inside the fold');
     // The icon/caret used to be preserved by takeIcon/putIcon because the rewrite wiped the
     // host they lived in. They live in the summary now, so nothing can wipe them.
-    const after = summary.childNodes.map(c => (c.nodeType === 1 ? c.className : 'text')).join(',');
+    const after = summaryOrder(summary);
     assert.ok(after.includes('rec-icon') && after.includes('fold-caret'), `header row lost a widget: ${after}`);
   });
 
@@ -584,7 +640,7 @@ suite('chat client logic: assistant message fold (stub DOM)', () => {
       'plain streaming text: one line, and only the first one');
     assert.strictEqual(body!.textContent, '第一行\n第二行', 'the whole text stays in the body');
     // Reading order in the header row: icon, caret, preview (INV-J ①).
-    const order = summary.childNodes.map(c => (c.nodeType === 1 ? c.className : 'text')).join(',');
+    const order = summaryOrder(summary);
     assert.ok(order.startsWith('rec-icon,fold-caret,msg-preview'), `unexpected header order: ${order}`);
 
     // The markdown rewrite replaces the body wholesale; the preview has to come along.
@@ -759,7 +815,6 @@ suite('chat client logic: tab strip (stub DOM)', () => {
       agentBar: new StubNode('div'),
       agentSelect: new StubNode('select'),
       cwdBtn: new StubNode('button'),
-      usageBar: new StubNode('div'),
       newTab: new StubNode('button'),
     };
     const { NS } = loadClient(els);
@@ -770,6 +825,32 @@ suite('chat client logic: tab strip (stub DOM)', () => {
   const summary = (id: string) => ({
     sessionId: id, agentName: 'Claude Code', title: 'a session', cwd: '/tmp',
     createdAt: '', loading: false, running: false, unread: false,
+  });
+
+  // [CUSTOM-20260930-130] The dot carries two independent signals, which is the whole
+  // point of the change: the COLOUR says what the session is doing, the RING says it is
+  // working. They cannot be collapsed into one — a turn parked on a permission prompt is
+  // both "running" and "waiting", and the reader has to see that nothing moves until they
+  // answer while the turn itself is still alive.
+  test('the tab dot keeps "what state" and "is it working" apart', () => {
+    const { NS, els } = tabStrip();
+    const dotFor = (over: Record<string, unknown>) => {
+      NS.tabs.setSessions([{ ...summary('s1'), ...over }]);
+      return els.tabs.querySelector('.tab-dot') as StubNode;
+    };
+    // A plain session: neutral colour, no ring.
+    assert.strictEqual(dotFor({}).className, 'tab-dot');
+    // Running: coloured, and ringed.
+    assert.strictEqual(dotFor({ running: true }).className, 'tab-dot running busy');
+    // Waiting wins the COLOUR (nothing advances without the reader), while the ring stays
+    // (the turn it is parked on is still alive).
+    assert.strictEqual(dotFor({ running: true, waiting: true }).className, 'tab-dot waiting busy');
+    // Waiting with nothing running: colour only — and that absence is the message.
+    assert.strictEqual(dotFor({ waiting: true }).className, 'tab-dot waiting');
+    // Loading a replay is "working" too.
+    assert.strictEqual(dotFor({ loading: true }).className, 'tab-dot loading busy');
+    // Unread is a hint about the past, not activity happening now.
+    assert.strictEqual(dotFor({ unread: true }).className, 'tab-dot attention');
   });
 
   test('the close button is out of the tab order; exactly one tab is tabbable', () => {
@@ -1252,15 +1333,33 @@ suite('chat client logic: composer input bar (stub DOM)', () => {
     createdAt: '', loading: false, running: false, unread: false,
   });
 
-  test('the context meter shows a percentage, and hides without a size', () => {
+  test('the context meter is a ring with the percentage inside it', () => {
     const { NS, contextMeter } = composerBar();
     NS.composer.setMeta({ availableCommands: [], configOptions: [], usage: { used: 450000, size: 1000000 } });
     assert.strictEqual(contextMeter.hidden, false, 'usage with a size must show the meter');
-    assert.ok(contextMeter.textContent.includes('45%'), `percent label, got: ${contextMeter.textContent}`);
-    assert.ok(contextMeter.querySelector('.usage-fill'), 'a fill is rendered');
+    // [CUSTOM-20260930-129] Ring + number in the middle, replacing the bar + label.
+    assert.strictEqual(contextMeter.querySelector('.gauge-text')!.textContent, '45');
+    const fill = contextMeter.querySelector('.gauge-fill')!;
+    assert.ok(fill, 'the progress arc is rendered');
+    // The arc is a plain circle whose dashoffset hides the part not yet reached.
+    assert.strictEqual(fill.getAttribute('stroke-dashoffset'), String(2 * Math.PI * 9 * (1 - 0.45)));
+    assert.strictEqual(fill.getAttribute('stroke-dasharray'), String(2 * Math.PI * 9));
+    assert.ok(contextMeter.querySelector('.gauge-spin'), 'the running arc is always in the DOM (CSS shows it)');
+    assert.match(contextMeter.title, /45%/, 'the exact numbers live in the tooltip');
 
     NS.composer.setMeta({ availableCommands: [], configOptions: [], usage: { used: 450000, size: 0 } });
     assert.strictEqual(contextMeter.hidden, true, 'no context size ⇒ hide the meter');
+  });
+
+  test('the running arc lights up only while a turn is in flight', () => {
+    const { NS, contextMeter } = composerBar();
+    NS.composer.setMeta({ availableCommands: [], configOptions: [], usage: { used: 450000, size: 1000000 } });
+    assert.strictEqual(contextMeter.classList.contains('running'), false);
+    // setRunning is the only signal for it, and that path has no meta of its own.
+    NS.composer.setRunning(true);
+    assert.strictEqual(contextMeter.classList.contains('running'), true);
+    NS.composer.setRunning(false);
+    assert.strictEqual(contextMeter.classList.contains('running'), false);
   });
 
   test('empty text sends only when an attachment is present', () => {
@@ -1815,5 +1914,378 @@ suite('chat client logic: form card (stub DOM, CUSTOM-20260929-119)', () => {
     assert.strictEqual(card.querySelector('.elic-actions')!.hidden, true);
     assert.ok(card.querySelector('.elic-note')!.textContent.includes('dialog'),
       'a disabled form with no explanation looks broken');
+  });
+});
+
+// [CUSTOM-20260930-123] 连接状态卡（client/stateCard.ts）。
+//
+// 这里钉的是**相位机与它发出的消息**：什么时候显示什么、什么时候发 connectAgent、
+// 什么时候**不**发。布局（居中、窄侧边栏下会不会撑破容器）不在这里测 —— 那要真 Chromium，
+// 见 CUSTOMIZATIONS/scripts/preview-records.mjs 的 #empty / #connecting / #ready / #narrow。
+suite('chat client logic: connect card (stub DOM, CUSTOM-20260930-123)', () => {
+  function cardWith(options: { autoConnect?: boolean } = {}) {
+    const els: Record<string, StubNode> = {
+      stateCard: new StubNode('div'),
+      stateBusy: new StubNode('span'),
+      stateTitle: new StubNode('p'),
+      stateHint: new StubNode('p'),
+      stateError: new StubNode('p'),
+      stateActions: new StubNode('div'),
+      emptyConnect: new StubNode('button'),
+      autoConnectRow: new StubNode('label'),
+      autoConnectToggle: new StubNode('input'),
+    };
+    const harness = loadClient(els);
+    const { NS, doc, docListeners, timers } = harness;
+    NS.stateCard.init();
+    if (options.autoConnect) { NS.stateCard.setAutoConnect(true); }
+    const posted: Array<Record<string, unknown>> = [];
+    NS.bridge.post = (message: Record<string, unknown>) => { posted.push(message); };
+    return { NS, els, posted, doc, docListeners, timers };
+  }
+
+  /** Fire a non-click event — the switch is a checkbox, so it reports 'change'. */
+  function fire(target: StubNode, type: string): void {
+    target.dispatch(type, {
+      target,
+      preventDefault: () => { /* nothing to cancel */ },
+      stopPropagation: () => { /* the stub has no ancestors here */ },
+    });
+  }
+
+  const withDelay = (timers: Array<{ fn: () => void; delay: number }>, delay: number) =>
+    timers.filter(t => t.delay === delay);
+
+  test('the offline card names the agent and offers the button', () => {
+    const { NS, els } = cardWith();
+    assert.strictEqual(NS.stateCard.phase(), 'disconnected');
+    assert.strictEqual(els.stateTitle.textContent, 'Claude Code');
+    assert.strictEqual(els.emptyConnect.disabled, false);
+    assert.strictEqual(els.stateBusy.hidden, true, 'no spinner while idle');
+    assert.strictEqual(els.stateError.hidden, true);
+    assert.strictEqual(els.stateActions.hidden, false, 'the button is on offer');
+    assert.strictEqual(els.autoConnectRow.hidden, false, 'the switch is where you would look for it');
+  });
+
+  test('the button asks the host and opens no draft of its own', () => {
+    const { NS, els, posted, docListeners } = cardWith();
+    // The draft is boot's job now (it opens one when the connection lands). A card that
+    // opened one here would put the panel on a draft page while still disconnected —
+    // and the composer is disabled until a session or a draft exists, so the user would
+    // be looking at a page they cannot type into.
+    let started = 0;
+    NS.draft = { start: () => { started++; } };
+    dispatchClick(els.emptyConnect, docListeners);
+    assert.deepStrictEqual(posted, [{ type: 'connectAgent' }]);
+    assert.strictEqual(started, 0, 'the card must not open a draft itself');
+  });
+
+  test('a second click while connecting is not a second request', () => {
+    const { NS, els, posted, docListeners } = cardWith();
+    dispatchClick(els.emptyConnect, docListeners);
+    assert.strictEqual(NS.stateCard.phase(), 'connecting');
+    assert.strictEqual(els.emptyConnect.disabled, true, 'the button is the anti-double-click gate');
+    dispatchClick(els.emptyConnect, docListeners);
+    assert.strictEqual(posted.length, 1, 'still exactly one request');
+  });
+
+  test('a connect started on the other surface shows up here too', () => {
+    const { NS, els } = cardWith();
+    NS.stateCard.onConnection({ type: 'connection', state: 'connecting' });
+    assert.strictEqual(NS.stateCard.phase(), 'connecting');
+    assert.strictEqual(els.stateBusy.hidden, false);
+    assert.strictEqual(els.emptyConnect.disabled, true);
+    assert.strictEqual(els.stateTitle.textContent, 'Connecting to Claude Code…');
+  });
+
+  test('connected swaps to the guidance phase and retires the button', () => {
+    const { NS, els } = cardWith();
+    NS.stateCard.onConnection({ type: 'connection', state: 'connected' });
+    assert.strictEqual(NS.stateCard.phase(), 'ready');
+    assert.strictEqual(els.stateActions.hidden, true);
+    assert.strictEqual(els.stateBusy.hidden, true);
+    assert.strictEqual(els.stateTitle.textContent, 'Claude Code is ready');
+    // [CUSTOM-20260930-127] Connected means the card is a "go type below" sign, not a
+    // settings form: the switch belongs to the state where it can still do something.
+    assert.strictEqual(els.autoConnectRow.hidden, true, 'no setting to fiddle with once connected');
+  });
+
+  test('the switch stays put while connecting', () => {
+    // The one state where the user may well want to turn auto-connect OFF is the one
+    // where the agent is being slow — hiding the switch there would be the wrong half.
+    const { NS, els } = cardWith();
+    NS.stateCard.beginConnect(false);
+    assert.strictEqual(els.autoConnectRow.hidden, false);
+  });
+
+  test('a failed connect reports it and re-arms the button', () => {
+    const { NS, els } = cardWith();
+    NS.stateCard.beginConnect(false);
+    NS.stateCard.onConnection({ type: 'connection', state: 'failed', message: 'boom' });
+    assert.strictEqual(NS.stateCard.phase(), 'disconnected');
+    assert.strictEqual(NS.stateCard.isConnecting(), false);
+    assert.strictEqual(els.emptyConnect.disabled, false, 'the user can try again');
+    assert.strictEqual(els.stateError.hidden, false);
+    assert.strictEqual(els.stateError.textContent, 'boom');
+  });
+
+  test('a slow start loosens the button instead of claiming failure', () => {
+    const { NS, els, timers } = cardWith();
+    NS.stateCard.beginConnect(false);
+    const watch = withDelay(timers, 45000);
+    assert.strictEqual(watch.length, 1);
+    watch[0].fn();
+    // npx downloading for minutes is not an error: saying "failed" would be a lie the
+    // user acts on. The button comes back so they CAN retry, and the text says why.
+    assert.strictEqual(NS.stateCard.isConnecting(), false);
+    assert.strictEqual(els.emptyConnect.disabled, false);
+    assert.ok(els.stateError.textContent.startsWith('Still starting'), els.stateError.textContent);
+  });
+
+  test('the switch persists through the host and follows it back', () => {
+    const { NS, els, posted } = cardWith();
+    els.autoConnectToggle.checked = true;
+    fire(els.autoConnectToggle, 'change');
+    assert.deepStrictEqual(posted, [{ type: 'setAutoConnect', value: true }]);
+    // The host echoes the value the SETTING holds — including when the write failed, which
+    // is why the checkbox listens instead of assuming its own optimism was right.
+    NS.stateCard.setAutoConnect(false);
+    assert.strictEqual(els.autoConnectToggle.checked, false);
+  });
+
+  test('auto-connect arms one 1000ms timer and re-checks before firing', () => {
+    const { NS, timers, posted } = cardWith();
+    NS.stateCard.noteBoot({ agentConnected: false, autoConnect: true, focused: false });
+    const arm = withDelay(timers, 1000);
+    assert.strictEqual(arm.length, 1);
+    arm[0].fn();
+    assert.deepStrictEqual(posted, [{ type: 'connectAgent' }]);
+  });
+
+  test('boot is delivered twice per document, and only arms once', () => {
+    const { NS, timers } = cardWith();
+    NS.stateCard.noteBoot({ agentConnected: false, autoConnect: true, focused: false });
+    NS.stateCard.noteBoot({ agentConnected: false, autoConnect: true, focused: false });
+    assert.strictEqual(withDelay(timers, 1000).length, 1);
+  });
+
+  test('auto-connect stays out of the way when it should', () => {
+    for (const boot of [
+      { agentConnected: false, autoConnect: false, focused: false },
+      { agentConnected: true, autoConnect: true, focused: false },
+      { agentConnected: false, autoConnect: true, focused: true },
+    ]) {
+      const { NS, timers } = cardWith();
+      NS.stateCard.noteBoot(boot);
+      assert.strictEqual(withDelay(timers, 1000).length, 0, JSON.stringify(boot));
+    }
+  });
+
+  test('the timer re-checks, so a user who can already type is not interrupted', () => {
+    const { NS, timers, posted } = cardWith();
+    NS.stateCard.noteBoot({ agentConnected: false, autoConnect: true, focused: false });
+    const arm = withDelay(timers, 1000);
+    // Another surface opened a draft in the meantime: the composer is composable, so
+    // connecting now would be answering a question nobody asked. isComposable is the
+    // DIRECT signal for that (pitfall #25: never a proxy).
+    NS.composer.isComposable = () => true;
+    arm[0].fn();
+    assert.strictEqual(posted.length, 0);
+  });
+
+  test('the host saying "connected" ends the connecting phase', () => {
+    const { NS } = cardWith();
+    NS.stateCard.beginConnect(false);
+    NS.stateCard.setConnected(true);
+    assert.strictEqual(NS.stateCard.isConnecting(), false);
+    assert.strictEqual(NS.stateCard.phase(), 'ready');
+  });
+
+  test('the phase is published on the body, so CSS can key off it', () => {
+    // [CUSTOM-20260930-131] The header's Times button is hidden while there is nothing to
+    // put a time on; that rule lives in CSS, and this attribute is what it reads. Putting
+    // it on the body (rather than letting each button watch the phase) also covers the
+    // `connecting` phase a local click starts, which never reaches the host.
+    const { NS, doc } = cardWith();
+    assert.strictEqual(doc.body.getAttribute('data-phase'), 'disconnected');
+    NS.stateCard.beginConnect(false);
+    assert.strictEqual(doc.body.getAttribute('data-phase'), 'connecting');
+    NS.stateCard.onConnection({ type: 'connection', state: 'connected' });
+    assert.strictEqual(doc.body.getAttribute('data-phase'), 'ready');
+  });
+
+  test("a '+' pressed offline is remembered exactly once", () => {
+    const { NS } = cardWith();
+    NS.stateCard.beginConnect(true);
+    assert.strictEqual(NS.stateCard.takeDraftIntent(), true);
+    assert.strictEqual(NS.stateCard.takeDraftIntent(), false, 'consumed, not sticky');
+  });
+});
+
+// [CUSTOM-20260930-128] 助手/思考记录的 markdown 请求必须**自己**发得出去。
+//
+// 118 给工具卡的正文修过同一个病（toolCallView 的 scheduleMarkdown），助手这一侧当时漏了：
+// markPending 只入队，而全项目唯一的 flushPending 挂在 patch 路径上 ⇒ "最后一次 DOM 更新
+// 就是它自己的 append"的记录**永远等不到渲染请求**，界面上只剩原文，两侧还都不报错。
+// 一轮里的最后一条记录正好是这个形状（收尾的 revise 若晚到，或这一轮根本不是本面板发起的）。
+suite('chat client logic: markdown asks for itself (stub DOM, CUSTOM-20260930-128)', () => {
+  function withRequestLog() {
+    const harness = loadClient({}, { syncFrames: true });
+    const NS = harness.NS;
+    let asked = 0;
+    NS.boot.requestMarkdown = () => { asked++; };
+    const container = new StubNode('div');
+    NS.transcriptView.init(container);
+    // hydrate is how the client learns its session id (and it is how a real panel always
+    // arrives: boot / focus carry a snapshot).
+    NS.transcriptView.hydrate({ sessionId: 's1', entries: [] });
+    return { NS, asked: () => asked };
+  }
+
+  test('an assistant record asks for its own markdown the moment it lands', () => {
+    const h = withRequestLog();
+    // No `revise` will ever follow this one in the test — which is the whole point.
+    h.NS.transcriptView.append({ id: 'a1', kind: 'assistant', at: Date.now(), text: '**bold**' }, undefined);
+    assert.ok(h.asked() > 0, 'nothing else would ever ask for it');
+    assert.strictEqual(h.NS.transcriptView.pendingMarkdown().length, 1);
+  });
+
+  test('a settled thought asks too', () => {
+    const h = withRequestLog();
+    h.NS.transcriptView.append(
+      { id: 't1', kind: 'thought', at: Date.now(), text: '_hmm_', streaming: false }, undefined);
+    assert.ok(h.asked() > 0);
+    assert.strictEqual(h.NS.transcriptView.pendingMarkdown().length, 1);
+  });
+
+  test('a still-streaming thought waits for its finalize', () => {
+    const h = withRequestLog();
+    h.NS.transcriptView.append(
+      { id: 't2', kind: 'thought', at: Date.now(), text: 'thinking...', streaming: true }, undefined);
+    assert.strictEqual(h.asked(), 0, 'html for a streaming block would freeze a prefix of it');
+    assert.strictEqual(h.NS.transcriptView.pendingMarkdown().length, 0);
+  });
+
+  test('and asks as soon as it settles', () => {
+    const h = withRequestLog();
+    h.NS.transcriptView.append(
+      { id: 't3', kind: 'thought', at: Date.now(), text: '_hmm_', streaming: true }, undefined);
+    assert.strictEqual(h.asked(), 0);
+    h.NS.transcriptView.patch('t3', { streaming: false });
+    assert.ok(h.asked() > 0, 'the finalize patch is what lets it ask');
+    assert.strictEqual(h.NS.transcriptView.pendingMarkdown().length, 1);
+  });
+
+  // [CUSTOM-20260930-147] 完整链路：**正文后到**的那种流式记录。真实路径是
+  // append（此刻还没有正文）→ revise 送 text（仍在流式）→ finalize（streaming: false）。
+  // 用户报的"最后一条不渲染、重开会话就正常"就是这个形状 —— 重开走的是 hydrate（html 直接
+  // 在快照里），而实时这条路要靠最后那一次 finalize 把请求补出来。
+  test('an assistant whose text arrives later still asks once it settles', () => {
+    const h = withRequestLog();
+    h.NS.transcriptView.append(
+      { id: 'a9', kind: 'assistant', at: Date.now(), text: '', streaming: true }, undefined);
+    assert.strictEqual(h.asked(), 0, '还没有正文，没什么可渲染的');
+    h.NS.transcriptView.patch('a9', { text: '**bold**' });
+    assert.strictEqual(h.asked(), 0, '正文随 revise 到了，但这一块还在流式 —— 渲染会冻结前缀');
+    h.NS.transcriptView.patch('a9', { streaming: false });
+    assert.ok(h.asked() > 0, 'finalize 必须把请求补出来，否则它永远停在原文');
+    assert.strictEqual(h.NS.transcriptView.pendingMarkdown().length, 1);
+  });
+
+  // [CUSTOM-20260930-149] 真机那条路径的**根因**：reset() 会清掉会话身份，而只有快照（hydrate）
+  // 会把它设回来。于是"重开面板 / 切会话之后新到的记录"整段时间里 sessionId 是 null，
+  // markdown 请求带着 null 发出去 ⇒ 宿主 verifySession 不认、**静默丢弃**（Output 里的原话是
+  // `dropped markdown item <id> (unknown session null)`）⇒ 界面永远停在原文，而重开会话正常
+  // （重开走 hydrate，有值）。boot 现在用每条带记录的消息自带的 sessionId 校正它。
+  test('reset 之后要靠 setSessionId 把会话身份找回来', () => {
+    const h = withRequestLog();
+    h.NS.transcriptView.append({ id: 'a1', kind: 'assistant', at: Date.now(), text: '**x**' }, undefined);
+    assert.strictEqual(h.NS.transcriptView.pendingMarkdown()[0].sessionId, 's1');
+
+    h.NS.transcriptView.reset();
+    h.NS.transcriptView.append({ id: 'a2', kind: 'assistant', at: Date.now(), text: '**y**' }, undefined);
+    assert.strictEqual(h.NS.transcriptView.pendingMarkdown()[0].sessionId, null,
+      'reset 之后是 null —— 宿主就是因为这个把回填全丢了');
+
+    h.NS.transcriptView.setSessionId('s2');
+    assert.strictEqual(h.NS.transcriptView.pendingMarkdown()[0].sessionId, 's2');
+  });
+
+  // The "already has html" guard in markPending is not pinned here: letting an assistant
+  // record actually render html goes through the sanitiser, which needs a real DOMParser
+  // (the stub has none). That path is exercised by the replay suite in chat-panel.test.ts.
+});
+
+// [CUSTOM-20260930-132 / 137 / 138] 面板静态标记的**结构断言**（不是布局断言 —— 布局仍然只能量）。
+//
+// 它守的是底部栏与消息列那几处"谁在谁里面"：
+//   · `#rail` 与 `#jumpToLatest` 在 `.messages-column` 内（132 搬的）。它们的横坐标来自 CSS 的
+//     `left:0` / `left:50%`，锚在哪一层就贴哪条边 —— 132 给消息列加过版心，那时锚错一层会与内容
+//     错开几百像素；**137 按用户要求撤销了消息区限宽**（消息要平铺开），列恢复满宽，于是它们与
+//     改动前逐像素一致。搬迁仍然保留：列是消息内容的定位容器，这两者本就属于它，将来若再限宽
+//     也不必重做。**别挪回 `.message-area`** —— 那会让"结构说明"与代码再次分家。
+//   · 底部栏的两列：`.composer-main`（输入卡）与 `.composer-aside`（预留功能区）。圆环 138 起
+//     在预留区里，把它挪回卡内就等于把发送按钮又推远。
+// "谁在谁里面"桩 DOM 测不了尺寸，但**测得了序关系**，而它正是最容易被"顺手挪回去"的地方。
+// 真正的布局回归由真 Chromium 兜底：CUSTOMIZATIONS/scripts/preview-records.mjs 的 #composer* 档
+// 与几何探针（dxCardVsCol / dxRailVsCol / dxJumpVsCol / dxAsideVsOutline）。
+suite('chat panel markup: 底部栏与消息列的承重结构 (stub markup, CUSTOM-20260930-132..138)', () => {
+  const markup = chatPanelMarkup('view');
+
+  /** 取一层容器"内部"的近似切片：从它的开标签到下一个无关兄弟的开标签。 */
+  const inside = (open: string, next: string): string => {
+    const from = markup.indexOf(open);
+    assert.ok(from >= 0, `标记里找不到 ${open}`);
+    const to = markup.indexOf(next, from + open.length);
+    assert.ok(to > from, `标记里 ${open} 之后找不到 ${next}`);
+    return markup.slice(from, to);
+  };
+
+  test('#rail 与 #jumpToLatest 锚在 .messages-column 里，不在 .message-area 上', () => {
+    const area = inside('<div id="messageArea"', '<div id="outlineSidebar"');
+    const column = inside('<div class="messages-column">', '<div id="outlineSidebar"');
+    // 从列里切掉，剩下的就是列的兄弟 —— 也就是 .message-area 的直接子层。
+    const siblings = area.replace(column, '');
+
+    assert.ok(column.includes('id="rail"'),
+      '#rail 必须在 .messages-column 内：它的 left:0 以定位祖先为基准，锚在 .message-area 上会贴面板左缘');
+    assert.ok(!siblings.includes('id="rail"'), '#rail 被挪回 .message-area 了');
+    assert.ok(column.includes('id="jumpToLatest"'),
+      '#jumpToLatest 必须在列内：它的 left:50% 同理（钉住大纲栏时列中心是 (W−S)/2）');
+    assert.ok(!siblings.includes('id="jumpToLatest"'), '#jumpToLatest 被挪回 .message-area 了');
+    // 顺序：引导条在 #messages 之前（它是那条 19px 通道的起点，不是正文的一部分）。
+    assert.ok(column.indexOf('id="rail"') < column.indexOf('id="messages"'));
+    // 回归护栏：置顶卡片本来就锚在列上，别在搬来搬去的时候把它带出去。
+    assert.ok(column.includes('id="stickyUser"'));
+  });
+
+  test('覆盖层仍留在 .message-area 上（099 与 123 的构造）', () => {
+    const area = inside('<div id="messageArea"', '<div id="composer"');
+    for (const id of ['id="outlineSidebar"', 'id="emptyState"', 'id="loadOverlay"']) {
+      assert.ok(area.includes(id), `${id} 应当仍是 .message-area 的直接子节点`);
+    }
+  });
+
+  test('底部栏是两列：主列（输入卡）与预留功能区', () => {
+    const main = inside('<div class="composer-main">', '<div class="composer-aside">');
+    assert.ok(main.includes('class="composer-inner"'), '.composer-main 要包住 .composer-inner');
+    assert.ok(main.includes('id="slashPopup"'),
+      '#slashPopup 必须在输入卡那一路里：锚在 .composer 上时它的 left/right 会按面板算，宽屏下横跨整屏');
+
+    const card = inside('<div class="composer-card">', '<div class="composer-aside">');
+    assert.ok(card.includes('id="promptInput"'));
+    assert.ok(card.includes('id="sendStopBtn"'), 'Send 是卡片的一部分（一体式），不能留在卡外');
+    // [CUSTOM-20260930-143] 上下文圆环在**按钮栏里**：138 曾把它搬到预留区（为了腾横向空间），
+    // 143 搬了回来 —— 用户要的是"预留区先空着，方案定了再谈怎么用"。
+    assert.ok(card.includes('id="contextMeter"'), '上下文圆环属于按钮栏，不该在别处');
+
+    // [CUSTOM-20260930-138] 预留功能区：与输入区并列为第二列，宽度与大纲栏同源
+    // （--acpc-aside-w，由 outline.ts 的 applyReserve 写；143 起只在钉住且可见时才非 0），
+    // 可见时它的左边界（那根竖线）与钉住的大纲栏左边界在同一条线上。
+    const aside = inside('<div class="composer-aside">', 'id="ctxMenu"');
+    assert.ok(!aside.includes('id="contextMeter"'), '预留区 143 起是空的，别再往里塞东西');
+
+    assert.ok(!markup.includes('class="input-row"'),
+      '.input-row 这层已删：它唯一的子节点就是 textarea，留下的 flex:1 在新父级里含义完全不同');
   });
 });

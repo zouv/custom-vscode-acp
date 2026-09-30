@@ -190,7 +190,7 @@ webview→扩展消息类型（**按"要不要带 sessionId"分组——这正�
 ### 2.8 agent 默认列表与设置项
 agent 定义是**纯数据**：`package.json` 的
 `contributes.configuration.properties["acpc.agents"].default`（11 条）+ `AgentConfig.ts` 读取。
-加/改 agent 不需要动代码。其余设置项：`acpc.autoApprovePermissions` / `acpc.defaultWorkingDirectory` / `acpc.logTraffic`。
+加/改 agent 不需要动代码。其余设置项：`acpc.autoApprovePermissions` / `acpc.defaultWorkingDirectory` / `acpc.logTraffic` / `acpc.autoConnectOnOpen`（面板打开 1s 后自动连接，面板初始界面上有同一个开关，见 [`docs/arch/chat-panel.md`](./docs/arch/chat-panel.md) §5.28）。
 
 ### 2.9 打包 / 发布
 `package.json` 的 `scripts`（`compile`/`watch`/`package`/`lint`/`test`）、

@@ -160,6 +160,9 @@ export const outlineClient = `
     if (drawer) { drawer.hidden = !(live && mode === 'popup'); }
     if (sidebar) { sidebar.hidden = !(live && mode === 'sidebar'); }
     if (button) { button.classList.toggle('on', live); }
+    // [CUSTOM-20260930-135] 写在 sidebar.hidden 之后：输入区的版心对齐要知道侧栏**此刻**
+    // 是不是真的占着宽度（见 applyReserve）。
+    applyReserve();
   }
 
   /** Measure each anchor's position. Only ever called from the rAF pass. */
@@ -324,6 +327,29 @@ export const outlineClient = `
 
   function applyWidth() {
     if (sidebar) { sidebar.style.width = width + 'px'; }
+    applyReserve();
+  }
+
+  /**
+   * [CUSTOM-20260930-135 / 138 / 143] 把大纲栏宽度复述给 CSS（底部**预留功能区**的宽度用它）。
+   *
+   * 为什么非得由 JS 说一遍：CSS 读不到 flex 项的**实测**宽度，而右下角那块预留区的左边界要
+   * 与钉住的大纲栏左边界落在同一条竖线上 —— 两个宽度必须是同一个来源（pitfall #19）。
+   *
+   * 语义演进：135 写的是"侧栏占用宽度"（给 .composer 的 padding-right 做中线补偿）；138 起
+   * 底部栏改成两列 flex，主列宽度天然等于"面板宽 − 预留区宽"，中线自动对齐，于是直接写
+   * **预留区宽度**；143 起**只在钉住且可见时**才给宽度，其余时候写 0 —— 没有大纲就没有那根
+   * 竖线，输入卡随之居中（用户要求）。
+   *
+   * 幂等。两个调用点覆盖了"什么时候会变"的全部路径：宽度变化（applyWidth）与显示/隐藏变化
+   * （renderVisibility，它是 sidebar.hidden 的唯一写者，所以钉住 / 取消钉住都会走到这里）。
+   */
+  function applyReserve() {
+    // 桩 DOM（src/test/chat-client.test.ts）的 document.body.style 是普通对象、没有
+    // setProperty ⇒ 这里必须判空跳过，否则一条新代码就能把整个客户端逻辑测试打红。
+    if (!document.body || !document.body.style || !document.body.style.setProperty) { return; }
+    var visible = !!(sidebar && !sidebar.hidden);
+    document.body.style.setProperty('--acpc-aside-w', visible ? (width + 'px') : '0px');
   }
 
   /** [CUSTOM-20260926-076] 调宽手柄：拖左变宽、拖右变窄（负号决定方向）。 */

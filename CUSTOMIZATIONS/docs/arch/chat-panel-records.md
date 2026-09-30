@@ -71,7 +71,7 @@ Thought 的 `Thought for Ns` 是**耗时**不是时刻。
 |---|---|---|
 | 悬停 | 每条记录的 `title` 是完整时刻（HH:MM:SS） | 零成本、零噪声，随时可查 |
 | 工具耗时 | `ToolCallView.elapsedMs`（宿主用 `endedAt - startedAt` 算），卡头显示 `1.2s` / `420ms` / `2m 5s`，**常显** | 与 `Thought for Ns` 同类信息，不设开关。**不下发两个时间戳**：已完成的时长不需要客户端时钟；**仍在跑的不显示**——`status` 的脉动已说明"进行中"，实时计时器意味着每帧重渲染 |
-| 每条时刻 | 头部「Times」开关（持久化）⇒ 每条前显示 HH:MM | `.rec-time` 元素**始终在 DOM 里**，可见性由 `#messages` 上的一个类决定（与「Sub-agents」同一套机制）⇒ **切换开关不重渲染任何东西** |
+| 每条时刻 | 头部「Times」开关（持久化）⇒ **只在工具卡上**显示 HH:MM：关 = `3ms`（耗时，常显）；开 = `3ms 18:32`（耗时 + 时刻，见 129）。**[146] 普通消息与 Thought 不显示时刻** —— ACP 里只有工具调用带 `elapsedMs`，它们根本没有"耗时"这个量，单独挂一个时刻读起来像缺了一半 | `.rec-time` 元素**始终在 DOM 里**（`transcriptView` 一律插入），显隐由一个类决定：`.messages.show-times .tool-head .rec-time { display: block }` ⇒ **切换开关不重渲染任何东西**。工具卡的时刻是**标题行里的一项**（`.tool-head .rec-time { position: static }`，跟在 `.tool-time` 后面，整行读作 `3ms 18:32`）；其余记录的时刻元素仍插在 `summary` 里，只是选择器不放它出来（`.rec-time` 的绝对定位对它们才成立，工具卡是例外）。挂在**标题行**而不是记录节点上，是因为折叠的 `<details>` 会隐藏 summary 之外的一切。**145 曾试图让工具卡的时刻也浮到右上角**（好让所有记录对齐），靠 `padding-right` 硬留槽位 —— 结果把工具卡本来工整的一行挤散了，**已回退** |
 
 **时长的格式化在 `NS.dom.duration`**（最底层模块）：`toolCallView` 与记录层都要用，而模块加载顺序
 **只允许依赖指向前方**——放在 `transcriptView` 里 `toolCallView` 用不到，抄第二份又会漂（pitfalls #19）。
@@ -89,6 +89,17 @@ Thought 的 `Thought for Ns` 是**耗时**不是时刻。
 - 客户端两份缓存（`mdCache` / `mdPending`），**按会话清空**（`transcriptView.reset()` 里调到）：
   工具 body 在 `bodySignature` 变化时会**整块重建**，缓存是让已渲染 HTML 挺过重建的关键。
 - **防御**：拿不到 `entryId` 时（无唯一 key）**回落纯文本**——key 撞车会把一条记录的 HTML 喂给另一条。
+- **[147] 助手/思考那条往返上的两处守卫**（用户报"最后一条不渲染、重开会话就正常"）：
+  ①`boot.requestMarkdown` 里原来有一条"聚焦会话为空就整批不发"的守卫 —— 而 `transcriptView` 的
+  item **自带 sessionId**（请求方就是它），根本不需要借聚焦状态；那道守卫只会在"正文刚落地、
+  聚焦还没同步好"的那一帧白白丢掉一次请求（pending 不清空，但下一次触发可能永远不来 —— 128 修
+  的就是这个形状）。守卫现在只留给**没有会话身份**的工具项。
+  ②客户端处理 `markdownRendered` 时**不再**拿 item.sessionId 跟 boot 的 `currentSessionId` 比：
+  两端来源不同，一旦不一致就把回填**静默丢掉**，那条记录于是一直停在原文 —— 而宿主其实已经把
+  html 写进了 store，所以它表现为"重开会话就正常"（重开走快照，不经过这里）。`entryId` 在 store
+  里全局唯一，按它回填本来就串不了台。**判据**：客户端的请求链路本身由桩测试钉住了
+  （`markdown asks for itself`，含"正文后到 + finalize"那条），所以再遇到同类症状应当先怀疑
+  **回填这一侧**，而不是去翻 `markPending`。
 
 ### 5.19 右键菜单是自己的（067）
 
@@ -113,7 +124,7 @@ Webview 默认弹 **Chromium 的原生菜单**，它在这个面板上有两个�
   （需要真 Chromium——用 jsdom 之类的近似实现测布局只会给出**假信心**，与 `dev-workflow.md` 的分区表一致）。
 - 桩是**外部 API 的测试替身**（同目录里早有假 Memento），不是我们自己知识的第二份拷贝（那才是 pitfalls #19）。
 - **它的假设也要被检验**：068 落地过程中两次"测试错了、产品没错"——①按"容器的第一个子节点"取记录，
-  而 `place()` 会把 `.rec-time` 插到最前（**第一例是假通过**）；②用户记录是**包着 details 的 div**，
+  而 `place()` 会把 `.rec-time` 插进标题行（**第一例是假通过**）；②用户记录是**包着 details 的 div**，
   而 Thought 记录**本身就是 details**，只认一种形态会误判"无折叠"。⇒ **按标记（`[data-kind]`）定位，不要假设位置。**
 - **071 之后的桩**：折叠判据要"实测行数"，于是在 `document` 上补了一个**确定性的 Range 模型**
   （每 N 字一行，`charsPerLine` 可调）。**这不是假装测布局**：换行位置仍是浏览器的活，桩只回答
@@ -157,6 +168,15 @@ Webview 默认弹 **Chromium 的原生菜单**，它在这个面板上有两个�
   `config_option_update` / `current_mode_update`。**先到的那条**算出差异并提示，后到的那条与我们刚写入的
   快照一比就是空的。**通知路径用载荷**而不是 `SessionManager` 的状态：两个监听器的先后顺序不保证，
   读状态可能拿到改前或改后。
+- **[CUSTOM-20260930-128] 但"两条路径产出同一个快照"是个契约，而它一度不成立。** 模式在
+  `session.modes.currentModeId` 与 `configOptions[category='mode'].currentValue` 里**各有一份副本**，
+  而两份**不会同时被写**（`setMode` 在会话有 configOptions 时提前 return，`current_mode_update`
+  也从不落到 `SessionManager`）⇒ 上面那句去重**静默失效**：一次切换被报成两条，第二条还是
+  "新的一半 + 旧的一半"拼出来的、现实中不存在的状态（实测 `Manual mode · Bypass permissions mode`）。
+  现在**以 config option 为权威**：快照的 modeId 由它派生（没有这个选项时才回退 `modes.currentModeId`，
+  纯 modes 通道的 agent 不受影响），只带 modeId 的 payload 会把值**写回**那份副本，`choiceChanges`
+  跳过该选项（否则一次变化会被报两遍）。`SessionManager.applyConfigOptions` 同步把值写回 `modes`，
+  让 `metaOf` 等其它消费者也看到新值。完整教训见 pitfalls #34。
 - **首次见到某会话只做基线**（`onSessionUpdate` 顶部播种）⇒ 打开会话不会打印"切到它本来就有的模型"。
   同理，**"从无到有"不算切换而是初始化**：会话的第一个快照是空的（`SessionManager` 那时还没有东西），
   选项列表往往随后才到——把"出现"当"切换"会给每个会话都打印一行 `Model: … · Mode: … · Reasoning effort: …`。
@@ -195,7 +215,7 @@ Webview 默认弹 **Chromium 的原生菜单**，它在这个面板上有两个�
 | IN / OUT | 段标只在**有命令行**时出现（`tool.command`）：Bash 这类 execute 调用是"输入 → 输出"，正是官方的样子；Read / Edit / Search 没有输入行，**不套 OUT 标签**——那会是对调用方向的断言，而客户端并不知道。它们的正文布局与 117 之前逐字一致（零回归） |
 | 默认展开还是收起 | **收起**（118 定案）：117 让"有命令行的卡"自动展开，用户否掉了——长会话会变成一堵命令输出墙。所以**每张卡都默认收起**，IN/OUT 一点即开，标题行给的是 agent 的描述，读者知道点开是什么。展开态与 caret/`aria-expanded` 由 `links.toggleBody` 统一维护 |
 | **OUT 空盒子（118）** | 用户报"IN/OUT 出来了但 OUT 没内容"。两个独立的成因，都修了：①**空白文本项**照旧渲染出一个空节点（026 的规矩是空白不可见）⇒ `fillToolBody` 直接跳过它；②`rawOutput` 是 agent 在**每条**结果里都会写的字段，却从未进过视图模型 ⇒ `ToolCallView.output` 兜底渲染（**仅当 items 里没有可见项**，见 `hasVisibleItem`）。`bodySignature` 必须带 `out:`（INV-H） |
-| **工具文本的 markdown 请求曾没人发（118）** | `toolCallView` 的 `mdPending` 队列**只写不读**：全项目只有 `transcriptView.flushPending` 会 `requestMarkdown()`，而它只在 assistant/thought 记录跟踪 markdown 时触发 ⇒ 工具正文的渲染请求**只在恰好后面跟着一次 assistant finalize 时**才发得出去。以工具调用结束的轮次（或 assistant 条目本来就带 html 的 replay）⇒ 工具正文**永远空白**，且没有任何报错。修法：`markdownText` 入队后 `scheduleMarkdown()`（一帧一次，合并多个 item） |
+| **工具文本的 markdown 请求曾没人发（118）** | `toolCallView` 的 `mdPending` 队列**只写不读**：全项目只有 `transcriptView.flushPending` 会 `requestMarkdown()`，而它只在 assistant/thought 记录跟踪 markdown 时触发 ⇒ 工具正文的渲染请求**只在恰好后面跟着一次 assistant finalize 时**才发得出去。以工具调用结束的轮次（或 assistant 条目本来就带 html 的 replay）⇒ 工具正文**永远空白**，且没有任何报错。修法：`markdownText` 入队后 `scheduleMarkdown()`（一帧一次，合并多个 item）。**[CUSTOM-20260930-128] 助手/思考这一侧当时漏了同一个病**：`transcriptView.markPending` 只入队，而全项目唯一的 `flushPending` 挂在 `patch()` 路径上 ⇒ 「最后一次 DOM 更新就是它自己的 append」的记录（**一轮的最后一条正是这个形状**：收尾的 revise 若晚到，或这轮根本不是本面板发起的，就再也没有 patch 了）永远等不到渲染请求，界面只剩原文，两侧还都不报错。照同一形态补上 `scheduleMarkdown()`；另给 `handleRenderMarkdown` 的静默丢弃补了一行日志 |
 | 输出限高 | `.tool-seg-out` 复用 `.diff-body` 的 340px + `overflow:auto`（长输出不该把面板顶走，也不再引入第二个魔数） |
 | 测试 | 客户端 4 条（描述回退 / update 路径补上描述 / IN-OUT 分段与默认展开 / 无命令行卡不变）+ 宿主 3 条（latch 跨 `_meta` 替换存活、无描述就是无描述、真夹具 live 流把 description 送到 webview） |
 | 观感证据 | `preview-records.mjs` 的夹具里有两条 Bash（一条带描述、一条没有），真 Chromium 截图即验收（pitfall #31） |

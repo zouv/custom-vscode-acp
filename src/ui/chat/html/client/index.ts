@@ -16,6 +16,9 @@ import { elicitationViewClient } from './elicitationView';
 import { toolCallViewClient } from './toolCallView';
 import { transcriptViewClient } from './transcriptView';
 import { outlineClient } from './outline';
+// [CUSTOM-20260930-123] 连接状态卡（取代 sessionMenu 里的空态按钮）。加载期不碰 DOM，
+// 全部由 boot 的 init() 驱动——这也是它能在桩 DOM 测试里被单独加载的前提。
+import { stateCardClient } from './stateCard';
 import { sessionMenuClient } from './sessionMenu';
 import { directoryMenuClient } from './directoryMenu';
 import { railClient } from './rail';
@@ -40,6 +43,7 @@ const MODULES: ReadonlyArray<string> = [
   toolCallViewClient,
   transcriptViewClient,
   outlineClient,
+  stateCardClient,
   sessionMenuClient,
   // [CUSTOM-20260925-058] The draft page's directory drawer (same drawer shape
   // as sessionMenu, which is why it sits next to it).

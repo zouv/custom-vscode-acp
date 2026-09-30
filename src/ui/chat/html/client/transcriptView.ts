@@ -140,20 +140,40 @@ export const transcriptViewClient = `
     var text = entry.text;
     if (!text) { return; }
     if (entry.html !== undefined && entry.html !== null && entry.html !== '') { return; }
-    if (entry.kind === 'assistant') { pending[entry.id] = text; return; }
+    if (entry.kind === 'assistant') { pending[entry.id] = text; scheduleMarkdown(); return; }
     // [CUSTOM-20260926-072] A thought renders markdown through the same round-trip,
     // but only once it has SETTLED: html for a block that is still streaming would
     // freeze a prefix of the text while the stream keeps appending. A settled
     // thought collapses immediately anyway, so the reader sees the rendered form
     // rather than a flicker. markPending runs for every placed record, so this also
     // covers records hydrated from a snapshot (replay / session switch).
-    if (entry.kind === 'thought' && entry.streaming === false) { pending[entry.id] = text; }
+    if (entry.kind === 'thought' && entry.streaming === false) { pending[entry.id] = text; scheduleMarkdown(); }
   }
 
   function flushPending() {
     if (!hasPending() || !NS.boot) { return; }
     NS.boot.requestMarkdown();
   }
+
+  // [CUSTOM-BEGIN] CUSTOM-20260930-128 - 记录落地时**自己**去要渲染，不要等下一次 patch。
+  //
+  // 118 给工具卡的正文修过同一个病（toolCallView 的 scheduleMarkdown），助手/思考这一侧当时漏了：
+  // markPending 在 place() 里入队，而全项目唯一的 flushPending 只在 trackMarkdown（patch 路径）
+  // 里被调 ⇒ 一条记录若"最后一次 DOM 更新就是它自己的 append"，它的 markdown 请求**永远发不出去**，
+  // 界面上只剩原文，而且两侧都不报任何错。**一轮里的最后一条记录正好是这个形状**（收尾的 revise
+  // 若晚到、或这一轮根本不是本面板发起的，就再也没有 patch 了）。
+  var markdownFlushPending = false;
+
+  /** One request per frame, however many records were queued. */
+  function scheduleMarkdown() {
+    if (markdownFlushPending) { return; }
+    markdownFlushPending = true;
+    NS.dom.schedule(function () {
+      markdownFlushPending = false;
+      flushPending();
+    });
+  }
+  // [CUSTOM-END] CUSTOM-20260930-128
 
   /**
    * [CUSTOM-20260925-061] The fold triangle for a <details>.
@@ -763,7 +783,28 @@ export const transcriptViewClient = `
     // same mechanism the sub-agent toggle uses), so flipping the toggle never has
     // to re-render anything. Hover shows the full timestamp regardless.
     if (entry.at) {
-      node.insertBefore(NS.dom.el('span', 'rec-time', clockLabel(entry.at)), node.firstChild);
+      // [CUSTOM-20260930-129] The stamp rides on the record's TITLE ROW instead of being a
+      // block of its own. A tool card puts it inside .tool-head, after the elapsed time, so
+      // the line reads "2.2s 11:57"; every other record floats it to the top-right corner
+      // (see the .rec-time rules) — which is what "no longer takes a whole line" means.
+      var stamp = NS.dom.el('span', 'rec-time', clockLabel(entry.at));
+      // [CUSTOM-20260930-129] It goes in the record's TITLE ROW, which is the one part
+      // that stays visible in every state: a collapsed details hides everything that is
+      // not its summary, so a stamp placed beside the details would disappear exactly
+      // when the reader turned Times on to look for it (a collapsed thought block was
+      // doing just that).
+      var toolHead = node.querySelector('.tool-head');
+      var summary = toolHead ? null : node.querySelector('summary');
+      if (toolHead) {
+        // A tool card reads "2.2s 11:57" — appended, so the stamp follows the elapsed time.
+        toolHead.appendChild(stamp);
+      } else if (summary) {
+        // Prepended inside the summary: absolute positioning makes its DOM order
+        // irrelevant, and this keeps "the body is the summary's last child" true.
+        summary.insertBefore(stamp, summary.firstChild);
+      } else {
+        node.insertBefore(stamp, node.firstChild);
+      }
       node.title = fullStamp(entry.at);
     }
     // Drives the three-tier spacing ladder in the stylesheet (same-kind blocks
@@ -792,6 +833,22 @@ export const transcriptViewClient = `
   }
 
   /** Render a full snapshot (session switch, boot). */
+  /**
+   * [CUSTOM-20260930-149] 由 boot 用**当前消息自带的** sessionId 校正会话身份。
+   *
+   * reset() 有意把 sessionId 清空（见那里的注释：旧的 id 会把下一批 markdown 打上前一个会话的
+   * 标签），但**只有 hydrate（快照路径）会把它设回来** —— 于是"重开面板 / 切会话之后新到的记录"
+   * 这段时间里它一直是 null，markdown 请求于是带着 null 发出去，宿主 verifySession 不认、**静默
+   * 丢弃**。实测 Output 的原话：
+   *     chat-panel: dropped markdown item <id>:2:2 (unknown session null)
+   * 表现就是"最后一条只显示原文、重开会话却正常"（重开走 hydrate，sessionId 有值）。
+   * 每条带记录的消息本来就带 sessionId，用它校正最可靠；同值则什么都不做。
+   */
+  function setSessionId(next) {
+    if (!next || next === sessionId) { return; }
+    sessionId = next;
+  }
+
   function hydrate(snapshot) {
     reset();
     if (!snapshot) { return; }
@@ -861,7 +918,14 @@ export const transcriptViewClient = `
   function patch(entryId, changes) {
     var entry = objects[entryId];
     var node = nodes[entryId];
-    if (!entry || !node || !changes) { return; }
+    if (!entry || !node || !changes) {
+      // [CUSTOM-20260930-147] 这里原来是**静默返回** —— 宿主明明回了 html，只要这一侧找不到
+      // entry/node 就当作没发生，界面上永远停在原文，而 Output 里一个字都没有。这条日志是
+      // 定位"最后一条不渲染"的关键：有它说明回填到了客户端但落不了地，没它说明回填根本没到。
+      console.warn('[acpc] patch dropped: entry=' + !!entry + ' node=' + !!node
+        + ' changes=' + !!changes + ' id=' + entryId);
+      return;
+    }
 
     // [CUSTOM-20260925-048] Capture before the copy: a streaming -> settled
     // transition is the moment to let assistive tech speak.
@@ -995,6 +1059,8 @@ export const transcriptViewClient = `
     patch: patch,
     updateTool: updateTool,
     pendingMarkdown: pendingMarkdown,
+    // [CUSTOM-20260930-149] boot 用每条带记录的消息自带的 sessionId 校正它（reset 之后会是 null）。
+    setSessionId: setSessionId,
     // [CUSTOM-20260926-071] Called by the rail when a record gains a real size.
     resolvePendingFolds: resolvePendingFolds,
     ordered: ordered,

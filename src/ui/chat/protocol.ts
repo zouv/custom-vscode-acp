@@ -28,6 +28,13 @@ export interface SessionSummary {
    * notification: nothing pops up and focus is never stolen.
    */
   unread: boolean;
+  /**
+   * [CUSTOM-20260930-130] A permission prompt or a form is parked on this session, so
+   * nothing moves until the reader answers. Distinct from `running`: both are usually
+   * true at once, and the tab dot paints them with two independent signals (colour vs.
+   * the pulsing ring).
+   */
+  waiting: boolean;
 }
 
 /** Everything the panel needs to render one session's header + composer. */
@@ -109,7 +116,7 @@ export type ExtToChat =
   // its button is "Connect Claude Code" or "New session"): a sessionless panel can have
   // a live agent process — closing the last session does not stop it. Optional so an
   // older surface simply keeps the old copy.
-  | { type: 'boot'; focused: SessionSummary | null; sessions: SessionSummary[]; snapshot: TranscriptSnapshotWire | null; meta: SessionMeta | null; agentConnected?: boolean }
+  | { type: 'boot'; focused: SessionSummary | null; sessions: SessionSummary[]; snapshot: TranscriptSnapshotWire | null; meta: SessionMeta | null; agentConnected?: boolean; autoConnect?: boolean }
   | { type: 'focus'; summary: SessionSummary | null; snapshot: TranscriptSnapshotWire | null; meta: SessionMeta | null; agentConnected?: boolean }
   | { type: 'sessionsChanged'; sessions: SessionSummary[]; agentConnected?: boolean }
   // [CUSTOM-20260926-077] 大纲钉住/宽度偏好，随 boot 一起带回（跨窗口重载存活）。
@@ -145,6 +152,21 @@ export type ExtToChat =
   | { type: 'toolUpdate'; sessionId: string; entryId: string; tool: ToolCallView }
   | { type: 'meta'; sessionId: string; meta: SessionMeta }
   | { type: 'attachments'; sessionId: string; attachments: Attachment[] }
+  // [CUSTOM-BEGIN] CUSTOM-20260930-124 - 一次连接尝试的相位（状态卡用）。
+  // **必须无条件回话**，这不是锦上添花：`refreshSessions` 靠签名去重（1867 行的 `conn:` 位），
+  // 而 `ensureConnected` 在进程已经起来时不发任何事件 ⇒「已连接 + 无会话 + 点 Connect」
+  // 这条路上宿主一条消息都不会发，客户端的「连接中」会**永久卡死**（pitfall #29 的形态：
+  // 效果上没变化 ≠ 可以不回话）。
+  // 没有 'disconnected'：断开方向由 `agentConnected` 单独表达，不设第二条真相（pitfall #19）。
+  | { type: 'connection'; state: 'connecting' | 'connected' | 'failed'; message?: string }
+  // [CUSTOM-END] CUSTOM-20260930-124
+  // [CUSTOM-BEGIN] CUSTOM-20260930-125 - 设置项 acpc.autoConnectOnOpen 的当前值。
+  // 走**广播**：两个面渲染的是同一个开关，不能各显示各的。
+  // 带在 boot 里的是**首屏值**（客户端要靠 {agentConnected, focused, autoConnect} 三者
+  // 同时成立才布防自动连接，拆成两条消息就会出现半状态窗口），
+  // 这条消息则负责**运行期**的变更（另一个面改了 / 用户在 Settings 里改了）。
+  | { type: 'autoConnectPref'; value: boolean }
+  // [CUSTOM-END] CUSTOM-20260930-125
   | { type: 'error'; sessionId?: string; message: string };
 
 /** Snapshot variant carrying wire entries. */
@@ -159,6 +181,9 @@ export type ChatToExt =
   | { type: 'ready' }
   // [CUSTOM-20260926-077] 大纲钉住/宽度偏好：非会话作用域，宿主存 globalState。
   | { type: 'setUiPref'; outlineMode: 'popup' | 'sidebar'; outlineWidth: number }
+  // [CUSTOM-20260930-125] 状态卡上的自动连接开关。**非会话作用域**（正是没有会话时
+  // 才需要它），所以必须放在 verifySession 守卫**之前**处理，与 setUiPref 同一位置。
+  | { type: 'setAutoConnect'; value: boolean }
   | { type: 'sendPrompt'; sessionId: string; text: string }
   | { type: 'cancelTurn'; sessionId: string }
   | { type: 'newSession'; agentName: string }

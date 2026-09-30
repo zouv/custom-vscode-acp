@@ -4,9 +4,13 @@
 // 引导条管「这一轮干到哪一步了」。
 //
 // 实现要点：
-//   · 引导条是 `.message-area` 的**兄弟节点**（不在 `#messages` 里），靠 track 的
+//   · 引导条与 `#messages` 同属 `.messages-column`（**不在 `#messages` 里**），靠 track 的
 //     translateY(-scrollTop) 与内容同步滚动。放在 #messages 内会被那里的三档间距阶梯
 //     （`.messages > * + *` 的 margin-top）位移，也会被当成一个"条目"参与排版。
+//     [CUSTOM-20260930-132] 它原是 `.message-area` 的直接子节点，随版心改动搬进了
+//     .messages-column：横向位置全靠 CSS 的 `.rail{left:0}`，锚在哪一层就贴哪条左缘。
+//     137 撤销了消息列的限宽（列恢复满宽、与改动前逐像素一致），搬迁保留 —— 列才是消息
+//     内容的定位容器，将来若再限宽也不必重做。
 //   · **布局读取分两种，别混**：`invalidate()` 只在标记集合/状态变化时才重新测量；
 //     `reflow()` 只测量（markdown 回填、窗口尺寸变化）。流式 chunk 走的是 append 同一 entry，
 //     签名不变 → 完全不读布局，只更新 transform 与高亮。

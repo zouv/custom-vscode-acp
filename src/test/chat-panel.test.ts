@@ -33,6 +33,9 @@ import { ConnectionManager, type ConnectionInfo } from '../core/ConnectionManage
 import { SessionHistoryStore } from '../core/SessionHistoryStore';
 import { SessionManager, pickDefaultCwd, type SessionInfo } from '../core/SessionManager';
 import { SessionUpdateHandler } from '../handlers/SessionUpdateHandler';
+// [CUSTOM-20260930-130] The tab dot's "waiting" state is read from these two bridges.
+import { PermissionBridge } from '../handlers/PermissionBridge';
+import { ElicitationBridge } from '../handlers/ElicitationBridge';
 import { isBlankText } from '../ui/chat/content/contentBlocks';
 import { choiceChanges, choiceSnapshotFromState, choiceSnapshotPatched } from '../ui/chat/sessionChoices';
 import { directoryKey, directoryOptions } from '../ui/chat/historyDirs';
@@ -40,7 +43,9 @@ import { panelIdForAgent } from '../ui/chat/panelContract';
 import { readDiskSessions, readTranscriptTimes } from '../ui/chat/diskSessions';
 import { ToolInvocationStore } from '../ui/chat/transcript/ToolInvocationStore';
 import type { ChatSurface, SurfaceKey } from '../ui/chat/ChatSurface';
-import { ChatPanelHost } from '../ui/chat/ChatPanelHost';
+// [CUSTOM-20260930-124/125] `resolveAutoConnect` / `PanelPrefsIO` are exported so this
+// file can drive the settings seam with a stub instead of the developer's settings.json.
+import { ChatPanelHost, resolveAutoConnect, type PanelPrefsIO } from '../ui/chat/ChatPanelHost';
 import type { ExtToChatMessage, TranscriptSnapshotWire } from '../ui/chat/protocol';
 import type { TranscriptEntry } from '../ui/chat/transcript/types';
 
@@ -153,22 +158,50 @@ interface Harness {
   sessionManager: SessionManager;
   sessionId: string;
   agentName: string;
+  /** [CUSTOM-20260930-125] The settings seam the host was given. */
+  prefs: StubPrefs;
+}
+
+/**
+ * [CUSTOM-20260930-125] Stands in for `vscode.workspace.getConfiguration`.
+ *
+ * The same reason `FakeMemento` exists: this suite must not read or write the developer's
+ * real settings. It also makes the interesting failure reachable — a write that throws —
+ * which a real configuration object will not do on demand.
+ */
+class StubPrefs implements PanelPrefsIO {
+  readonly writes: boolean[] = [];
+  failWith: Error | null = null;
+  constructor(private value = false) {}
+  getAutoConnect(): boolean { return this.value; }
+  async setAutoConnect(value: boolean): Promise<void> {
+    this.writes.push(value);
+    if (this.failWith) { throw this.failWith; }
+    this.value = value;
+  }
 }
 
 function makeHarness(
   sessionId: string,
   agentName = 'Claude Code',
   managerFactory?: (handler: SessionUpdateHandler) => SessionManager,
+  prefs = new StubPrefs(),
+  // [CUSTOM-20260930-130] Optional bridges: the tab dot's "waiting" state is read from
+  // them, and a test needs to be able to park a request on a session.
+  bridges: { permission?: PermissionBridge; elicitation?: ElicitationBridge } = {},
 ): Harness {
   const handler = new SessionUpdateHandler();
   const sessionManager = managerFactory
     ? managerFactory(handler)
     : new SessionManager(new AgentManager(), new ConnectionManager(handler), handler);
   registerFakeSession(sessionManager, sessionId, agentName);
-  const host = new ChatPanelHost(vscode.Uri.file('/tmp/chat-panel-test'), sessionManager, handler);
+  const host = new ChatPanelHost(
+    vscode.Uri.file('/tmp/chat-panel-test'), sessionManager, handler,
+    bridges.permission, undefined, bridges.elicitation, prefs,
+  );
   const surface = new RecordingSurface();
   host.attachSurface(surface, { agentName, sessionId });
-  return { host, surface, handler, sessionManager, sessionId, agentName };
+  return { host, surface, handler, sessionManager, sessionId, agentName, prefs };
 }
 
 function feed(harness: Harness, notifications: readonly FixtureNotification[]): void {
@@ -980,12 +1013,17 @@ suite('chat panel: switch snapshot diff (model / mode / options)', () => {
 
   test('a mode switch is labelled the same way whether it arrives as a mode or as an option', () => {
     const before = choiceSnapshotFromState(MODES, CONFIG_OPTIONS);
-    // (a) through session.modes (a `current_mode_update`)
+    // (a) An agent that expresses modes ONLY through `session.modes` (no mode option at
+    // all): the fallback branch still has to work.
+    const withoutModeOption = CONFIG_OPTIONS.filter(option => option.id !== 'mode');
     assert.deepStrictEqual(
-      choiceChanges(before, choiceSnapshotFromState({ ...MODES, currentModeId: 'plan' }, CONFIG_OPTIONS)),
+      choiceChanges(
+        choiceSnapshotFromState(MODES, withoutModeOption),
+        choiceSnapshotFromState({ ...MODES, currentModeId: 'plan' }, withoutModeOption),
+      ),
       ['Switched to Plan mode'],
     );
-    // (b) through a config option with category 'mode' — which is how Claude Code
+    // (b) Through a config option with category 'mode' — which is how Claude Code
     // reports it. The reader must not be able to tell which channel was used.
     assert.deepStrictEqual(
       choiceChanges(before, choiceSnapshotFromState(MODES, withValue('mode', 'plan'))),
@@ -1032,7 +1070,40 @@ suite('chat panel: switch snapshot diff (model / mode / options)', () => {
     // NAME must both survive, or the line would read "Switched to plan mode".
     const fromMode = choiceSnapshotPatched(before, { modeId: 'plan' });
     assert.deepStrictEqual(choiceChanges(before, fromMode), ['Switched to Plan mode']);
-    assert.deepStrictEqual(fromMode.options, before.options, 'a mode update must not drop the options');
+    // [CUSTOM-20260930-128] A mode payload carries an id and nothing else, so every OTHER
+    // option must survive — and the mode option itself is the same fact, so it is written
+    // through (the setter path reads that copy; leaving it behind is what made one switch
+    // print two lines).
+    const { mode: patchedMode, ...patchedRest } = fromMode.options;
+    const { mode: beforeMode, ...beforeRest } = before.options;
+    assert.deepStrictEqual(patchedRest, beforeRest, 'every other option must survive');
+    assert.strictEqual(patchedMode.value, 'plan');
+    // The name comes from the mode list, since the payload does not carry one — otherwise
+    // the line would read "Switched to plan mode".
+    assert.strictEqual(patchedMode.valueName, 'Plan');
+    assert.strictEqual(beforeMode.valueName, 'Manual');
+  });
+
+  test('one switch reported through both channels is announced once', () => {
+    // [CUSTOM-20260930-128] The two reporters see different HALVES of the same change:
+    // the notification path patches the mode id from its payload (leaving the option
+    // behind), while the setter path reads SessionManager — where `modes.currentModeId`
+    // is frozen, because `setMode` early-returns when the session has configOptions
+    // (Claude Code's shape). Their snapshots used to disagree forever, so the
+    // "the second report diffs to nothing" rule failed and the user saw two lines,
+    // the second one naming a state that never existed ("Manual mode · Bypass
+    // permissions mode").
+    const before = choiceSnapshotFromState(MODES, CONFIG_OPTIONS);
+    const fromNotification = choiceSnapshotPatched(before, { modeId: 'plan' });
+    // MODES still says 'default' on purpose: that frozen copy IS the setter path's view.
+    const fromSetter = choiceSnapshotFromState(MODES, withValue('mode', 'plan'));
+
+    assert.deepStrictEqual(choiceChanges(before, fromNotification), ['Switched to Plan mode']);
+    assert.deepStrictEqual(choiceChanges(fromNotification, fromSetter), [],
+      'the second report of the same switch must be silent');
+    // ...and the other arrival order has no silent gap either.
+    assert.deepStrictEqual(choiceChanges(before, fromSetter), ['Switched to Plan mode']);
+    assert.deepStrictEqual(choiceChanges(fromSetter, fromNotification), []);
   });
 
   test('a state that APPEARS is initialization, not a switch', () => {
@@ -1396,7 +1467,7 @@ suite('chat panel: history picker directory filter', () => {
       'win32',
     );
     assert.deepStrictEqual(options.map(o => [o.name, o.count, o.current]), [
-      ['alpha', 2, true],   // the current folder leads, with its sessions merged
+      ['alpha', 2, true],   // 两种拼写合成一项（count=2）；顺序按名称（它恰好也在前面）
       ['beta', 1, false],
     ]);
   });
@@ -1430,10 +1501,15 @@ suite('chat panel: history picker directory filter', () => {
     );
   });
 
-  test('ordering: current, then most sessions, then name', () => {
+  test('ordering: by name (CUSTOM-20260930-142)', () => {
+    // 用户要求"目录列表排下序（按字母顺序）"。原来是 current 优先 → 会话数降序 → 名称，
+    // 前两个键把字母序盖住了 —— 看起来就像"根本没排序"。现在纯按名称；当前目录只保留
+    // current 标记（客户端据此高亮），不再置顶。
     const options = directoryOptions(
       [{ cwd: '/b' }, { cwd: '/b' }, { cwd: '/a' }, { cwd: '/c' }, { cwd: '/c' }], '/z');
-    assert.deepStrictEqual(options.map(o => o.name), ['z', 'b', 'c', 'a']);
+    assert.deepStrictEqual(options.map(o => o.name), ['a', 'b', 'c', 'z']);
+    // 会话数（b 与 c 各 2）与 current（z）都不再影响顺序。
+    assert.deepStrictEqual(options.map(o => o.current), [false, false, false, true]);
   });
 
   /** An agent whose history spans directories — the case the filter exists for. */
@@ -1478,11 +1554,11 @@ suite('chat panel: history picker directory filter', () => {
     // A row with no directory has no key: it can only ever show in an unfiltered list.
     assert.strictEqual(byId.get('no-dir').dirKey, undefined);
 
-    // The current session's directory ('/tmp') leads, and the two spellings of alpha
-    // are ONE candidate with a count of 2.
+    // The two spellings of alpha are ONE candidate with a count of 2, and the order is
+    // by name — '/tmp' is the current directory but no longer leads (CUSTOM-20260930-142).
     assert.deepStrictEqual(reply.directories.map((d: any) => [d.name, d.count, d.current]), [
-      ['tmp', 1, true],
       ['alpha', 2, false],
+      ['tmp', 1, true],
     ]);
   });
 
@@ -2096,5 +2172,222 @@ suite('chat panel: Bash tool payloads (real capture, CUSTOM-20260929-118)', () =
     assert.strictEqual(last.status, 'failed');
     assert.ok(itemText(last).includes('not a git repository'),
       'the error text is what the reader needs here — it must not be dropped');
+  });
+});
+
+// [CUSTOM-20260930-124/125] 连接相位与自动连接开关（宿主侧协议流）。
+//
+// 最要紧的是**无条件回话**：`refreshSessions` 靠签名去重，而 `ensureConnected` 在进程
+// 已经起来时不发任何事件 ⇒ 少了 `connection` 消息，「已连接 + 无会话 + 点 Connect」这条路上
+// 宿主一句话都不会说，客户端的「连接中」就永久卡死（pitfalls #29 的形态）。
+// 下面第二个用例就是那条回归钉。
+suite('chat panel: connection phase and the auto-connect switch', () => {
+  /** The phases the host reported, in order. */
+  function phases(harness: Harness): string[] {
+    return harness.surface.sent
+      .filter(m => m.type === 'connection')
+      .map(m => String((m as { state?: string }).state));
+  }
+
+  function connectedAt(harness: Harness): number {
+    return harness.surface.sent
+      .findIndex(m => m.type === 'connection' && (m as { state?: string }).state === 'connected');
+  }
+
+  async function waitFor(predicate: () => boolean, label: string): Promise<void> {
+    for (let i = 0; i < 100; i++) {
+      if (predicate()) { return; }
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.fail(`timed out waiting for ${label}`);
+  }
+
+  class ConnectSessionManager extends SessionManager {
+    readonly ensured: string[] = [];
+    readonly liveIds: string[] = [];
+    readonly created: string[] = [];
+    failWith: string | null = null;
+
+    override async ensureConnected(agentName: string): Promise<ConnectionInfo> {
+      this.ensured.push(agentName);
+      if (this.failWith) { throw new Error(this.failWith); }
+      return {} as ConnectionInfo;
+    }
+
+    override getSessionIdsForAgent(): string[] { return this.liveIds; }
+
+    /** [CUSTOM-20260930-131] A connect with no session to focus now creates one. */
+    override async createSession(agentName: string): Promise<SessionInfo> {
+      this.created.push(agentName);
+      const sessionId = `fresh-session-${this.created.length}`;
+      registerFakeSession(this, sessionId, agentName);
+      return {
+        sessionId,
+        agentId: 'fake-agent-id',
+        agentName,
+        agentDisplayName: agentName,
+        cwd: '/tmp',
+        createdAt: new Date().toISOString(),
+        initResponse: {},
+        modes: null,
+        models: null,
+        configOptions: null,
+        availableCommands: [],
+      } as unknown as SessionInfo;
+    }
+  }
+
+  function connectHarness(liveIds: string[] = [], prefs = new StubPrefs()): {
+    harness: Harness; manager: ConnectSessionManager;
+  } {
+    let manager!: ConnectSessionManager;
+    const harness = makeHarness('placeholder-session', 'Claude Code', handler => {
+      manager = new ConnectSessionManager(new AgentManager(), new ConnectionManager(handler), handler);
+      // Registered for real: `focusSession` looks the id up, and a focus is what the
+      // "connected comes last" ordering test needs to observe.
+      for (const id of liveIds) { registerFakeSession(manager, id, 'Claude Code'); }
+      manager.liveIds.push(...liveIds);
+      return manager;
+    }, prefs);
+    harness.surface.sent.length = 0;   // drop the attach-time boot noise
+    return { harness, manager };
+  }
+
+  test('a connect reports connecting, then connected', async () => {
+    const { harness, manager } = connectHarness();
+    harness.host.onMessage({ type: 'connectAgent' });
+    // Immediate: this is the phase that disables the button, so a frame of delay is a
+    // frame in which a second click gets through.
+    assert.deepStrictEqual(phases(harness), ['connecting']);
+    await waitFor(() => phases(harness).length >= 2, 'connected');
+    assert.deepStrictEqual(phases(harness), ['connecting', 'connected']);
+    // [CUSTOM-20260930-131] Nothing to focus ⇒ a session is created, so the composer the
+    // user gets is a real one (images, mode/model pickers all hang off a session).
+    assert.deepStrictEqual(manager.created, ['Claude Code']);
+  });
+
+  test('a connect with a session to focus does not create another one', async () => {
+    const { harness, manager } = connectHarness(['other-session']);
+    harness.host.onMessage({ type: 'connectAgent' });
+    await waitFor(() => phases(harness).includes('connected'), 'connected');
+    assert.deepStrictEqual(manager.created, [], 'reuse, do not pile up');
+  });
+
+  test('a panel whose process is already up still hears "connected"', async () => {
+    // The regression this message exists for: on this path nothing else speaks — no
+    // `agent-connected` event, no signature change to trip `refreshSessions` — so a
+    // silent host would leave the client on "Connecting…" forever.
+    const { harness, manager } = connectHarness([]);
+    harness.host.onMessage({ type: 'connectAgent' });
+    await waitFor(() => phases(harness).includes('connected'), 'connected');
+    assert.deepStrictEqual(manager.ensured, ['Claude Code']);
+    assert.deepStrictEqual(phases(harness), ['connecting', 'connected']);
+  });
+
+  test('the focus lands before "connected"', async () => {
+    // Load-bearing order: the client opens a draft on 'connected' only when no session is
+    // focused. Sending the phase first would hand the user a spare tab next to the session
+    // the connect just found.
+    const { harness } = connectHarness(['other-session']);
+    harness.host.onMessage({ type: 'connectAgent' });
+    await waitFor(() => connectedAt(harness) >= 0, 'connected');
+    const focusAt = harness.surface.sent.findIndex(m => m.type === 'focus');
+    assert.ok(focusAt >= 0, 'the session the connect found must be focused');
+    assert.ok(focusAt < connectedAt(harness),
+      `focus@${focusAt} must precede connected@${connectedAt(harness)}`);
+  });
+
+  test('a failed connect reports the phase and the error', async () => {
+    const { harness, manager } = connectHarness();
+    manager.failWith = 'agent would not start';
+    harness.host.onMessage({ type: 'connectAgent' });
+    await waitFor(() => phases(harness).includes('failed'), 'failed');
+    assert.deepStrictEqual(phases(harness), ['connecting', 'failed']);
+    const failure = harness.surface.sent
+      .find(m => m.type === 'connection' && (m as { state?: string }).state === 'failed');
+    assert.match(String((failure as { message?: string }).message), /agent would not start/);
+    assert.ok(harness.surface.sent.some(m => m.type === 'error'), 'and the usual error line');
+  });
+
+  test('the switch writes through the seam and is echoed back', async () => {
+    const prefs = new StubPrefs(false);
+    const { harness } = connectHarness([], prefs);
+    harness.host.onMessage({ type: 'setAutoConnect', value: true });
+    await waitFor(() => prefs.writes.length > 0, 'the write');
+    assert.deepStrictEqual(prefs.writes, [true]);
+    await waitFor(() => harness.surface.sent.some(m => m.type === 'autoConnectPref'), 'the echo');
+    const echo = harness.surface.sent.filter(m => m.type === 'autoConnectPref');
+    assert.strictEqual((echo[echo.length - 1] as { value?: boolean }).value, true);
+  });
+
+  test('a write that fails echoes the value the setting actually holds', async () => {
+    const prefs = new StubPrefs(false);
+    prefs.failWith = new Error('read-only');
+    const { harness } = connectHarness([], prefs);
+    harness.host.onMessage({ type: 'setAutoConnect', value: true });
+    await waitFor(() => harness.surface.sent.some(m => m.type === 'autoConnectPref'), 'the echo');
+    const echo = harness.surface.sent.filter(m => m.type === 'autoConnectPref');
+    // Not `true`: the write threw, so the setting still says false. Echoing the request
+    // back would leave the checkbox showing a value settings.json does not have.
+    assert.strictEqual((echo[echo.length - 1] as { value?: boolean }).value, false);
+  });
+
+  test('boot carries the setting', () => {
+    const { harness } = connectHarness([], new StubPrefs(true));
+    harness.host.onMessage({ type: 'ready' });
+    const boot = harness.surface.sent.filter(m => m.type === 'boot').pop();
+    assert.strictEqual((boot as { autoConnect?: boolean }).autoConnect, true);
+  });
+
+  test('only the boolean true turns auto-connect on', () => {
+    for (const raw of [undefined, null, 'true', 'yes', 0, 1, {}, []]) {
+      assert.strictEqual(resolveAutoConnect(raw), false, JSON.stringify(raw));
+    }
+    assert.strictEqual(resolveAutoConnect(true), true);
+  });
+});
+
+// [CUSTOM-20260930-130] 标签圆点的「等待回答」：宿主从两个桥读（它们才是 pending 的唯一
+// 持有者），并且**必须计入 refreshSessions 的签名**——漏签名的后果在 022/063 上踩过两次：
+// 数据变了，标签栏却永远不刷新。
+suite('chat panel: the tab dot and the waiting state', () => {
+  interface SummaryWire { sessionId: string; waiting: boolean }
+
+  function summaries(harness: Harness): SummaryWire[] {
+    for (let i = harness.surface.sent.length - 1; i >= 0; i--) {
+      const message = harness.surface.sent[i] as { type?: string; sessions?: SummaryWire[] };
+      if (message.type === 'sessionsChanged') { return message.sessions ?? []; }
+    }
+    return [];
+  }
+
+  async function waitFor(predicate: () => boolean, label: string): Promise<void> {
+    for (let i = 0; i < 100; i++) {
+      if (predicate()) { return; }
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.fail(`timed out waiting for ${label}`);
+  }
+
+  test('a session parked on a permission prompt is marked waiting, and cleared when answered', async () => {
+    const permission = new PermissionBridge();
+    const harness = makeHarness('s-1', 'Claude Code', undefined, new StubPrefs(), { permission });
+    harness.surface.sent.length = 0;
+
+    void permission.request(
+      { sessionId: 's-1', toolCall: { toolCallId: 't1', title: 'Run the tests' } } as never,
+      // Only the dialog path uses the fallback; the harness has a presenter, so the
+      // prompt lands in the panel and this never runs.
+      (async () => ({ outcome: { outcome: 'cancelled' } })) as never,
+    );
+
+    await waitFor(() => summaries(harness).some(row => row.waiting), 'a waiting summary');
+    assert.strictEqual(summaries(harness).find(row => row.sessionId === 's-1')?.waiting, true,
+      'nothing advances until the reader answers — the strip has to be able to say so');
+
+    // Settling it has to reach the strip too, or the dot would stay orange forever.
+    permission.cancelSession('s-1');
+    await waitFor(() => summaries(harness).some(row => row.waiting === false), 'the flag cleared');
+    assert.strictEqual(summaries(harness).find(row => row.sessionId === 's-1')?.waiting, false);
   });
 });

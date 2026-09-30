@@ -17,6 +17,203 @@
 
 ---
 
+### 2026-09-30 - CUSTOM-20260930-150
+- **改进**：把"日志落盘"这条排查路径放回**入口处**（能力早就有，问题是想不起来用）
+- **改动文件**：`CUSTOMIZATIONS/docs/dev-workflow.md`、`CUSTOMIZATIONS/docs/pitfalls.md`（另加一条 AI 长期记忆，不在仓库里）
+- **来源**：用户复验 149 时提出 —— "这次要我手动拷贝日志，上次添加本地日志，下次类似问题你可以自己记录到日志里然后排查？"
+- **详细说明**：
+  - 落盘本身在 **CUSTOM-20260928-095** 就做了：`~/.claude/acp-client-custom.log`，宿主的 `log()` / `logTraffic()`、以及 webview 客户端经 `clientLog` 转发的 `console.warn/error` 全都写进去（超 5MB 先截断）。代码注释里当时写的就是"让 AI 排查时能直接读文件而不必用户手动贴日志"。
+  - 但这条知识**只存在注释里**，而排查的入口是文档与长期记忆 —— 两处不重合，等于没记：147 / 149 两轮里我三次请用户"打开输出面板 → 搜 [acpc] → 发我"。
+  - 本次：①`dev-workflow.md` 新增「排查入口：日志已经落盘」（路径、`grep` 姿势、"要新证据就加 `console.warn('[acpc] …')`"、**不要请用户手工拷贝**）；②`pitfalls.md` **#35** 记下这条流程教训（"我们已经有这个能力"与"我下次会想起用它"是两件事）；③147 加的三条诊断（`renderMarkdown asked` / `markdownRendered` / `patch dropped`）由"临时"**转正为常驻** —— 它们噪声低，而且现在会自动进日志文件。
+- **验证方式**：`grep -n "acpc]" ~/.claude/acp-client-custom.log | tail` 能看到 149 修复后的正常往返（`renderMarkdown asked` 紧跟 `markdownRendered`、**不再有** `dropped markdown item`）—— 这条链路现在自带留痕，下次同类问题不必再让用户搬日志。`check-registry.mjs` 六节全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-30 - CUSTOM-20260930-149
+- **修复**：最后一条助手消息不渲染 markdown（真凶找到了 —— 客户端没有会话身份）
+- **改动文件**：`src/ui/chat/html/client/boot.ts`、`src/ui/chat/html/client/transcriptView.ts`、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`
+- **来源**：用户提供的 Output 日志 —— 里面反复出现 `chat-panel: dropped markdown item <id> (unknown session null)`
+- **详细说明**：
+  - **真凶**：客户端发出去的 markdown 请求里 **`sessionId` 是 `null`**，宿主 `verifySession` 不认，于是把**每一条回填都静默丢弃** —— 记录显示得出来（数据在客户端、append 那道守卫也放行了），可渲染结果永远回不来。
+  - **null 从哪来**：`transcriptView.sessionId`。`reset()` 有意清空它（防止旧的 id 把下一批 markdown 打上前一个会话的标签 —— 那里有注释），而**只有 hydrate（快照路径）会把它设回来**。于是"重开面板 / 切会话之后新到的记录"整段时间里它是 `null`。**注意 boot 自己的 `currentSessionId` 是有值的**（`case 'append'` 有一道 `message.sessionId !== currentSessionId` 的守卫，记录能显示就证明它通过了）—— 两个 sessionId 不是一回事，这正是症状别扭的原因。
+  - **修法**：新增 `transcriptView.setSessionId()`；`boot.onMessage` 在每条**带记录**的消息（`entries` 或 `entryId`，即 append / revise / toolUpdate）上顺手校正它 —— 那些消息本来就带 `sessionId`，用它最可靠。
+  - **验证方法本身也修了一个假阴性**：我给端到端档写采样时用的是 `setTimeout(0)`，而 `window.postMessage` 的派发是**独立的一次 task**、排在它之后 ⇒ 回填还没被处理就下了"未渲染"的结论。前三轮我报告的"本地跑通/没跑通"因此都不可靠 —— 采样已延后到 120ms。
+- **验证方式**：预览新增 `#bootround` 档，走**与真机同一条路径**：`boot`（`focused` 为会话摘要对象）→ `reset()` → `append` → `revise`，且模拟宿主**像真宿主那样校验 sessionId**（没有就丢弃）。结果：`asked: ["md1:v1","md1:v2"]` → `markdownRendered` ×2 → `hasMdClass: true, text: "v2"`、**`droppedNoSession: 0`**。桩测试"reset 之后要靠 setSessionId 把会话身份找回来"把根因钉死（断言 reset 之后确实是 `null`、校正后恢复）。`npm test` **205 passing**、`npm run lint` 0、`check-registry.mjs` 六节全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-30 - CUSTOM-20260930-147
+- **修复**：最后一条助手消息不渲染 markdown（停在原文），重开会话却正常
+- **改动文件**：`src/ui/chat/html/client/boot.ts`、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/docs/arch/chat-panel-records.md`
+- **来源**：用户报"最后一条消息会出现不渲染的情况（应该按 markdown 渲染），对话后动态更新出来的往往不渲染，重开会话就正常"
+- **详细说明**：
+  - **先复现再判**：加了一条桩测试走**完整链路**（append 时无正文 → revise 送 text → finalize），**通过** ⇒ 客户端的请求链路（`markPending` → `scheduleMarkdown` → `requestMarkdown`）没问题，问题在**回填那一侧**。
+  - **真凶是两道过严的守卫**（都在 boot.ts）：
+    ①`requestMarkdown` 开头的 `if (!currentSessionId) { return; }` —— `transcriptView` 的 item **自带 sessionId**（请求方就是它），不需要借 boot 的聚焦状态；这道守卫只会在"正文刚落地、聚焦还没同步好"的那一帧把整批请求吞掉（pending 不清空，但下一次触发可能永远不来，正是 128 修过的那个形状）。现在守卫只包住**没有会话身份**的工具项。
+    ②`markdownRendered` 的回填循环里 `if (items[j].sessionId !== currentSessionId) continue;` —— 两端的 sessionId 来源不同（请求方是 transcriptView，这里是 boot），一旦不一致就把回填**静默丢掉**，那条记录于是一直停在原文。而宿主其实**已经把 html 写进了 store**（`handleRenderMarkdown` 里 `transcripts.patch`），所以"重开会话就正常"——重开走的是快照，不经过这里。`entryId` 在 store 里全局唯一，按它回填本来就串不了台。
+  - **为什么是"往往"**：两条守卫都只在"两个 id 不同步"的窗口里发作，所以它是偶发的 —— 这也解释了为什么重开一次就好了。
+- **本地端到端复现（本轮补上的能力）**：这条链路此前**从来没被预览覆盖过** —— `boot.ts` 顶层有 `var vscode = acquireVsCodeApi();`，而预览脚本没提供它，于是 boot 模块一加载就抛错、`NS.boot` 根本不存在，`flushPending` 里那句守卫让它静默什么都不做。现在预览补了三件东西：①`acquireVsCodeApi` 替身（排在客户端脚本之前）；②`#bootround` 档 —— 让 boot 自己初始化（并手动补一次 `DOMContentLoaded`：预览里那个事件早已派发过，boot 的 init 因此一直挂在等它）、由本档**模拟宿主**把 `renderMarkdown` 渲染成 html 回填，走的是真实的流式形状（先落地无正文 → patch 送 text → finalize）；③最早时机的未捕获错误收集器 + 把三条诊断日志抓进探针。**结论**：修好的代码在这条链路上通过（`asked: ["md1"]` → `markdownRendered` → `hasMdClass: true`）；而这条链路里 `currentSessionId` 一直是 `null`（预览收不到 boot 消息），**正是老代码会失败的那条路径**。
+- **诊断留痕**：`requestMarkdown` 发出时、`markdownRendered` 到达时、`patch` 因找不到 entry/node 提前返回时，各打一条 `[acpc]` 日志（走既有 Output 通道）。三条合起来能一次判定断点：只有第一条 ⇒ 宿主没回；三条都有 ⇒ 回填落地失败；一条都没有 ⇒ 请求压根没发。
+- **验证方式**：新增桩测试"正文后到的助手记录在 settle 时仍会请求"（走 append → patch(text) → patch(streaming:false) 完整链路），`npm test` **204 passing**；`npm run lint` 0、`check-webview-client` 通过、`check-registry.mjs` 六节全绿。真机路径建议 `Ctrl+R` 后连续对话两轮观察最后一条。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-30 - CUSTOM-20260930-146
+- **功能**：Times 开关改成**只作用于工具卡** —— 关 = `3ms`（耗时，常显）；开 = `3ms 18:32`（耗时 + 时刻）。普通消息与 Thought 不再显示时刻
+- **改动文件**：`src/ui/chat/html/styles.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`、`CUSTOMIZATIONS/docs/arch/chat-panel-records.md`
+- **来源**：用户复验 145 —— "排版更乱了，不仅没对齐，原本工具调用很工整的现在也都乱了。既然只有'工具调用才有耗时'，那就处理成：开启 times 后，只在工具上显示时间+耗时（不开则只显示耗时）"
+- **详细说明**：
+  - **145 为什么错**：我为了"让工具卡的时刻与其它记录对齐"，把工具卡的时刻从"标题行里的一项"改成"也浮到右上角"，并给标题行加 `padding-right: calc(5.5ch + 13px)` 硬留槽位 —— 结果是**把工具卡原本工整的那一行挤散了**（标题被压、时刻与耗时分离）。为了对齐去改其中一类的排版，往往把它原本对的东西也搞坏。
+  - **回退 + 换方向**：撤销 145 的全部改动（`.tool-head` 的 padding、`.rec-time` 的固定槽位、以及那条"工具卡时刻浮右上"的例外）。真正的修法是用户给的那个：**时刻只属于有耗时的东西**（工具调用），所以选择器从 `.messages.show-times .rec-time` 收窄成 `.messages.show-times .tool-head .rec-time`；非工具记录的时刻元素仍在 DOM 里（`transcriptView` 一律插入），只是不再放它出来 —— **零 JS 改动**。顺带把 `.sticky-user.show-times .rec-time` 改成 `display: none`（置顶条里永远是用户消息，不该冒出时刻）。
+- **验证方式**：真 Chromium 无头 + 探针（`times` 读数改为**先按可见过滤**：`visible` 应等于工具卡数量、`rows` 里只该出现 tool）。实测：`visible = 3`（三个工具卡）、`total = 9`（其余 6 个元素在 DOM 里但不可见）、`rows` 全是 `tool`；宽窄两种面板一致。截图 `times.png` 里工具卡读作 `420ms 18:24`，消息/Thought 上没有任何时刻。`npm test` 203 passing、`npm run lint` 0、`check-registry.mjs` 六节全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-30 - CUSTOM-20260930-145
+- **功能**：打开 Times 后，**所有**记录的时刻落在同一条竖线上（工具卡的时刻不再由它自己那行挤出来）
+- **改动文件**：`src/ui/chat/html/styles.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`、`CUSTOMIZATIONS/docs/arch/chat-panel-records.md`
+- **来源**：用户复验"勾上 times 之后所有卡片都显示时间了（没有时长，而且不对齐）"，并问"其他卡片没有时长是因为拿不到吗"
+- **详细说明**：
+  - **先回答"时长"那一问**：不是拿不到 —— **只有工具调用**有耗时（ACP 的 `elapsedMs`），普通消息与 Thought 都没有这个数据，所以它们只显示时刻（Thought 的 `Thought for Ns` 是耗时，但它写在正文里、也不是每条都有）。也就是说"没有时长的记录不显示时长"是**对的**，问题只在**排版**。
+  - **对齐**：`.rec-time` 本来就是"绝对定位浮在记录右上角"，但工具卡是个例外（`.tool-head .rec-time { position: static }`，它是标题行里的一项、排在耗时之后）。实测工具卡的时刻比其它记录靠左 8px、低 8px，而且**窄面板下偏移量还不一样**（宽面板 18/8、窄面板 13/8）—— 因为它的位置由标题行里的内容挤出来，不是钉住的。
+  - **修法**：删掉那个例外，让工具卡的时刻**走同一套绝对定位**；标题行用 `padding-right: calc(5.5ch + 13px)` 把槽位让出来（否则会盖住耗时）。同时给 `.rec-time` 一个**固定宽度的槽位**（`width: 5.5ch; text-align: right`）—— 时刻恒为 HH:MM 五个字符、又是 `tabular-nums`，所以这个宽度是定的，右缘因此天生对齐。
+- **验证方式**：真 Chromium 无头 + 探针（新增 `times` 读数：逐条量 `.rec-time` 距消息区右缘的距离与距自己卡片顶部的高度）。改前：工具卡 `gapRight = 18`（宽面板）/ `13`（窄面板）、`gapTop = 8`，其余记录 `10`/`0`；改后：工具卡 **`11` / `1`，且宽窄两种面板完全一致**，其余仍是 `10`/`0`（那 1px 是工具卡自己的边框）。窄面板（260px）截图 `times-narrow.png` 里所有时刻贴在同一条右缘上。`npm test` 203 passing、`npm run lint` 0、`check-registry.mjs` 六节全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-30 - CUSTOM-20260930-144
+- **功能**：底栏悬浮的收尾 —— 消息区底部留白**一贯存在**（内容永不被输入卡遮挡），并把只在**编辑区面板**里出现的两处"隐形遮挡"修掉
+- **改动文件**：`src/ui/chat/html/styles.ts`、`src/ui/chat/html/client/scroll.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`
+- **来源**：用户三轮复验 —— ①"悬浮效果还是没出来（左右空白区域还是会遮挡消息）"；②"还是遮挡了"（附 devtools）；③"消息区的触底判断也应该保持在输入框上面的位置" + "右侧大纲的内容也没显示全"
+- **详细说明**：
+  - **最终形态**：`.messages` 的 `padding-bottom: calc(24px + var(--acpc-composer-h, 0px))` **一贯存在** —— 内容永远停在卡片上方。配套的是 `scroll.ts` 的判据要**减掉这段留白**：用"内容末尾"而不是"可滚动范围的末尾"算 distance，于是"内容末尾进入视口"与"判定为到底"是同一件事，不会出现"Jump 还说没到底、下面却已经是空白"的灰色地带（那正是前两轮被反复报的区间）。
+  - **走过的弯路（已整体撤销）**：中途改成"只在贴底那一刻让位"的条件式 —— `.pin-bottom` 类 + `syncPinBottom()` 单一入口。方向是错的：未到底的内容会被卡片切断，而且为了让它不抖，要在 scroll.ts 里维护"切类 + 滚动位置补偿"，白白多出三个坑（判据减 padding 会撑大贴底区 / 撤留白时 scrollTop 被 clamp 导致来回抖 / `toBottom()` 绕过切类）。教训是：**留白该不该存在，与滚动位置的判定，本来就是两件事**，我一度把它们耦合成一个开关。
+  - **编辑区面（真凶）**：`.surface-editor .composer { background: var(--vscode-editor-background) }` 会把这条**浮在消息上的透明层**刷成一块不透明带 —— 输入卡两侧的消息、右侧大纲栏的底部全被它盖住。而这个面正是用户日常用的（面板在编辑区），预览脚本默认渲染的却是**侧边栏面**，所以前三轮一直没照出来。修法：`.surface-editor` 那段只保留 `.load-overlay`（它本来就是不透明遮罩）。
+  - **底栏空区吞点击**：`.composer` 通栏但 `pointer-events: none`，只有 `.composer-inner`（卡片与它的弹层）是 `auto` —— 否则输入卡两侧、大纲栏底部那块的点击会被它拦下（实测大纲最后一条的 `elementFromPoint` 命中的是 composer，而不是那条记录）。
+- **验证方式**：真 Chromium 无头 + 探针。**编辑区面**（新增 `#…surfaceeditor` 档：把 body 的类改成 surface-editor）：`composerBg = rgba(0, 0, 0, 0)` —— 改之前是 `rgb(31, 31, 31)`，那就是"遮挡"本身。**大纲滚到底**（`#composeroutlinescroll`）：`topElementAtLastItem` 从 `composer` 让开（底栏不再拦事件）。**留白**：各档 `messagesPadBottom = 108px`（= 24 + 卡片 84）一贯存在；`#composerjustup`（贴底后上滚 40px）读到 `messagesClasses = messages`（已无任何切类逻辑，Jump 与留白天然一致）。`npm test` 203 passing、`npm run lint` 0、`check-registry.mjs` 六节全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-30 - CUSTOM-20260930-143
+- **功能**：未连接时不显示底栏；预留功能区只在钉住大纲栏时占位（没有大纲输入卡就居中）；上下文圆环搬回按钮栏
+- **改动文件**：`src/ui/chat/html/{body,styles}.ts`、`src/ui/chat/html/client/outline.ts`、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`
+- **来源**：用户第三轮反馈 —— ①没完成连接前把输入框隐藏（这时候显示了也无法输入）；②如果当前没有大纲（新会话或大纲侧边栏没打开），右侧的竖条（预留功能区）也要隐藏，并且输入框居中；③"你错误把上下文进度移到右侧去了，刚才是说先对齐方案才能改，先改回来。右侧预设功能区留着后面设计好方案再看怎么利用"
+- **详细说明**：
+  - **未连接隐藏底栏**（143）：`body[data-phase="disconnected"] .composer, body[data-phase="connecting"] .composer { display: none }`。相位是 `stateCard` 写在 `body[data-phase]` 上的（与 `Times` 那条同一个机制），所以**不需要新增任何 JS**。副产品：`display: none` 让 ResizeObserver 把 `--acpc-composer-h` 归零，消息区不再为一条并不存在的底栏留白。
+  - **预留区条件化**（143）：`applyReserve()` 恢复可见性判断 —— 只在 `sidebar && !sidebar.hidden` 时写侧栏宽，否则写 `0px`；CSS 的 fallback 同步从 `240px` 改成 `0px`（JS 未跑时也居中）。**踩到的细节**：光把 `width` 归零不够 —— `border-left` 会在面板右缘留一条 1px 的孤线、`padding-left` 还会撑出 8px，所以三处都得用 `min(…, var(--acpc-aside-w, 0px))`。
+  - **圆环回位**（143）：`#contextMeter` 从 `.composer-aside` 搬回 `.composer-bar`。138 把它挪到预留区是我理解错了 —— 用户当时说的是"先对齐方案才能改"，预留区要**先空着**，等方案定了再谈放什么。
+  - **顺带**：写 `styles.ts` 的注释时在模板体里用了反引号（`` `disconnected` ``），`tsc` 立刻报 TS1005 —— pitfall #11 的第三次复发，闸门照样拦住了，没有流出去。
+- **验证方式**：真 Chromium 无头 + 探针。`#composerwide`（未钉住）：`asideW = 0`、`cardCenter = colCenter = 712`（输入卡居中于面板）、`dxCardVsCol = 0`；`#composeroutline`（钉住 240px）：`asideW = 240`、`dxAsideVsOutline = 0`（竖线与大纲栏左边界对齐）、`dxCardVsCol = 0`；`#phasedisconnected`：`composerDisplay = none`、`composerH = 0`、`messagesPadBottom = 24px`（回落）。`chat-client.test.ts` 的结构断言改成"圆环在按钮栏内、预留区是空的"，`npm test` 203 passing；`npm run lint`、`check-registry.mjs` 六节全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-30 - CUSTOM-20260930-140..142
+- **功能**：底栏改成**真悬浮**（消息铺到面板底部，输入卡浮在上面）；历史浮层里的目录过滤菜单不再被裁剪、并与历史列表在观感上区分开；目录候选改按字母序
+- **改动文件**：`src/ui/chat/html/{body,styles}.ts`、`src/ui/chat/html/client/composer.ts`、`src/ui/chat/historyDirs.ts`、`src/test/chat-panel.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`
+- **来源**：用户第二轮反馈 —— ①输入框两侧还是会盖住消息内容；②目录选择的弹出列表被历史记录列表高度限制，需改为单独控制；②.1 目录列表风格跟历史记录列表过于相似，加个高亮边框区分；②.2 目录列表按字母顺序排序
+- **详细说明**：
+  - **真悬浮**（140）：139 的"悬浮"仍留在文档流里 —— 底部这一整条（含卡片两侧那两块空白）都不显示消息，用户报"输入框两侧还是会盖住消息内容"。现在 `.composer` 绝对定位（`body` 因此要 `position: relative`）、**背景透明**（有底色就等于把那两侧蒙上一块），消息区占满整个高度、卡片浮在上面。脱离文档流的代价是占位要补回来：`.messages` 的 `padding-bottom: calc(24px + var(--acpc-composer-h, 0px))`、`#jumpToLatest` 的 `bottom` 同款补偿；`--acpc-composer-h` 由 `composer.ts` 新增的 `watchHeight()` 用 **ResizeObserver 观察底栏本身**写入（pitfall #27：别去列"哪些事件会改变高度"，那份清单必然落后）。桩 DOM 里 `#composer` 与 `body.style.setProperty` 都不存在，两处都判空跳过。
+  - **目录菜单被裁**（141）：菜单是绝对定位，包含块是 `.outline-head`（sticky），而 head 在 `#history` **内部** —— 后者是 `overflow-y: auto` 的滚动容器 ⇒ 菜单的可见高度 = head 底边到浮层底边的距离，**历史列表越短菜单越矮**（实测只剩两三行）。修法是把滚动**下移**到 `.outline-list`：`#history` 改成 flex column + `overflow: visible`，于是它不再裁剪任何后代，菜单高度交回自己的 `max-height` 单独控制。**只写 `#history`** —— `#outline` / `#cwdMenu` 没有这种嵌套菜单，不动 `.outline` 的通用规则。
+  - **观感区分**（141）：菜单与历史列表都吃 `--vscode-dropdown-*` 那套 token（底色/边框/圆角/阴影几乎同值），叠在一起分不清谁是谁。给菜单加 `.filter-menu`，只把边框换成 `--vscode-focusBorder` —— 借 `.filter-chip.on` 那套"当前项"语义，**不是画环**（环在这个面板里是键盘焦点，062 的教训）。
+  - **字母序**（142）：`historyDirs.ts` 的排序原本是 `current → 条数降序 → 名称`，前两个键把字母序盖住了，看起来就像"根本没排序"。改成纯按名称；当前目录仍带 `current` 标记（客户端据此高亮它），只是不再置顶。**会话列表不受影响**：它按 `updatedAt` 倒序，是另一条独立的 sort（两者只共享同一次 `listHistory` 的数据，不共享顺序）。
+- **验证方式**：真 Chromium 无头 + 探针。`#composerbottom` 档（滚到最底）：`composerPosition = absolute`、`composerBg = rgba(0,0,0,0)`、`messagesPadBottom = 108px`（= 24 + 底栏 84）、**`lastGap = 111 > 底栏高 85`**（判据就是这一条：小于说明最后一条被卡片压住、而且滚不动）、`jumpBottom = 96px`。`#historyfilter` 档：**`drawerOverflowY = visible`**、`menuH = 260`（= 它自己的 max-height；修好前只露两三行）、`menuScrollH = 484`（菜单内部滚动）、`menuBorderColor = rgb(0,120,212)` = `--vscode-focusBorder`、`menuOverhang = 142`（伸出浮层的那 142px 现在看得见）。排序改动让两条既有断言按新行为更新（`ordering: by name`），`npm test` 203 passing；`npm run lint`、`check-registry.mjs` 六节全绿、行尾 CRLF。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-30 - CUSTOM-20260930-137..139
+- **功能**：底部输入区改成**悬浮输入卡 + 右下角预留功能区**（两列，中间一条与大纲栏对齐的竖线）；撤销上一轮给消息区加的版心（消息恢复平铺）；输入卡默认只占**一行**高
+- **改动文件**：`src/ui/chat/html/{body,styles}.ts`、`src/ui/chat/html/client/{composer,outline,rail}.ts`、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`
+- **来源**：用户对 132-136 的五条反馈 —— ①输入框固定尺寸 OK，但发送按钮离得太远；②**消息面板不要限尺寸**，应当平铺开（更多阅读区域）；③输入框应做成悬浮样式（参考官方插件）；④高度改小，默认一行、多行时才变高；⑤在指定位置加一根与侧边栏对齐的竖线，右下角作预留功能区
+- **详细说明**：
+  - **撤销消息区限宽**（137）：132 把消息列与输入区一起限到 820px；本轮按反馈只保留底部限宽（消息要宽、输入条要短），`.messages-column` 恢复满宽，变量改名 `--acpc-composer-max: 720px`（720 是"发送按钮够得着"与"长文本可读"之间的折中）。**132 对 `#rail` / `#jumpToLatest` 的搬迁保留**：列恢复满宽后它们与改动前逐像素一致，而列才是消息内容的定位容器，将来若再限宽不必重做。
+  - **底部两列**（138）：`.composer` 变成 `.composer-main`（输入卡）+ `.composer-aside`（预留功能区）。用两列而不是 135 那种"给左边补 padding"的算法，是因为主列宽度天然等于"面板宽 − 预留区宽"，**输入卡的中线与消息列的中线自动重合** —— 少维护一个等式（pitfall #24）。
+  - **竖线与大纲栏同源**（138）：预留区宽度取自 `--acpc-aside-w`（`outline.ts` 的 `applyReserve()` 写 = 大纲栏宽度，默认 240），它的 `border-left` 因此与**钉住的大纲栏左边界**落在同一条竖线上。这里踩了一个坑：第一版给 `.composer` 留了 8px 左右 padding，探针立刻测出 `dxAsideVsOutline = -8` —— **右侧任何 padding 都会让竖线偏移同样的像素数**，于是左右 padding 归零，输入卡自己的边距交给 `.composer-main` 的**对称** padding（对称 padding 不改变主列中心，实测 `dxCardVsCol` 仍为 0）。`applyReserve()` 的语义也从"侧栏占用宽度"变成"预留区宽度"（未钉住时照写，那块区域常驻）。
+  - **悬浮观感**（139）：去掉 `.composer` 通栏的 `border-top`，改由卡片自己的描边 + `box-shadow` + 8px 圆角 + 四周留白表达。**没有脱离文档流** —— 卡片仍在布局里，所以不必随卡片高度动态给消息区让位（那会变成 pitfall #27 的活）。
+  - **默认一行**（139）：`composer.ts` 的 `autoGrow` 去掉了 `Math.max(60, …)` 的下限（高度 = 内容的自然高度），空内容 / JS 未跑时由 `.prompt-input` 的 `min-height: calc(1.4em + 4px)` 保底（与 1.4 的行高同源）。上限仍是 320，视口上限仍由 CSS 的 `max-height: min(320px, 38vh)` 夹。
+  - **预留功能区放什么**：本轮先放入**上下文用量圆环**（从输入卡里搬出来 —— 它本来就是"这一轮用了多少"的读数，搬走也腾出了按钮栏的横向空间）。后续可放会话级动作（清空 / 导出 / 在编辑区打开），届时再走协议。
+- **验证方式**：真 Chromium 无头 + `#composer*probe` 几何读数（1440×1000）：钉住 240px 大纲栏时 **`dxAsideVsOutline = 0`**（竖线与大纲栏左边界对齐）、`dxCardVsCol = 0`（输入卡中心与消息列中心重合）、`dxRailVsCol = 0`、`dxJumpVsCol = 0`、`asideW = 240`、`asideVar = 240px`、`cardW = 720`、`inputH = 27`（单行；改动前是 71）、`cardRadius = 8px`、`cardOverflow = visible`；未钉住时 `colW = 1424`（消息满宽）、`asideLeft = 1184`；窄档 500 下输入卡随主列收缩且 `dxCardVsCol = 0`。结构断言改为守新布局（两列、圆环在预留区而不在卡内、`#sendStopBtn` 仍在卡内），`npm test` 203 passing；`npm run lint`、`check-registry.mjs` 六节全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-30 - CUSTOM-20260930-132..136
+- **功能**：输入区与消息区改成**共用版心**（820px、水平居中、窄面板自动满宽）；底部输入框从"横贯整屏的一条带"变成**一体式圆角输入卡**
+- **改动文件**：`src/ui/chat/html/{body,styles}.ts`、`src/ui/chat/html/client/{outline,rail}.ts`、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`
+- **来源**：用户反馈"底部的输入框有点太长了（因为这个界面一般宽度会拉的比较开），有没有更好的排版及交互方案"；确认范围 = 输入区 + 消息区、宽度 ≈ 820px、一次做到位
+- **详细说明**：
+  - **诊断**：`.composer` 是 `<body>`（flex column）的直接子块、**无 width/max-width**，`.prompt-input` 在 `.input-row` 里 `flex:1` ⇒ 宽屏下一行文字横跨 1400px+；消息列同样是 `flex:1` 无上限。全文件没有任何容器查询（唯一的媒体查询是 `prefers-reduced-motion`）。
+  - **版心**（132）：`max-width + margin-inline:auto` 加在 `.messages-column` 与新的 `.composer-inner` 上，宽度取自 body 上的 `--acpc-content-max`（一处定义、两处引用，pitfall #19）。**不用 media / container query**：它们键的是窗口（或另一个容器），而版心取决于**面板**宽度——那正是 pitfall #25/#26 说的代理信号；`max-width` 自带窄面板退化。限宽必须落在 `.messages-column` 而不是 `#messages`：置顶卡片与引导条都是前者的绝对定位子元素。
+  - **两处 DOM 搬迁**（132，本次最容易被"顺手挪回去"的地方）：`#rail` 与 `#jumpToLatest` 从 `.message-area` 搬进 `.messages-column`。它们的横坐标分别来自 CSS 的 `left:0` / `left:50%`，JS 只测纵向 ⇒ 锚错一层就会与内容脱开 `(W−820)/2`（宽面板上几百像素）或 `S/2`（钉住大纲栏时 120px）。搬进列之后"锚到已经在正确位置上的元素"才成立，不引常量、不需 JS 测宽（pitfall #24）。
+  - **一体式卡片**（133）：textarea 与按钮栏合进 `.composer-card`（1px 描边 + 6px 圆角），textarea 去边框、透明底；`.input-row` 这层随之删除（它唯一的子节点就是 textarea，而原 `flex:1` 在 flex **列**里含义完全不同）。卡片**绝不能写 overflow**：`.picker-menu` 与 `.slash-popup` 都要向上弹，且 column flex 上的 overflow 会压扁子项（pitfalls #17）。`.slash-popup` 的 `left/right` 从 6px 改 0 —— 定位祖先已从 `.composer` 换成 `.composer-inner`。
+  - **焦点与高度上限**（134）：焦点环从 textarea 移到卡片（`:focus-within` 变色），只抑制 `.prompt-input` 的 outline，全局 `:focus-visible` 不动（"环 = 键盘焦点"，062 的语义不变）。高度上限取 `min(autoGrow 的 320px, 38vh)`——前者管内容、后者管屏幕，同时存在时浏览器取小的那个，所以 `composer.ts` 一行没改、也不需要知道视口高度。
+  - **侧栏对齐**（135）：钉住大纲栏时消息列中心是 `(W−S)/2`（auto margin 在扣掉侧栏后的剩余空间里居中），而输入区不在那条 flex 行里、中心恒为 `W/2` ⇒ 差 `S/2`（240px 侧栏 = 120px，与是否触到 820 上限无关；之前看不出来只因为两者都近似满宽）。`.composer` 的 `padding-right` 补偿它，`S` 由 `outline.ts` 新增的 `applyReserve()` 复述成 `--acpc-outline-w`（CSS 读不到 flex 项的实测宽度）——这是本轮**唯一**的 JS 改动，必须判空 `document.body.style.setProperty`（桩 DOM 的 body.style 是普通对象）。
+  - **验收工具**（136）：`preview-records.mjs` 的 `shoot()` 加 size 参数（默认的 500 是**故意**的窄档——版心只在面板宽 > 820 时才显形，照默认档截"改前/改后"会一模一样），新增 `#composer*` 六档与 composer 几何探针；探针在量 rail / jump-latest 前会临时去掉它们的 `hidden`（`display:none` 的元素 rect 全为 0，否则根本量不到）。
+- **验证方式**：真 Chromium 无头截图 + `#composer*probe` 几何读数（1440×1000）：无侧栏 `colW=cardW=820`、`colLeft=cardLeft=302`、`dxCardVsCol=0`、`dxRailVsCol=0`（`railParent=messages-column`）、`dxJumpVsCol=0`；钉住 240px 侧栏时 `dxCardVsCol` **仍为 0**（改动前会是 +120）、`--acpc-outline-w=240px`、`dxCardVsPanel=−120`（= −S/2，有意）；窄档 500 下 `colW=500`（版心退化）且 `dxCardVsCol=0`；矮窗口 1440×560 下 `inputH=177 ≈ max-height 176.7px`（38vh 生效）；`:focus-within` 时 `cardBorderColor=rgb(0,120,212)`=`--vscode-focusBorder`；`#composerslash` 档 `slashW=820`（弹层跟着版心而不是整屏）。`chat-client.test.ts` 新增 3 条**结构断言**守住承重关系（rail/jump 在列内且 rail 在 `#messages` 之前、覆盖层仍留在 `.message-area`、卡片层级不可互换）；`npm test` 203 passing，`npm run lint` / `check-registry.mjs` 六节全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-30 - CUSTOM-20260930-123..126
+- **功能**：面板初始界面改成**连接状态卡**（未连接 / 连接中 / 已就绪三态）；新增配置项 `acpc.autoConnectOnOpen`（默认开，面板打开 0.5s 后自动连接），并在同一张卡片上以复选框呈现、两边双向同步
+- **改动文件**：`src/ui/chat/html/client/stateCard.ts`（新增）、`src/ui/chat/html/{body,styles}.ts`、`src/ui/chat/html/client/{boot,sessionMenu,tabs,index}.ts`、`src/ui/chat/protocol.ts`、`src/ui/chat/ChatPanelHost.ts`、`package.json`、`src/test/{chat-client,chat-panel}.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`
+- **来源**：用户四项要求——①配置项控制面板打开时是否自动连接（0.5s，且连接中要看得见、避免重复点击）；②该配置以勾选方式出现在初始界面且可随时取消；③未连接时输入框禁用、连接成功后可用（发送即建新会话）、连接成功后中央要有内容；④基于现有排版重新设计界面与交互
+- **详细说明**：
+  - **要修的根因**：点 Connect 后面板立刻切到草稿页，而真正的 spawn + initialize（首次 `npx` 可能要下载几分钟）**在界面上完全不可见**——既没有"连接中"，按钮也没有 pending 态，用户会反复点击；而草稿页中央是空的（`focusDraft` 调 `showEmpty(false)`），这正是用户说的"连接成功后一片空白"。
+  - **`connection` 下行消息是必需品，不是装饰**（124）：`refreshSessions` 靠签名去重（`conn:` 位），而 `ensureConnected` 在进程已经起来时**不发任何事件** ⇒「已连接 + 无会话 + 点 Connect」这条路上宿主原本一句话都不会说，客户端的"连接中"会**永久卡死**（pitfalls #29 的形态：效果上没变化 ≠ 可以不回话）。`handleConnectAgent` 的三种出口（无 agent / 成功 / 失败）各回一次，且 `connected` 排在 `focusSession` **之后**——客户端靠这个顺序决定要不要开草稿，反了就会在刚打开的会话旁边多出一张空标签。
+  - **点 Connect 不再立即开草稿**：推迟到 `connected` 到达时由 `boot` 开（无会话时开一张；用户按过 `+` 则无论有无会话都开）。于是"未连接时输入框禁用"自然成立——**`composer.ts` 一个字节没改**（草稿不存在就不满足 `canCompose()`）。代价是 058 的离线草稿路径（未连接 → 选目录 → 发送时拉起进程）被有意收掉：`+` 在未连接时改为先连接。
+  - **单一写者与一个隐患**：`#emptyState` 的 `display` 仍然只有 `boot.showEmpty()` 一个写者，`stateCard.ts` 只写内容（textContent / checked / disabled / 子节点 hidden）。`showEmpty(true)` 里补 `stickyUser.reset()`——置顶卡片是 `.messages-column` 的绝对定位子元素，`transcriptView.reset()` 清不掉它，而卡片没有背景 ⇒ 草稿页会让上一个会话的置顶卡**透出来**。
+  - **无会话的失败改走卡片**：`case 'error'` 与 `draftFailed` 原先往空 transcript 里 append 一条通知并 `showEmpty(false)`（卡片被藏起来、中央只剩一行孤零零的报错），现在写进卡片的 `.state-error`。
+  - **配置项与双向同步**（125）：`acpc.autoConnectOnOpen` 的读写经 `PanelPrefsIO` 注入缝（默认实现才是 `getConfiguration('acpc')` + `ConfigurationTarget.Global`）——测试 harness 刻意不碰真实 settings.json。**写入失败时广播的是设置真值而不是请求值**，否则复选框会显示一个 settings.json 里没有的值。宿主**首次**引入 `onDidChangeConfiguration`：理由不是"同步方便"，而是面板把这个配置项**渲染成了控件**，控件显示过期值就是在撒谎。
+  - **自动连接的三个前提**：`autoConnect && !agentConnected && !focused`。布防**幂等**（boot 会在同一个文档上投递两次：attachSurface 一次、客户端 ready 一次），触发时**再复查一遍**（这 500ms 里可能已经连上、或用户已经在别的草稿页上打字——判据用 `composer.isComposable()` 这个直接信号，不用代理信号）。连接超过 45s **不谎报失败**，只把按钮放开并说明 npx 可能还在下载（`ensureConnected` 本身没有超时，谎报失败比慢更糟）。
+  - **`+` 的两种含义**：已连接 = 立刻开草稿（原行为）；未连接 = 先连接并记下意图，`connected` 到达时兑现——否则用户会看到"点了 `+` 却打不了字"。
+  - **视觉**：卡片走 VSCode 设计语言（`--vscode-editorWidget-background` / `--vscode-panel-border` / `--vscode-button-*`）。居中用「容器 `flex-start` + 卡片 `margin: auto`」而不是 `justify-content: center`——内容一旦超高，center 会把顶部裁掉且**滚不到**（pitfall #17 同族）；卡片自身**不写 overflow**（会把它在 flex 列里压扁）。删掉 `styles.ts` 里已无使用者的 `kbd` 规则（旧提示硬编码的 `Ctrl+Shift+A` 在 Mac 上本来就是错的，而快捷键本身已有平台差异，不值得在卡片里复述）。
+- **验证方式**：`npm test` **189 passing**（新增桩 DOM 14 条 + 宿主侧协议流 8 条）；`preview-records.mjs` 新增 `#empty` / `#connecting` / `#ready` 三张截图与 `#narrow` 窄档，`#probe` 读实测几何：260px 容器下 cardW=220、居中偏差 0、无裁切、`overflow` 仍为 `visible`；`lint` / `check-registry` / EOL 全绿。**过程中踩到一个工具坑并已写进脚本注释**：`--window-size=430` 只裁剪截图、布局视口仍是 500（Chrome 有约 500px 的最小窗口宽度），图像上看着像"卡片右边被裁掉一截"——量了 `innerWidth` 才定性它根本不是 CSS 问题。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-30 - CUSTOM-20260930-131
+- **功能**：① 自动连接延迟 0.5s → **1s**；② **连接成功（且无历史会话）时直接建一个会话**，输入区与正常会话完全一致；③ 未连接时 header 隐藏 `Times` 按钮
+- **改动文件**：`src/ui/chat/html/client/stateCard.ts`、`src/ui/chat/html/styles.ts`、`src/ui/chat/ChatPanelHost.ts`、`src/test/{chat-client,chat-panel}.test.ts`
+- **来源**：用户三条要求
+- **详细说明**：
+  - **① 1s**：0.5s 太赶 —— 面板刚渲染完就开始连接，用户还没看清卡片上写着什么。
+  - **② 连上就开会话**（用户在两方案里选的）：草稿页**永远做不到**"和正常会话一样" —— 图片要挂在会话上，而模式/模型选择器来自 `session/new` 的响应，**没有会话就没有**（`composer.setDraft` 的注释早就写着这条："That is inherent to a draft, not an oversight"）。所以 `handleConnectAgent` 在"进程已起 + 无会话"时改为 `createSession(agent, {focus:true})`，并且**在报 `connected` 之前**完成 —— 客户端靠这个顺序决定要不要再开一张草稿。代价写在明处：连上之后不说话就离开，agent 历史里会留一条空会话（`session/close` 不删历史，058 的老账）。
+  - **③ Times**：相位是**整块面板**的状态，所以 `stateCard.render()` 把它写到 `body[data-phase]`，CSS 据此隐藏。比让每个按钮各自监听相位少三处同步，而且**本地点击发起的 `connecting` 也覆盖到了**（那条路径不经过宿主，各按钮自己监听会漏）。
+- **验证方式**：`npm test` **200 passing**（新增 3 条：无会话时建会话 / 有会话时复用不建 / `data-phase` 跟随相位；两条既有用例按新行为改写）；`preview-records.mjs` 的 `empty` 截图确认未连接时 header 只剩历史按钮；`lint` / `check-registry` / EOL 全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-30 - CUSTOM-20260930-130
+- **功能**：① 就绪卡的标题改成 `Claude Code is ready`；② 标签栏的状态点拆成**两个独立信号**——颜色说状态，外圈说"正在做事"
+- **改动文件**：`src/ui/chat/html/client/{stateCard,tabs}.ts`、`src/ui/chat/html/styles.ts`、`src/ui/chat/protocol.ts`、`src/ui/chat/ChatPanelHost.ts`、`src/handlers/{PermissionBridge,ElicitationBridge}.ts`、`src/test/{chat-client,chat-panel}.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`
+- **来源**：用户两条要求（各带一张截图）
+- **详细说明**：
+  - **① 文案**：`Connected to Claude Code` 与 `Connect to Claude Code` 只差一个字母，扫读时会被读成后者 —— 于是"已经连上了"变成"还需要连接"。状态句（`Claude Code is ready`）比被动语态难误读。
+  - **② 圆点的两个信号**：早先 `running` 被映射成"圆点变蓝 **+ 自己脉动**"，一个信号同时说了两件事。现在按分工拆开：**颜色**说这个会话处在什么状态（等人回答 = 橙 > 轮次在跑 = 蓝 > 载入历史 = 黄 > 后台有新输出 = 蓝 > 平常 = 灰），**圆点外的涟漪圈**说"它正在做事"。**为什么必须独立**：一个卡在权限提示上的轮次两件事同时为真（在跑 + 在等人），挤进同一个信号就必然丢掉一件。颜色走 `color` + `background: currentColor`，外圈才能用同一个 `currentColor` 画出来（颜色只有一个来源）。
+  - **新增 `SessionSummary.waiting`**：从 `PermissionBridge` / `ElicitationBridge` 的 `hasPendingFor(sessionId)` 读 —— 两个桥才是 pending 的唯一持有者，宿主不再存第二份（pitfalls #19）。`show` / `update` 里各刷一次标签栏（bridge 在这两个调用点前后已经更新过 pending 列表，所以读到的永远是最新值），并且 **`waiting` 必须计入 `refreshSessions` 的签名** —— 漏签名的后果 022（unread）与 063 各踩过一次，那条警告就写在签名旁边。
+- **验证方式**：`npm test` **198 passing**（客户端一条覆盖五个组合的用例，颜色与外圈**分别**断言；宿主一条"停在权限提示上 → waiting=true → 结算后回落 false"）；`preview-records.mjs` 新增 `#tabs` / `#tabsbig`（后者把标签栏放大 2.5 倍 —— 7px 的点在整页截图里只有几个像素，不放大看不出外圈）；`lint` / `check-registry` / EOL 全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-30 - CUSTOM-20260930-129
+- **功能**：界面三处调整——① 打开 Times 时每条记录的时刻移到**标题行右侧**（工具卡读作 `2.2s 11:57`），不再单占一行；② 删掉顶部地址栏的上下文进度条；③ 底部的上下文进度改成**圆环 + 圆心数字**，有轮次在跑时外圈转一段弧
+- **改动文件**：`src/ui/chat/html/client/transcriptView.ts`、`src/ui/chat/html/{body,styles}.ts`、`src/ui/chat/html/client/{tabs,boot,composer}.ts`、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`
+- **来源**：用户三条要求（各带一张截图，第 3 条明确委托设计）
+- **详细说明**：
+  - **① 时刻进标题行**：原先 `.rec-time` 是记录节点的第一个子元素 + `display: block` ⇒ 单占一行。现在它挂在记录的**标题行**里并绝对定位浮在右上角；工具卡例外——它是 `.tool-head` 里的一项、`appendChild` 在耗时之后，于是读作 `2.2s 11:57`。**为什么必须进 summary**：折叠的 `<details>` 会隐藏 summary 之外的一切，早先"挂在记录节点上"的写法会让时刻在**折叠的记录上直接消失**（思考块默认折叠，第一版实测就是它没有时刻）。`.messages > *` 加 `position: relative` 提供定位上下文（不改变布局，rail 测量与置顶克隆都不受影响）。
+  - **② 删掉顶部进度条**：`#usageBar` / `renderUsage` / `.usage-bar` 一并删除，`.usage-track` / `.usage-fill` 也随之成为死 CSS 一起清掉。那里的**成本**信息没有丢——移进了底部圆环的 tooltip。
+  - **③ 圆环**：24px 的两圈 SVG。内圈是进度（`stroke-dashoffset` 由 JS 按百分比算好，起点用 `rotate(-90deg)` 挪到 12 点方向，否则进度看起来"从右边长出来"），圆心是百分比数字（不带 `%`，精确数值与成本在 tooltip 里），配色沿用 0.7 / 0.9 两档。**外圈**是「有轮次在跑」的信号：一段 1/4 弧缓慢旋转。两处是看截图才定下来的：**外圈必须用 `currentColor` 而不是进度的蓝色**（同色时两圈被读成"两根进度条"）；**外圈半径要比内圈大 2.5**（只差 1.5 时两环贴在一起，读不出是"外圈"）。
+  - **测试里 5 条断言按新结构改写**（不是为了让测试变绿）：三处文本断言学会排除那个浮层（`textContent` 不看 `display: none`，pitfall #16 的老账），两处 DOM 顺序断言改用新增的 `summaryOrder()` —— 时刻绝对定位、脱离文档流，不该参与"谁在谁后面"的判断。另：桩 DOM 的 `setAttribute` 补了 `class → className` 的反射（SVG 元素只能 `setAttribute`，没有这层反射桩就找不到 SVG 构造出来的东西）。
+- **验证方式**：`npm test` **196 passing**；`preview-records.mjs` 新增 `#times` / `#timescollapsed` / `#gauge`（含 `#gaugewarn` / `#gaugehot` / `#gaugebusy`，以及 `#gaugebig` 放大档）共 8 张截图，肉眼确认时刻位置与圆环形态——**布局靠看，不靠推**（pitfall #31：第一版的外圈配色与半径都是看图才改对的）；`lint` / `check-registry` / EOL 全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-30 - CUSTOM-20260930-128
+- **功能**：修两个既有缺陷——① 切换模式时记录区出现**两条**提示（第二条把第一条又带了一遍）；② 一轮的**最后一条助手消息**停在原始 markdown 不渲染
+- **改动文件**：`src/ui/chat/sessionChoices.ts`、`src/core/SessionManager.ts`、`src/ui/chat/html/client/transcriptView.ts`、`src/ui/chat/ChatPanelHost.ts`（只加一行丢弃日志）、`src/test/{chat-client,chat-panel}.test.ts`、`CUSTOMIZATIONS/docs/pitfalls.md`
+- **来源**：用户复验 123 时同时报的两条（各带一张截图）
+- **详细说明**：
+  - **① 模式切换报两次**：`session.modes.currentModeId` 与 `configOptions[category='mode'].currentValue` 是**同一事实的两份副本**，而它们**不会同时被写**——`SessionManager.setMode` 在会话有 configOptions 时提前 return（Claude Code 正是这种），`current_mode_update` 也从不落到 SessionManager。于是宿主的两条上报路径各看到一半：通知路径用 payload 拿到新 modeId，却留着**旧的** mode option；setter 路径读 SessionManager 拿到新 option，却读到**冻结的** `currentModeId`。两份快照永不相等 ⇒「先到的那条提示、后到的那条 diff 为空」这个去重前提失效 ⇒ 第二条提示是现实中不存在的混合态（实测：`Switched to Manual mode · Switched to Bypass permissions mode`）。修法是**让 config option 成为权威**：快照的 modeId 由它派生（没有该选项时回退 `modes.currentModeId`，纯 modes 通道的 agent 不受影响），收到只带 modeId 的 payload 时把新值写回那份副本，`choiceChanges` 跳过该选项（否则一次变化会被报两遍）。`SessionManager.applyConfigOptions` 顺带把值写回 `modes.currentModeId`，让 `metaOf` 等其它消费者也看到新值。
+  - **② 最后一条助手消息不渲染**：`transcriptView` 的 `markPending` 在 `place()` 时把记录放进待渲染队列，但**全项目唯一的 `flushPending` 挂在 `patch()` 路径上** ⇒ 一条记录若「最后一次 DOM 更新就是它自己的 append」，它的渲染请求**永远发不出去**，界面上只剩原文，而且两侧都不报任何错。**一轮里的最后一条记录正好是这个形状**（收尾的 revise 若晚到、或这一轮根本不是本面板发起的，就再也没有 patch 了）。这与 **118** 是同一个病——118 给工具卡的正文加了 `scheduleMarkdown()`，助手/思考这一侧当时漏了；现在照同一形态补上（入队即排一帧，一帧最多一次请求）。顺带给 `handleRenderMarkdown` 的静默丢弃加了一行日志：被丢弃的 item 意味着那条记录永远停在原文，而那是唯一能查的地方（120 的教训）。
+  - **测试里两处既有断言按新规则改写**（不是为了让测试变绿）：①「模式切换无论走哪个通道标签都一样」原本把两个通道混在一条用例里，且构造了「`modes` 变了而 option 没变」——在新规则下那是**不可能出现的状态**（Claude Code 的 setMode 走 option），现在拆成「无 mode 选项的 agent 走回退」与「有 mode 选项时以它为准」两条；②「mode payload 不丢其它选项」原本断言 `options` 完全不变，现在 mode 副本**应当**被写回，改为断言「其余选项逐一不变 + mode 副本同步」。
+- **验证方式**：`npm test` **195 passing**（新增 5 条，其中宿主侧的 `one switch reported through both channels is announced once` 是先红后绿）；`lint` / `check-registry` / EOL 全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-30 - CUSTOM-20260930-127
+- **功能**：已连接时，状态卡上的 "Connect automatically when a panel opens" 整行退场
+- **改动文件**：`src/ui/chat/html/body.ts`、`src/ui/chat/html/client/stateCard.ts`、`src/test/chat-client.test.ts`
+- **来源**：用户复验 123 后报「已经连接成功就不要显示 Connect automatically when a panel opens 了」（截图）
+- **详细说明**：
+  - 连上之后卡片是"去下面打字"的路标，不是一个设置表单——开关管的是"下次打开这个面板"，留在这里只是噪音。
+  - **隐藏的是整行（`#autoConnectRow`）而不是那个 `<input>`**：只藏复选框会把它的标签文字留在原地。
+  - **连接中仍然保留**：那恰恰是用户最可能想关掉它的时刻（agent 起得慢时会想"下次别自动连了"）。测试把这一半也钉住了——只测"连上后消失"的话，一个"永远消失"的实现同样会通过。
+- **验证方式**：`npm test` **190 passing**（新增 2 条）；`preview-records.mjs` 的 `ready` 截图确认卡片只剩标题 + 一行引导；`lint` / `check-registry` / EOL 全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
 ### 2026-09-29 - CUSTOM-20260929-122
 - **功能**：工具卡 `IN` / `OUT` 的**内容左右对齐**（并把输出字体统一成编辑器字体）
 - **改动文件**：`src/ui/chat/html/styles.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（新增 `#probe`）、`CUSTOMIZATIONS/docs/arch/chat-panel-records.md`
