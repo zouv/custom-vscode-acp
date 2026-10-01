@@ -49,7 +49,7 @@
 | `html/index.ts` | `renderChatHtml(webview, nonce, surface = 'view')`：外壳 + 样式 + 标记 + 脚本。**`surface` 会变成 `<body class="surface-view\|surface-editor">`**（050），供 CSS 区分侧边栏与编辑区底色 | 装配顺序变更 |
 | `html/shell.ts` / `styles.ts` / `body.ts` | CSP 与文档外壳 / 全部 CSS / 静态标记 | UI 外观 |
 | `html/nonce.ts` | CSP nonce 生成 | — |
-| `html/client/*.ts` | webview 内联客户端 JS，**每个模块是一个字符串**，统一挂到 `window.__acpc`。058 新增 `directoryMenu.ts`（草稿页的目录抽屉，形态照抄 `sessionMenu.ts`）；097 新增 `lightbox.ts`（图片点击放大）；102 新增 `stickyUser.ts`（置顶最近一条用户消息，判据见 §5.25）；123 新增 `stateCard.ts`（**连接状态卡**：未连接/连接中/已就绪三态 + 自动连接开关，见 §5.28——它同时接管了原先散在 `sessionMenu.ts` 与 `boot.ts` 的空态文案和 Connect 按钮） | 改前端交互 |
+| `html/client/*.ts` | webview 内联客户端 JS，**每个模块是一个字符串**，统一挂到 `window.__acpc`。058 新增 `directoryMenu.ts`（草稿页的目录抽屉，形态照抄 `sessionMenu.ts`）；097 新增 `lightbox.ts`（图片点击放大）；102 新增 `stickyUser.ts`（置顶最近一条用户消息，判据见 §5.25）；123 新增 `stateCard.ts`（**连接状态卡**：未连接/连接中/已就绪三态 + 自动连接开关，见 §5.28——它同时接管了原先散在 `sessionMenu.ts` 与 `boot.ts` 的空态文案和 Connect 按钮）。151 起 `composer.ts` 也接管**草稿页**的输入卡（模式/模型/斜杠命令来自宿主的快照，见 §5.32）；152 起 `elicitationView.ts` 从"记录里的内联卡"改成**悬浮抽屉**（记录只留一行待答条，见 §5.33） | 改前端交互 |
 
 **终端输出通路**（CUSTOM-20260923-012）：ACP 的 `Terminal` 工具内容只是引用（`{terminalId}`），终端归客户端所有。
 链路为：`ConnectionInfo.terminals`（`ConnectionManager` 暴露）→ `TerminalHandler.readOutput(terminalId)`
@@ -459,12 +459,16 @@ pending ──用户点按钮──► selected        （回答 optionId）
 > **编号不连续是正常的**：`§5.24` 在 sessions 文件、`§5.16–§5.23` 在 records 文件、
 > `§5.25`（置顶最近一条用户消息）在本文件——章节号是**稳定的引用地址**，不是阅读顺序。
 
-### 5.27 表单卡：ACP elicitation / AskUserQuestion（CUSTOM-20260929-119）
+### 5.27 表单：ACP elicitation / AskUserQuestion（CUSTOM-20260929-119，152 改悬浮抽屉）
 
 **为什么需要它**：AskUserQuestion 在 ACP 里走 **elicitation（form 模式）**协议，而 adapter 用
 `clientCapabilities.elicitation.form` 门控——**不声明时连工具本身都被禁用**
 （`disallowedTools = ["AskUserQuestion"]`）。所以"官方插件会弹选项面板、我们的面板只有一个卡住的工具卡"
 不是渲染问题，是**能力声明缺失**。
+
+**[152] 呈现方式**：记录里只留一行"待回答"条，表单本体在**悬浮抽屉**里（底部、贴着输入卡上方、
+与它同宽同中线），多道题按 tab 分页 —— 用户 2026-09-30 报"表单以消息卡片的形式出现"，而问题多、
+选项带长介绍时那张卡会把记录区撑得很长，且混在消息里不像"现在需要你操作"。细节见 §5.33。
 
 | 关注点 | 规则 |
 |---|---|
@@ -472,9 +476,9 @@ pending ──用户点按钮──► selected        （回答 optionId）
 | 通道 | `AcpClientImpl.unstable_createElicitation` → `ElicitationHandler`（策略+弹框兜底）→ `ElicitationBridge`（**与 `PermissionBridge` 同构**：FIFO / `resolved` 幂等位 / `settleWith` 单点 resolve / `cancelSession`·`cancelAll`·`onPresenterLost`） |
 | 三态 | `accept`（带 content）/ `decline`（**跳过**：空答案，轮次继续）/ `cancel`（中止工具调用）。adapter 的 `applyAskElicitationResponse` 就是这么解释的；**轮次被取消时回 cancel 而不是 decline**——空答案会骗到 agent |
 | 作用域 | **只支持 `sessionId`**：ACP 还允许把表单挂在 `requestId` 上（与任何会话无关），那种没有会话可归属 ⇒ 直接 `cancel`，并记日志说明 |
-| 字段扁平化 | `fieldsOf(requestedSchema)` → `select`(oneOf) / `multi`(array+anyOf) / `boolean` / `number` / `text`。**认不出的形状不进表单**（省略字段是合法答案——schema 里没有任何 required；猜一个比不填更糟）。`_meta._askUserQuestionCustomAnswer` 标记的自由文本框会带上 `customFor`，客户端据此把它缩进到对应问题下面 |
-| 记录与回传 | 新记录类型 `kind: 'elicitation'`（`TranscriptStore.appendElicitation`，一个 promptId 一条，同权限卡）+ 客户端 `elicitationView.ts`；回答走 `elicitationAnswer` 消息（**会话作用域，必须放在 `verifySession` 守卫之后**）。**表单卡是 transcript 的记录 ⇒ boot/focus 的全量快照天然把它带回来**，切会话/双 surface/重挂载都不需要新机制 |
-| 半填的草稿 | **只留在 webview 里**（DOM 就是表单状态），不进 transcript——否则每次 revise/快照都会把草稿重发一遍。结算态（accepted/declined/cancelled + summary）才由宿主写进记录 |
+| 字段扁平化 | `fieldsOf(requestedSchema)` → `select`(oneOf) / `multi`(array+anyOf) / `boolean` / `number` / `text`。**认不出的形状不进表单**（省略字段是合法答案——schema 里没有任何 required；猜一个比不填更糟）。`_meta._askUserQuestionCustomAnswer` 标记的自由文本框会带上 `customFor`，客户端据此把它排进对应问题（§5.33）。**[153] 标记缺失时按名字兜底**：实测 2026-10-01 的真机请求里 adapter **不再发** `_meta`（只有 `title: 'Other'` + 一句 description），只认标记会让那个框变成**独立的一题**（多出一个 "Other" 标签页、问题块里看不到自拟输入框）⇒ 现在额外认 `<某字段>_custom` 这个名字约定，且**父字段必须存在**；误判面很窄，真误判也只是排到那道题下面（提交时的字段名与取值不变） |
+| 记录与回传 | 新记录类型 `kind: 'elicitation'`（`TranscriptStore.appendElicitation`，一个 promptId 一条，同权限卡）+ 客户端 `elicitationView.ts`；回答走 `elicitationAnswer` 消息（**会话作用域，必须放在 `verifySession` 守卫之后**）。**表单记录是 transcript 的记录 ⇒ boot/focus 的全量快照天然把它带回来**，切会话/双 surface/重挂载都不需要新机制；抽屉**不是**真相，它每次都由记录重新算出来 |
+| 半填的草稿 | **只留在 webview 里**（DOM 就是表单状态），不进 transcript——否则每次 revise/快照都会把草稿重发一遍。结算态（accepted/declined/cancelled + summary）才由宿主写进记录。152 的抽屉因此**不重建已渲染的表单**（按 promptId 缓存元素），切 tab / 收起 / 重绘 chrome 都不碰输入控件 |
 | 兜底弹框 | 无面板时**逐字段**问（VS Code 没有表单对话框）：select/multi → QuickPick、boolean → Yes/No、文本/数字 → InputBox。**取消某一步 = decline（跳过）**；面板里的 Cancel 才是硬中止 |
 | **重开别人的会话不会重抛（实测）** | `session/load` 一个"卡在提问上"的会话时，adapter **只回放工具卡**、不会重新发 elicitation（`probe-elicitation.mjs --no-answer` 造出该状态再 `--reopen` 实测：0 次）。官方插件能弹是因为**那个未决请求在它自己的进程里**；我们重开时是另一个进程，替它回答不了。详见 pitfalls #32 |
 
@@ -566,3 +570,54 @@ pending ──用户点按钮──► selected        （回答 optionId）
 **实测（1440×1000，Chrome 无头）**：钉住 240px 大纲栏时 `dxAsideVsOutline = 0`、`dxCardVsCol = 0`、`dxRailVsCol = 0`、`dxJumpVsCol = 0`、`asideW = 240`、`asideVar = 240px`、`cardW = 720`、`inputH = 27`、`cardRadius = 8px`、`cardOverflow = visible`；未钉住时 `colW = 1424`（消息满宽）、`asideLeft = 1184`；窄档 500 下输入卡随主列收缩且 `dxCardVsCol = 0`；矮窗口 1440×560 下 `inputH` 被 `max-height` 夹在 176.7px。
 
 **[140] 真悬浮**：`#composerbottom` 档（滚到最底）读 `composerPosition = absolute`、`composerBg = rgba(0,0,0,0)`、`messagesPadBottom = 108px`（= 24 + 底栏 84），关键是 **`lastGap = 111 > 底栏高 85`** —— 小于就说明最后一条被卡片压住、而且滚不动。**[141] 目录菜单**：`#historyfilter` 档读 `drawerOverflowY = visible`、`menuH = 260`（= 它自己的 max-height；修好前只露两三行）、`menuBorderColor = rgb(0,120,212)`。**[143]**：`#composerwide`（未钉住）`asideW = 0` 且 `cardCenter = colCenter = 712`（输入卡居中于面板）、`#composeroutline`（钉住）`asideW = 240` 且 `dxAsideVsOutline = 0`、`#phasedisconnected` 档 `composerDisplay = none` 且 `messagesPadBottom` 回落 24px。**[144]**：各档 `messagesPadBottom = 108px`（= 24 + 卡片 84，**一贯存在**），`scroll.ts` 的判据减掉它 ⇒ `#composerjustup`（贴底后上滚 40px）读到 `messagesClasses = messages`（已无切类逻辑，Jump 与留白天然一致）。**编辑区面**（`#…surfaceeditor` 档）：`composerBg = rgba(0, 0, 0, 0)` —— 改之前是 `rgb(31, 31, 31)`，那就是"遮挡"本身。**大纲滚到底**：`topElementAtLastItem` 从 `composer` 让开（底栏空区加了 `pointer-events: none`）。
+
+---
+
+### 5.32 草稿页的输入卡为什么能"完整"（模式/模型/斜杠命令，CUSTOM-20260930-151）
+
+**问题**：点 tab 栏的「+」得到的是草稿页（058），它在 ACP 里**还不是 session** —— 而模式、模型、
+可用命令在协议里**全是会话级的**：`NewSessionRequest` 只有 `cwd` / `mcpServers` /
+`additionalDirectories`（**没有 mode/model 入参**，已核对 SDK 的 `types.gen.d.ts`），
+`availableCommands` 也**只**出现在 `session/update` 的 `available_commands_update` 通知里。
+于是草稿页的输入卡长期只有一个 textarea，看起来"没渲染完整"。
+
+**做法**：宿主按 agent 留一份**上一次会话的快照**，草稿页拿它渲染，用户的选择随
+`createDraftAndSend` 一起走、在建出会话后逐项校验并应用（"新会话继承上次用的模式/模型"）。
+
+| 主题 | 结论 |
+|---|---|
+| 数据从哪来 | `ChatPanelHost.rememberAgentOptions(sessionId)` → `Map<agentName, {configOptions, availableCommands}>`，并按 agent 持久化到 `globalState`（`acpc.draftOptions.v1`，照抄 077 的 `uiPrefs` 模式）。**不持久化等于默认路径不生效**：VS Code 重载后宿主内存里的活动会话全没了，"全新窗口点 + 还是空输入卡"正是用户报的现象 |
+| 挂在哪些事件上 | `session-created` / `session-load-end` / `config-options-changed` / `available-commands-changed`。**不挂 `pushMeta`**：它在"没有 surface attach"或"不是聚焦会话"时提前 return，后台会话的变化进不了快照 |
+| 为什么还要 `session-load-end` | `loadSession` 是"先注册 placeholder → emit `session-created` → 收到响应才写 `configOptions`"，**而且不走 `applyConfigOptions`** ⇒ 只挂 `session-created` 会让"打开一个历史会话"把快照的配置项清空 |
+| 为什么**空值不覆盖** | `resumeSession` 的 `availableCommands` 恒为 `[]`（不重放），照单全收会把斜杠命令**擦掉**。空数组在这两条路径上只表示"还没填"，不表示"这个 agent 没有"。代价：可能留着一个陈旧的选项而它应用时会被跳过；收益：快照不会退化（陈旧 ≠ 退化） |
+| 隐藏依赖 | `config-options-changed` / `available-commands-changed` 会响，是因为**旧面板**（`ChatWebviewProvider`）的 listener 调用了 `applyConfigOptions` / `applyAvailableCommands`，而它是这两个方法的唯一调用者（新版子系统的斜杠命令本来就靠它）。哪天旧面板改成惰性创建，快照会**静默停止更新** |
+| 谁发起请求 | `composer.setDraft()` 自己发 `listDraftOptions`（不是 boot）：要渲染应答的组件才是知道自己缺东西的那个，而且这样能落在 `chat-client.test.ts` 的桩 DOM 覆盖里（`loadClient` **刻意不加载 boot**）。应答由 boot 的消息 switch 转给 `NS.composer.setDraftOptions` |
+| 迟到的应答 | 请求与应答都带 `draftId`，`setDraftOptions` 只认**当前聚焦的那个草稿**。`draftSeq` 是每个 webview 独立的，两个面会同时存在 `draft-1` ⇒ 定向与 `draftId` 两道判定都不能省 |
+| 选择存在哪 | 存在 **boot 持有的 draft 对象**上（`draft.selections`），composer 只读它 —— 一份副本（pitfall #19）。切走再切回时靠它重放；快照每次聚焦都会重新下发，所以"快照值"永远不许覆盖用户已经选过的值 |
+| 草稿态点菜单**不发** `setConfigOption` | 草稿没有 sessionId，那条消息会带 `sessionId: null` 被守卫静默丢弃（§5.4 规则一）—— 用户选了等于没选。改为只改本地副本的 `currentValue`（显示即所得）+ 记进 `selections` |
+| 应用时机 | `createSession` → 发 `draftResolved`（保持 058 的不变量）→ 逐项校验后 `await setConfigOption` → 播种切换基线 → `pushMeta` → 首条消息。**在首条消息之前**是重点：第一轮就该跑在用户选的模式/模型上 |
+| 三道校验闸门 | ① 按**新会话**的 `configOptions` 校验 id 与取值（`selectValues()`，`sessionChoices.ts` 的纯函数，含分组形态；快照可能来自 agent 旧版本）；② 与当前值相同的跳过（省一次往返，也少一次让 agent 推通知的机会）；③ 单项失败**不阻断**发消息，但**不许静默**（pitfalls #29）：记日志 + 在记录区留一行，否则用户只看到选择器自己弹回默认值 |
+| 为什么要播种切换基线 | 应用完 `this.choices.set(sessionId, choiceState(sessionId))`。**不播种反而静默**（`syncChoices` 在 `!previous` 时 return），真正会出噪声的时序是：agent 在应用前先推过一次 `session/update`（`onSessionUpdate` 拿**默认值**当基线），应用后的通知 diff 非空 ⇒ 播出一条用户**从未做过**的切换。这是 pitfall #34 那套"两份副本 + 去重"的既定前提 |
+| 不可覆盖的边界 | 全新环境（本进程没开过该 agent 的会话、globalState 也空）仍然只有输入框 —— 没有会话就没有地方问，这是这条路的**固有边界**，不是漏做 |
+| 验收 | 桩 DOM：`chat-client.test.ts` 的 `draft composer options` 套件（渲染、迟到的应答、不发 setConfigOption、重试带当前选择、切回不丢）。宿主：`chat-panel.test.ts` 的草稿套件（空也回话、load/resume 两条时序、应用在首条消息之前、陈旧值跳过、失败留痕、应用不播报切换）。布局：`preview-records.mjs` 的 `#composerdraft*` 档（卡片 + 完整底栏） |
+
+### 5.33 表单抽屉：分页 / 下拉 / 收起（CUSTOM-20260930-152）
+
+**一句话**：记录层一行（`⏳ 待回答 · <gist>` + `Open form`），抽屉层一面（`#elicDrawer`）。
+
+| 关注点 | 规则 |
+|---|---|
+| 层级 | `position: fixed`。**不要**用 `transform` 居中：我们要的规则是"与输入卡**同一个包含块**"（见下），transform 给不了这个。居中规则**必须与输入卡同源**：`left: 0; right: var(--acpc-aside-w, 0px); margin: 0 auto; width: min(100% - 16px, --acpc-composer-max)`。输入卡的中心不是面板中心——`.composer-main` 是"面板宽 − 预留功能区"，钉住大纲栏时两者差 `asideW/2`（240px 的栏 ⇒ 120px 偏移，用户 2026-10-01 报的"没居中"就是这个）。`bottom: var(--acpc-composer-h)` 直接叠在底栏上（实测抽屉下沿 = 输入卡上沿）。`z-index: 9`（高于底栏 8、低于右键菜单 60 与图片浮层 90） |
+| 高度让位 | 新增 `--acpc-elic-h`：`#messages` 的 `padding-bottom` 与 `#jumpToLatest` 的 `bottom` 各加一段（实测展开 405px = 24 + 底栏 84 + 抽屉 297；收起 145px）。写变量的是 `applyDrawerHeight()`，**观察器 + 显式调用两条腿**：ResizeObserver 的回调按帧投递，不是每个宿主都送达（无头预览里就没送达，第一版只靠它 ⇒ 留白停在旧值，抽屉会压住最后一条记录）。这是 pitfall #27 的同一件事：量，并且别赌回调时机 |
+| 题目分页 | 一个 tab 一道题（标题取 `field.title`，即 AskUserQuestion 的 `header`）；`customFor === X` 的字段并进 `X` 那道题（**按名字配对**，不按位置）。tab 上的圆点 = 已答/未答。**[154] bar（用户要求）：没有标题行** —— tab 条、`Answered n/N` 与收起箭头合成一条，进度与箭头**靠右**；收起时 tab 条换成当前题的名字 |
+| 单选 | **[154] 平铺的 radio 列表**（用户第二次改规则：不要下拉）——每行 = **主标题 + 副标题（选项说明）**，末尾一行 `Other`（自由作答也是一"选"）。底层就是一组普通 radio，`collect()` 的判据一个字节没动；点击时**显式**取消同级 checked（桩 DOM 没有原生 radio 组行为，显式让两边一致）。没有下拉菜单 = 没有"菜单被裁/开错方向"那一类问题（153 为此改过两版规则） |
+| 多选 | **经典复选框列表**（用户规则 2），行 = 选项名 + 选项介绍（用户规则 3） |
+| 自拟框 | **[154] 单选：跟着"被选中的那一行"走**（`placeCustomBoxes` 把它 `appendChild` 进那行的容器里），没选时**藏在自己的题块里**（`data-elic-home`）而不是从 DOM 摘掉 —— 摘掉就再也找不回来，写进去的字也会掉出 `collect()`（这条是踩出来的）。多选：仍在列表下方。**任何形态都必须带那行说明**（"填了它就以它作答、取代上面所选"）——adapter 的 `applyAskElicitationResponse` 里 custom **优先于**选择，只写"追加"就是 UI 撒谎 |
+| 收起 | bar 右端的箭头把抽屉收成**一行**（当前题的名字 + 进度 + 箭头）。**Escape 只收起、绝不 cancel**（cancel 会中止工具调用，不能由一次误按键触发）。收起会把这个 promptId 记进 `dismissed`：切走再回来不会自动重弹，内联条的「Open form」是回来的路 |
+| 打开策略 | 自动打开 = 聚焦会话里有 pending 且该 promptId 没被收起过；**主动打开**（内联条 / 收起态）才把焦点给抽屉（显式动作才抢焦点，同 019/125 的态度） |
+| **只看当前会话** | `setSession(sessionId)`（boot 在 `syncElicitations()` 这个唯一入口里同步）+ `pendingForms()` 按 `state.sessionId` 过滤。为什么不用"转录已经是当前会话的"当判据：那是**代理信号**（pitfall #25/#26），一旦某条路径没重建转录，别的会话的表单就会在这边显示出来（用户 2026-10-01 报的正是它）。记录仍记着"谁的表单" —— 切回去它自己会回来。**[154] 另一半在清记录那一侧**：`sessionId` 为空时 `pendingForms()` 直接返回空（草稿页/空态没有会话），而 boot 里所有清记录的地方统一走 `resetTranscript()` 包装（reset + 对账）—— 上一版只调了 `reset`，切到草稿页时抽屉就留在屏幕上了（用户第二张图） |
+| 多个待答表单 | 抽屉同一时刻只呈现一个（记录里第一条未收起的），其余靠各自内联条的「Open form」切过去（`open(promptId)`）——不做叠层 |
+| 委托点击 | 抽屉自己持有一个**容器级** click 监听（tab / 收起 / 清除所选，容器不重建 ⇒ 不怕 pitfall #28 的"重建后 target 脱离"）；`data-elic-action`（提交/跳过/取消）继续走 `links.ts` 的全局委托，根节点查找改为 `.elic` **或** `.elic-drawer`；下拉菜单项的 `data-elic-pick` 与"点外面关菜单"走 document 级监听 |
+| 记录层的 pending 条 | 一行：⏳ + `<gist>`（`state.message` 折成一行）+ `Open form`。结算后仍是那张只读卡（问题 + 曾提供的选项 + 结果说明）——那是历史，不该被这次改动抹掉 |
+| 已答判定 | 从 **DOM** 读（DOM 就是表单状态）：radio/checkbox 看 `checked`，文本框看非空。`onDrawerChange`（容器上的 change/input 委托）负责重算 tab 圆点/进度/未答提示 —— 少了它，勾选框不会让进度动（第一版就漏了） |
+| 桩 DOM 的两个约束 | ①客户端代码里**不要用带值的属性选择器**（`[data-x="v"]`）——`src/test/chat-client.test.ts` 的桩只支持 `[attr]`，用它会让"找不到自己的 input"的 bug 在测试里永远绿；一律 `querySelectorAll('[attr]')` + 过滤（`inputsNamed`/`findByAttr`）。②`loadClient` 刻意不加载 boot，所以抽屉的**请求/应答**接线由 `NS.elicitationView.init()` 自己完成，测试直接调它 |

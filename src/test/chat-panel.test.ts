@@ -26,7 +26,7 @@ import * as vscode from 'vscode';
 
 import type { SessionNotification } from '@agentclientprotocol/sdk';
 
-import type { PromptResponse } from '@agentclientprotocol/sdk';
+import type { PromptResponse, SessionConfigOption } from '@agentclientprotocol/sdk';
 
 import { AgentManager } from '../core/AgentManager';
 import { ConnectionManager, type ConnectionInfo } from '../core/ConnectionManager';
@@ -113,13 +113,20 @@ class RecordingSurface implements ChatSurface {
  * that the host should take its session lookup as an injected dependency
  * instead of reaching into `SessionManager`.
  */
-function registerFakeSession(manager: SessionManager, sessionId: string, agentName: string): void {
+function registerFakeSession(
+  manager: SessionManager,
+  sessionId: string,
+  agentName: string,
+  // [CUSTOM-20260930-151] 需要"这个会话有真实的 configOptions / 可用命令"的用例（草稿页快照
+  // 就靠它）。字段名故意是宽松的：种的是协议形状的普通对象，不需要在测试里构造 SDK 类型。
+  seed: Record<string, unknown> = {},
+): Record<string, unknown> {
   const internals = manager as unknown as {
     sessions: Map<string, unknown>;
     agentSessions: Map<string, Set<string>>;
     agentProcesses: Map<string, string>;
   };
-  internals.sessions.set(sessionId, {
+  const session: Record<string, unknown> = {
     sessionId,
     agentId: 'fake-agent-id',
     agentName,
@@ -131,11 +138,16 @@ function registerFakeSession(manager: SessionManager, sessionId: string, agentNa
     models: null,
     configOptions: null,
     availableCommands: [],
-  });
+  };
+  Object.assign(session, seed);
+  internals.sessions.set(sessionId, session);
   internals.agentProcesses.set(agentName, 'fake-agent-id');
   const ids = internals.agentSessions.get(agentName) ?? new Set<string>();
   ids.add(sessionId);
   internals.agentSessions.set(agentName, ids);
+  // [CUSTOM-20260930-151] 返回这个对象：`loadSession` 那类"先注册、后写字段"的时序要靠调用方
+  // 就地改它来复现（见下面草稿快照的用例），这样那个 cast 仍然只留在本 helper 里。
+  return session;
 }
 
 /** Minimal in-memory Memento — touches no real user or workspace settings. */
@@ -189,6 +201,9 @@ function makeHarness(
   // [CUSTOM-20260930-130] Optional bridges: the tab dot's "waiting" state is read from
   // them, and a test needs to be able to park a request on a session.
   bridges: { permission?: PermissionBridge; elicitation?: ElicitationBridge } = {},
+  // [CUSTOM-20260930-151] Optional globalState: the draft page's option snapshot is
+  // persisted there, and "survives a window reload" is only testable with one.
+  globalState?: vscode.Memento,
 ): Harness {
   const handler = new SessionUpdateHandler();
   const sessionManager = managerFactory
@@ -197,7 +212,7 @@ function makeHarness(
   registerFakeSession(sessionManager, sessionId, agentName);
   const host = new ChatPanelHost(
     vscode.Uri.file('/tmp/chat-panel-test'), sessionManager, handler,
-    bridges.permission, undefined, bridges.elicitation, prefs,
+    bridges.permission, globalState, bridges.elicitation, prefs,
   );
   const surface = new RecordingSurface();
   host.attachSurface(surface, { agentName, sessionId });
@@ -683,6 +698,13 @@ suite('chat panel: draft page creates the session on first send', () => {
     readonly sent: Array<{ sessionId: string; prompt: unknown }> = [];
     readonly ensured: string[] = [];
     failCreateWith: string | null = null;
+    // [CUSTOM-20260930-151] The session the draft creates carries a real config-option list
+    // (the draft's picks are validated against it), and the applies are recorded in order with
+    // the send — "before the first message" is the whole point of applying them there.
+    configOptionsForNew: unknown[] | null = null;
+    readonly applied: Array<{ configId: string; value: string }> = [];
+    readonly order: string[] = [];
+    failApplyWith: string | null = null;
 
     override async ensureConnected(agentName: string): Promise<ConnectionInfo> {
       this.ensured.push(agentName);
@@ -696,7 +718,7 @@ suite('chat panel: draft page creates the session on first send', () => {
       if (this.failCreateWith) { throw new Error(this.failCreateWith); }
       this.created.push({ agentName, cwd: opts.cwd });
       const sessionId = `draft-session-${this.created.length}`;
-      registerFakeSession(this, sessionId, agentName);
+      registerFakeSession(this, sessionId, agentName, { configOptions: this.configOptionsForNew });
       return {
         sessionId,
         agentId: 'fake-agent-id',
@@ -707,13 +729,27 @@ suite('chat panel: draft page creates the session on first send', () => {
         initResponse: {},
         modes: null,
         models: null,
-        configOptions: null,
+        configOptions: this.configOptionsForNew,
         availableCommands: [],
       } as unknown as SessionInfo;
     }
 
+    override async setConfigOption(sessionId: string, configId: string, value: string): Promise<SessionConfigOption[] | null> {
+      if (this.failApplyWith) { throw new Error(this.failApplyWith); }
+      this.applied.push({ configId, value });
+      this.order.push(`apply:${configId}=${value}`);
+      // Mirror the real one: the agent's response IS the new option list, and the host's switch
+      // baseline is read back from it. A stub that does not write it would make the "applying a
+      // draft pick must not announce a switch" invariant untestable (and untrue in the test).
+      const options = (this.getSession(sessionId)?.configOptions ?? []) as Array<Record<string, unknown>>;
+      const next = options.map(option => (option.id === configId ? { ...option, currentValue: value } : option));
+      this.applyConfigOptions(sessionId, next as unknown as SessionConfigOption[]);
+      return next as unknown as SessionConfigOption[];
+    }
+
     override async sendPrompt(sessionId: string, prompt: unknown): Promise<PromptResponse> {
       this.sent.push({ sessionId, prompt });
+      this.order.push('send');
       return { stopReason: 'end_turn' } as PromptResponse;
     }
   }
@@ -727,12 +763,12 @@ suite('chat panel: draft page creates the session on first send', () => {
     assert.fail(`timed out waiting for ${label}`);
   }
 
-  function draftHarness(): { harness: Harness; manager: DraftSessionManager } {
+  function draftHarness(memento?: FakeMemento): { harness: Harness; manager: DraftSessionManager } {
     let manager!: DraftSessionManager;
     const harness = makeHarness('placeholder-session', 'Claude Code', handler => {
       manager = new DraftSessionManager(new AgentManager(), new ConnectionManager(handler), handler);
       return manager;
-    });
+    }, new StubPrefs(), {}, memento as unknown as vscode.Memento | undefined);
     harness.surface.sent.length = 0;   // drop the attach-time boot noise
     return { harness, manager };
   }
@@ -804,6 +840,196 @@ suite('chat panel: draft page creates the session on first send', () => {
     await waitFor(() => manager.ensured.length > 0, 'ensureConnected');
     assert.deepStrictEqual(manager.ensured, ['Claude Code']);
     assert.deepStrictEqual(manager.created, [], 'connect must not create a session');
+  });
+
+  // [CUSTOM-20260930-151] 草稿页的输入卡要"显示完整"（模式/模型/斜杠命令）。这些在 ACP 里
+  // 都是**会话级**的（`session/new` 没有 mode/model 入参），草稿按定义还没有会话 —— 所以宿主
+  // 回的是「该 agent 上一次会话的快照」。钉住三条：没有快照也必须回话、快照跟着会话走、
+  // 快照跨窗口重载存活（否则全新窗口点「+」时输入卡还是空的，那正是用户报的现象）。
+  const SNAPSHOT_OPTIONS = [
+    {
+      id: 'mode', name: 'Mode', description: 'Session permission mode', category: 'mode',
+      type: 'select', currentValue: 'plan',
+      options: [{ value: 'default', name: 'Manual' }, { value: 'plan', name: 'Plan' }],
+    },
+  ];
+
+  function seedAgentOptions(manager: SessionManager, sessionId: string, options: unknown[]): void {
+    registerFakeSession(manager, sessionId, 'Claude Code', {
+      configOptions: options,
+      availableCommands: [{ name: 'compact', description: 'Compact the conversation', input: { hint: 'what to keep' } }],
+    });
+    // The host learns the snapshot from these two events (it subscribes to both).
+    manager.emit('config-options-changed', sessionId);
+    manager.emit('available-commands-changed', sessionId);
+  }
+
+  test('with no known snapshot the reply is empty — but it IS a reply', function () {
+    const { harness } = draftHarness();
+    harness.host.onMessage({ type: 'listDraftOptions', draftId: 'd1' });
+
+    const replies = messagesOf(harness, 'draftOptions');
+    assert.strictEqual(replies.length, 1, 'the client waits for this reply (pitfall #29)');
+    assert.strictEqual(replies[0].draftId, 'd1');
+    assert.strictEqual(replies[0].agentName, 'Claude Code');
+    assert.deepStrictEqual(replies[0].configOptions, []);
+    assert.deepStrictEqual(replies[0].availableCommands, []);
+  });
+
+  test('the snapshot is the agent\'s last session, commands included', function () {
+    const { harness, manager } = draftHarness();
+    seedAgentOptions(manager, 'seeded-session', SNAPSHOT_OPTIONS);
+
+    harness.host.onMessage({ type: 'listDraftOptions', draftId: 'd2' });
+    const reply = messagesOf(harness, 'draftOptions')[0];
+    assert.deepStrictEqual(reply.configOptions, SNAPSHOT_OPTIONS);
+    assert.deepStrictEqual(reply.availableCommands, [
+      { name: 'compact', description: 'Compact the conversation', inputHint: 'what to keep' },
+    ]);
+  });
+
+  test('the snapshot survives a window reload (globalState)', function () {
+    const memento = new FakeMemento();
+    const first = draftHarness(memento);
+    seedAgentOptions(first.manager, 'seeded-session', SNAPSHOT_OPTIONS);
+
+    // A reloaded window: no live session carries these options any more, only globalState.
+    const second = draftHarness(memento);
+    second.harness.host.onMessage({ type: 'listDraftOptions', draftId: 'd3' });
+    assert.deepStrictEqual(
+      messagesOf(second.harness, 'draftOptions')[0].configOptions, SNAPSHOT_OPTIONS,
+      'a fresh window must still be able to render the full composer');
+  });
+
+  test('opening a history session does not empty the snapshot (load writes its options late)', function () {
+    const { harness, manager } = draftHarness();
+    // `loadSession` registers the placeholder FIRST, emits `session-created`, and only writes
+    // the response's configOptions afterwards — and it does not go through
+    // `applyConfigOptions`. Missing the second read leaves the draft page with no pickers right
+    // after the user opened a history session, which is the reported symptom all over again.
+    const placeholder = registerFakeSession(manager, 'loading-session', 'Claude Code');
+    manager.emit('session-created', 'loading-session');
+    placeholder.configOptions = SNAPSHOT_OPTIONS;
+    manager.emit('session-load-end', 'loading-session', 'Claude Code', true);
+
+    harness.host.onMessage({ type: 'listDraftOptions', draftId: 'd-load' });
+    assert.deepStrictEqual(messagesOf(harness, 'draftOptions')[0].configOptions, SNAPSHOT_OPTIONS);
+  });
+
+  test('an empty list does not displace a good snapshot (resume reports no commands)', function () {
+    const { harness, manager } = draftHarness();
+    seedAgentOptions(manager, 'with-options', SNAPSHOT_OPTIONS);
+    // `resumeSession` returns `availableCommands: []` and never replays, so taking its empty
+    // answer at face value would erase the slash list — a "degenerated" snapshot is worse than
+    // a stale one, because stale only means "a value that gets skipped when the session exists".
+    registerFakeSession(manager, 'resumed-session', 'Claude Code', { configOptions: SNAPSHOT_OPTIONS });
+    manager.emit('session-created', 'resumed-session');
+
+    harness.host.onMessage({ type: 'listDraftOptions', draftId: 'd-resume' });
+    const reply = messagesOf(harness, 'draftOptions')[0];
+    assert.deepStrictEqual(reply.configOptions, SNAPSHOT_OPTIONS);
+    assert.deepStrictEqual(reply.availableCommands, [
+      { name: 'compact', description: 'Compact the conversation', inputHint: 'what to keep' },
+    ]);
+  });
+
+  // --- 阶段 3：草稿上选的值怎么落到新建的会话上 ---------------------------------
+  // [CUSTOM-20260930-151] 会话存在之前没有地方可下发，所以选择随 createDraftAndSend 一起走，
+  // 并在首条消息**之前**应用。三条边界：陈旧的选项要跳过、单项失败不能挡住发消息、应用本身
+  // 不能被当成一次"切换"播报出来。
+
+  const NEW_SESSION_OPTIONS = [
+    {
+      id: 'mode', name: 'Mode', description: 'Session permission mode', category: 'mode',
+      type: 'select', currentValue: 'default',
+      options: [{ value: 'default', name: 'Manual' }, { value: 'plan', name: 'Plan' }],
+    },
+    {
+      id: 'model', name: 'Model', description: 'AI model to use', category: 'model',
+      type: 'select', currentValue: 'sonnet',
+      options: [{ value: 'sonnet', name: 'Sonnet' }, { value: 'opus', name: 'Opus' }],
+    },
+  ];
+
+  /** Every notice text the host appended to a session (read through the coalescing queue). */
+  function noticesOf(harness: Harness): string[] {
+    const out: string[] = [];
+    for (const message of messagesOf(harness, 'append')) {
+      for (const entry of (message.entries as Array<Record<string, unknown>>) ?? []) {
+        if (entry.kind === 'notice') { out.push(String(entry.text)); }
+      }
+    }
+    return out;
+  }
+
+  test('the picks are applied to the new session BEFORE its first message', async function () {
+    const { harness, manager } = draftHarness();
+    manager.configOptionsForNew = NEW_SESSION_OPTIONS;
+    harness.host.onMessage({
+      type: 'createDraftAndSend', draftId: 'd1', cwd: '/dir', text: 'hello',
+      configSelections: [{ configId: 'mode', value: 'plan' }],
+    });
+    await waitFor(() => manager.sent.length > 0, 'the prompt to be sent');
+
+    assert.deepStrictEqual(manager.applied, [{ configId: 'mode', value: 'plan' }]);
+    assert.deepStrictEqual(manager.order, ['apply:mode=plan', 'send'],
+      'the first turn has to run with what the draft page showed');
+  });
+
+  test('a value this session no longer offers is skipped, and the message still goes out', async function () {
+    const { harness, manager } = draftHarness();
+    manager.configOptionsForNew = NEW_SESSION_OPTIONS;
+    harness.host.onMessage({
+      type: 'createDraftAndSend', draftId: 'd2', cwd: '/dir', text: 'hi',
+      configSelections: [
+        { configId: 'mode', value: 'plan' },
+        { configId: 'ghost', value: 'x' },
+        { configId: 'model', value: 'haiku-9000' },
+      ],
+    });
+    await waitFor(() => manager.sent.length > 0, 'the prompt to be sent');
+
+    assert.deepStrictEqual(manager.applied, [{ configId: 'mode', value: 'plan' }],
+      'only the pick this session still recognises may be sent to the agent');
+    assert.strictEqual(messagesOf(harness, 'draftFailed').length, 0);
+  });
+
+  test('a pick the agent rejects is reported, not silently snapped back', async function () {
+    const { harness, manager } = draftHarness();
+    manager.configOptionsForNew = NEW_SESSION_OPTIONS;
+    manager.failApplyWith = 'agent refused';
+    harness.host.onMessage({
+      type: 'createDraftAndSend', draftId: 'd3', cwd: '/dir', text: 'hi',
+      configSelections: [{ configId: 'mode', value: 'plan' }],
+    });
+    await waitFor(() => manager.sent.length > 0, 'the prompt to be sent');
+    await waitFor(() => noticesOf(harness).length > 0, 'the failure notice');
+
+    assert.match(noticesOf(harness)[0], /Mode/);
+    assert.strictEqual(manager.sent.length, 1, 'a failed pick must not block the message');
+  });
+
+  test('applying the picks is not announced as a switch the user never made', async function () {
+    const { harness, manager } = draftHarness();
+    manager.configOptionsForNew = NEW_SESSION_OPTIONS;
+    harness.host.onMessage({
+      type: 'createDraftAndSend', draftId: 'd4', cwd: '/dir', text: 'hi',
+      configSelections: [{ configId: 'mode', value: 'plan' }],
+    });
+    await waitFor(() => manager.sent.length > 0, 'the prompt to be sent');
+    const sessionId = manager.sent[0].sessionId;
+
+    // The agent then reports the state we just applied — the usual `config_option_update`.
+    harness.handler.handleUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: 'config_option_update',
+        configOptions: (manager.getSession(sessionId)?.configOptions ?? []),
+      } as unknown as SessionNotification['update'],
+    });
+    await new Promise(resolve => setTimeout(resolve, 40));   // let the coalescing queue flush
+    assert.deepStrictEqual(noticesOf(harness), [],
+      'the session started in that mode; the user never switched to it');
   });
 });
 

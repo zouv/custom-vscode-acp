@@ -17,6 +17,60 @@
 
 ---
 
+### 2026-10-01 - CUSTOM-20261001-154
+- **修复**：用户第二轮真机复验的四条 —— 单选改平铺（带主/副标题）、自拟框跟着所选行、去掉标题行（进度与箭头挪到 tab 栏右侧）、**切到草稿页/别的会话浮框还在**
+- **改动文件**：`src/ui/chat/html/client/elicitationView.ts`（单选重写 + bar + 自拟框落点 + 删掉整套下拉）、`src/ui/chat/html/styles.ts`、`src/ui/chat/html/client/boot.ts`（`resetTranscript()` 包装）、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（档位与探针读数）。（文档：`docs/arch/chat-panel.md` §5.33）
+- **来源**：用户真实使用后的四条反馈（附三张截图，其中图1 是官方插件的目标形状）
+- **详细说明**：
+  - **① 单选从下拉改成平铺列表**（用户第二次改规则）：每行 = **主标题 + 副标题（选项说明）**，末尾一行 `Other`（自由作答也是一"选"）。底层仍是普通 radio，`collect()` 判据一字未动；**整套下拉机制（菜单定位、开合、点击外面关闭）连同它的 CSS 一起删掉** —— 那条"菜单被裁/开错方向"的坑（153 为此改过两版规则）随之消失。因为 radio 不能"再点一次取消"，补了一个 `Clear answer` 链接守住"允许不选"。
+  - **② 自拟框跟着"被选中的那一行"走**：默认不显示，选了哪行就出现在那行下面（元素用 `appendChild` **移动**，所以写进去的字跟着走）。**没选时它藏在自己的题块里（`data-elic-home`）而不是从 DOM 摘掉** —— 第一版就是摘掉的，结果下一次查找找不到它（日志显示 `checked=0`、`box` 找不到），而且脱节点里的文字也会掉出 `collect()`。这条坑写进了 §5.33。
+  - **③ 去掉标题行**：tab 条、`Answered n/N` 与收起箭头合成一条 bar，**进度与箭头靠右**；收起时 tab 条换成当前题的名字。抽屉里再没有"Please answer the following questions."那一行。
+  - **④ 切走还在（上一版没修对）**：153 只修了"表单属于哪个会话"，漏了另一半 —— **记录被清空时没人对账抽屉**。`focusDraft` / `dropDraft` 只调 `transcriptView.reset()`，切到草稿页后浮框就留在屏幕上（用户第二张图正是那个状态：面板停在草稿页）。现在 boot 里**所有清记录的地方统一走 `resetTranscript()`**（reset + 对账），并且 `sessionId` 为空时 `pendingForms()` 直接返回空（草稿页/空态没有会话可归属）。
+- **验证方式**：`npm test` **230 passing**（客户端表单套件改为 14 条：平铺行含主/副标题、Other 行、选中互斥、自拟框落点与随行移动、Clear、隐藏规则、进度与圆点、会话隔离、缺容器不炸…）。`npm run lint` 0、webpack 成功、`check-registry.mjs` 六节全绿、`normalize-eol` 修正 1 个文件后一致。**无头截图 + 探针**：`#elicreal` / `#elicrealpick` / `#elicrealsidebar` / `#elicshrunk` 四档，读数 `customHidden`（未选 true）、`customInPickedRow`（选了 true）、`drawerCenter == cardCenter`（588 钉住 / 708 未钉住）、收起态抽屉高 26px。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-01 - CUSTOM-20261001-153
+- **修复**：用户复验 152 报的四条 —— 抽屉没居中、切到别的会话还能看到它、下拉菜单开到了上面、单选少了自拟输入框
+- **改动文件**：`src/handlers/ElicitationBridge.ts`（`fieldsOf` 配对兜底）、`src/ui/chat/html/styles.ts`（抽屉居中 + 下拉/自拟并排的样式）、`src/ui/chat/html/client/elicitationView.ts`（会话作用域 / 菜单一律向下 / 单选行布局）、`src/ui/chat/html/client/boot.ts`（`setSession` 同步）、`src/test/chat-client.test.ts`、`src/test/elicitation-bridge.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（"真机形状"三档 + 探针读数）。（文档：`docs/arch/chat-panel.md` §5.27 / §5.33）
+- **来源**：用户真实使用后报的四条（附三张截图）
+- **详细说明**：
+  - **① 没居中**：抽屉按**面板**居中，而输入卡按"面板宽 − 预留功能区"居中 —— `.composer-main` 右侧让出了 `--acpc-aside-w`（钉住大纲栏时 240px），所以两者中心差 `asideW/2`。修法：抽屉的包含块也用同一个变量（`left:0; right: var(--acpc-aside-w, 0px); margin:0 auto`），宽度沿用 `min(100% - 16px, --acpc-composer-max)`。**实测**：钉住 240px 时抽屉与输入卡中心都是 **588**（改之前抽屉 708 —— 那 120px 就是用户看到的那条偏差）；未钉住时都是 708。
+  - **② 切会话还能看到**：原判据是"当前转录里有没有 pending 表单"——那是**代理信号**（pitfall #25/#26）：转录本该在切会话时重建，可一旦某条路径没重建（或别的原因让旧记录还在），别的会话的表单就会在这边显示。修法：新增 `NS.elicitationView.setSession(sessionId)`，由 boot 在 `syncElicitations()` 这**唯一入口**同步聚焦会话，`pendingForms()` 再按 `state.sessionId` **直接过滤**；记录本身仍记着"谁的表单"，切回去它自己回来（见新增用例）。
+  - **③ 菜单开到上面**：上一版有一条"下方不够就整块抬到抽屉之上"的规则，实测在真面板里会盖住正在回答的那道题。改为**一律开在按钮下方**，唯一的夹取是视口剩余高度（超出就在菜单内滚动）；压住表单自己的下半部分是正常的——那正是插入符指向的地方。
+  - **④ 单选少了自拟输入框（根因在宿主侧）**：去日志里核对了那次真请求（`~/.claude/acp-client-custom.log` 的 `elicitation/create`），发现 adapter 新版**不再发** `_meta._askUserQuestionCustomAnswer`（只给 `title: 'Other'` 与一句 description），而 `fieldsOf` 只认那个标记 ⇒ 自拟框既没配到题上、还成了**独立的一题**（抽屉里多出一个 "Other" 标签页）。修法：除标记外再认 `<某字段>_custom` 这个名字约定（adapter 自己的 `questionCustomFieldKey` 就是这么拼的），且**父字段必须存在**；另外把单选那一行改成**下拉与自拟框并排**（官方插件的布局，用户点名要的形状），窄面板用 `flex-wrap` 自动折行。
+  - **顺带确认**（用户报的"选项说明丢了"）：把日志里那份真实 schema 直接喂给 `fieldsOf` 跑了一遍 —— 4 个选项的 `description` **都在**，而且把它们搬进预览档截图后，菜单里每行都是"选项名 + 选项说明"两行。也就是说这条**在客户端是好的**；如果真机上还看不到，下一步要给菜单加一行诊断日志（记下收到的选项数与带说明的条数）再看。
+- **验证方式**：`npm test` **230 passing**（新增：客户端"属于别的会话的表单不在这里显示"；宿主 `fieldsOf` 的两条 —— 无标记时按名字配对、父字段不存在时不乱认）。`npm run lint` 0、webpack 成功、`check-registry.mjs` 六节全绿、`normalize-eol` 无需修正。**无头截图 + 探针实测**：新增 `#elicreal` / `#elicrealmenu` / `#elicrealsidebar` 三档（状态照抄真机请求），读数见 §5.33 —— 居中 `drawerCenter = cardCenter`（588 / 708）、菜单 `menuBelowBtn: true`。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-30 - CUSTOM-20260930-152
+- **功能**：表单（ACP elicitation / AskUserQuestion）从记录里的**内联卡**改成**悬浮抽屉**：多题按 tab 分页、单选用下拉、多选经典勾选列表、可收起成一行
+- **改动文件**：`src/ui/chat/html/client/elicitationView.ts`（重写渲染层）、`src/ui/chat/html/body.ts`（新增 `#elicDrawer` 容器）、`src/ui/chat/html/styles.ts`（抽屉/标签/下拉/选项行 + `--acpc-elic-h` 让位）、`src/ui/chat/html/client/boot.ts`（`init` + `syncElicitations()` 对账点）、`src/ui/chat/html/client/links.ts`（委托点击的根节点查找改为 `.elic` 或 `.elic-drawer`）、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（四档截图 + 探针）。（文档：`docs/arch/chat-panel.md` §5.27 改写 + 新增 §5.33）
+- **来源**：用户报「表单现在是直接以消息卡片的形式出现的（图1），应该使用悬浮弹框的方式展示」，并给了四条排版规则（单选用下拉且允许不选 + 自定义内容、多选经典样式、每项以"选项 + 选项介绍"呈现）与官方插件的参考图
+- **详细说明**：
+  - **数据从哪来（先核对 adapter 源码）**：`@agentclientprotocol/claude-agent-acp/dist/elicitation.js` 里每题两个字段 —— `question_<n>`（单选 `oneOf` / 多选 `anyOf`）+ `question_<n>_custom`（自由文本，`_meta._askUserQuestionCustomAnswer.questionId` 指回该题）。三条事实决定了 UI 语义：① **自拟文本取代该题所选**（`applyAskElicitationResponse` 里 custom 优先），所以那个框的标签按用户要求写 `Additional input (optional)`，但下面**必须**有一行说明真实效果 —— 只写"追加"就是 UI 撒谎；② schema 里**没有任何 required**，留空合法（该题不进 `answers`），所以"允许不选"不是特例；③ 单选与多选**都**有自拟框（图 2 里多选下面那个 Notes 就是它）。
+  - **记录层只留一行**：pending 的记录不再画整张表单，而是一行「⏳ 待回答 · 题干摘要」+ `Open form`；结算后仍是那张只读卡（问题 + 曾提供的选项 + 结果说明）—— 那是历史。**记录仍是唯一真相**（119 的不变量）：抽屉每次都由记录重算（`sync()`），所以 boot/focus 全量快照、切会话、双 surface、重挂载都不需要新协议，**宿主侧零改动**。
+  - **抽屉**：`#elicDrawer` 是 body 级浮层，`position: fixed` + `left/right:0; margin:auto; width: min(100% - 16px, --acpc-composer-max)` 与输入卡同宽同中线，`bottom: var(--acpc-composer-h)` 直接叠在底栏上（实测抽屉下沿 = 输入卡上沿）。**不能用 `transform` 居中**：里面的下拉菜单是 `position: fixed`，而 transform 会让 fixed 变成"相对该元素"。
+  - **分页 / 控件**：一题一个 tab（标题取 question header，圆点表示已答/未答），`customFor` 的字段**按名字**并进它所属那道题；单选用下拉（菜单行 = 选项名 + 选项介绍，已选时多一行 `Clear selection`），底层仍是一组 hidden radio ⇒ `collect()` 的判据一个字节没动，点击时**显式**取消同级 checked（桩 DOM 没有原生 radio 组行为）；多选是经典勾选列表；`Answered n/N` 与 `Submit n/N` 随输入实时更新（`onDrawerChange` 委托 change/input —— 少了它勾选框不会让进度动）。
+  - **收起**：头部箭头把抽屉收成**一行**（标题 + 进度 + 箭头），点整行也可展开；**Escape 只收起、绝不 cancel**（cancel 会中止工具调用，不能由一次误按键触发）；收起按 promptId 记进 `dismissed`，切走再回来不自动重弹，内联条的 `Open form` 是回来的路。
+  - **两个自己踩出来的坑**（都写进了 §5.33）：① **只靠 ResizeObserver 写让位变量不成立** —— 回调按帧投递，无头预览里就没送达，`--acpc-elic-h` 停在旧值（0），抽屉会压住最后一条记录；现在是"观察器 + 状态变化时显式调用"两条腿（实测：展开 405px = 24 + 底栏 84 + 抽屉 297，收起 145px）。② **下拉菜单的落位不能照预览截图改**：截图模式与 dump-dom 模式的视口高度不同（同一次 `--window-size=1440,900`，dump-dom 报 innerH=808、截图画布却是 900），fixed 元素在两张图里位置不同 —— 我为此白改了两版规则，最后用探针读数字定案（`menuBelowBtn: true`）。
+  - 桩 DOM 的一个硬约束也借这次记了下来：客户端里**不要用带值的属性选择器**（`[data-x="v"]`），桩只支持 `[attr]` —— 用它会让"找不到自己的 input"这类 bug 在测试里永远绿。现已改成 `querySelectorAll('[attr]')` + 过滤（`inputsNamed` / `findByAttr`）。
+- **验证方式**：`npm test` **227 passing**（客户端表单套件重写为 12 条：记录只留一行 / tab 分页与 customFor 归位 / 下拉选值与清除 / 单选互斥 / 进度与未答提示 / 自拟框标签与说明 / 抽屉提交的 collect 结果 / skip·cancel 不带 content / Escape 只收起 / 结算后不可再答 / deferred 提示 / 缺抽屉容器时不炸）。`npm run lint` 0 warning、`npm run compile` 成功、`check-registry.mjs` 六节全绿、`normalize-eol` 无需修正。**无头截图 + 探针实测**：`#elic` / `#elicmenu` / `#elicmulti` / `#elicshrunk` 四档，读数记录在 §5.33（抽屉 720 宽、居中 708、下沿 = 输入卡上沿 724；菜单开在按钮下方）。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-09-30 - CUSTOM-20260930-151
+- **功能**：草稿页（点「+」的新会话页）的输入卡补全 —— 模式 / 模型 / 斜杠命令；用户选的模式与模型**随首条消息一起应用**到新建的会话上
+- **改动文件**：`src/ui/chat/protocol.ts`、`src/ui/chat/ChatPanelHost.ts`、`src/ui/chat/sessionChoices.ts`、`src/ui/chat/html/client/composer.ts`、`src/ui/chat/html/client/boot.ts`、`src/test/chat-panel.test.ts`、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（文档：`architecture.md`、`docs/arch/chat-panel.md` §5.32、`docs/arch/chat-panel-sessions.md` §5.23）
+- **来源**：用户报「点『+』New Session 时，新的会话界面的输入框需要显示完整（模式转换、模型选择等）」
+- **详细说明**：
+  - **为什么草稿页天生缺这些**：草稿按 058 的设计**还不是 ACP session**（cwd 必须在创建前定好，而 `session/close` 不会把会话从 agent 历史里删掉 ⇒ 提前创建会每换一次目录就留下一个空会话）。而模式/模型/可用命令在协议里**全是会话级的** —— 核对 SDK 的 `NewSessionRequest`：只有 `cwd` / `mcpServers` / `additionalDirectories`，**没有 mode/model 入参**；`availableCommands` 更是只出现在 `session/update` 的 `available_commands_update` 通知里。所以"草稿页没有选择器"不是渲染漏了，是**没有数据**。
+  - **做法**：宿主按 agent 留一份"**上一次会话的快照**"（`rememberAgentOptions`）。草稿页 `setDraft` 时自己发 `listDraftOptions`（不是 boot 发 —— 要渲染应答的组件才是知道自己缺东西的那个，而且这样能落进桩 DOM 覆盖里），宿主**定向**回 `draftOptions`；用户选择记在 boot 持有的 draft 对象上（一份副本），随 `createDraftAndSend` 的 `configSelections` 走，建出会话后**在首条消息之前**逐项校验并应用。
+  - **两处时序坑（评审发现，各有专门用例）**：①`loadSession` 是"先注册 placeholder → emit `session-created` → 收到响应才写 `configOptions`"，**且不走 `applyConfigOptions`** ⇒ 只挂 `session-created` 会让"打开一个历史会话"把快照的配置项清空 —— 补挂 `session-load-end`；②`resumeSession` 的 `availableCommands` 恒为 `[]`（不重放）⇒ 照单全收会把斜杠命令**擦掉** —— 改成**空值不覆盖**（空数组在这两条路径上只表示"还没填"）。快照还会按 agent 持久化到 `globalState`（`acpc.draftOptions.v1`）：VS Code 重载后宿主内存里的活动会话全没了，"全新窗口点 + 还是空输入卡"正是用户报的现象。
+  - **应用的三道闸门**：按**新会话**的 `configOptions` 校验 id 与取值（新增纯函数 `sessionChoices.selectValues()`，含分组形态；快照可能来自 agent 的旧版本）、与当前值相同的跳过、单项失败**留痕但不阻断**发送（用户不该因为一个坏值发不出话，但也不该只看到选择器自己弹回默认值 —— pitfalls #29）。应用完 `this.choices.set(...)` **播种切换基线**：不播种反而静默（`syncChoices` 在 `!previous` 时 return），真正会出噪声的是"agent 在应用前先推过一次 `session/update`（拿默认值当基线）"那条路 —— 那会播出一条用户**从未做过**的切换（pitfall #34 的既定前提）。
+  - **测试抓到的一处真 bug**：失败提示走的是 `appendNotice`，而 `TranscriptStore.append` 在"这个会话还没有桶"时**返回 null**——应用跑在首条消息之前，桶正是还没建（平时由 `onSessionUpdate` 的 `ensureSession` 建）。于是"失败了要留痕"这条在实现里等于没生效，被用例逼出来后在 `applyDraftSelections` 里补了一次 `ensureSession`。
+  - **草稿页点菜单不发 `setConfigOption`**：草稿没有 sessionId，那条消息会带 `sessionId: null` 被宿主 `verifySession` 静默丢弃（§5.4 规则一）—— 用户选了等于没选。改为只改本地副本的 `currentValue`（显示即所得）。
+- **验证方式**：`npm test` **221 passing**（新增：宿主 7 条 —— 空快照也回话 / load 后仍非空 / 空值不覆盖 / 应用在首条消息之前 / 陈旧值跳过 / 失败留痕 / 应用不播报切换；客户端 7 条 —— 请求发出 / 迟到应答按 `draftId` 丢弃 / 斜杠列表 / 不发 setConfigOption / 选择随创建消息走 / 重试带当前选择 / 切回不丢）。`npm run lint` 0 warning；`check-registry.mjs` 六节全绿（含客户端模板字符串可解析）。布局：`preview-records.mjs` 新增 `#composerdraft` / `#composerdraftwide` 两档无头截图，确认选择器与斜杠提示都出现。
+- **基于上游版本**：0.2.0（commit e7371659）
+
 ### 2026-09-30 - CUSTOM-20260930-150
 - **改进**：把"日志落盘"这条排查路径放回**入口处**（能力早就有，问题是想不起来用）
 - **改动文件**：`CUSTOMIZATIONS/docs/dev-workflow.md`、`CUSTOMIZATIONS/docs/pitfalls.md`（另加一条 AI 长期记忆，不在仓库里）

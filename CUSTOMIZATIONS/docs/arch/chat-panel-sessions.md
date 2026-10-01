@@ -152,8 +152,12 @@ ACP 没有"改会话 cwd"的请求——cwd 只在 `session/new` / `session/load
 | 键盘 | `#cwdBtn` 是真 `<button>`（047 的规矩）；三个抽屉（outline / history / cwd）**互斥**，开一个关掉另外两个 |
 | **切回会话标签（080）** | 点会话标签只发一条 `focusSession`，**渲染完全依赖宿主的 `focus` 应答**；而 `SessionManager.focusSession` 在"**已经是这个会话**"时 early-return（只在**变化**时 emit）。草稿是客户端私有的、宿主不知道它存在 ⇒ 宿主"我这边已经是 A 了"就不回话 ⇒ 面板永远停在草稿页，A 的标签看起来是坏的。修法是宿主侧 `focusSession(sessionId, { force: true })`（manager 自己对 newConversation/loadSession/resume 用的同一条惯用法）。**规矩：客户端显式请求的聚焦，宿主必须回话**——客户端的"我在看什么"不是宿主状态的函数（草稿/空白页就是反例）。守卫不放宽：未知会话照旧丢弃 |
 
-**草稿的固有代价（写进代码注释，不是 bug）**：草稿没有 `sessionId`，所以**模式 / 模型 / 斜杠命令**
-要到建会话之后才有——那些是 agent 在 `session/new` 时下发的。
+**草稿的固有代价 —— 已被 [CUSTOM-20260930-151] 补上**：草稿没有 `sessionId`，而模式 / 模型 /
+斜杠命令都是 agent 在 `session/new` 时（或之后的通知里）下发的，所以草稿页本来只有输入框。
+现在由宿主按 agent 留一份"上一次会话的快照"来填（`listDraftOptions` → `draftOptions`），
+用户选的值随 `createDraftAndSend` 一起走、建出会话后逐项校验再应用 —— 见
+[`chat-panel.md`](./chat-panel.md) §5.32。**仍然成立的部分**：全新环境（本进程没开过该 agent
+的会话）没有快照可用，那时草稿页依旧只有输入框。
 
 ### 5.24 历史选择器的目录过滤（CUSTOM-20260926-079）
 

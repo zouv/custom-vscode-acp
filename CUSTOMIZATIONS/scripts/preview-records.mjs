@@ -216,7 +216,10 @@ function driver() {
   // [CUSTOM-20260930-123] 状态卡模式：不喂记录，让卡片独占消息区。
   // 原因是几何：.empty-state 是 inset:0 的覆盖层，但**只有 .state-card 有背景色**，
   // 底下有记录时正文会从卡片四周透出来 —— 那样截出来的图不是用户看到的样子。
-  var CARD_MODE = hash.indexOf('empty') >= 0 || hash.indexOf('connecting') >= 0 || hash.indexOf('ready') >= 0;
+  var CARD_MODE = hash.indexOf('empty') >= 0 || hash.indexOf('connecting') >= 0 || hash.indexOf('ready') >= 0
+    // [CUSTOM-20260930-151] 草稿页（点「+」的新会话页）的用户现场就是"卡片 + 底栏"，
+    // 底下有记录时正文会从卡片四周透出来，截出来不是用户看到的样子。
+    || hash.indexOf('draft') >= 0;
   // [CUSTOM-20260930-123] #narrow：把消息区钉死在 260px。**不要**改用 --window-size 来
   // 测窄侧边栏——实测它只影响截图的裁剪，布局视口是另一回事（dump-dom 与 screenshot
   // 两种模式下的视口宽度甚至互不相同），于是"卡片溢出了吗"这个问题的答案会随模式变化。
@@ -230,7 +233,7 @@ function driver() {
     NS.stateCard.setAutoConnect(true);
     if (hash.indexOf('connecting') >= 0) {
       NS.stateCard.onConnection({ type: 'connection', state: 'connecting' });
-    } else if (hash.indexOf('ready') >= 0) {
+    } else if (hash.indexOf('ready') >= 0 || hash.indexOf('draft') >= 0) {
       NS.stateCard.setConnected(true);
     }
   }
@@ -385,6 +388,115 @@ function driver() {
       for (var tl = 1; tl <= 24; tl++) { tallLines.push('第 ' + tl + ' 行 —— 用来把 autoGrow 顶到上限。'); }
       inputEl.value = tallLines.join('\\n');
       inputEl.dispatchEvent(new Event('input'));
+    }
+    // [CUSTOM-20260930-151] 草稿页：输入卡必须**完整**。走真路径 —— 先 setDraft（它会向宿主
+    // 请求），再把宿主的应答喂给 setDraftOptions。改之前这一档只有光秃秃一个输入框，正是用户
+    // 报的"输入框没显示完整（模式转换、模型选择等）"。
+    if (location.hash.indexOf('draft') >= 0) {
+      NS.composer.setDraft({ draftId: 'draft-1', cwd: null });
+      // setDraft 清空了 configOptions（草稿本来没有会话），所以上面那个 value 也不该留着：
+      // 真机上草稿是空的。这两句的顺序就是"用户点 + 之后，应答到达"那个瞬间。
+      if (inputEl) { inputEl.value = ''; inputEl.dispatchEvent(new Event('input')); }
+      NS.composer.setDraftOptions({
+        draftId: 'draft-1',
+        agentName: 'Claude Code',
+        configOptions: composerMeta.configOptions,
+        availableCommands: composerMeta.availableCommands
+      });
+    }
+  }
+  // [CUSTOM-20260930-152] 表单抽屉（ACP elicitation / AskUserQuestion）：记录里只留一行
+  // "待回答"条，表单本体在悬浮抽屉里 —— 多题按 tab 分页、单选用下拉（选项 = 名称 + 介绍）、
+  // 可收起成一行。载荷形状照 adapter 的产物（'askUserQuestionsToCreateRequest'）：每题一个
+  // 'oneOf'/'anyOf' 字段，外加一个 '_meta' 标记的自由文本框。
+  if (location.hash.indexOf('elic') >= 0) {
+    var elicState = {
+      promptId: 'preview:1',
+      sessionId: SESSION,
+      status: 'pending',
+      message: '「导出项目」→ 生成「发布1-图文」文档，这个功能在哪个位置？',
+      fields: [
+        { name: 'question_0', kind: 'select', title: '功能位置',
+          options: [
+            { value: 'in-repo', title: '就在当前项目（ai-vibe-creator）', description: '和现有脚本放在一起，共用一套配置。' },
+            { value: 'sibling', title: '同工作区的另一个项目', description: '跨仓库引用，需要额外的依赖声明。' },
+            { value: 'elsewhere', title: '在别的目录的项目', description: '与当前工作区无关，导出时才拉取。' }
+          ] },
+        { name: 'question_0_custom', kind: 'text', title: 'Other', customFor: 'question_0' },
+        { name: 'question_1', kind: 'multi', title: '命令范围',
+          options: [
+            { value: 'new', title: 'new —— 新建文章', description: '骨架：交互式问模块/分类/标题/标签，生成带 frontmatter 的 md。' },
+            { value: 'dev', title: 'dev / build / preview', description: '起 astro dev（4311）、build（含 pagefind 索引）、preview。' },
+            { value: 'deploy', title: 'deploy —— 调阿里云部署', description: '转发到 .claude/skills/deploy-aliyun，默认 --dry-run。' }
+          ] },
+        { name: 'question_1_custom', kind: 'text', title: 'Other', customFor: 'question_1' }
+      ]
+    };
+    // [CUSTOM-20260930-153] 'real' 档：**照抄 2026-10-01 那次真机请求**（日志
+    // ~/.claude/acp-client-custom.log 里的 'elicitation/create'）—— 用来复现用户报的两个现象：
+    //   · 选项**带描述**（真 schema 里 4 个选项都有 description）；
+    //   · 那个自由文本框**没有** _meta 标记 ⇒ 宿主算不出 customFor ⇒ 它成了独立的一题
+    //     "Other"，问题块里因此看不到追加输入框（用户报的"缺少自定义内容"）。
+    if (location.hash.indexOf('real') >= 0) {
+      elicState = {
+        promptId: 'preview:real',
+        sessionId: SESSION,
+        status: 'pending',
+        message: '你说的「这个功能」指哪一个？想知道的是它在 UI 上的入口，还是它在代码里的位置？',
+        fields: [
+          { name: 'question_0', kind: 'select', title: '定位哪个',
+            options: [
+              { value: '📖 图文故事书 PDF', title: '📖 图文故事书 PDF',
+                description: '「发布1-图文」→ AI 版面设计 → HTML → PDF 的书籍版式（services/book/ 十个小模块 + 五个端点 + 预览弹层）' },
+              { value: '🗂 首页任务显示区', title: '🗂 首页任务显示区',
+                description: '首页任务显示区 + 项目类型筛选记忆（background_tasks 表 + GET /api/tasks 聚合）' },
+              { value: 'UI 上的入口位置', title: 'UI 上的入口位置',
+                description: '进入某个项目后，这个功能的入口按钮/菜单挂在界面的哪一处（我来指路或建议放哪）' },
+              { value: '代码里的所在位置', title: '代码里的所在位置',
+                description: '我先把代码链路图谱作用域内的小节读出来，告诉你它在哪些文件/分层里' }
+            ] },
+          { name: 'question_0_custom', kind: 'text', title: 'Other', customFor: 'question_0',
+            description: 'Type your own answer, or add a note to the option you chose above (optional).' }
+        ]
+      };
+    }
+    // [CUSTOM-20261001-153] 钉住大纲栏那一档：抽屉必须与输入卡**同一条中线**（用户报的"没居中"）。
+    // 输入卡的中心是"面板宽 − --acpc-aside-w"再居中，所以这一档没有它根本量不出来。
+    // 记录层：hydrate 一条 pending 的表单记录 —— 内联那行"待回答"就是它画的。
+    try {
+      NS.transcriptView.hydrate({
+        sessionId: SESSION,
+        entries: [{ id: 'preview-elic', kind: 'elicitation', at: Date.now(), elicitation: elicState }]
+      });
+    } catch (err) { failed++; console.warn('elicitation hydrate failed:', err); }
+    // 底栏先初始化：抽屉的 bottom 用的是 --acpc-composer-h（composer.ts 的观察器写的）。
+    NS.composer.init();
+    NS.elicitationView.init();
+    NS.elicitationView.setSession(SESSION);
+    NS.elicitationView.sync();
+    // [CUSTOM-20261001-153] 钉住大纲栏那一档：抽屉必须与输入卡**同一条中线**（用户报的"没居中"）。
+    // 输入卡的中心是"面板宽 − --acpc-aside-w"再居中，所以这一档没有它根本量不出来。
+    // 这里**直接写那个变量**而不是去驱动真大纲：抽屉与输入卡都只认这一个变量（CSS 的单一真相），
+    // 而本档的记录里没有 user/assistant 锚点，真大纲栏不会显示（旁栏宽度就还是 0）。
+    if (location.hash.indexOf('sidebar') >= 0) {
+      if (document.body && document.body.style) {
+        document.body.style.setProperty('--acpc-aside-w', '240px');
+      }
+    }
+    // 分档：默认第一题（单选，菜单关着）；menu 打开下拉；multi 切到第二题（多选）；
+    // shrunk 收起成一行。**不要**用 collapsed 命名 —— 那个子串会命中记录区的折叠档。
+    //
+    // ⚠️ 下拉菜单的位置在**截图**里看着不对（会盖住抽屉的标题栏），那是本脚本的已知假象：
+    // 截图模式与 dump-dom 模式的视口高度不一致（实测同一次 --window-size=1440,900，
+    // dump-dom 报 innerH=808 而截图画布是 900），而菜单是 position: fixed、按视口算坐标。
+    // **判定菜单落在哪一侧要用探针读数字**（'#elicmenuprobe' 的 menuBelowBtn / menuTopVsDrawerTop），
+    // 不要照着截图改代码 —— 我为此白改了两版规则（pitfall #31）。
+    if (location.hash.indexOf('multi') >= 0) { NS.elicitationView.selectTab(1); }
+    if (location.hash.indexOf('shrunk') >= 0) { NS.elicitationView.setCollapsed(true); }
+    // 单选那一档：点第一行（真实路径 —— 点 label 里的 radio 会触发 change）。
+    if (location.hash.indexOf('pick') >= 0) {
+      var firstRadio = document.querySelector('.elic-option-row input');
+      if (firstRadio) { firstRadio.click(); }
     }
   }
   // [CUSTOM-20260930-141] 目录过滤菜单：它挂在历史浮层内部的 .outline-head 里，而浮层原先
@@ -630,6 +742,50 @@ function driver() {
     var inputEl2 = document.getElementById('promptInput');
     var slashEl = document.getElementById('slashPopup');
     function midOf(el) { var r = el.getBoundingClientRect(); return r.left + r.width / 2; }
+    // [CUSTOM-20260930-152] 表单抽屉的实测几何：抽屉与输入卡是否同宽同中线、下拉菜单落在
+    // 按钮的哪一侧（"菜单把问题盖住了"这种事只能量，pitfall #31 —— 我一开始就是靠推断，
+    // 连试了两版规则都没生效）。
+    (function () {
+      var elicDrawerEl = document.getElementById('elicDrawer');
+      if (!elicDrawerEl || elicDrawerEl.hidden) { return; }
+      var dRect = elicDrawerEl.getBoundingClientRect();
+      var btnEl = document.querySelector('.elic-select-btn');
+      var menuEl2 = document.querySelector('.elic-menu');
+      var composerEl3 = document.getElementById('composer');
+      var cRect3 = composerEl3 ? composerEl3.getBoundingClientRect() : null;
+      var bRect = btnEl ? btnEl.getBoundingClientRect() : null;
+      var mRect = menuEl2 ? menuEl2.getBoundingClientRect() : null;
+      var innerEl = document.querySelector('.composer-inner');
+      out.push(JSON.stringify({
+        kind: 'elicitation',
+        innerW: window.innerWidth, innerH: window.innerHeight,
+        drawerW: Math.round(dRect.width), drawerCenter: Math.round(midOf(elicDrawerEl)),
+        // 验收 1：抽屉中线必须等于输入卡中线（钉住大纲栏时最容易露馅 —— 差 asideW/2）。
+        cardCenter: innerEl ? Math.round(midOf(innerEl)) : null,
+        asideVar: getComputedStyle(document.body).getPropertyValue('--acpc-aside-w').trim(),
+        drawerTop: Math.round(dRect.top), drawerBottom: Math.round(dRect.bottom),
+        composerTop: cRect3 ? Math.round(cRect3.top) : null,
+        btnBottom: bRect ? Math.round(bRect.bottom) : null,
+        // [CUSTOM-20261001-154] 单选改平铺后不再有下拉菜单；这两项改读"自拟框的落点"：
+        // 没选时应当 hidden，选了一行之后应当落在**那一行**里（用户规则 2）。
+        progress: document.querySelector('.elic-progress')
+          ? document.querySelector('.elic-progress').textContent : null,
+        customHidden: document.querySelector('.elic-custom') ? document.querySelector('.elic-custom').hidden : null,
+        customInPickedRow: (function () {
+          var rows = document.querySelectorAll('.elic-option-row');
+          for (var i = 0; i < rows.length; i++) {
+            var radio = rows[i].querySelector('input');
+            if (radio && radio.checked) { return rows[i].contains(document.querySelector('.elic-custom')); }
+          }
+          return null;
+        })(),
+        // 让位：消息区的底部留白必须把抽屉的高度也加进去（--acpc-elic-h），否则最后一条记录
+        // 会被抽屉压住 —— 同 144 对输入卡做的那件事。
+        elicVar: document.body ? document.body.style.getPropertyValue('--acpc-elic-h') : null,
+        messagesPadBottom: document.getElementById('messages')
+          ? getComputedStyle(document.getElementById('messages')).paddingBottom : null,
+      }));
+    })();
     // rail 与 jump-latest 在预览里通常都是 hidden 的（rail 由 transcriptView 的标记驱动、
     // jump-latest 由滚动位置驱动，而 hydrate 不会通知它们）。量位置之前先临时显示一下：
     // hidden 只决定"显不显示"，位置完全由 CSS（left:0 / left:50%）与**定位祖先**决定，
@@ -941,6 +1097,22 @@ const SHOTS = [
   ['#historyfilter', 'history-filter', '1440,900'],
   // [CUSTOM-20260930-143] 未连接时底栏应当整块消失。
   ['#phasedisconnected', 'phase-disconnected', '1440,900'],
+  // [CUSTOM-20260930-151] 草稿页（点「+」的新会话页）的输入卡：模式/模型/努力度三个选择器
+  // 与斜杠补全都必须出现（数据来自宿主回的 draftOptions 快照）。窄档走默认 500 看退化，
+  // 宽档显式 1440 让限宽与选择器排布显形。
+  ['#composerdraft', 'draft-narrow'],
+  ['#composerdraftwide', 'draft-wide', '1440,1000'],
+  // [CUSTOM-20260930-152] 表单抽屉：记录里的"待回答"条 + 抽屉本体（tab 分页 / 单选下拉 /
+  // 多选 / 收起成一行）。窄档看侧边栏里的退化，宽档看 tab 与选项介绍的排布。
+  ['#elic', 'elic-narrow'],
+  ['#elicmenu', 'elic-wide', '1440,900'],
+  ['#elicmulti', 'elic-multi', '1440,900'],
+  ['#elicshrunk', 'elic-shrunk'],
+  // [CUSTOM-20260930-153] 真机形状（照抄日志里那次请求）：选项带长描述、自拟框那题没有 _meta 标记。
+  ['#elicreal', 'elic-real', '1440,1000'],
+  ['#elicrealpick', 'elic-real-pick', '1440,1000'],
+  // 钉住大纲栏：抽屉与输入卡必须同一条中线（asideW/2 = 120px 的偏移就是用户看到的"没居中"）。
+  ['#elicrealsidebar', 'elic-real-sidebar', '1440,1000'],
 ];
 for (const [hash, name, size] of SHOTS) {
   const out = join(OUT_DIR, `${name}.png`);

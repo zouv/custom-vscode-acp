@@ -52,6 +52,9 @@ export const composerClient = `
   // how its text went missing (see ownerKey).
   var drafts = {};
   var draftTimer = null;
+  // [CUSTOM-20260930-151] 当前聚焦草稿上用户已选的配置项（configId → value 字符串）。
+  // 权威副本在 draft 对象上（见 setDraft）；这里只是"此刻那一个"的引用。
+  var selections = {};
 
   /**
    * Who owns what is in the textarea right now: the focused draft, or the focused
@@ -151,9 +154,16 @@ export const composerClient = `
       return;
     }
     setSendIcon(state.running);
+    // [CUSTOM-20260930-151] Pickers are inert while the create-then-send is in flight: the
+    // message already carries the choices, so a change now would only desync the label.
+    var pickerButtons = pickersEl.querySelectorAll('.picker-btn');
+    for (var i = 0; i < pickerButtons.length; i++) { pickerButtons[i].disabled = state.draftPending; }
     if (state.draft) {
-      // Say why the tab says "New session": the first message is what creates it.
-      input.placeholder = 'Your first message creates this session\\u2026';
+      // Say why the tab says "New session": the first message is what creates it. The slash
+      // list is mentioned when the host could give us one (the agent's last session's commands).
+      input.placeholder = state.commands.length > 0
+        ? 'Your first message creates this session, or / for commands\\u2026'
+        : 'Your first message creates this session\\u2026';
       return;
     }
     if (state.commands.length > 0) {
@@ -185,7 +195,12 @@ export const composerClient = `
         type: 'createDraftAndSend',
         draftId: state.draft.draftId,
         cwd: state.draft.cwd || undefined,
-        text: text
+        text: text,
+        // [CUSTOM-20260930-151] The mode/model picked on this page travels with the message
+        // that creates the session (there is nothing to configure until it exists).
+        // Read at SEND time, not at press time: a failed attempt keeps the draft, and the
+        // retry must carry the selection as it is then, not as it was.
+        configSelections: draftSelections()
       });
       refreshControls();
       return;
@@ -389,7 +404,10 @@ export const composerClient = `
     var wrap = NS.dom.el('div', 'picker');
     var btn = NS.dom.el('button', 'picker-btn');
     btn.type = 'button';
-    btn.title = option.description || option.name || option.id;
+    // [CUSTOM-20260930-151] 草稿页的选择器不是"现有会话的设置"，而是"这条消息将要创建的那个
+    // 会话的选择"——不说清楚，按钮上显示的值（来自该 agent 上一次会话）会被当成新会话已有的值。
+    var hint = option.description || option.name || option.id;
+    btn.title = state.draft ? 'For the session this message creates: ' + hint : hint;
     btn.appendChild(NS.dom.el('span', 'picker-icon', iconFor(option.category)));
     btn.appendChild(NS.dom.el('span', 'picker-label', optionLabel(option)));
     wrap.appendChild(btn);
@@ -437,6 +455,8 @@ export const composerClient = `
     item.addEventListener('click', function (event) {
       event.stopPropagation();
       closeMenus();
+      // [CUSTOM-20260930-151] A draft has no session to configure yet — see chooseDraftValue.
+      if (state.draft) { chooseDraftValue(option, value); return; }
       NS.bridge.post({
         type: 'setConfigOption',
         sessionId: state.sessionId,
@@ -560,10 +580,19 @@ export const composerClient = `
     state.running = false;
     state.loading = false;
     state.draft = draft ? { draftId: draft.draftId, cwd: draft.cwd || null } : null;
+    // [CUSTOM-20260930-151] 用户在这个草稿页上选过的配置项（configId → value），随草稿存活。
+    // 存回 boot 持有的那个 draft 对象上：切换草稿/切走再切回时它还在，而且**只有一份**
+    // （composer 只读它，pitfall #19 的"两份副本"在这里要避开）。
+    selections = draft ? (draft.selections || {}) : {};
+    if (draft) { draft.selections = selections; }
     state.draftPending = false;
     state.attachments = [];
     // No session ⇒ no 'meta' yet: mode/model/commands only arrive once the agent
     // has created the session. That is inherent to a draft, not an oversight.
+    // [CUSTOM-20260930-151] …but the panel no longer leaves it at that: the HOST keeps a
+    // snapshot of this agent's last session (config options + available commands) and
+    // 'setDraftOptions' fills these two in from it. They are the *candidates* for the
+    // session this message will create — not that session's state, which does not exist yet.
     state.commands = [];
     state.configOptions = [];
     hideSlash();
@@ -574,6 +603,96 @@ export const composerClient = `
     // previous draft's text across (and a discarded-then-reopened draft came back empty).
     restoreDraft(state.draft ? state.draft.draftId : null);
     autoGrow();
+    // [CUSTOM-20260930-151] Ask the host for the composer's options. A draft has no session,
+    // and mode/model/commands are session-scoped in ACP, so the host answers from a snapshot of
+    // this agent's LAST session ('setDraftOptions'). The request lives here rather than in boot
+    // because the component that has to render the answer is the one that knows it is missing;
+    // draftId rides along so a late answer cannot land on a different draft.
+    if (state.draft) {
+      NS.bridge.post({ type: 'listDraftOptions', draftId: state.draft.draftId });
+    }
+  }
+
+  /**
+   * [CUSTOM-20260930-151] The host answered 'listDraftOptions'.
+   *
+   * Guarded by 'draftId': the answer is asynchronous, so by the time it lands the user may have
+   * switched to another draft (or dropped this one). Applying it anyway is how a value chosen
+   * for draft A silently shows up in draft B — see pitfall #23's family.
+   */
+  function setDraftOptions(payload) {
+    if (!state.draft || state.draft.draftId !== payload.draftId) { return; }
+    state.configOptions = payload.configOptions || [];
+    state.commands = payload.availableCommands || [];
+    // The user's own picks outrank the snapshot's values: this draft may have been focused
+    // before, and the answer always arrives with the snapshot's (agent-side) current values.
+    applyDraftSelections();
+    renderPickers();
+    refreshControls();
+  }
+
+  /**
+   * [CUSTOM-20260930-151] Put the values the user already picked back onto a fresh snapshot copy.
+   *
+   * Only ids and values that the snapshot actually offers are replayed: a stale snapshot (the
+   * agent's model list changed) must not make the button label claim a value this agent no
+   * longer has — the host would then skip it silently at creation time.
+   */
+  function applyDraftSelections() {
+    for (var i = 0; i < state.configOptions.length; i++) {
+      var option = state.configOptions[i];
+      if (!Object.prototype.hasOwnProperty.call(selections, option.id)) { continue; }
+      var value = selections[option.id];
+      if (option.type === 'boolean') {
+        option.currentValue = value === 'true';
+      } else if (offersValue(option, value)) {
+        option.currentValue = value;
+      }
+    }
+  }
+
+  /** Does this select option still offer 'value'? (Both the flat and the grouped shape.) */
+  function offersValue(option, value) {
+    var options = option.options || [];
+    for (var i = 0; i < options.length; i++) {
+      var entry = options[i];
+      if (!entry) { continue; }
+      if (entry.options) {
+        for (var j = 0; j < entry.options.length; j++) {
+          if (String(entry.options[j].value) === value) { return true; }
+        }
+      } else if (String(entry.value) === value) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * [CUSTOM-20260930-151] The user picked a value on the DRAFT page: record it on the draft.
+   *
+   * Deliberately **no** 'setConfigOption' message: a draft has no sessionId, so that message
+   * would carry 'sessionId: null' and be dropped by the host's 'verifySession' guard (§5.4
+   * rule 1) — the user would have chosen something and nothing at all would happen. The choice
+   * travels with 'createDraftAndSend' instead, and the local copy's 'currentValue' is updated
+   * so the button says what it will do.
+   */
+  function chooseDraftValue(option, value) {
+    var next = option.type === 'boolean' ? (value === true || value === 'true') : String(value);
+    option.currentValue = next;
+    selections[option.id] = String(next);
+    renderPickers();
+  }
+
+  /** The draft's picked values, in protocol shape (only what the user actually touched). */
+  function draftSelections() {
+    var out = [];
+    for (var id in selections) {
+      if (Object.prototype.hasOwnProperty.call(selections, id)) {
+        out.push({ configId: id, value: selections[id] });
+      }
+    }
+    return out;
   }
 
   /** The user picked a directory for the focused draft. */
@@ -690,6 +809,7 @@ export const composerClient = `
     isComposable: isComposable,
     forgetDraft: forgetDraft,
     setDraft: setDraft,
+    setDraftOptions: setDraftOptions,
     updateDraftCwd: updateDraftCwd,
     resolveDraft: resolveDraft,
     failDraft: failDraft

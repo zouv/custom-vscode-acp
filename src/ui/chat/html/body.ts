@@ -213,6 +213,13 @@ export function body(surface: SurfaceKey = 'view'): string {
     <!-- [CUSTOM-END] CUSTOM-20260930-138 -->
   </div>
 
+  <!-- [CUSTOM-BEGIN] CUSTOM-20260930-152 - 表单抽屉（ACP elicitation / AskUserQuestion）：
+       悬浮在输入卡之上、与它同宽同中线的一个浮层。它**不在记录流里** —— 记录流只留一行
+       "待回答"条（见 client/elicitationView.ts），表单本身在这里。内容全部由 JS 生成。
+       放在覆盖层之前：它的 z-index 高于底栏、低于右键菜单与图片浮层。 -->
+  <div id="elicDrawer" class="elic-drawer" hidden></div>
+  <!-- [CUSTOM-END] CUSTOM-20260930-152 -->
+
   <!-- [CUSTOM-20260925-067] 自定义右键菜单；项由 JS 按上下文生成（见 client/contextMenu.ts）。 -->
   <div id="ctxMenu" class="ctx-menu" hidden><div class="ctx-items"></div></div>
 

@@ -1,13 +1,27 @@
 // [CUSTOM-BEGIN] CUSTOM-20260929-119 - 表单卡（ACP elicitation / AskUserQuestion）。
+// [CUSTOM-20260930-152] 从"记录流里的一张内联卡"改成**悬浮抽屉**（底部、贴在输入卡上方）：
+//   内联记录只留一行"待回答"条（点「Open form」把表单调到抽屉里）；表单本体在抽屉里，
+//   多道题按 tab 分页，单选是下拉、多选是经典勾选列表，每题都可带一个"追加/自拟"输入框。
+//   为什么改：问题多、选项带长介绍时，内联卡会把记录区撑得很长，而且它混在消息里不像
+//   "现在需要你操作"（用户 2026-09-30 报的现象）。
 //
-// 它渲染宿主送来的 `ElicitationState`：`fields` 是**已经扁平化**的字段表（宿主的
+// 数据仍然全部来自宿主送来的 `ElicitationState`：`fields` 是**已经扁平化**的字段表（宿主的
 // ElicitationBridge.fieldsOf 把 ACP 的 JSON Schema 转成可选/多选/布尔/数字/文本五种），
-// 所以这里不做任何 schema 解析，只负责画控件、收值、回传。
+// 所以这里不做任何 schema 解析，只负责画控件、收值、回传。字段的真实形状（来自 adapter
+// `askUserQuestionsToCreateRequest`）：每道题 = `question_<n>`（单选 string+oneOf / 多选
+// array+anyOf）+ `question_<n>_custom`（自由文本，`_meta` 标记指回该题 ⇒ 宿主标成 customFor）。
+// **自拟文本会取代该题所选**（adapter 的 applyAskElicitationResponse 里 custom 优先），
+// 所以那个框下面的说明必须写清真实效果，不能只说"追加"。
 //
-// 三处与权限卡（permissionView）同源的设计：
+// 四处与权限卡（permissionView）同源的设计：
 //   · 全部走 NS.dom.el / textContent —— **禁 innerHTML**（agent 可控字符串）；
 //   · 回传走 NS.bridge.postForSession —— 会话作用域，宿主放在 verifySession 守卫之后处理；
-//   · 结算后按钮禁用/隐藏，且卡上留一行"结果"说明（比"点了没反应"诚实）。
+//   · 结算后按钮禁用/隐藏，且留一行"结果"说明（比"点了没反应"诚实）；
+//   · 半填的草稿只留在 webview 里（DOM 就是表单状态），不进记录。
+//
+// **不变量（119 立的，不许破）**：记录仍是唯一真相 —— `kind:'elicitation'` 的 transcript 记录
+// 承载一切，于是 boot/focus 的全量快照天然把表单带回来，切会话 / 双 surface / 重挂载都不需要
+// 新协议或宿主改动。抽屉只是**同一份 state 的另一种呈现**，它自己不存任何真相。
 //
 // 注意：本文件是嵌在模板字符串里的客户端代码，**每个反斜杠都要写成 \\**，禁用反引号。
 // [CUSTOM-END] CUSTOM-20260929-119
@@ -18,100 +32,608 @@ export const elicitationViewClient = `
   /** What the buttons send. 'submit' = accept, 'skip' = decline, 'cancel' = cancel. */
   var ACTION_OF = { submit: 'accept', skip: 'decline', cancel: 'cancel' };
 
-  function button(cls, label, action, promptId) {
-    var btn = NS.dom.el('button', cls, label);
-    btn.type = 'button';
-    btn.setAttribute('data-elic-action', action);
-    btn.setAttribute('data-elic-id', promptId || '');
-    return btn;
+  /** The body-level floating drawer (#elicDrawer). Null in the stub DOM. */
+  var drawer = null;
+  /** The pending form the drawer is showing right now (promptId). */
+  var activeId = null;
+  /** Collapsed = the drawer is a single row (the user asked for a '^' toggle). */
+  var collapsed = false;
+  /**
+   * promptId -> true once the user collapses that form. Kept for the whole webview life
+   * (not per session switch): a form you deliberately pushed aside must not spring back
+   * every time you leave and return to the session.
+   */
+  var dismissed = {};
+  /**
+   * promptId -> the built form element. Reused so that switching between forms (or between
+   * tabs) never discards half-filled answers — the DOM *is* the form state (119).
+   */
+  var forms = {};
+  /** Index of the visible question inside the active form. */
+  var activeTab = 0;
+  /** True while an answer is in flight: the actions are disabled and say so. */
+  var sending = false;
+  /**
+   * The session whose transcript is on screen, as boot understands it.
+   *
+   * The record says WHICH forms are pending; this says WHOSE they are. Filtering on it is a
+   * direct check rather than a bet that the transcript was rebuilt on every switch — a form that
+   * belongs to another session must not be shown in this one (user report, 2026-10-01).
+   */
+  var sessionId = null;
+
+  function el(tag, cls, text) { return NS.dom.el(tag, cls, text); }
+
+  function closestAttr(node, attr) {
+    for (var n = node; n; n = n.parentNode) {
+      if (n.getAttribute && n.getAttribute(attr) !== null && n.getAttribute(attr) !== undefined) { return n; }
+    }
+    return null;
   }
 
-  function group(field) {
-    var wrap = NS.dom.el('div', 'elic-field' + (field.customFor ? ' elic-other' : ''));
-    // The question text. For a single-question AskUserQuestion the adapter carries the
-    // question in 'message' and the field has only a short 'title' (the header), so
-    // neither alone is enough: show the title when present and the description under it.
-    if (field.title) { wrap.appendChild(NS.dom.el('div', 'elic-label', field.title)); }
-    if (field.description) { wrap.appendChild(NS.dom.el('div', 'elic-help', field.description)); }
+  function inputsNamed(root, name) {
+    // Attribute-only selector, then filter: the stub DOM in src/test/chat-client.test.ts
+    // matches '[attr]' but NOT '[attr="value"]' (its selector support is deliberately minimal),
+    // and a value selector would silently match nothing there — i.e. the tests would pass
+    // against a UI that cannot find its own inputs.
+    var all = root.querySelectorAll('input[data-field]');
+    var out = [];
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].getAttribute('data-field') === name) { out.push(all[i]); }
+    }
+    return out;
+  }
+
+  /** The one element carrying this attribute value (attribute-only selector + filter). */
+  function findByAttr(root, attr, value) {
+    var all = root.querySelectorAll('[' + attr + ']');
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].getAttribute(attr) === value) { return all[i]; }
+    }
+    return null;
+  }
+
+  // --- Questions -----------------------------------------------------------
+
+  /**
+   * Group the flat field list into one entry per QUESTION.
+   *
+   * A field with 'customFor' belongs to the question it is the custom answer for (the adapter
+   * emits them adjacent, but the pairing is by name, not by position). Everything else is its
+   * own question — a bare text/number/boolean field from some other agent still gets a tab.
+   */
+  function groupsOf(state) {
+    var fields = state.fields || [];
+    var groups = [];
+    var byName = {};
+    var i;
+    for (i = 0; i < fields.length; i++) {
+      var field = fields[i];
+      if (field.customFor) { continue; }
+      var group = { field: field, extras: [] };
+      byName[field.name] = group;
+      groups.push(group);
+    }
+    for (i = 0; i < fields.length; i++) {
+      var extra = fields[i];
+      if (!extra.customFor) { continue; }
+      var parent = byName[extra.customFor];
+      if (parent) { parent.extras.push(extra); continue; }
+      // A custom field whose question is missing: show it on its own rather than dropping it.
+      groups.push({ field: extra, extras: [] });
+    }
+    return groups;
+  }
+
+  /** Is this field answered? (Answering is read from the DOM — that is where it lives.) */
+  function fieldAnswered(root, field) {
+    var inputs = inputsNamed(root, field.name);
+    for (var i = 0; i < inputs.length; i++) {
+      var input = inputs[i];
+      if (input.type === 'radio' || input.type === 'checkbox') {
+        if (!input.checked) { continue; }
+        // The "Other" row carries an empty value: picking it is a gesture, not an answer — what
+        // answers the question is the text typed in its box (which counts as its own field).
+        if (input.value === '') { continue; }
+        return true;
+      } else if (String(input.value || '').trim() !== '') {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function groupAnswered(root, group) {
+    if (fieldAnswered(root, group.field)) { return true; }
+    for (var i = 0; i < group.extras.length; i++) {
+      if (fieldAnswered(root, group.extras[i])) { return true; }
+    }
+    return false;
+  }
+
+  function answeredCount(root, state) {
+    var groups = groupsOf(state);
+    var n = 0;
+    for (var i = 0; i < groups.length; i++) { if (groupAnswered(root, groups[i])) { n++; } }
+    return n;
+  }
+
+  /** A one-line gist of the form, for the inline record row and the collapsed drawer. */
+  function gistOf(state) {
+    var text = String(state.message || '').replace(/\\s+/g, ' ').trim();
+    if (text === '') { text = 'Input needed'; }
+    return text;
+  }
+
+  // --- Controls ------------------------------------------------------------
+
+  /**
+   * A single-select field, laid out FLAT (user's 2026-10-01 revision of rule 1): one radio row per
+   * option with its title AND description, plus an "Other" row when the question has a custom box.
+   * No dropdown — a list is what the official panel shows, and it makes the descriptions readable
+   * without a second click.
+   *
+   * Still a plain radio group under the hood, so 'collect()' (which reads 'input[data-field]')
+   * keeps working unchanged and the value that travels back is exactly the same. Sibling radios
+   * are unchecked explicitly on pick: a stub DOM has no native radio-group behaviour, so being
+   * explicit is what makes both worlds agree.
+   */
+  function selectRow(field, value, title, description) {
+    var row = el('div', 'elic-option-row');
+    var label = el('label', 'elic-option');
+    var radio = document.createElement('input');
+    radio.type = 'radio';
+    radio.name = field.name;
+    radio.value = value;
+    radio.setAttribute('data-field', field.name);
+    radio.setAttribute('data-kind', 'select');
+    radio.addEventListener('change', function () { onPick(field.name, value); });
+    label.appendChild(radio);
+    var text = el('span', 'elic-option-text');
+    text.appendChild(el('span', 'elic-option-label', title));
+    if (description) { text.appendChild(el('span', 'elic-option-desc', description)); }
+    label.appendChild(text);
+    row.appendChild(label);
+    // The custom box is MOVED into the chosen row (see placeCustomBoxes) — inside the row wrapper
+    // but OUTSIDE the <label>, or clicking into the box would toggle the radio.
+    return row;
+  }
+
+  function buildSelect(field, extras) {
+    var wrap = el('div', 'elic-select');
+    var list = el('div', 'elic-options');
+    var options = field.options || [];
+    for (var i = 0; i < options.length; i++) {
+      var option = options[i];
+      list.appendChild(selectRow(field, option.value, option.title, option.description));
+    }
+    // A free-form answer is a CHOICE here, exactly like the official "Other" row: picking it means
+    // "my answer is what I type", and its radio carries the empty value (an answer the adapter
+    // drops, since a typed custom answer is what travels back).
+    if (extras.length > 0) {
+      var other = selectRow(field, '', extras[0].title || 'Other', null);
+      other.className = 'elic-option-row elic-other-row';
+      list.appendChild(other);
+    }
+    wrap.appendChild(list);
+    // Nothing is required, so a pick must be undoable: a radio cannot be unchecked by clicking it
+    // again, and the dropdown that used to offer "Clear selection" is gone.
+    var clear = el('button', 'elic-clear', 'Clear answer');
+    clear.type = 'button';
+    clear.setAttribute('data-elic-clear', field.name);
+    clear.hidden = true;
+    wrap.appendChild(clear);
     return wrap;
   }
 
-  function optionRow(field, option, type) {
-    var row = NS.dom.el('label', 'elic-option');
-    var input = document.createElement('input');
-    input.type = type;
-    input.name = field.name;
-    input.value = option.value;
-    input.setAttribute('data-field', field.name);
-    input.setAttribute('data-kind', field.kind);
-    row.appendChild(input);
-    row.appendChild(NS.dom.el('span', 'elic-option-label', option.title));
-    if (option.description) { row.appendChild(NS.dom.el('span', 'elic-option-desc', option.description)); }
-    // The SDK's option 'preview' has no structural slot in ACP, so the adapter forwards
-    // it under its own _meta key; the host passes it through and we surface it on hover.
+  /** Drop a single-select pick (back to "not answered"). */
+  function clearPick(fieldName) {
+    var form = activeId ? forms[activeId] : null;
+    var state = activeId ? formOf(activeId, pendingForms()) : null;
+    if (!form || !state) { return; }
+    var inputs = inputsNamed(form, fieldName);
+    for (var i = 0; i < inputs.length; i++) { inputs[i].checked = false; }
+    refresh(form, state);
+  }
+
+  /**
+   * Put each custom box under the row it belongs to: the SELECTED option of its question (or the
+   * "Other" row), and keep it hidden while that question has no pick.
+   *
+   * Why under the chosen row: the typed text answers THAT choice (the adapter lets it replace the
+   * option), so it should read as part of it — and it only shows up once there is something to
+   * attach it to (user's rule 2, 2026-10-01).
+   */
+  function placeCustomBoxes(root, state) {
+    var groups = groupsOf(state);
+    for (var i = 0; i < groups.length; i++) {
+      var group = groups[i];
+      if (group.field.kind !== 'select') { continue; }
+      var rows = root.querySelectorAll('.elic-option-row');
+      for (var e = 0; e < group.extras.length; e++) {
+        var box = findByAttr(root, 'data-elic-custom', group.extras[e].name);
+        if (!box) { continue; }
+        var host = null;
+        for (var r = 0; r < rows.length && !host; r++) {
+          var input = rows[r].querySelector('input');
+          if (input && input.type === 'radio' && input.checked && input.name === group.field.name) {
+            host = rows[r];
+          }
+        }
+        if (host) {
+          // appendChild MOVES the element: its typed value survives (the DOM is the form state).
+          host.appendChild(box);
+          box.hidden = false;
+        } else {
+          // Park it back in its question block (hidden) rather than detaching it: a detached node
+          // cannot be found by the next lookup, and its text would drop out of collect() too.
+          var home = findByAttr(root, 'data-elic-home', group.field.name);
+          if (home) { home.appendChild(box); }
+          box.hidden = true;
+        }
+      }
+    }
+  }
+
+  /** Pick a single-select value: exclusive by construction, then re-place the custom boxes. */
+  function onPick(fieldName, value) {
+    var form = activeId ? forms[activeId] : null;
+    var state = activeId ? formOf(activeId, pendingForms()) : null;
+    if (!form || !state) { return; }
+    var inputs = inputsNamed(form, fieldName);
+    for (var i = 0; i < inputs.length; i++) { inputs[i].checked = inputs[i].value === value; }
+    refresh(form, state);
+  }
+
+  function optionRow(field, option) {
+    var row = el('label', 'elic-option');
+    var box = document.createElement('input');
+    box.type = 'checkbox';
+    box.name = field.name;
+    box.value = option.value;
+    box.setAttribute('data-field', field.name);
+    box.setAttribute('data-kind', 'multi');
+    row.appendChild(box);
+    var text = el('span', 'elic-option-text');
+    text.appendChild(el('span', 'elic-option-label', option.title));
+    if (option.description) { text.appendChild(el('span', 'elic-option-desc', option.description)); }
+    row.appendChild(text);
     if (option.preview) { row.title = option.preview; }
     return row;
   }
 
-  function renderField(field) {
-    var wrap = group(field);
+  function buildMulti(field) {
+    var wrap = el('div', 'elic-options');
     var options = field.options || [];
-    if (field.kind === 'select') {
-      for (var i = 0; i < options.length; i++) { wrap.appendChild(optionRow(field, options[i], 'radio')); }
-      return wrap;
-    }
-    if (field.kind === 'multi') {
-      for (var j = 0; j < options.length; j++) { wrap.appendChild(optionRow(field, options[j], 'checkbox')); }
-      return wrap;
-    }
-    if (field.kind === 'boolean') {
-      var row = NS.dom.el('label', 'elic-option');
-      var box = document.createElement('input');
-      box.type = 'checkbox';
-      box.name = field.name;
-      box.setAttribute('data-field', field.name);
-      box.setAttribute('data-kind', 'boolean');
-      row.appendChild(box);
-      row.appendChild(NS.dom.el('span', 'elic-option-label', field.title || 'Yes'));
-      wrap.appendChild(row);
-      return wrap;
-    }
+    for (var i = 0; i < options.length; i++) { wrap.appendChild(optionRow(field, options[i])); }
+    return wrap;
+  }
+
+  function buildBoolean(field) {
+    var row = el('label', 'elic-option');
+    var box = document.createElement('input');
+    box.type = 'checkbox';
+    box.name = field.name;
+    box.setAttribute('data-field', field.name);
+    box.setAttribute('data-kind', 'boolean');
+    row.appendChild(box);
+    var text = el('span', 'elic-option-text');
+    text.appendChild(el('span', 'elic-option-label', field.title || 'Yes'));
+    row.appendChild(text);
+    return row;
+  }
+
+  function buildInput(field) {
+    var wrap = el('div', 'elic-input-wrap');
     var input = document.createElement('input');
     input.className = 'elic-input';
     input.type = field.kind === 'number' ? 'number' : 'text';
     input.name = field.name;
     input.setAttribute('data-field', field.name);
     input.setAttribute('data-kind', field.kind);
-    input.setAttribute('data-elic-input', '1');
     if (field.customFor) { input.placeholder = 'Type your own answer'; }
     wrap.appendChild(input);
     return wrap;
   }
 
-  /** Build the card for one form request. */
-  function render(state) {
-    var el = NS.dom.el;
-    var card = el('div', 'elic');
-    card.setAttribute('data-elic-id', state.promptId || '');
-    card.appendChild(el('div', 'elic-title', state.message || 'Input needed'));
-    var body = el('div', 'elic-body');
-    var fields = state.fields || [];
-    for (var i = 0; i < fields.length; i++) { body.appendChild(renderField(fields[i])); }
-    card.appendChild(body);
-    var actions = el('div', 'elic-actions');
-    actions.appendChild(button('elic-btn primary', 'Submit', 'submit', state.promptId));
-    actions.appendChild(button('elic-btn', 'Skip', 'skip', state.promptId));
-    actions.appendChild(button('elic-btn', 'Cancel', 'cancel', state.promptId));
-    card.appendChild(actions);
-    card.appendChild(el('div', 'elic-note'));
-    applyState(card, state);
-    return card;
+  /** The custom-answer box of one question, with the line that says what it really does. */
+  function buildCustomBox(extra, compact) {
+    var box = el('div', 'elic-custom');
+    box.setAttribute('data-elic-custom', extra.name);
+    box.hidden = true;   // shown by placeCustomBoxes once its question has a pick
+    // The honest sentence is mandatory: the adapter gives a typed answer precedence over the
+    // picked option, so calling it a mere "note" would be a lie the user only discovers from the
+    // model's reply.
+    var hint = 'If you type here, this text is used as the answer for this question \\u2014 replacing the option picked above.';
+    if (!compact) { box.appendChild(el('div', 'elic-custom-label', 'Additional input (optional)')); }
+    var wrap = buildInput(extra);
+    var input = wrap.querySelector('input');
+    if (input) {
+      input.placeholder = compact ? 'Notes or other answer\\u2026' : 'Type your own answer';
+      if (compact) { input.title = hint; }
+    }
+    box.appendChild(wrap);
+    box.appendChild(el('div', 'elic-custom-hint', hint));
+    return box;
   }
 
+  /** The block for one question: the question text, its control, and its custom box. */
+  function buildGroup(group, index) {
+    var wrap = el('div', 'elic-field');
+    wrap.setAttribute('data-elic-group', String(index));
+    var field = group.field;
+    if (field.title) { wrap.appendChild(el('div', 'elic-label', field.title)); }
+    if (field.description) { wrap.appendChild(el('div', 'elic-help', field.description)); }
+    var extras = group.extras;
+    if (field.kind === 'select') {
+      // Flat radio list (rule 1 as revised on 2026-10-01). The custom boxes start here and are
+      // MOVED under the picked row by placeCustomBoxes (hidden until there is a pick) — keeping
+      // them in the DOM is what preserves whatever the user has typed.
+      var select = buildSelect(field, extras);
+      // Where a box waits while its question has no pick (see placeCustomBoxes).
+      select.setAttribute('data-elic-home', field.name);
+      for (var e = 0; e < extras.length; e++) { select.appendChild(buildCustomBox(extras[e], true)); }
+      wrap.appendChild(select);
+    } else {
+      if (field.kind === 'multi') { wrap.appendChild(buildMulti(field)); }
+      else if (field.kind === 'boolean') { wrap.appendChild(buildBoolean(field)); }
+      else { wrap.appendChild(buildInput(field)); }
+      // Anything that is not a select keeps its custom box underneath, in full (label + hint).
+      for (var i = 0; i < extras.length; i++) { wrap.appendChild(buildCustomBox(extras[i], false)); }
+    }
+    wrap.appendChild(el('div', 'elic-unanswered', 'Not answered \\u00b7 it will not be part of the answer'));
+    return wrap;
+  }
+
+  // --- The form (shared by the drawer) -------------------------------------
+
+  function buildForm(state) {
+    var form = el('div', 'elic-form');
+    var groups = groupsOf(state);
+    // [CUSTOM-20261001-154] 标题行没了（用户要求）：tab 栏、进度与收起按钮合成一条 bar，
+    // 进度与箭头**靠右**对齐。收起来时 tab 条隐藏、只留当前题的名字 + 进度 + 箭头。
+    var bar = el('div', 'elic-bar');
+    var tabs = el('div', 'elic-tabs');
+    var panes = el('div', 'elic-panes');
+    var firstTitle = '';
+    for (var i = 0; i < groups.length; i++) {
+      var title = groups[i].field.title || ('Question ' + (i + 1));
+      if (i === 0) { firstTitle = title; }
+      var tab = el('button', 'elic-tab');
+      tab.type = 'button';
+      tab.setAttribute('data-elic-tab', String(i));
+      tab.appendChild(el('span', 'elic-tab-dot'));
+      tab.appendChild(el('span', 'elic-tab-text', title));
+      tabs.appendChild(tab);
+      panes.appendChild(buildGroup(groups[i], i));
+    }
+    bar.appendChild(el('span', 'elic-collapsed-title', firstTitle));
+    bar.appendChild(tabs);
+    bar.appendChild(el('span', 'elic-progress', ''));
+    var toggle = el('button', 'elic-toggle');
+    toggle.type = 'button';
+    toggle.setAttribute('data-elic-toggle', '1');
+    bar.appendChild(toggle);
+    form.appendChild(bar);
+    form.appendChild(panes);
+    form.appendChild(el('div', 'elic-actions'));
+    return form;
+  }
+
+  function actionsOf(form) { return form.querySelector('.elic-actions'); }
+
+  /**
+   * Update everything that is NOT an input: tab dots, per-question "not answered" hints, where the
+   * custom box goes, the progress line and the Submit label. Never rebuilds inputs — that would
+   * wipe what the user has typed (and move the caret).
+   */
+  function refreshChrome(form, state) {
+    var groups = groupsOf(state);
+    var answered = 0;
+    var panes = form.querySelectorAll('.elic-field');
+    var tabs = form.querySelectorAll('.elic-tab');
+    for (var i = 0; i < groups.length; i++) {
+      var isAnswered = groupAnswered(form, groups[i]);
+      if (isAnswered) { answered += 1; }
+      if (tabs[i]) {
+        tabs[i].className = 'elic-tab' + (isAnswered ? ' answered' : '') + (i === activeTab ? ' active' : '');
+        tabs[i].setAttribute('aria-selected', i === activeTab ? 'true' : 'false');
+      }
+      if (panes[i]) {
+        panes[i].hidden = i !== activeTab;
+        var hint = panes[i].querySelector('.elic-unanswered');
+        if (hint) { hint.hidden = isAnswered; }
+      }
+    }
+    var total = groups.length;
+    var progress = form.querySelector('.elic-progress');
+    if (progress) { progress.textContent = 'Answered ' + answered + '/' + total; }
+    var collapsedTitle = form.querySelector('.elic-collapsed-title');
+    if (collapsedTitle && groups[activeTab]) {
+      collapsedTitle.textContent = groups[activeTab].field.title || ('Question ' + (activeTab + 1));
+    }
+    // The "Clear answer" link belongs to a select that HAS a pick.
+    var clears = form.querySelectorAll('.elic-clear');
+    for (var c = 0; c < clears.length; c++) {
+      var clearName = clears[c].getAttribute('data-elic-clear');
+      var clearField = null;
+      for (var g = 0; g < groups.length; g++) {
+        if (groups[g].field.name === clearName) { clearField = groups[g].field; }
+      }
+      clears[c].hidden = !clearField || !fieldAnswered(form, clearField);
+    }
+    var submit = form.querySelector('.elic-submit');
+    if (submit) { submit.textContent = 'Submit ' + answered + '/' + total; }
+    // The custom box follows the pick — after the counts, so a move never fights the tally.
+    placeCustomBoxes(form, state);
+  }
+
+  function refresh(form, state) {
+    refreshChrome(form, state);
+  }
+
+  // --- The drawer ----------------------------------------------------------
+
+  function buildDrawer(state) {
+    if (!drawer) { return; }
+    drawer.setAttribute('data-elic-id', state.promptId || '');
+    drawer.setAttribute('data-elic-root', state.promptId || '');
+    // The same guard the inline card uses: only a PENDING form may be answered (a settled one
+    // has no buttons, but the status is what makes that a rule rather than a coincidence).
+    drawer.setAttribute('data-elic-status', 'pending');
+    NS.dom.clear(drawer);
+    // [CUSTOM-20261001-154] 没有标题行：tab、进度与收起按钮都在表单自己的 bar 上（用户要求）。
+    var form = forms[state.promptId];
+    if (!form) {
+      form = buildForm(state);
+      forms[state.promptId] = form;
+    }
+    // The action bar is rebuilt each time and lives at the bottom of the form, so the progress
+    // line and the collapse toggle stay put while the form scrolls.
+    var actions = actionsOf(form);
+    if (actions) {
+      NS.dom.clear(actions);
+      var submit = el('button', 'elic-btn primary elic-submit', 'Submit');
+      submit.type = 'button';
+      submit.setAttribute('data-elic-action', 'submit');
+      submit.setAttribute('data-elic-id', state.promptId || '');
+      var skip = el('button', 'elic-btn', 'Skip');
+      skip.type = 'button';
+      skip.setAttribute('data-elic-action', 'skip');
+      skip.setAttribute('data-elic-id', state.promptId || '');
+      skip.title = 'Skip this request (the turn continues)';
+      var cancel = el('button', 'elic-btn', 'Cancel');
+      cancel.type = 'button';
+      cancel.setAttribute('data-elic-action', 'cancel');
+      cancel.setAttribute('data-elic-id', state.promptId || '');
+      cancel.title = 'Cancel the request (the tool call is aborted)';
+      actions.appendChild(submit);
+      actions.appendChild(skip);
+      actions.appendChild(cancel);
+    }
+    drawer.appendChild(form);
+    drawer.appendChild(el('div', 'elic-note'));
+    sending = false;
+    applyCollapsed();
+    refresh(form, state);
+    applyDrawerHeight();
+  }
+
+  function applyCollapsed() {
+    if (!drawer) { return; }
+    drawer.className = 'elic-drawer' + (collapsed ? ' collapsed' : '');
+    var toggle = drawer.querySelector('.elic-toggle');
+    if (toggle) {
+      NS.dom.clear(toggle);
+      toggle.appendChild(el('span', 'elic-toggle-glyph', collapsed ? '\\u25b4' : '\\u25be'));
+      toggle.title = collapsed ? 'Expand' : 'Collapse';
+      toggle.setAttribute('aria-label', collapsed ? 'Expand' : 'Collapse');
+    }
+    if (drawer.hidden) { return; }
+    applyDrawerHeight();
+  }
+
+  function show(state) {
+    if (!drawer) { return; }
+    drawer.hidden = false;
+    buildDrawer(state);
+  }
+
+  function hide() {
+    if (!drawer) { return; }
+    drawer.hidden = true;
+    drawer.className = 'elic-drawer';
+    NS.dom.clear(drawer);
+    applyDrawerHeight();
+  }
+
+  /** Pending forms in the record, in order. The DOM holds only the focused session's records,
+   *  so this list is already session-scoped (no sessionId needed here). */
+  function pendingForms() {
+    var out = [];
+    // No focused session = nothing to answer here (a draft page, the empty state, a closed
+    // session). This is the direct half of the guard: 'setSession(null)' is what boot pushes on
+    // every path that clears the transcript.
+    if (!sessionId) { return out; }
+    if (!NS.transcriptView || !NS.transcriptView.ordered || !NS.transcriptView.entry) { return out; }
+    var ids = NS.transcriptView.ordered() || [];
+    for (var i = 0; i < ids.length; i++) {
+      var entry = NS.transcriptView.entry(ids[i]);
+      if (!entry || entry.kind !== 'elicitation') { continue; }
+      var state = entry.elicitation || {};
+      if (state.status !== 'pending' || !state.promptId) { continue; }
+      // A form for another session is not ours to show — even if it is somehow still in this
+      // transcript. (Returns to it when you switch back: the record is what remembers.)
+      if (state.sessionId && state.sessionId !== sessionId) { continue; }
+      out.push(state);
+    }
+    return out;
+  }
+
+  function formOf(promptId, list) {
+    for (var i = 0; i < list.length; i++) { if (list[i].promptId === promptId) { return list[i]; } }
+    return null;
+  }
+
+  /**
+   * Reconcile the drawer with the record. Called by boot after boot/focus and after any
+   * append/revise that carried an elicitation, so the drawer tracks the truth without the
+   * host having to know a drawer exists.
+   */
+  function sync() {
+    if (!drawer) { return; }
+    var pending = pendingForms();
+    if (pending.length === 0) { activeId = null; hide(); return; }
+    var active = formOf(activeId, pending);
+    if (!active) {
+      // Pick the first form the user has not pushed aside. All of them dismissed => stay
+      // hidden; their inline rows are the way back in.
+      for (var i = 0; i < pending.length; i++) {
+        if (!dismissed[pending[i].promptId]) { active = pending[i]; break; }
+      }
+    }
+    if (!active) { activeId = null; hide(); return; }
+    var sameForm = activeId === active.promptId && !drawer.hidden;
+    activeId = active.promptId;
+    if (sameForm) { refresh(forms[activeId], active); return; }
+    show(active);
+  }
+
+  /** Open a specific pending form (the inline row's button, or the collapsed drawer). */
+  function open(promptId) {
+    if (!drawer) { return; }
+    var pending = pendingForms();
+    var state = formOf(promptId, pending);
+    if (!state) { return; }
+    delete dismissed[promptId];
+    activeId = promptId;
+    collapsed = false;
+    show(state);
+    // An explicit open is a user action, so it MAY take the caret (an automatic one must not).
+    var first = drawer.querySelector('.elic-input, .elic-select-btn, .elic-option input');
+    if (first && first.focus) { first.focus(); }
+  }
+
+  function setCollapsed(value) {
+    collapsed = value === true;
+    if (collapsed && activeId) { dismissed[activeId] = true; }
+    if (collapsed && activeId === null) { hide(); return; }
+    applyCollapsed();
+    if (activeId) { refresh(forms[activeId], formOf(activeId, pendingForms()) || {}); }
+  }
+
+  function selectTab(index) {
+    activeTab = index;
+    var state = drawer ? formOf(activeId, pendingForms()) : null;
+    if (state) { refresh(forms[activeId], state); }
+  }
+
+  // --- Answers -------------------------------------------------------------
+
   /** Read the form's current values back out of the DOM (the DOM is the form's state). */
-  function collect(card) {
+  function collect(root) {
     var out = {};
-    var inputs = card.querySelectorAll('input[data-field]');
+    var inputs = root.querySelectorAll('input[data-field]');
     for (var i = 0; i < inputs.length; i++) {
       var input = inputs[i];
       var name = input.getAttribute('data-field');
@@ -135,14 +657,27 @@ export const elicitationViewClient = `
     return out;
   }
 
+  function noteText(status, summary) {
+    if (status === 'sent') { return 'Sending\\u2026'; }
+    if (status === 'deferred') { return 'Waiting for an answer in the dialog\\u2026'; }
+    if (status === 'accepted') { return summary ? 'Answered \\u00b7 ' + summary : 'Answered'; }
+    if (status === 'declined') { return 'Skipped'; }
+    if (status === 'cancelled') { return 'Cancelled'; }
+    return '';
+  }
+
   /**
    * Send one of the three outcomes. Called by the delegated click handler in links.ts
-   * (which is also where the permission card's buttons are wired).
+   * (which is also where the permission card's buttons are wired) with the form root —
+   * the inline record card OR the drawer.
    */
-  function answer(card, action) {
-    if (!card) { return; }
-    var promptId = card.getAttribute('data-elic-id');
+  function answer(root, action) {
+    if (!root || sending) { return; }
+    var promptId = root.getAttribute('data-elic-id');
     if (!promptId) { return; }
+    // Only a PENDING form may be answered: a settled one is history, and a deferred one belongs
+    // to the VS Code dialog (its buttons would race the open QuickPick).
+    if (root.getAttribute('data-elic-status') !== 'pending') { return; }
     var outgoingKind = ACTION_OF[action];
     if (!outgoingKind) { return; }
     var message = {
@@ -151,33 +686,190 @@ export const elicitationViewClient = `
       action: outgoingKind
     };
     // 'accept' carries the answers; the other two are decisions, not data.
-    if (outgoingKind === 'accept') { message.content = collect(card); }
+    if (outgoingKind === 'accept') { message.content = collect(root); }
+    // A second click before the host answers would send a duplicate — the bridge is idempotent,
+    // but the UI should not look like nothing happened either.
+    sending = true;
+    var actions = root.querySelector ? root.querySelector('.elic-actions') : null;
+    if (actions) {
+      var buttons = actions.querySelectorAll('button');
+      for (var i = 0; i < buttons.length; i++) { buttons[i].disabled = true; }
+    }
+    var note = root.querySelector ? root.querySelector('.elic-note') : null;
+    if (note) { note.textContent = noteText('sent'); }
     NS.bridge.postForSession(message);
   }
 
-  function noteText(status, summary) {
-    if (status === 'deferred') { return 'Waiting for an answer in the dialog\\u2026'; }
-    if (status === 'accepted') { return summary ? 'Answered \\u00b7 ' + summary : 'Answered'; }
-    if (status === 'declined') { return 'Skipped'; }
-    if (status === 'cancelled') { return 'Cancelled'; }
-    return '';
+  // --- Inline record -------------------------------------------------------
+
+  /**
+   * The record node for one elicitation entry.
+   *
+   * Pending: a single compact row — the form itself lives in the drawer, and a full card here
+   * would push the conversation around for something that is not part of it (user report).
+   * Settled/deferred: the read-only card (what was asked + what came of it), which is history.
+   */
+  function render(state) {
+    var card = el('div', 'elic');
+    fill(card, state);
+    return card;
+  }
+
+  function fill(card, state) {
+    var status = state.status || 'pending';
+    card.className = 'elic ' + status;
+    card.setAttribute('data-elic-id', state.promptId || '');
+    card.setAttribute('data-elic-root', state.promptId || '');
+    card.setAttribute('data-elic-status', status);
+    NS.dom.clear(card);
+    if (status === 'pending') {
+      var row = el('div', 'elic-pending-row');
+      row.appendChild(el('span', 'elic-pending-icon', '\\u23f3'));
+      row.appendChild(el('span', 'elic-pending-text', gistOf(state)));
+      var openBtn = el('button', 'elic-open', 'Open form');
+      openBtn.type = 'button';
+      openBtn.setAttribute('data-elic-open', state.promptId || '');
+      row.appendChild(openBtn);
+      card.appendChild(row);
+      card.appendChild(el('div', 'elic-note'));
+      return;
+    }
+    card.appendChild(el('div', 'elic-title', state.message || 'Input needed'));
+    var body = el('div', 'elic-body');
+    var fields = state.fields || [];
+    for (var i = 0; i < fields.length; i++) { body.appendChild(readOnlyField(fields[i])); }
+    card.appendChild(body);
+    card.appendChild(el('div', 'elic-note', noteText(status, state.summary)));
+  }
+
+  /** A settled form, rendered as a record: the question, the options it offered, the note. */
+  function readOnlyField(field) {
+    var wrap = el('div', 'elic-field' + (field.customFor ? ' elic-other' : ''));
+    if (field.title) { wrap.appendChild(el('div', 'elic-label', field.title)); }
+    if (field.description) { wrap.appendChild(el('div', 'elic-help', field.description)); }
+    var options = field.options || [];
+    if (options.length > 0) {
+      var list = el('div', 'elic-options');
+      for (var i = 0; i < options.length; i++) {
+        var row = el('div', 'elic-option static');
+        var text = el('span', 'elic-option-text');
+        text.appendChild(el('span', 'elic-option-label', options[i].title));
+        if (options[i].description) {
+          text.appendChild(el('span', 'elic-option-desc', options[i].description));
+        }
+        row.appendChild(text);
+        list.appendChild(row);
+      }
+      wrap.appendChild(list);
+      return wrap;
+    }
+    if (field.kind !== 'boolean') { wrap.appendChild(el('div', 'elic-help', '\\u2014')); }
+    return wrap;
   }
 
   /** Reflect the state the host sent (same contract as permissionView.applyState). */
   function applyState(card, state) {
     if (!card) { return; }
-    var status = state.status || 'pending';
-    card.className = 'elic ' + status;
-    var actions = card.querySelector('.elic-actions');
-    var note = card.querySelector('.elic-note');
-    // Only a PENDING card may be answered. A deferred one belongs to the dialog (its
-    // buttons would race the open QuickPick), a settled one is history.
-    if (actions) { actions.hidden = status !== 'pending'; }
-    var inputs = card.querySelectorAll('input');
-    for (var i = 0; i < inputs.length; i++) { inputs[i].disabled = status !== 'pending'; }
-    if (note) { note.textContent = noteText(status, state.summary); }
+    var was = card.getAttribute('data-elic-status');
+    var samePending = was === 'pending' && (state.status || 'pending') === 'pending'
+      && card.getAttribute('data-elic-id') === (state.promptId || '');
+    // A pending form that is already on screen is NOT rebuilt: the DOM holds the user's
+    // half-filled answers, and a snapshot/revise for the same prompt would wipe them (119).
+    if (samePending) { return; }
+    fill(card, state);
   }
 
-  NS.elicitationView = { render: render, applyState: applyState, answer: answer };
+  // --- Wiring --------------------------------------------------------------
+
+  function onDrawerClick(event) {
+    var target = event.target;
+    var tab = closestAttr(target, 'data-elic-tab');
+    if (tab) { selectTab(Number(tab.getAttribute('data-elic-tab'))); return; }
+    var toggle = closestAttr(target, 'data-elic-toggle');
+    if (toggle) { setCollapsed(!collapsed); return; }
+    var clear = closestAttr(target, 'data-elic-clear');
+    if (clear) { clearPick(clear.getAttribute('data-elic-clear')); return; }
+  }
+
+  /**
+   * Any input inside the form changed: re-count. Without this the tab dots, the "not answered"
+   * hints and the Submit progress would only move for the controls that go through a handler of
+   * their own (the single-select radios) and stay stale for every checkbox / text field.
+   */
+  function onDrawerChange() {
+    var state = activeId ? formOf(activeId, pendingForms()) : null;
+    if (state && forms[activeId]) { refresh(forms[activeId], state); }
+  }
+
+  function onDocumentClick(event) {
+    var openBtn = closestAttr(event.target, 'data-elic-open');
+    if (openBtn) { open(openBtn.getAttribute('data-elic-open')); }
+  }
+
+  function onDocumentKeyDown(event) {
+    if (event.key !== 'Escape') { return; }
+    // Escape COLLAPSES the drawer; it must never cancel. 'Cancel' aborts the agent's tool call,
+    // and that is not something a stray keypress may do.
+    if (drawer && !drawer.hidden && !collapsed) { setCollapsed(true); }
+  }
+
+  /**
+   * The floating drawer is a layer, so the message area has to make room for it — measured,
+   * never inferred from "what could change its height" (pitfall #27).
+   *
+   * The observer covers content-driven growth; the callers below ALSO poke it whenever THEY
+   * change the drawer (hidden ⇄ shown, expanded ⇄ collapsed), because a ResizeObserver callback
+   * is delivered at the end of a frame and is not guaranteed to run in every host (headless
+   * previews, for one) — leaving '--acpc-elic-h' at its old value would let the drawer cover the
+   * last record.
+   */
+  function applyDrawerHeight() {
+    if (!drawer || !document.body || !document.body.style || !document.body.style.setProperty) { return; }
+    document.body.style.setProperty('--acpc-elic-h', drawer.hidden ? '0px' : drawer.offsetHeight + 'px');
+  }
+
+  function watchHeight() {
+    if (!drawer || !document.body || !document.body.style || !document.body.style.setProperty) { return; }
+    applyDrawerHeight();
+    if (typeof window.ResizeObserver === 'function') {
+      var observer = new window.ResizeObserver(applyDrawerHeight);
+      observer.observe(drawer);
+    } else {
+      window.addEventListener('resize', applyDrawerHeight);
+    }
+  }
+
+  function init() {
+    // Idempotent: boot wires this once, but the preview harness and any future second caller
+    // must not end up with two sets of listeners on the same element.
+    var found = NS.dom.qs('elicDrawer');
+    if (!found || drawer) { return; }
+    drawer = found;
+    drawer.addEventListener('click', onDrawerClick);
+    drawer.addEventListener('change', onDrawerChange);
+    drawer.addEventListener('input', onDrawerChange);
+    document.addEventListener('click', onDocumentClick);
+    document.addEventListener('keydown', onDocumentKeyDown);
+    watchHeight();
+  }
+
+  /** Tell the drawer which session is on screen (boot calls this on every focus change). */
+  function setSession(id) {
+    sessionId = id || null;
+  }
+
+  NS.elicitationView = {
+    init: init,
+    setSession: setSession,
+    render: render,
+    applyState: applyState,
+    answer: answer,
+    sync: sync,
+    open: open,
+    setCollapsed: setCollapsed,
+    selectTab: selectTab,
+    groupsOf: groupsOf,
+    collect: collect
+  };
 })(window.__acpc = window.__acpc || {});
 `;

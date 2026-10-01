@@ -137,7 +137,11 @@ export const linksClient = `
       if (elicBtn) {
         event.preventDefault();
         if (elicBtn.disabled) { return; }
-        var elicCard = target.closest ? target.closest('.elic') : null;
+        // [CUSTOM-20260930-152] 表单有两处宿主：记录里的内联条（.elic）与悬浮抽屉
+        // （.elic-drawer）。两者都带 data-elic-id，收集值的活仍是 elicitationView 的。
+        var elicCard = target.closest
+          ? (target.closest('.elic') || target.closest('.elic-drawer'))
+          : null;
         NS.elicitationView.answer(elicCard, elicBtn.getAttribute('data-elic-action'));
         return;
       }

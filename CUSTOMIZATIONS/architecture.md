@@ -160,11 +160,12 @@ webview→扩展消息类型（**按"要不要带 sessionId"分组——这正�
 - **非会话作用域**（按设计**不带** `sessionId`，必须在守卫**之前**处理，否则被静默丢弃）：
   `ready` / `newSession` / `focusAgent` / `renderMarkdown` / `copy` / `openLink` / `executeCommand`、
   `connectAgent` / `listHistory` / `openHistorySession`(032/033)、`clientLog`(029)、
-  `listDirectoryChoices` / `pickDirectory` / `createDraftAndSend`(058)、`supplementHistory`(095)。
+  `listDirectoryChoices` / `pickDirectory` / `createDraftAndSend`(058)、`listDraftOptions`(151)、
+  `supplementHistory`(095)。
 
 扩展→webview 消息类型：`boot`/`focus`/`sessionsChanged`/`sessionClosed`/`append`/`revise`/`toolUpdate`/
 `markdownRendered`/`meta`/`attachments`/`error`/`history`(033)/`historySupplement`(095)/`directoryChoices`/`directoryPicked`/
-`draftResolved`/`draftFailed`(058)。**定向 vs 广播**：`boot` 与 058 那四条**定向**（只回发起请求的那个面，
+`draftResolved`/`draftFailed`(058)/`draftOptions`(151)。**定向 vs 广播**：`boot` 与 058/151 那几条**定向**（只回发起请求的那个面，
 058 的是"某个文档正在编辑的草稿"），其余广播——见 §5.7。
 
 **旧面板的历史协议**（仅 `LegacyPanelAdapter` 使用，勿与新协议混用）：
