@@ -435,8 +435,10 @@ export function styles(): string {
        （中途试过"只在贴底那一刻让位"的条件式，那会让未到底的内容被卡片切断 —— 方向是错的，
        而且它还要在 scroll.ts 里维护"切类 + 位置补偿"，白白多出三个坑。）
        高度随输入框在 1 行与多行之间变化，由 composer.ts 的 ResizeObserver 写进
-       --acpc-composer-h（pitfall #27：别去列"什么会让它变高"）。 */
-    padding-bottom: calc(24px + var(--acpc-composer-h, 0px));
+       --acpc-composer-h（pitfall #27：别去列"什么会让它变高"）。
+       [CUSTOM-20260930-152] 表单抽屉（.elic-drawer）也浮在底栏之上，同一个道理再加一段：
+       --acpc-elic-h 由 elicitationView.ts 的观察器写（收起成一行时它自己会变小）。 */
+    padding-bottom: calc(24px + var(--acpc-composer-h, 0px) + var(--acpc-elic-h, 0px));
     display: flex;
     flex-direction: column;
     /* 间距交给下面的阶梯控制。统一 gap 会让「同属一组的连续推理」和「跨类型的独立块」
@@ -558,9 +560,10 @@ export function styles(): string {
   .messages > [data-kind="content"] + [data-kind="content"] { margin-top: 2px; }
   .messages > [data-kind="user"] { margin-top: 16px; }
   .jump-latest {
-    /* [CUSTOM-20260930-140] 底栏浮在面板底部，这个按钮要跟着抬起来，否则会被输入卡盖住。 */
+    /* [CUSTOM-20260930-140] 底栏浮在面板底部，这个按钮要跟着抬起来，否则会被输入卡盖住。
+       [CUSTOM-20260930-152] 表单抽屉也浮在同一处，所以再抬一段（同 --acpc-composer-h 的写法）。 */
     position: absolute; left: 50%; transform: translateX(-50%);
-    bottom: calc(12px + var(--acpc-composer-h, 0px));
+    bottom: calc(12px + var(--acpc-composer-h, 0px) + var(--acpc-elic-h, 0px));
     padding: 3px 10px; border-radius: 12px; cursor: pointer;
     background: var(--vscode-button-background); color: var(--vscode-button-foreground);
     border: none; font-family: inherit; font-size: 0.9em;
@@ -748,9 +751,15 @@ export function styles(): string {
   .rec-icon svg { display: block; }
   .tool-icon { flex: 0 0 auto; display: inline-flex; align-items: center; opacity: 0.7; }
   .tool-icon svg { display: block; }
-  /* --- Form card: ACP elicitation / AskUserQuestion (CUSTOM-20260929-119) ----
+  /* --- Form: ACP elicitation / AskUserQuestion (CUSTOM-20260929-119, 152 改悬浮抽屉) ----
      与权限卡同一族观感（它也是**阻塞的**：agent 在等到答复前不会继续），但内容是一张表单，
-     所以用的是 VS Code 的输入控件配色，而不是自造一套。 */
+     所以用的是 VS Code 的输入控件配色，而不是自造一套。
+
+     [152] 分成两层：
+       · 记录层（.elic）：内联的一条记录。pending 时**只有一行**"待回答"（表单本体在抽屉里，
+         内联卡会把记录区撑长、也不像"现在需要你操作"）；结算后是只读的问答摘要（历史）。
+       · 抽屉层（.elic-drawer，body 级浮层）：贴在输入卡之上、与它同宽同中线。多道题按 tab
+         分页，题内控件见下面的 .elic-select / .elic-option / .elic-input。 */
   .entry-elicitation { align-self: stretch; }
   .elic {
     border: 1px solid var(--vscode-inputValidation-infoBorder, var(--vscode-panel-border));
@@ -773,7 +782,9 @@ export function styles(): string {
   .elic-label { font-size: 0.9em; color: var(--vscode-descriptionForeground); }
   .elic-help { font-size: 0.92em; word-break: break-word; }
   .elic-option { display: flex; align-items: baseline; gap: 6px; cursor: pointer; }
+  .elic-option.static { cursor: default; }
   .elic-option input { flex: none; margin: 0; }
+  .elic-option-text { display: flex; flex-direction: column; }
   .elic-option-label { font-size: 0.95em; }
   .elic-option-desc { font-size: 0.88em; color: var(--vscode-descriptionForeground); }
   .elic-input {
@@ -796,6 +807,114 @@ export function styles(): string {
   .elic-btn:disabled { cursor: default; opacity: 0.5; }
   .elic-note { font-size: 0.88em; color: var(--vscode-descriptionForeground); }
   .elic-note:empty { display: none; }
+
+  /* --- [CUSTOM-20260930-152] 记录里的"待回答"条 --------------------------- */
+  .elic-pending-row { display: flex; align-items: center; gap: 6px; }
+  .elic-pending-icon { flex: none; font-size: 0.95em; }
+  .elic-pending-text {
+    flex: 1; min-width: 0; font-size: 0.92em;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .elic-open {
+    flex: none; font-family: inherit; font-size: 0.88em; padding: 2px 8px;
+    border-radius: 3px; cursor: pointer;
+    background: var(--vscode-button-background); color: var(--vscode-button-foreground);
+    border: 1px solid var(--vscode-button-border, transparent);
+  }
+  .elic-open:hover { background: var(--vscode-button-hoverBackground); }
+
+  /* --- [CUSTOM-20260930-152] 抽屉 ---------------------------------------- */
+  /* 定位：与输入卡**同一套居中规则**（用户 2026-10-01 报"没居中"）。输入卡的中心不是面板中心：
+     '.composer-main' 是"面板宽 − 预留功能区（--acpc-aside-w，钉住大纲栏时 240px）"，卡片在它
+     里面居中 —— 所以抽屉的包含块必须用 right 把那一段让出来，否则钉住大纲时抽屉会整体右移
+     asideW/2（实测差 ~120px）。'.composer-main' 的 padding-inline: 8px 用 '100% - 16px' 对齐。
+     **不要**用 transform 居中 —— 抽屉里的下拉菜单是 position: fixed，transform 会让它变成
+     "相对该元素"定位。bottom 跟着 --acpc-composer-h：浮层叠在底栏之上，两者一起由消息区的
+     留白让位。 */
+  .elic-drawer {
+    position: fixed; left: 0; right: var(--acpc-aside-w, 0px); margin: 0 auto;
+    bottom: var(--acpc-composer-h, 0px);
+    width: min(100% - 16px, var(--acpc-composer-max, 720px));
+    max-height: min(70vh, 560px);
+    z-index: 9;                       /* 高于底栏（8），低于右键菜单（60）与图片浮层（90） */
+    display: flex; flex-direction: column;
+    background: var(--vscode-editor-background);
+    border: 1px solid var(--vscode-inputValidation-infoBorder, var(--vscode-panel-border));
+    border-radius: 8px;
+    box-shadow: 0 -2px 14px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.35));
+  }
+  .elic-drawer[hidden] { display: none; }
+  /* [CUSTOM-20261001-154] 抽屉的头部行没了：tab 条、进度与收起箭头合成一条 bar，
+     进度与箭头靠右（用户要求）。收起时 tab 条让位给当前题的名字。 */
+  .elic-bar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 2px 8px 0 10px; border-bottom: 1px solid var(--vscode-panel-border);
+  }
+  .elic-progress { flex: none; font-size: 0.85em; color: var(--vscode-descriptionForeground); }
+  .elic-collapsed-title {
+    display: none; flex: 1; min-width: 0; font-size: 0.92em; font-weight: 600;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .elic-toggle {
+    flex: none; width: 22px; height: 20px; padding: 0; cursor: pointer;
+    background: transparent; border: none; color: inherit; font-family: inherit;
+    font-size: 0.8em; line-height: 1;
+  }
+  .elic-toggle:hover { background: var(--vscode-toolbar-hoverBackground, transparent); border-radius: 3px; }
+  /* 收起态 = 只剩 bar 这一行（用户要的"^ 收成一行"）：正文与操作栏都藏起来，
+     tab 条换成当前题的名字。 */
+  .elic-drawer.collapsed .elic-note { display: none; }
+  .elic-drawer.collapsed .elic-panes { display: none; }
+  .elic-drawer.collapsed .elic-actions { display: none; }
+  .elic-drawer.collapsed .elic-tabs { display: none; }
+  .elic-drawer.collapsed .elic-collapsed-title { display: block; }
+  .elic-form { display: flex; flex-direction: column; min-height: 0; }
+  /* 操作栏与结果说明固定在抽屉底部（表单区自己滚，按钮不跟着滚走）。 */
+  .elic-drawer .elic-actions { padding: 8px 10px; border-top: 1px solid var(--vscode-panel-border); }
+  .elic-drawer .elic-note { padding: 0 10px 8px; }
+  .elic-tabs {
+    display: flex; flex-wrap: wrap; gap: 2px; flex: 1; min-width: 0;
+  }
+  .elic-tab {
+    display: flex; align-items: center; gap: 5px; max-width: 100%;
+    font-family: inherit; font-size: 0.88em; padding: 3px 8px; cursor: pointer;
+    background: transparent; color: var(--vscode-descriptionForeground);
+    border: none; border-bottom: 2px solid transparent;
+  }
+  .elic-tab.active { color: var(--vscode-foreground); border-bottom-color: var(--vscode-focusBorder); }
+  .elic-tab-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .elic-tab-dot {
+    flex: none; width: 6px; height: 6px; border-radius: 50%;
+    background: var(--vscode-descriptionForeground); opacity: 0.5;
+  }
+  .elic-tab.answered .elic-tab-dot { background: var(--vscode-charts-green, #89d185); opacity: 1; }
+  /* 表单区可滚动（表单可以很长）。 */
+  .elic-panes { padding: 10px; overflow-y: auto; min-height: 0; }
+  .elic-panes .elic-field[hidden] { display: none; }
+  .elic-unanswered { font-size: 0.85em; color: var(--vscode-descriptionForeground); opacity: 0.85; }
+  .elic-unanswered[hidden] { display: none; }
+  .elic-custom-label {
+    margin-top: 4px; font-size: 0.88em; color: var(--vscode-descriptionForeground);
+  }
+  .elic-custom-hint { font-size: 0.82em; color: var(--vscode-descriptionForeground); opacity: 0.85; }
+  /* [CUSTOM-20261001-154] 自拟框：跟着**被选中的那一行**走（默认藏着，选了才出现）。 */
+  .elic-custom { display: flex; flex-direction: column; gap: 3px; margin: 4px 0 2px 22px; }
+  .elic-custom[hidden] { display: none; }
+  /* 单选改成平铺的 radio 列表（用户 2026-10-01 的修改）：每行 = 主标题 + 副标题（说明），
+     自拟框插在选中行的下面（见 .elic-custom 的 margin-left 缩进）。 */
+  .elic-option-row { display: flex; flex-direction: column; }
+  .elic-option-row + .elic-option-row { margin-top: 6px; }
+  .elic-option-row .elic-option { align-items: flex-start; }
+  .elic-option-row .elic-option input { margin-top: 2px; }
+  .elic-option-row .elic-option-desc { margin-top: 1px; }
+  .elic-option-row.elic-other-row .elic-option-label { color: var(--vscode-descriptionForeground); }
+  .elic-clear {
+    align-self: flex-start; margin-top: 4px; padding: 0;
+    font-family: inherit; font-size: 0.82em; cursor: pointer;
+    background: transparent; border: none; color: var(--vscode-textLink-foreground, var(--vscode-descriptionForeground));
+    text-decoration: underline;
+  }
+  .elic-clear[hidden] { display: none; }
 
   /* --- Permission card (CUSTOM-20260924-020) --------------------------- */
   /* 面板内的权限请求卡：替代窗口级 QuickPick。配色故意用 warn 边框而不是普通卡片，

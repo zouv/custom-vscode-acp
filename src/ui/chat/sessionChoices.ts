@@ -93,8 +93,33 @@ export function choiceSnapshotFromState(
   };
 }
 
-/** Snapshot after applying a `config_option_update` / `current_mode_update` payload. */
-export function choiceSnapshotPatched(
+/**
+ * [CUSTOM-20260930-151] 一个 select 型配置项**现在**提供的全部取值（含分组形态）。
+ *
+ * 用途：草稿页把用户选的模式/模型带到新建的会话上，而下发前必须确认"这个值现在还认不认"——
+ * 快照可能来自 agent 的旧版本（模型列表换了、选项改名了）。对不上就跳过：一个陈旧的选择不该
+ * 变成一条 agent 会拒绝的请求，更不该让整条"创建会话并发送"失败。
+ *
+ * 客户端 `composer.ts` 的 `optionLabel` / `renderMenu` 有同一套 `entry.options ?? entry.value`
+ * 遍历（**跨构建边界，代码无法共享**，pitfall #19 的既定形态）；这里只取 value，不做标签映射。
+ */
+export function selectValues(option: SessionConfigOption): string[] {
+  const out: string[] = [];
+  const entries = (option as { options?: unknown }).options;
+  if (!Array.isArray(entries)) { return out; }
+  for (const entry of entries as Array<{ value?: unknown; options?: unknown }>) {
+    if (Array.isArray(entry?.options)) {
+      for (const grouped of entry.options as Array<{ value?: unknown }>) {
+        if (grouped?.value !== undefined) { out.push(String(grouped.value)); }
+      }
+    } else if (entry?.value !== undefined) {
+      out.push(String(entry.value));
+    }
+  }
+  return out;
+}
+
+/** Snapshot after applying a `config_option_update` / `current_mode_update` payload. */export function choiceSnapshotPatched(
   previous: ChoiceSnapshot,
   patch: { modeId?: string | null; configOptions?: SessionConfigOption[] | null },
 ): ChoiceSnapshot {

@@ -13,7 +13,7 @@
 // [CUSTOM-END] CUSTOM-20260923-011
 import * as vscode from 'vscode';
 
-import type { ContentBlock, SessionNotification } from '@agentclientprotocol/sdk';
+import type { ContentBlock, SessionConfigOption, SessionNotification } from '@agentclientprotocol/sdk';
 
 import type { SessionManager, SessionInfo } from '../../core/SessionManager';
 import type { SessionUpdateHandler, SessionUpdateListener } from '../../handlers/SessionUpdateHandler';
@@ -56,6 +56,7 @@ import {
   choiceChanges,
   choiceSnapshotFromState,
   choiceSnapshotPatched,
+  selectValues,
   type ChoiceSnapshot,
 } from './sessionChoices';
 // [CUSTOM-20260926-079] The history picker's directory filter: `directoryKey` /
@@ -87,6 +88,21 @@ const STRUCTURAL_MESSAGE_TYPES: ReadonlySet<string> = new Set([
 
 /** [CUSTOM-20260926-077] globalState key for the outline pin/width prefs. */
 const UI_PREFS_KEY = 'acpc.outlinePrefs.v1';
+
+// [CUSTOM-BEGIN] CUSTOM-20260930-151 - 草稿页的配置项/命令快照，按 agent 存。
+// 为什么要持久化：VS Code 重载后宿主内存里的活动会话**全没了**，而"全新窗口点 + 时输入卡
+// 还是只有输入框"正是用户报的那个现象——只存内存等于默认路径上不生效。
+const DRAFT_OPTIONS_KEY = 'acpc.draftOptions.v1';
+
+/** One agent's last-seen composer options (see ChatPanelHost.rememberAgentOptions). */
+interface AgentOptionSnapshot {
+  configOptions: SessionConfigOption[];
+  availableCommands: SessionMeta['availableCommands'];
+}
+
+/** The persisted shape: agent name → snapshot. */
+type DraftOptionsStore = Record<string, AgentOptionSnapshot>;
+// [CUSTOM-END] CUSTOM-20260930-151
 
 /**
  * [CUSTOM-20260930-125] The setting behind the start card's auto-connect switch.
@@ -149,6 +165,9 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
   private focused: PanelContext = { agentName: null, sessionId: null };
   /** [CUSTOM-20260926-077] Outline pin/width prefs, cached from globalState. */
   private uiPrefs: UiPrefs | null = null;
+  // [CUSTOM-20260930-151] agent → 它最后一次会话的配置项/命令快照（草稿页拿它渲染输入卡）。
+  // 只由 rememberAgentOptions 写；**不是**可写状态——用户真正生效的那份永远在 SessionManager。
+  private readonly draftOptions: Map<string, AgentOptionSnapshot> = new Map();
 
   // [CUSTOM-BEGIN] CUSTOM-20260924-022 - 合帧队列 + 标签栏快照签名（见 refreshSessions）。
   private readonly outbox: Outbox;
@@ -180,6 +199,16 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
   ) {
     this.sessionUpdateHandler = sessionUpdateHandler;
     this.uiPrefs = this.globalState?.get<UiPrefs>(UI_PREFS_KEY) ?? null;
+    // [CUSTOM-20260930-151] 草稿页的配置项/命令快照（重载窗口后仍可用）。
+    const storedOptions = this.globalState?.get<DraftOptionsStore>(DRAFT_OPTIONS_KEY) ?? {};
+    for (const agentName of Object.keys(storedOptions)) {
+      const snapshot = storedOptions[agentName];
+      if (!snapshot) { continue; }
+      this.draftOptions.set(agentName, {
+        configOptions: snapshot.configOptions ?? [],
+        availableCommands: snapshot.availableCommands ?? [],
+      });
+    }
     // The host IS the permission presenter for the modern panel: no other
     // object knows whether a surface is on screen and which session is focused.
     this.permissionBridge?.setPresenter(this);
@@ -198,7 +227,12 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       this.subscriptions.push({ dispose: () => this.sessionManager.off(event, handler) });
     };
 
-    on('session-created', refresh);
+    on('session-created', (sessionId: string) => {
+      // [CUSTOM-20260930-151] 会话一建好就把它的配置项/命令收进草稿页快照——下一次点「+」用的
+      // 就是这一份。
+      this.rememberAgentOptions(sessionId);
+      refresh();
+    });
     on('session-closed', (sessionId: string, _agentName: string, reason: CloseReason) => {
       // Release everything keyed by this session, then tell the client so a
       // closed tab disappears immediately rather than waiting for the focus
@@ -234,6 +268,10 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       // which silently mutes the screen reader. (Found by
       // src/test/chat-panel.test.ts against a real captured replay.)
       this.finalizeEntries(sessionId);
+      // [CUSTOM-20260930-151] `loadSession` 把 configOptions 写进 placeholder 是在
+      // `session-created` **之后**（而且不走 applyConfigOptions）—— 不在这儿再记一次的话，
+      // 打开一个历史会话会把草稿页快照的配置项清成空，用户点「+」就又看不到模式/模型了。
+      this.rememberAgentOptions(sessionId);
       refresh();
     });
     on('active-session-changed', (sessionId: string | null, agentName: string | null) => {
@@ -246,6 +284,17 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       this.pushFocus();
       this.refreshSessions();
     });
+
+    // [CUSTOM-20260930-151] 配置项 / 可用命令一变就刷新草稿页快照。挂在 SessionManager 的
+    // 事件上而不是 pushMeta 里：pushMeta 在"没有 surface attach"或"不是聚焦会话"时会提前
+    // return，后台会话的变化就进不了快照——而那正是下一次草稿页要用的那份。
+    //
+    // 隐藏依赖（查过才敢写）：这两个事件之所以会响，是因为**旧面板**（ChatWebviewProvider）
+    // 的 listener 调用了 `applyConfigOptions` / `applyAvailableCommands`，而它是这两者的唯一
+    // 调用者（ChatWebviewProvider.ts:132/138；新版子系统的斜杠命令本来就靠它）。哪天旧面板改成
+    // 惰性创建，快照会**静默停止更新**（现代面板的斜杠补全也会一起坏）。
+    on('config-options-changed', (sessionId: string) => this.rememberAgentOptions(sessionId));
+    on('available-commands-changed', (sessionId: string) => this.rememberAgentOptions(sessionId));
 
     // [CUSTOM-20260930-125] 本仓库第一次用 onDidChangeConfiguration。理由不是"同步方便"：
     // 面板把这个配置项**渲染成了一个控件**，控件显示过期值就是在撒谎（与 pitfalls #29 同族）。
@@ -471,6 +520,16 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
           (msg as { agentName?: string }).agentName,
           (msg as { cwd?: string }).cwd,
           (msg as { text?: string }).text ?? '',
+          (msg as { configSelections?: Array<{ configId: string; value: string }> }).configSelections ?? [],
+          from,
+        );
+        return;
+      // [CUSTOM-20260930-151] 草稿页的输入卡该显示什么（模式/模型/命令）。同区、同样不带
+      // sessionId —— 放守卫之后会被静默丢弃（§5.4 规则二）。
+      case 'listDraftOptions':
+        this.handleListDraftOptions(
+          (msg as { agentName?: string }).agentName,
+          (msg as { draftId?: string }).draftId ?? '',
           from,
         );
         return;
@@ -1735,6 +1794,67 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
   /** How many recent directories the picker offers (keeps the drawer scannable). */
   private static readonly MAX_RECENT_DIRECTORIES = 8;
 
+  // [CUSTOM-BEGIN] CUSTOM-20260930-151 - 草稿页的输入卡要"显示完整"（模式/模型/命令）。
+  // 数据只能来自**该 agent 上一次会话**：模式/模型/可用命令在 ACP 里都是会话级的，而
+  // `session/new` 没有 mode/model 入参（已核对 SDK 的 NewSessionRequest），草稿又还没有会话。
+  // 所以这里按 agent 留一份"上次见到的快照"，草稿页拿它渲染、创建会话时再逐项校验后应用。
+  /**
+   * 记下某个会话当前的配置项与可用命令，作为该 agent 的草稿页快照。
+   *
+   * 调用点都挂在 SessionManager 的事件上（session-created / session-load-end /
+   * config-options-changed / available-commands-changed），**不**挂 pushMeta —— 那个在
+   * "没 surface attach"或"不是聚焦会话"时提前 return，后台会话的变化就进不来（而那正是下次
+   * 点「+」要用的那份）。
+   *
+   * **空值不覆盖**：三条创建路径的时序并不一致，`[]` 常常只表示"这条路径还没填"而不是"这个
+   * agent 没有"：
+   *   · `loadSession` 在建好 placeholder 后才把 `configOptions` 写回去（`session-created`
+   *     早于它，且不走 `applyConfigOptions`）—— 所以这里还额外订阅了 `session-load-end`；
+   *   · `resumeSession` 的 `availableCommands` 恒为 `[]`（不重放），会把上一次好快照里的
+   *     斜杠命令**清空**。
+   * 一个陈旧的选项列表是无害的（应用时会逐项校验后跳过），而"快照退化"会让草稿页又变得不完整
+   * —— 那正是这个功能要修的东西。空数组的代价则只是显示一个用不上、用不上就跳过的选项。
+   */
+  private rememberAgentOptions(sessionId: string): void {
+    const session = sessionOf(this.sessionManager, sessionId);
+    if (!session) { return; }
+    const previous = this.draftOptions.get(session.agentName);
+    const configOptions = session.configOptions ?? [];
+    const availableCommands = wireCommands(session);
+    const next: AgentOptionSnapshot = {
+      configOptions: configOptions.length > 0 ? configOptions : (previous?.configOptions ?? []),
+      availableCommands: availableCommands.length > 0 ? availableCommands : (previous?.availableCommands ?? []),
+    };
+    const signature = JSON.stringify(next);
+    if (previous && JSON.stringify(previous) === signature) { return; }
+    this.draftOptions.set(session.agentName, next);
+    // globalState 只在真的变了才写：这个函数会跟着会话的每一次配置项变化跑。
+    const store: DraftOptionsStore = {};
+    for (const [agentName, snapshot] of this.draftOptions) { store[agentName] = snapshot; }
+    void this.globalState?.update(DRAFT_OPTIONS_KEY, store);
+    log(`${LOG_PREFIX}: draft options for ${session.agentName}: ${next.configOptions.length} option(s), ${next.availableCommands.length} command(s)`);
+  }
+
+  /**
+   * [CUSTOM-20260930-151] 草稿页问"这个 agent 的输入卡该显示什么"。
+   *
+   * 必须**无条件回话**（哪怕是空的）：客户端要靠这条应答才把选择器/斜杠列表布置好，让它在
+   * 没有快照时静默等，正是 pitfalls #29 的形态（"效果上没变化 ≠ 可以不回话"）。
+   * 定向发给发起请求的那个面，理由同 058 那四条：这是"某个文档正在编辑的草稿"。
+   */
+  private handleListDraftOptions(agentName: string | undefined, draftId: string, to: SurfaceKey): void {
+    const agent = this.panelAgent(agentName);
+    const snapshot = agent ? this.draftOptions.get(agent) : undefined;
+    this.post({
+      type: 'draftOptions',
+      draftId,
+      agentName: agent,
+      configOptions: snapshot?.configOptions ?? [],
+      availableCommands: snapshot?.availableCommands ?? [],
+    }, to);
+  }
+  // [CUSTOM-END] CUSTOM-20260930-151
+
   /**
    * [CUSTOM-20260925-058] Candidate directories for the draft page.
    *
@@ -1820,6 +1940,7 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
     agentName: string | undefined,
     cwd: string | undefined,
     text: string,
+    selections: Array<{ configId: string; value: string }>,
     to: SurfaceKey,
   ): Promise<void> {
     const agent = this.panelAgent(agentName);
@@ -1840,10 +1961,73 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       // whole turn (it is what carries the stop reason back), and the client must
       // be able to swap its draft tab for the real one immediately.
       this.post({ type: 'draftResolved', draftId, sessionId: session.sessionId }, to);
+      // [CUSTOM-20260930-151] 草稿页上选过的模式/模型只能在这里落到会话上（会话存在之前没有
+      // 地方可下发），而且必须在首条消息**之前**——第一轮就该跑在用户选的设置上。
+      await this.applyDraftSelections(session, selections);
       void this.handleSendPrompt(session.sessionId, text)
         .catch(e => this.reportError(session.sessionId, e));
     } catch (e: any) {
       this.post({ type: 'draftFailed', draftId, message: e?.message ?? String(e) }, to);
+    }
+  }
+
+  /**
+   * [CUSTOM-20260930-151] 把草稿页选好的配置项应用到刚建出来的这个会话上。
+   *
+   * 三道闸门，缺一不可：
+   *   · 按**新会话**的 configOptions 校验（id 存在 + 取值仍在候选里）——快照可能来自 agent
+   *     的旧版本，这正是"陈旧无害"这句话兑现的地方；
+   *   · 与当前值相同的直接跳过：省一次往返，也少一次让 agent 推通知的机会；
+   *   · 单项失败**不阻断**首条消息（一个坏值不该让用户发不出话），但也不许静默（pitfalls #29）：
+   *     记日志 + 在记录区留一行，否则用户只会看到选择器自己弹回默认值。
+   */
+  private async applyDraftSelections(
+    session: SessionInfo,
+    selections: Array<{ configId: string; value: string }>,
+  ): Promise<void> {
+    if (selections.length === 0) { return; }
+    // 记录区可能还没有这个会话的桶：`ensureSession` 平时由 `onSessionUpdate` 负责，而这里跑的时候
+    // 首条消息还没发出去。少了这一句，下面那条"没能应用"的提示会被 `append` **静默丢掉**
+    // （没有桶就返回 null）—— 正好复现它要避免的那个坑（这条是测试发现的）。
+    this.transcripts.ensureSession(session.sessionId, session.agentName);
+    const options = session.configOptions ?? [];
+    let applied = 0;
+    for (const { configId, value } of selections) {
+      const option = options.find(o => o.id === configId);
+      if (!option) {
+        log(`${LOG_PREFIX}: draft selection ${configId} is not offered by session ${session.sessionId}; skipped`);
+        continue;
+      }
+      if (String((option as { currentValue?: unknown }).currentValue) === value) { continue; }
+      const valid = option.type === 'boolean'
+        ? value === 'true' || value === 'false'
+        : selectValues(option).includes(value);
+      if (!valid) {
+        log(`${LOG_PREFIX}: draft selection ${configId}=${value} is no longer a valid value; skipped`);
+        continue;
+      }
+      try {
+        await this.sessionManager.setConfigOption(session.sessionId, configId, value);
+        applied += 1;
+      } catch (e: any) {
+        const message = e?.message ?? String(e);
+        log(`${LOG_PREFIX}: draft selection ${configId}=${value} failed: ${message}`);
+        const entry = this.transcripts.appendNotice(
+          session.sessionId, 'info',
+          `Could not apply the ${option.name || configId} chosen on the new-session page.`,
+        );
+        if (entry) { this.post({ type: 'append', sessionId: session.sessionId, entries: [entry] }); }
+      }
+    }
+    // 播种切换基线：我们自己的 setter 已经把权威那份写对了，所以 agent 随后推来的同状态通知
+    // diff 为空（pitfall #34 那套"两份副本 + 去重"的既定前提）。不播种的话，只要 agent 在应用
+    // 之前已经推过一次 session/update（onSessionUpdate 会拿**默认值**当基线），应用后的通知就
+    // 会被当成一次用户从未做过的"切换"播报出来。
+    if (applied > 0) {
+      const state = this.choiceState(session.sessionId);
+      if (state) { this.choices.set(session.sessionId, state); }
+      this.pushMeta(session.sessionId);
+      log(`${LOG_PREFIX}: draft applied ${applied} selection(s) to ${session.sessionId}`);
     }
   }
 
@@ -2049,11 +2233,7 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       modes: session?.modes ?? null,
       models: session?.models ?? null,
       configOptions: session?.configOptions ?? null,
-      availableCommands: (session?.availableCommands ?? []).map(c => ({
-        name: c.name,
-        description: c.description,
-        inputHint: (c.input as any)?.hint ?? null,
-      })),
+      availableCommands: wireCommands(session),
       usage: this.usage.get(sessionId) ?? null,
       // Attachments live here so they survive a focus/boot round-trip; the
       // standalone `attachments` message is only for immediate feedback.
@@ -2122,6 +2302,20 @@ function isElicitationState(state: PermissionState | ElicitationState): state is
 
 function sessionOf(manager: SessionManager, sessionId: string): SessionInfo | undefined {
   return manager.getSession(sessionId);
+}
+
+/**
+ * [CUSTOM-20260930-151] ACP 的 `AvailableCommand` → 协议里的命令视图。
+ *
+ * 宿主里只有这一份映射：`metaOf`（会话）与草稿页快照（还没有会话）必须给出同一个形状，
+ * 否则客户端要按来源分两套读法——那正是 pitfalls #19 说的"跨边界的重复知识"。
+ */
+function wireCommands(session: SessionInfo | undefined): SessionMeta['availableCommands'] {
+  return (session?.availableCommands ?? []).map(c => ({
+    name: c.name,
+    description: c.description,
+    inputHint: (c.input as any)?.hint ?? null,
+  }));
 }
 
 /** Validate that a message's sessionId names a live session; else return null. */

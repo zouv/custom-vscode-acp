@@ -1395,6 +1395,170 @@ suite('chat client logic: composer input bar (stub DOM)', () => {
   });
 });
 
+// [CUSTOM-20260930-151] 草稿页（点「+」的新会话页）的输入卡要"显示完整"：模式/模型/斜杠命令在
+// ACP 里都是**会话级**的，而草稿按定义还没有会话 —— 宿主用"该 agent 上一次会话的快照"应答。
+// 本套件钉住客户端这一侧：快照怎么渲染、选中的值记在哪（**绝不**发 setConfigOption），
+// 以及它怎么随"创建会话并发送"那条消息一起走。
+suite('chat client logic: draft composer options (stub DOM)', () => {
+  const CONFIG_OPTIONS = [
+    {
+      id: 'mode', name: 'Mode', description: 'Session permission mode', category: 'mode',
+      type: 'select', currentValue: 'default',
+      options: [
+        { value: 'default', name: 'Manual' },
+        { value: 'plan', name: 'Plan' },
+        // The grouped shape: `renderMenu` (and the host's validation) must handle both.
+        { name: 'Advanced', options: [{ value: 'bypass', name: 'Bypass' }] },
+      ],
+    },
+  ];
+  // A fresh copy per call: the composer writes the picked value into the option objects it is
+  // given (that is what makes the button say what it will do), so a shared literal would leak
+  // one test's pick into the next.
+  const snapshot = () => ({
+    configOptions: JSON.parse(JSON.stringify(CONFIG_OPTIONS)),
+    availableCommands: [{ name: 'compact', description: 'Compact the conversation', inputHint: null }],
+  });
+
+  function draftComposer(): {
+    NS: Record<string, any>; input: StubNode; sendBtn: StubNode; pickers: StubNode;
+    slashPopup: StubNode; posted: Array<Record<string, unknown>>;
+    docListeners: Record<string, Array<(event: any) => void>>;
+  } {
+    const input = new StubNode('textarea');
+    const sendBtn = new StubNode('button');
+    const pickers = new StubNode('div');
+    const slashPopup = new StubNode('div');
+    const { NS, docListeners } = loadClient({
+      promptInput: input,
+      sendStopBtn: sendBtn,
+      slashPopup: slashPopup,
+      attachments: new StubNode('div'),
+      configPickers: pickers,
+      contextMeter: new StubNode('div'),
+    });
+    const posted: Array<Record<string, unknown>> = [];
+    NS.bridge.post = (message: Record<string, unknown>) => { posted.push(message); };
+    NS.composer.init();
+    return { NS, input, sendBtn, pickers, slashPopup, posted, docListeners };
+  }
+
+  const draft = (id: string) => ({ draftId: id, cwd: '/tmp/x' });
+
+  /** Open the config menu and click the row with this label. */
+  function pick(
+    pickers: StubNode,
+    label: string,
+    docListeners: Record<string, Array<(event: any) => void>>,
+  ): void {
+    dispatchClick(pickers.querySelector('.picker-btn')!, docListeners);
+    const item = pickers.querySelectorAll('.picker-item').find(i => i.textContent === label);
+    assert.ok(item, `the menu must offer "${label}"`);
+    dispatchClick(item!, docListeners);
+  }
+
+  test('entering a draft asks the host what the composer should show', () => {
+    const { NS, posted } = draftComposer();
+    posted.length = 0;
+    NS.composer.setDraft(draft('d1'));
+    assert.deepStrictEqual(posted, [{ type: 'listDraftOptions', draftId: 'd1' }]);
+  });
+
+  test('an answer for a different draft is ignored (the reply is asynchronous)', () => {
+    const { NS, pickers } = draftComposer();
+    NS.composer.setDraft(draft('d1'));
+    NS.composer.setDraftOptions({ draftId: 'd2', ...snapshot() });
+    assert.strictEqual(pickers.querySelectorAll('.picker').length, 0);
+    assert.strictEqual(pickers.querySelectorAll('.picker-label').length, 0);
+
+    NS.composer.setDraftOptions({ draftId: 'd1', ...snapshot() });
+    assert.strictEqual(pickers.querySelectorAll('.picker').length, 1);
+    assert.strictEqual(pickers.querySelector('.picker-label')!.textContent, 'Manual');
+  });
+
+  test('the slash list comes with the snapshot, and the placeholder says so', () => {
+    const { NS, input, slashPopup } = draftComposer();
+    NS.composer.setDraft(draft('d1'));
+    NS.composer.setDraftOptions({ draftId: 'd1', ...snapshot() });
+    assert.match(input.placeholder, /\/ for commands/);
+
+    input.value = '/';
+    input.dispatch('input', { target: input });
+    const items = slashPopup.querySelectorAll('.slash-item');
+    assert.strictEqual(items.length, 1, 'the draft page completes commands too');
+    assert.match(items[0].textContent, /compact/);
+  });
+
+  test('picking a value records it instead of messaging the agent', () => {
+    const { NS, pickers, posted, docListeners } = draftComposer();
+    NS.composer.setDraft(draft('d1'));
+    NS.composer.setDraftOptions({ draftId: 'd1', ...snapshot() });
+    posted.length = 0;
+
+    pick(pickers, 'Plan', docListeners);
+
+    // A draft has no sessionId, so a `setConfigOption` here would be dropped by the host's
+    // verifySession guard (§5.4 rule 1) — the user would have chosen something and nothing at
+    // all would have happened.
+    assert.deepStrictEqual(posted, [], 'nothing may be sent while the session does not exist');
+    assert.strictEqual(pickers.querySelector('.picker-label')!.textContent, 'Plan',
+      'the button must say what the session will get');
+  });
+
+  test('the picks ride along with the message that creates the session', () => {
+    const { NS, input, sendBtn, pickers, posted, docListeners } = draftComposer();
+    NS.composer.setDraft(draft('d1'));
+    NS.composer.setDraftOptions({ draftId: 'd1', ...snapshot() });
+    pick(pickers, 'Bypass', docListeners);   // the grouped value, to cover that shape too
+    posted.length = 0;
+
+    input.value = 'build me a thing';
+    dispatchClick(sendBtn, docListeners);
+
+    assert.deepStrictEqual(posted, [{
+      type: 'createDraftAndSend', draftId: 'd1', cwd: '/tmp/x', text: 'build me a thing',
+      configSelections: [{ configId: 'mode', value: 'bypass' }],
+    }]);
+  });
+
+  test('a retry after a failed create carries the CURRENT pick, not the first one', () => {
+    const { NS, input, sendBtn, pickers, posted, docListeners } = draftComposer();
+    NS.composer.setDraft(draft('d1'));
+    NS.composer.setDraftOptions({ draftId: 'd1', ...snapshot() });
+
+    input.value = 'first try';
+    dispatchClick(sendBtn, docListeners);              // sent with no picks
+    const first = posted.find(m => m.type === 'createDraftAndSend')!;
+    assert.deepStrictEqual(first.configSelections, []);
+
+    NS.composer.failDraft();                            // the create failed; the draft survives
+    pick(pickers, 'Plan', docListeners);
+    dispatchClick(sendBtn, docListeners);
+    const second = posted.filter(m => m.type === 'createDraftAndSend')[1];
+    assert.deepStrictEqual(second.configSelections, [{ configId: 'mode', value: 'plan' }],
+      'the retry must carry the selection as it is now');
+  });
+
+  test('re-entering a draft keeps the picks, and replays them onto a fresh snapshot', () => {
+    const { NS, pickers, docListeners } = draftComposer();
+    const d1 = draft('d1');
+    NS.composer.setDraft(d1);
+    NS.composer.setDraftOptions({ draftId: 'd1', ...snapshot() });
+    pick(pickers, 'Plan', docListeners);
+
+    // Leave for a session and come back: `focusDraft` runs `setDraft` again, and the answer
+    // arrives with the snapshot's own values — the user's pick must survive that.
+    NS.composer.setFocus({
+      sessionId: 's1', agentName: 'Claude Code', title: null, cwd: '/tmp',
+      createdAt: '', loading: false, running: false, unread: false,
+    }, null);
+    NS.composer.setDraft(d1);
+    NS.composer.setDraftOptions({ draftId: 'd1', ...snapshot() });
+
+    assert.strictEqual(pickers.querySelector('.picker-label')!.textContent, 'Plan');
+  });
+});
+
 
 // [CUSTOM-20260928-100] 大纲"当前项"的判定：拉到底时高亮的必须是最后一条。
 // 报的现象是「我已经拉到底了，右侧选中的是倒数第二个」——视口顶部的规则在最后一条比
@@ -1803,119 +1967,307 @@ suite('chat client logic: image chip and pinned question (stub DOM)', () => {
   });
 });
 
-// [CUSTOM-20260929-119] 表单卡（ACP elicitation / AskUserQuestion）的客户端逻辑。
+// [CUSTOM-20260929-119 / 20260930-152] 表单（ACP elicitation / AskUserQuestion）的客户端逻辑。
 // 载荷形状取自 adapter 的真实产物（`askUserQuestionsToCreateRequest`）：单选是 `oneOf` →
 // 宿主扁平化成 kind:'select'，每题还有一个 `_meta._askUserQuestionCustomAnswer` 标记的自由文本框。
-// 提交的值要按 ACP 的形状回传（`{question_0: '标签'}`），否则模型的答案表是空的。
-suite('chat client logic: form card (stub DOM, CUSTOM-20260929-119)', () => {
-  function state(over: Record<string, unknown> = {}): Record<string, unknown> {
-    return {
-      promptId: 's1:1',
-      sessionId: 's1',
-      message: '博客的基础框架方案倾向哪种？',
-      status: 'pending',
-      fields: [
-        {
-          name: 'question_0', kind: 'select', title: '基础方案',
-          options: [
-            { value: 'Astro 官方模板', title: 'Astro 官方模板', description: '以官方 blog 模板为底' },
-            { value: '使用现成主题', title: '使用现成主题' },
-          ],
-        },
-        { name: 'question_0_custom', kind: 'text', title: 'Other', customFor: 'question_0' },
-      ],
-      ...over,
-    };
-  }
+// 152 起记录里只留一行"待回答"条，表单本体在**悬浮抽屉**里：多题按 tab 分页、单选用下拉
+// （选项 = 名称 + 介绍），每题都可以带一个"追加/自拟"输入框。
+suite('chat client logic: form record + drawer (stub DOM, CUSTOM-20260929-119/20260930-152)', () => {
+  const SINGLE = {
+    promptId: 's1:1',
+    sessionId: 's1',
+    message: '博客的基础框架方案倾向哪种？',
+    status: 'pending',
+    fields: [
+      {
+        name: 'question_0', kind: 'select', title: '基础方案',
+        options: [
+          { value: 'Astro 官方模板', title: 'Astro 官方模板', description: '以官方 blog 模板为底' },
+          { value: '使用现成主题', title: '使用现成主题' },
+        ],
+      },
+      { name: 'question_0_custom', kind: 'text', title: 'Other', customFor: 'question_0' },
+    ],
+  };
+  const TWO = {
+    promptId: 's1:2',
+    sessionId: 's1',
+    message: 'Please answer the following questions.',
+    status: 'pending',
+    fields: [
+      {
+        name: 'question_0', kind: 'select', title: '功能位置',
+        options: [{ value: 'in-repo', title: '就在当前项目' }, { value: 'other-repo', title: '别的项目' }],
+      },
+      { name: 'question_0_custom', kind: 'text', title: 'Other', customFor: 'question_0' },
+      {
+        name: 'question_1', kind: 'multi', title: '命令范围',
+        options: [
+          { value: 'new', title: 'new', description: '新建文章' },
+          { value: 'deploy', title: 'deploy', description: '调到阿里云部署' },
+        ],
+      },
+      { name: 'question_1_custom', kind: 'text', title: 'Other', customFor: 'question_1' },
+    ],
+  };
 
-  /** A card plus the messages the client posted while answering it. */
-  function cardWith(NS: Record<string, any>, over: Record<string, unknown> = {}): {
-    card: StubNode; posted: Array<Record<string, unknown>>;
+  /** The client, a mounted drawer, a transcript holding `states`, and the wires boot installs. */
+  function mount(states: Array<Record<string, unknown>> = [SINGLE]): {
+    NS: Record<string, any>; drawer: StubNode; messages: StubNode; body: StubNode;
+    posted: Array<Record<string, unknown>>;
+    docListeners: Record<string, Array<(event: any) => void>>;
   } {
+    const drawer = new StubNode('div');
+    const messages = new StubNode('div');
+    const { NS, doc, docListeners } = loadClient({ elicDrawer: drawer, messages });
     const posted: Array<Record<string, unknown>> = [];
     NS.bridge.postForSession = (message: Record<string, unknown>) => { posted.push(message); };
-    const card = NS.elicitationView.render(state(over));
-    return { card, posted };
+    // The real delegated click path (boot installs it on body): that is what carries
+    // data-elic-action from a click to elicitationView.answer, including the drawer lookup.
+    NS.links.installDelegatedHandlers(doc.body);
+    // The drawer hangs off the body in production; the click path has to reach it.
+    doc.body.appendChild(drawer);
+    NS.transcriptView.init(messages);
+    NS.transcriptView.hydrate({
+      sessionId: 's1',
+      entries: states.map((elicitation, index) => ({
+        id: 'e' + index, kind: 'elicitation', at: index, elicitation,
+      })),
+    });
+    NS.elicitationView.init();
+    // The panel is on session 's1' (every state in this suite uses it): the drawer only shows the
+    // forms that belong to the session on screen.
+    NS.elicitationView.setSession('s1');
+    NS.elicitationView.sync();
+    return { NS, drawer, messages, body: doc.body, posted, docListeners };
   }
 
-  function inputsOf(card: StubNode, selector = 'input'): StubNode[] {
-    return card.querySelectorAll(selector);
+  /** Dispatch an event that bubbles — the stub only does that for clicks. */
+  function dispatchBubbling(target: StubNode, type: string): void {
+    const path: StubNode[] = [];
+    for (let node: StubNode | null = target; node; node = node.parentNode) { path.push(node); }
+    for (const node of path) { node.dispatch(type, {}); }
   }
 
-  test('the form shows the question, one radio per option, and the Other box', () => {
-    const { NS } = loadClient();
-    const { card } = cardWith(NS);
-    assert.strictEqual(card.querySelector('.elic-title')!.textContent, '博客的基础框架方案倾向哪种？');
-    const radios = inputsOf(card, 'input[data-field]').filter(i => i.type === 'radio');
-    assert.strictEqual(radios.length, 2, 'one radio per option');
-    assert.strictEqual(radios[0].value, 'Astro 官方模板');
-    assert.ok(card.querySelector('.elic-option-desc'), 'the option description is rendered');
-    const custom = inputsOf(card, 'input[data-field]').find(i => i.getAttribute('data-field') === 'question_0_custom');
-    assert.ok(custom, 'the "Other" box is there');
-    assert.ok((custom!.parentNode as StubNode).className.includes('elic-other'),
-      'and it is grouped under its question, not as a peer');
+  // The stub's selector support is deliberately minimal ('[attr]', never '[attr="value"]'),
+  // so value-carrying lookups are done by filtering here as well as in the client.
+  function inputsNamed(root: StubNode, name: string): StubNode[] {
+    return root.querySelectorAll('input[data-field]').filter(i => i.getAttribute('data-field') === name);
+  }
+
+  function byAttr(root: StubNode, attr: string, value: string): StubNode | null {
+    return root.querySelectorAll(`[${attr}]`).find(n => n.getAttribute(attr) === value) ?? null;
+  }
+
+  /** Pick a single-select row: set its radio and let the module hear about it. */
+  function pickRow(row: StubNode): void {
+    const radio = row.querySelector('input') as unknown as { checked: boolean; dispatch: (t: string, e: unknown) => void };
+    radio.checked = true;
+    radio.dispatch('change', {});
+  }
+
+  function byAction(root: StubNode, action: string): StubNode | null {
+    return root.querySelectorAll('button[data-elic-action]')
+      .find(b => b.getAttribute('data-elic-action') === action) ?? null;
+  }
+
+  function labelsOf(nodes: StubNode[], selector: string): string[] {
+    return nodes.map(n => n.querySelector(selector)!.textContent);
+  }
+
+  test('a pending form leaves ONE row in the record — the form itself is in the drawer', () => {
+    const { messages, drawer } = mount();
+    const record = messages.querySelector('.entry-elicitation')!;
+    assert.ok(record.querySelector('.elic-pending-row'), 'the record says a form is waiting');
+    assert.ok(record.querySelector('.elic-open'), '...and offers a way into it');
+    assert.strictEqual(record.querySelector('.elic-body'), null, 'the form is NOT drawn in the record');
+    assert.strictEqual(drawer.hidden, false, 'the drawer holds it instead');
   });
 
-  test('submitting posts the collected answers as an accept', () => {
-    const { NS } = loadClient();
-    const { card, posted } = cardWith(NS);
-    const radio = inputsOf(card, 'input[data-field]').find(i => i.type === 'radio')!;
-    (radio as unknown as { checked: boolean }).checked = true;
+  test('the drawer pages the questions with tabs, and each custom box stays with its question', () => {
+    const { drawer, docListeners } = mount([TWO]);
+    const tabs = drawer.querySelectorAll('.elic-tab');
+    assert.deepStrictEqual(labelsOf(tabs, '.elic-tab-text'), ['功能位置', '命令范围']);
 
-    NS.elicitationView.answer(card, 'submit');
+    const panes = drawer.querySelectorAll('.elic-field');
+    // Q1 is a single select: its box waits (hidden) in its own pane until a row is picked, and is
+    // then MOVED under that row.
+    const q1Box = byAttr(panes[0], 'data-elic-custom', 'question_0_custom')!;
+    assert.ok(q1Box, 'the box belongs to Q1');
+    assert.strictEqual(q1Box.hidden, true, 'but stays hidden while nothing is picked');
+    assert.strictEqual(byAttr(panes[1], 'data-elic-custom', 'question_0_custom'), null,
+      'and it is not in Q2');
+    // Q2 is a multi: its box stays under the list, always.
+    assert.ok(byAttr(panes[1], 'data-elic-custom', 'question_1_custom'), 'Q2 shows its own box');
+
+    assert.strictEqual(panes[0].hidden, false);
+    assert.strictEqual(panes[1].hidden, true, 'only the active question is shown');
+    dispatchClick(tabs[1], docListeners);
+    assert.strictEqual(panes[1].hidden, false);
+    assert.strictEqual(panes[0].hidden, true);
+  });
+
+  test('a single select is a flat list of title + description rows, plus an Other row', () => {
+    const { drawer } = mount();
+    const rows = drawer.querySelectorAll('.elic-option-row');
+    assert.strictEqual(rows.length, 3, 'two options and a free-form "Other"');
+
+    assert.strictEqual(rows[0].querySelector('.elic-option-label')!.textContent, 'Astro 官方模板',
+      'the option title is the row heading');
+    assert.strictEqual(rows[0].querySelector('.elic-option-desc')!.textContent, '以官方 blog 模板为底',
+      'the description is the sub-heading');
+    assert.strictEqual(rows[1].querySelector('.elic-option-desc'), null,
+      'an option without a description has no sub-heading');
+
+    assert.ok(rows[2].className.includes('elic-other-row'), 'the free-form answer is a row of its own');
+    assert.match(rows[2].querySelector('.elic-option-label')!.textContent!, /Other/);
+  });
+
+  test('picking a row unchecks the others, moves the box under it, and Clear undoes all of it', () => {
+    const { drawer, docListeners } = mount();
+    const rows = drawer.querySelectorAll('.elic-option-row');
+    const box = () => byAttr(drawer, 'data-elic-custom', 'question_0_custom')!;
+
+    assert.strictEqual(box().hidden, true, 'the box is parked and hidden before anything is picked');
+    pickRow(rows[0]);
+    assert.deepStrictEqual(inputsNamed(drawer, 'question_0').map(r => r.checked), [true, false, false]);
+    assert.ok(rows[0].contains(box()), 'the box appears UNDER the picked row');
+    assert.strictEqual(box().hidden, false);
+
+    // Typing then picking another row keeps the text: the element is MOVED, not rebuilt.
+    (box().querySelector('input') as unknown as { value: string }).value = '自己写的答案';
+    pickRow(rows[1]);
+    assert.deepStrictEqual(inputsNamed(drawer, 'question_0').map(r => r.checked), [false, true, false]);
+    assert.ok(rows[1].contains(box()), 'and it moves with the pick');
+    assert.strictEqual((box().querySelector('input') as unknown as { value: string }).value, '自己写的答案');
+
+    // Nothing is required, so the pick must be undoable (a dropdown used to offer "Clear").
+    const clear = drawer.querySelector('.elic-clear')!;
+    assert.strictEqual(clear.hidden, false, 'offered only once there is a pick');
+    dispatchClick(clear, docListeners);
+    assert.deepStrictEqual(inputsNamed(drawer, 'question_0').map(r => r.checked), [false, false, false]);
+    assert.strictEqual(box().hidden, true, 'and the box hides with the answer');
+  });
+
+  test('picking the Other row opens the box under it, with the honest explanation', () => {
+    const { drawer } = mount();
+    const rows = drawer.querySelectorAll('.elic-option-row');
+    pickRow(rows[2]);   // Other
+    const box = byAttr(drawer, 'data-elic-custom', 'question_0_custom')!;
+    assert.ok(rows[2].contains(box), 'the free-form box opens under the Other row');
+    assert.match(box.textContent, /replacing the option picked above/,
+      'the adapter lets a typed answer REPLACE the pick — saying only "add" would be a lie');
+  });
+
+  test('the progress line, the tab dots and the unanswered hint all follow the answers', () => {
+    const { drawer, docListeners } = mount([TWO]);
+    assert.match(drawer.querySelector('.elic-progress')!.textContent!, /Answered 0\/2/);
+    assert.match(drawer.querySelector('.elic-submit')!.textContent!, /Submit 0\/2/);
+    const panes = drawer.querySelectorAll('.elic-field');
+    assert.strictEqual(panes[0].querySelector('.elic-unanswered')!.hidden, false);
+
+    // Tick one box of the multi-select question and let the form re-count itself.
+    const boxes = inputsNamed(drawer, 'question_1');
+    (boxes[0] as unknown as { checked: boolean }).checked = true;
+    dispatchBubbling(boxes[0], 'change');
+
+    assert.match(drawer.querySelector('.elic-submit')!.textContent!, /Submit 1\/2/);
+    assert.ok(drawer.querySelectorAll('.elic-tab')[1].className.includes('answered'));
+    assert.strictEqual(panes[1].querySelector('.elic-unanswered')!.hidden, true);
+    assert.strictEqual(panes[0].querySelector('.elic-unanswered')!.hidden, false, 'Q1 is still open');
+    assert.ok(docListeners, 'sanity');
+  });
+
+  test('submitting from the drawer posts the collected answers as an accept', () => {
+    const { drawer, posted, docListeners } = mount();
+    pickRow(drawer.querySelectorAll('.elic-option-row')[0]);
+    const custom = byAttr(drawer, 'data-elic-custom', 'question_0_custom')!.querySelector('input') as unknown as { value: string };
+    custom.value = ' 我自己的方案 ';
+
+    dispatchClick(drawer.querySelector('.elic-submit')!, docListeners);
     assert.strictEqual(posted.length, 1);
     assert.deepStrictEqual(posted[0], {
       type: 'elicitationAnswer',
       promptId: 's1:1',
       action: 'accept',
-      content: { question_0: 'Astro 官方模板' },
-    }, 'the answer key is the field name, the value is the option label (what the tool records)');
-    assert.ok(!('question_0_custom' in (posted[0].content as Record<string, unknown>)),
-      'an empty Other box contributes nothing');
-  });
-
-  test('a typed Other answer travels alongside the selection', () => {
-    const { NS } = loadClient();
-    const { card, posted } = cardWith(NS);
-    const custom = inputsOf(card, 'input[data-field]').find(i => i.getAttribute('data-field') === 'question_0_custom')!;
-    (custom as unknown as { value: string }).value = ' 我自己的方案 ';
-    NS.elicitationView.answer(card, 'submit');
-    assert.strictEqual((posted[0].content as Record<string, string>).question_0_custom, '我自己的方案',
-      'trimmed; the adapter gives a typed answer precedence over the selection');
+      content: { question_0: 'Astro 官方模板', question_0_custom: '我自己的方案' },
+    }, 'keys are the field names, values are what the tool records');
   });
 
   test('skip and cancel are decisions, and carry no content', () => {
-    const { NS } = loadClient();
     for (const [action, expected] of [['skip', 'decline'], ['cancel', 'cancel']] as const) {
-      const { NS: fresh } = loadClient();
-      const { card, posted } = cardWith(fresh);
-      fresh.elicitationView.answer(card, action);
+      const { drawer, posted, docListeners } = mount();
+      dispatchClick(byAction(drawer, action)!, docListeners);
       assert.deepStrictEqual(posted[0], {
         type: 'elicitationAnswer', promptId: 's1:1', action: expected,
       }, `${action} → ${expected}, with no content key`);
     }
-    assert.ok(NS, 'sanity');
   });
 
-  test('a settled card cannot be answered again', () => {
-    const { NS } = loadClient();
-    const { card, posted } = cardWith(NS);
-    NS.elicitationView.applyState(card, state({ status: 'accepted', summary: 'question_0: Astro 官方模板' }));
-    assert.strictEqual(card.querySelector('.elic-actions')!.hidden, true, 'the buttons are gone');
-    assert.strictEqual(card.querySelector('.elic-note')!.textContent, 'Answered · question_0: Astro 官方模板');
-    for (const input of inputsOf(card, 'input')) { assert.strictEqual(input.disabled, true); }
-    assert.strictEqual(posted.length, 0, 'nothing was sent');
+  test('collapsing shrinks the drawer to its header, and Escape only ever collapses', () => {
+    const { drawer, posted, docListeners } = mount();
+    dispatchClick(drawer.querySelector('.elic-toggle')!, docListeners);
+    assert.ok(drawer.className.includes('collapsed'));
+
+    for (const fn of docListeners.keydown ?? []) { fn({ key: 'Escape' }); }
+    assert.deepStrictEqual(posted, [], 'Escape must never send cancel — that aborts the tool call');
   });
 
-  test('a deferred card is disabled and says where to answer', () => {
-    const { NS } = loadClient();
-    const { card } = cardWith(NS);
-    NS.elicitationView.applyState(card, state({ status: 'deferred' }));
-    assert.strictEqual(card.querySelector('.elic-actions')!.hidden, true);
-    assert.ok(card.querySelector('.elic-note')!.textContent.includes('dialog'),
+  test('a settled form is history: no controls, and a click cannot answer it again', () => {
+    const { NS, drawer, messages, posted } = mount();
+    // The host settles a form by revising the entry — the very path boot handles.
+    NS.transcriptView.patch('e0', {
+      elicitation: { ...SINGLE, status: 'accepted', summary: 'question_0: Astro 官方模板' },
+    });
+    NS.elicitationView.sync();
+
+    const record = messages.querySelector('.elic')!;
+    assert.strictEqual(record.querySelector('.elic-actions'), null, 'a settled record has no buttons');
+    assert.match(record.querySelector('.elic-note')!.textContent!, /Answered/);
+    assert.strictEqual(record.querySelector('.elic-pending-row'), null);
+
+    NS.elicitationView.answer(record, 'submit');
+    assert.deepStrictEqual(posted, [], 'only a pending form may be answered');
+    assert.strictEqual(drawer.hidden, true, 'and the drawer lets go of it');
+  });
+
+  test('a deferred form says where to answer it', () => {
+    const { NS } = mount();
+    const card = NS.elicitationView.render({ ...SINGLE, status: 'deferred' });
+    assert.strictEqual(card.querySelector('.elic-actions'), null);
+    assert.match(card.querySelector('.elic-note')!.textContent!, /dialog/,
       'a disabled form with no explanation looks broken');
   });
+
+  test('a form belonging to another session is not shown here', () => {
+    // The record remembers the form; the drawer only shows it for the session it belongs to
+    // (user report 2026-10-01: the drawer stayed visible after switching sessions).
+    const { NS, drawer } = mount([SINGLE]);
+    NS.elicitationView.setSession('s1');
+    NS.elicitationView.sync();
+    assert.strictEqual(drawer.hidden, false, 'its own session shows it');
+
+    NS.elicitationView.setSession('s2');
+    NS.elicitationView.sync();
+    assert.strictEqual(drawer.hidden, true, 'another session must not');
+
+    NS.elicitationView.setSession('s1');
+    NS.elicitationView.sync();
+    assert.strictEqual(drawer.hidden, false, 'and switching back brings it back');
+  });
+
+  test('with no drawer in the page the module still renders records (stub-DOM safety)', () => {
+    // #elicDrawer is absent whenever a test loads the client without it — the record path
+    // must not depend on the drawer existing.
+    const { NS } = loadClient();
+    const card = NS.elicitationView.render(SINGLE);
+    assert.ok(card.querySelector('.elic-pending-row'));
+    NS.elicitationView.init();
+    NS.elicitationView.sync();
+    assert.ok(true, 'init/sync tolerate a missing container');
+  });
 });
+
 
 // [CUSTOM-20260930-123] 连接状态卡（client/stateCard.ts）。
 //

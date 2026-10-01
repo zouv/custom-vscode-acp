@@ -187,4 +187,36 @@ suite('elicitation bridge: schema flattening', () => {
     assert.deepStrictEqual(fieldsOf({ type: 'object', properties: {} }), []);
     assert.deepStrictEqual(fieldsOf(undefined), []);
   });
+
+  test('a custom box WITHOUT the _meta marker is still paired with its question', () => {
+    // [CUSTOM-20261001-153] The real shape measured on 2026-10-01: the adapter sent
+    // title 'Other' plus a description, but NO `_meta._askUserQuestionCustomAnswer`. Reading only
+    // the marker left the box as a question of its own (an extra "Other" tab) and the question
+    // block with no custom input at all — the user's "缺少自定义内容".
+    const fields = fieldsOf({
+      type: 'object',
+      properties: {
+        question_0: { type: 'string', title: '定位哪个', oneOf: [{ const: 'a', title: 'A' }] },
+        question_0_custom: {
+          type: 'string',
+          title: 'Other',
+          description: 'Type your own answer, or add a note to the option you chose above (optional).',
+        },
+      },
+    });
+    assert.deepStrictEqual(fields.map(f => [f.name, f.kind, f.customFor]), [
+      ['question_0', 'select', undefined],
+      ['question_0_custom', 'text', 'question_0'],
+    ]);
+  });
+
+  test('a _custom field whose question does not exist is left on its own', () => {
+    // The fallback must not invent a parent: an unpaired field stays a field (it still travels
+    // back under its own name).
+    const fields = fieldsOf({
+      type: 'object',
+      properties: { question_7_custom: { type: 'string', title: 'Other' } },
+    });
+    assert.deepStrictEqual(fields.map(f => [f.name, f.customFor]), [['question_7_custom', undefined]]);
+  });
 });

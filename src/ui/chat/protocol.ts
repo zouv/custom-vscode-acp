@@ -146,6 +146,15 @@ export type ExtToChat =
   | { type: 'draftResolved'; draftId: string; sessionId: string }
   | { type: 'draftFailed'; draftId: string; message: string }
   // [CUSTOM-END] CUSTOM-20260925-058
+  // [CUSTOM-BEGIN] CUSTOM-20260930-151 - 草稿页的输入卡要"显示完整"：模式/模型等配置项与
+  // 斜杠命令在 ACP 里**都是会话级的**（`session/new` 只收 cwd/mcpServers，没有 mode/model
+  // 入参），而草稿按定义还没有会话——所以回的是「该 agent 上一次会话的快照」（宿主缓存，
+  // 见 ChatPanelHost.rememberAgentOptions）。快照只作候选与预选：创建会话时逐项按 id + 可选值
+  // 校验后才下发，陈旧无害。
+  // 定向发给发起请求的那个面（同 058 那四条——这是"某个文档正在编辑的草稿"）；
+  // `draftId` 同样不能省：应答回来时用户可能已经换了草稿，客户端据它丢弃过期结果。
+  | { type: 'draftOptions'; draftId: string; agentName: string | null; configOptions: SessionConfigOption[]; availableCommands: SessionMeta['availableCommands'] }
+  // [CUSTOM-END] CUSTOM-20260930-151
   | { type: 'sessionClosed'; sessionId: string; reason: CloseReason }
   | { type: 'append'; sessionId: string; entries: WireEntry[] }
   | { type: 'revise'; sessionId: string; entryId: string; patch: EntryPatch }
@@ -208,8 +217,18 @@ export type ChatToExt =
   // 所以它们必须和其他非会话作用域消息一样，在 `verifySession` 守卫**之前**处理（§5.4 规则二）。
   | { type: 'listDirectoryChoices'; agentName?: string }
   | { type: 'pickDirectory' }
-  | { type: 'createDraftAndSend'; draftId: string; agentName?: string; cwd?: string; text: string }
+  | { type: 'createDraftAndSend'; draftId: string; agentName?: string; cwd?: string; text: string; configSelections?: Array<{ configId: string; value: string }> }
   // [CUSTOM-END] CUSTOM-20260925-058
+  // [CUSTOM-BEGIN] CUSTOM-20260930-151 - 草稿页要"显示完整"：问宿主有没有该 agent 上一次会话
+  // 的配置项/命令快照（草稿还没有 session，这些在 ACP 里只存在于会话上）。
+  // 与 058 那三条同区：**不是**会话作用域（草稿按定义没有 sessionId），必须在
+  // `verifySession` 守卫**之前**处理（§5.4 规则二）。
+  | { type: 'listDraftOptions'; draftId: string; agentName?: string }
+  // @remarks `agentName` 与 `createDraftAndSend` 的一样，是"可选的偏好"而不是必填：草稿是**纯
+  // 客户端状态**，客户端其实不知道 agent。两条消息必须由宿主用**同一个** `panelAgent()` 解析
+  // （草稿页出现在屏幕上时，宿主手上的聚焦会话往往是别的那个），否则会出现"显示 A 的模型、
+  // 建的是 B 的会话"——而那种错配在应用阶段会被逐项校验静默丢掉。
+  // [CUSTOM-END] CUSTOM-20260930-151
   | { type: 'closeSession'; sessionId: string }
   | { type: 'focusSession'; sessionId: string }
   | { type: 'focusAgent'; agentName: string }

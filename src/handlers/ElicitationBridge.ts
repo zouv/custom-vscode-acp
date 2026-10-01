@@ -354,6 +354,22 @@ export function fieldsOf(schema: unknown): ElicitationFieldView[] {
     }
     fields.push(field);
   }
+  // [CUSTOM-20261001-153] 标记缺失时的兜底：**按名字配对**。
+  //
+  // 实测（2026-10-01 真机日志 `~/.claude/acp-client-custom.log`）：adapter 发来的自由文本框
+  // **不带** `_meta._askUserQuestionCustomAnswer`（只有 `title: 'Other'` 和一句 description），
+  // 于是它既没被认成"某题的自拟答案"，还被当成独立的一题 —— 抽屉里凭空多出一个 "Other" 标签页，
+  // 而问题块里看不到自拟输入框（用户报的"缺少自定义内容"）。
+  // 名字约定来自 adapter 自己（`questionCustomFieldKey` = `${questionFieldKey}_custom`），
+  // 而且只在**父字段确实存在**时才认，误判面很窄；真误判也只是把它排到那道题下面 ——
+  // 提交时的字段名与取值都不变。
+  const names = new Set(fields.map(f => f.name));
+  const SUFFIX = '_custom';
+  for (const field of fields) {
+    if (field.customFor || field.kind !== 'text' || !field.name.endsWith(SUFFIX)) { continue; }
+    const parent = field.name.slice(0, -SUFFIX.length);
+    if (names.has(parent)) { field.customFor = parent; }
+  }
   return fields;
 }
 

@@ -100,7 +100,7 @@ export const bootClient = `
     NS.composer.setAttachments((meta && meta.attachments) || []);
 
     if (!summary) {
-      NS.transcriptView.reset();
+      resetTranscript();
       // [CUSTOM-20260926-081] The outline goes with the transcript — including the
       // PINNED one. This early return used to skip both calls, so a pinned sidebar
       // kept showing "No messages yet" in a panel that has no session at all, and the
@@ -121,7 +121,7 @@ export const bootClient = `
     if (snapshot) {
       NS.transcriptView.hydrate(snapshot);
     } else {
-      NS.transcriptView.reset();
+      resetTranscript();
     }
     // Restore *after* hydrate: the decision needs the rebuilt DOM in place, and
     // a session with no memory falls back to "stick to the bottom".
@@ -246,7 +246,7 @@ export const bootClient = `
     focusedDraftId = draftId;
     NS.tabs.setDraftFocus(draft);
     NS.composer.setDraft(draft);
-    NS.transcriptView.reset();
+    resetTranscript();
     // [CUSTOM-20260930-123] 卡片留在中央，不再让位给一片空白：草稿页的「页面」就是它
     // （未连接时是提示、已连接时是引导）。这正是用户报的「连接成功后中间一片空白」。
     showEmpty(true);
@@ -297,7 +297,7 @@ export const bootClient = `
     NS.tabs.setFocus(null);
     NS.composer.setFocus(null, null);
     NS.composer.forgetDraft(draftId);
-    NS.transcriptView.reset();
+    resetTranscript();
     showEmpty(true);
     renderDrafts();
   }
@@ -416,6 +416,9 @@ export const bootClient = `
         }
         applyFocus(message.focused, message.snapshot, message.meta);
         syncFocusedState(message.sessions || []);
+        // [CUSTOM-20260930-152] 表单抽屉跟着记录走：快照重建后重新对账（切会话、重挂载、
+        // 双 surface 都靠这一步，不需要宿主知道有抽屉这回事）。
+        syncElicitations();
         break;
 
       // [CUSTOM-20260926-077] Outline pin/width prefs come back with boot.
@@ -438,12 +441,14 @@ export const bootClient = `
       case 'focus':
         applyEmptyState(message.agentConnected);
         applyFocus(message.summary, message.snapshot, message.meta);
+        // [CUSTOM-20260930-152] 另一个会话的表单不该跟着你走，也不该被丢掉：重新对账。
+        syncElicitations();
         break;
 
       case 'sessionClosed':
         if (message.sessionId === currentSessionId) {
           currentSessionId = null;
-          NS.transcriptView.reset();
+          resetTranscript();
           showEmpty(true);
           NS.outline.invalidate();
           NS.rail.invalidate();
@@ -453,12 +458,16 @@ export const bootClient = `
         NS.scroll.forget(message.sessionId);
         // [CUSTOM-20260925-050] Same for its draft.
         NS.composer.forgetDraft(message.sessionId);
+        // [CUSTOM-20260930-152] 关掉的是聚焦会话时记录已清空 ⇒ 抽屉必须跟着消失。
+        syncElicitations();
         break;
 
       case 'append': {
         if (message.sessionId !== currentSessionId) { break; }
         var entries = message.entries || [];
+        var appendedForm = false;
         for (var i = 0; i < entries.length; i++) {
+          if (entries[i].kind === 'elicitation') { appendedForm = true; }
           NS.transcriptView.append(entries[i], entries[i].toolView);
         }
         if (entries.length > 0) { showEmpty(false); }
@@ -469,6 +478,8 @@ export const bootClient = `
         // [CUSTOM-20260924-023] The rail self-checks its marker signature, so a
         // chunk on an existing entry costs one cheap comparison and no layout read.
         NS.rail.invalidate();
+        // [CUSTOM-20260930-152] 只在真的带了表单时对账：流式的每一条 chunk 都走这里。
+        if (appendedForm) { syncElicitations(); }
         break;
       }
 
@@ -477,6 +488,9 @@ export const bootClient = `
           NS.transcriptView.patch(message.entryId, message.patch);
           NS.outline.invalidate();
           NS.rail.invalidate();
+          // [CUSTOM-20260930-152] 表单结算（accepted/declined/cancelled）或转到弹框
+          // （deferred）都走这条 revise —— 抽屉据此收起。
+          if (message.patch && message.patch.elicitation) { syncElicitations(); }
         }
         break;
 
@@ -546,6 +560,13 @@ export const bootClient = `
 
       case 'draftResolved':
         resolveDraft(message.draftId);
+        break;
+
+      // [CUSTOM-20260930-151] 草稿页的配置项/命令快照（回复 composer 发的 listDraftOptions）。
+      // 不在下面过滤 currentSessionId：草稿本来就没有 sessionId。是否套用由 composer 按
+      // draftId 自己判断（应答是异步的，用户可能已经换了草稿）。
+      case 'draftOptions':
+        NS.composer.setDraftOptions(message);
         break;
 
       case 'draftFailed':
@@ -738,6 +759,33 @@ export const bootClient = `
     NS.bridge.postForSession({ type: 'attachImage', id: id, name: name, mimeType: mimeType, dataUrl: dataUrl });
   }
 
+  /**
+   * [CUSTOM-20260930-152] 让表单抽屉与记录对账。
+   *
+   * 抽屉**不是**真相：pending 的表单就是 transcript 里的一条记录，所以"该不该显示、显示哪一条"
+   * 每次都由记录算出来。这样切会话 / 重挂载 / 双 surface 都不需要宿主参与，也不需要新协议。
+   * 模块或容器缺失时静默跳过（桩 DOM 里没有 #elicDrawer）。
+   */
+  function syncElicitations() {
+    if (!NS.elicitationView) { return; }
+    // 会话身份先同步过去：抽屉据此只显示**属于当前会话**的表单（表单记录可能还躺在转录里，
+    // 但那是别的会话的事）。放在这个唯一的入口上，就不必在每个调用点各记一次。
+    if (NS.elicitationView.setSession) { NS.elicitationView.setSession(currentSessionId); }
+    if (NS.elicitationView.sync) { NS.elicitationView.sync(); }
+  }
+
+  /**
+   * [CUSTOM-20261001-154] 清空记录 —— 表单抽屉必须跟着对账。
+   *
+   * 表单是**记录的一部分**，所以记录被清掉就等于抽屉该收起来了。这个包装存在的理由是一次
+   * 真实的漏修：切到草稿页（focusDraft）只调了 reset，抽屉于是留在屏幕上（用户 2026-10-01 的图2
+   * 就是那个状态 —— 面板停在草稿页，浮框还在）。以后凡是清记录的地方都走这里，别再单独调 reset。
+   */
+  function resetTranscript() {
+    NS.transcriptView.reset();
+    syncElicitations();
+  }
+
   function init() {
     emptyState = NS.dom.qs('emptyState');
     loadOverlay = NS.dom.qs('loadOverlay');
@@ -750,6 +798,8 @@ export const bootClient = `
     NS.rail.init(NS.dom.qs('messages'), NS.dom.qs('rail'), NS.dom.qs('railTrack'));
     // [CUSTOM-20260930-123] 连接状态卡（取代 sessionMenu 里的空态按钮）。
     if (NS.stateCard) { NS.stateCard.init(); }
+    // [CUSTOM-20260930-152] 表单抽屉：接管 #elicDrawer 的委托点击 / Escape / 高度让位。
+    if (NS.elicitationView) { NS.elicitationView.init(); }
     // [CUSTOM-20260925-032/033] Connect button (empty state) + history picker.
     NS.sessionMenu.init();
     // [CUSTOM-20260925-058] Directory drawer for the draft page.
