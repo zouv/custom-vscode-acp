@@ -36,6 +36,11 @@ import type {
 import type { IChatPanel, PanelContext } from './panelContract';
 import { isModernAgent, MODERN_AGENTS } from './panelContract';
 import { viewSurface, type ChatSurface, type SurfaceKey } from './ChatSurface';
+// [CUSTOM-20261001-156] 会话状态通知（等待权限 / 等待表单 / 轮次完成）。宿主只认这个类型，
+// 测试塞假 channel；真实的 vscode 通知调用在下面（vscodeNoticeChannel —— 本文件不 import 它
+// 到 SessionNotifier 里去，那边必须保持不依赖 vscode）。
+import { SessionNotifier } from './SessionNotifier';
+import type { NoticeChannel } from './SessionNotifier';
 import type { PermissionPresenter, PermissionState } from '../../handlers/PermissionBridge';
 // [CUSTOM-20260929-119] 表单（elicitation）presenter —— 与权限卡同构。
 import type {
@@ -104,6 +109,25 @@ interface AgentOptionSnapshot {
 type DraftOptionsStore = Record<string, AgentOptionSnapshot>;
 // [CUSTOM-END] CUSTOM-20260930-151
 
+// [CUSTOM-BEGIN] CUSTOM-20261001-159 - 记住用户手动选过的模式，新建会话时套用。
+//
+// 为什么要**按 agent** 分开：模式是各 agent 自己的词表（Claude Code 的
+// `bypassPermissions` 对别的 agent 毫无意义），按会话记则等于没记（新建会话正是要跨会话）。
+//
+// 为什么存在 globalState 而不是内存：重载窗口后内存里什么都不剩，而"新开会话又回到默认模式"
+// 正是这个功能要消灭的现象（与 `acpc.draftOptions.v1` 同一条理由）。
+const LAST_MODE_KEY = 'acpc.lastMode.v1';
+
+/** One agent's remembered mode: the config option id and the value the user picked. */
+interface RememberedMode {
+  configId: string;
+  value: string;
+}
+
+/** The persisted shape: agent name → remembered mode. */
+type LastModeStore = Record<string, RememberedMode>;
+// [CUSTOM-END] CUSTOM-20261001-159
+
 /**
  * [CUSTOM-20260930-125] The setting behind the start card's auto-connect switch.
  * Declared in package.json, rendered as a checkbox by the panel — so a change made
@@ -163,11 +187,38 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
   private readonly replayUserImages: Map<string, Map<string, ContentBlockView[]>> = new Map();
 
   private focused: PanelContext = { agentName: null, sessionId: null };
+  // [CUSTOM-20261001-156] 会话状态通知（等待权限 / 等待表单 / 轮次完成）。默认实现打到
+  // vscode 通知；测试注入假的。分配放在 ctor 体内而不是参数属性：默认值要用 `this`
+  // （点击回调 = revealSession）。
+  private readonly notifier: SessionNotifier;
+  /** [CUSTOM-20261001-156] 每会话的轮次序号，只用来给 turn-done 通知一个稳定去重键。 */
+  private readonly turnSeq: Map<string, number> = new Map();
   /** [CUSTOM-20260926-077] Outline pin/width prefs, cached from globalState. */
   private uiPrefs: UiPrefs | null = null;
   // [CUSTOM-20260930-151] agent → 它最后一次会话的配置项/命令快照（草稿页拿它渲染输入卡）。
   // 只由 rememberAgentOptions 写；**不是**可写状态——用户真正生效的那份永远在 SessionManager。
   private readonly draftOptions: Map<string, AgentOptionSnapshot> = new Map();
+
+  // [CUSTOM-20261001-159] agent → 用户最后一次**手动**选的模式（新建会话时套用）。
+  // 只由 rememberUserMode 写（三个用户动作的落点），从不读 agent 自己的切换。
+  private readonly lastMode: Map<string, RememberedMode> = new Map();
+  // [CUSTOM-20261001-159] `session-created('new')` 启动的那次应用，按会话挂着：
+  // 草稿页在自己的显式选择之前要先 `await` 它落地，否则两个 setConfigOption 谁后到谁赢
+  // （用户刚选的模式可能被"默认模式"盖回去）。
+  private readonly modeApply: Map<string, Promise<void>> = new Map();
+
+  // [CUSTOM-20261001-162] 轮次之外还在干活的后台子任务（见 noteBackgroundTask）。
+  // 存在的理由：`running` 原本只看"轮次请求还没返回"，而 Claude Code 的后台子任务（Task 工具
+  // 带 run_in_background）**在轮次结束后继续干活**——它一停，面板就把发送按钮变回普通状态，
+  // 用户看到的就是"活还在跑，按钮却复原了"。
+  private readonly backgroundTasks: Map<string, NodeJS.Timeout> = new Map();
+
+  // [CUSTOM-20261001-164] 会话标题在"第二次发言"时冻结（见 trackTitle）。
+  // 为什么不是"最新那个"：adapter 每轮结束去拉 SDK 标题（`maybeUpdateSessionTitle`），而 SDK
+  // 的后台生成可能几轮之后才落盘 ⇒ 那些标题描述的是"聊了几轮之后的主题"，不是这次会话的名字。
+  private readonly titleFrozen = new Set<string>();
+  /** 已经跑完过至少一轮的会话 —— 冻结的判据（第二次发言时它一定在里面）。 */
+  private readonly turnsDone = new Set<string>();
 
   // [CUSTOM-BEGIN] CUSTOM-20260924-022 - 合帧队列 + 标签栏快照签名（见 refreshSessions）。
   private readonly outbox: Outbox;
@@ -196,7 +247,18 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
     // 测试 harness 刻意不碰真实用户设置（见 chat-panel.test.ts 的 FakeMemento 注释），
     // 而写 ConfigurationTarget.Global 会改掉开发者的 settings.json。
     private readonly prefs: PanelPrefsIO = vscodePanelPrefs(),
+    // [CUSTOM-20261001-156] 通知渠道（默认 = vscode 通知）。注入缝的理由与 prefs 相同：
+    // 测试不该真的弹系统通知（会被测试宿主吞掉且无法断言）。注入的是 channel 而不是
+    // SessionNotifier——这样"点击通知 → 聚焦会话"这条真路径（revealSession）也在被测范围里。
+    private readonly noticeChannel: NoticeChannel = vscodeNoticeChannel(),
+    // [CUSTOM-20261001-162] 后台子任务"多久没动静就不再等"（见 noteBackgroundTask）。
+    // 测试会把它调到毫秒级；默认两分钟——比实测看到的最长静默间隔（57s）宽裕一倍。
+    private readonly backgroundQuietMs: number = 120_000,
   ) {
+    this.notifier = new SessionNotifier(this.noticeChannel,
+      // 显式用户动作（点了通知）：可以抢焦点、把面板抬到前台。
+      notice => this.revealSession(notice.sessionId, notice.label),
+    );
     this.sessionUpdateHandler = sessionUpdateHandler;
     this.uiPrefs = this.globalState?.get<UiPrefs>(UI_PREFS_KEY) ?? null;
     // [CUSTOM-20260930-151] 草稿页的配置项/命令快照（重载窗口后仍可用）。
@@ -208,6 +270,14 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
         configOptions: snapshot.configOptions ?? [],
         availableCommands: snapshot.availableCommands ?? [],
       });
+    }
+    // [CUSTOM-20261001-159] 记住的模式（重载窗口后仍然生效）。
+    const storedModes = this.globalState?.get<LastModeStore>(LAST_MODE_KEY) ?? {};
+    for (const agentName of Object.keys(storedModes)) {
+      const entry = storedModes[agentName];
+      if (entry && typeof entry.configId === 'string' && typeof entry.value === 'string') {
+        this.lastMode.set(agentName, { configId: entry.configId, value: entry.value });
+      }
     }
     // The host IS the permission presenter for the modern panel: no other
     // object knows whether a surface is on screen and which session is focused.
@@ -227,11 +297,18 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       this.subscriptions.push({ dispose: () => this.sessionManager.off(event, handler) });
     };
 
-    on('session-created', (sessionId: string) => {
+    on('session-created', (sessionId: string, _agentName: string, origin?: string) => {
       // [CUSTOM-20260930-151] 会话一建好就把它的配置项/命令收进草稿页快照——下一次点「+」用的
       // 就是这一份。
       this.rememberAgentOptions(sessionId);
       refresh();
+      // [CUSTOM-20261001-159] 只有**新建**的会话套用记住的模式。打开历史（load）/恢复（resume）
+      // 走的是同一个事件：那个会话有自己的模式，那是"重新打开它"的一部分，覆盖掉就是改坏它。
+      // `undefined`（更老的调用方、测试直接 emit）按"不是新建"处理——宁可不动，也别在该不动时动。
+      if (origin === 'new') {
+        const applied = this.applyRememberedMode(sessionId);
+        this.modeApply.set(sessionId, applied);
+      }
     });
     on('session-closed', (sessionId: string, _agentName: string, reason: CloseReason) => {
       // Release everything keyed by this session, then tell the client so a
@@ -249,6 +326,16 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       // baseline could only ever suppress the first notice of a new session.
       this.choices.delete(sessionId);
       this.sessionTitles.delete(sessionId);
+      // [CUSTOM-20261001-156] Its notification keys can never fire again.
+      this.notifier.forget(sessionId);
+      this.turnSeq.delete(sessionId);
+      // [CUSTOM-20261001-159] …and a mode application that never got awaited.
+      this.modeApply.delete(sessionId);
+      // [CUSTOM-20261001-162] …and any wait on a background task of this session.
+      this.endBackgroundTask(sessionId, 'closed');
+      // [CUSTOM-20261001-164] Session ids are never reused: drop the title bookkeeping too.
+      this.titleFrozen.delete(sessionId);
+      this.turnsDone.delete(sessionId);
       for (const key of Array.from(this.toolEntryIds.keys())) {
         if (key.startsWith(`${sessionId}::`)) { this.toolEntryIds.delete(key); }
       }
@@ -477,7 +564,12 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
         return;
       }
       case 'listHistory': {
-        void this.handleListHistory((msg as { agentName?: string }).agentName);
+        void this.handleListHistory(
+          (msg as { agentName?: string }).agentName,
+          // [CUSTOM-20261001-155] The directory the CLIENT's address bar is showing —
+          // the only correct source for a draft page (drafts are client-local, 058).
+          (msg as { cwd?: string }).cwd,
+        );
         return;
       }
       // [CUSTOM-BEGIN] CUSTOM-20260928-095 - 按过滤目录补扫磁盘（非会话作用域，守卫前）。
@@ -651,7 +743,9 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
         void this.sessionManager.setMode(sessionId, (msg as { modeId: string }).modeId)
           // [CUSTOM-20260926-073] Announce the switch in the transcript, not just in
           // the picker: the record is what a reader scrolls back through.
-          .then(() => { this.syncChoices(sessionId); this.pushMeta(sessionId); })
+          // [CUSTOM-20261001-159] …and remember it as the user's choice (this is a
+          // user action by construction: the message only comes from the panel).
+          .then(() => { this.rememberUserMode(sessionId); this.syncChoices(sessionId); this.pushMeta(sessionId); })
           .catch(e => this.reportError(sessionId, e));
         return;
       case 'setModel':
@@ -665,7 +759,15 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
           (msg as { configId: string }).configId,
           (msg as { value: string }).value,
         )
-          .then(() => { this.syncChoices(sessionId); this.pushMeta(sessionId); })
+          // [CUSTOM-20261001-159] Remember only when the option that changed IS the mode
+          // (this one message carries model, mode, effort and anything else the agent adds).
+          .then(() => {
+            const session = sessionOf(this.sessionManager, sessionId);
+            const mode = modeOptionOf(session?.configOptions);
+            if (mode && mode.id === (msg as { configId: string }).configId) { this.rememberUserMode(sessionId); }
+            this.syncChoices(sessionId);
+            this.pushMeta(sessionId);
+          })
           .catch(e => this.reportError(sessionId, e));
         return;
       // [CUSTOM-20260924-027] Session-scoped: it must sit AFTER the guard above.
@@ -726,6 +828,10 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
     this.surfaces.clear();
     this.lastActive = null;
     this.unread.clear();
+    // [CUSTOM-20261001-162] No timers may outlive the host (they would refresh a
+    // torn-down panel and keep the extension host awake for nothing).
+    for (const timer of this.backgroundTasks.values()) { clearTimeout(timer); }
+    this.backgroundTasks.clear();
     // setPresenter(null) also cancels every prompt still awaiting an answer:
     // nothing can render or answer them once the host is gone.
     this.permissionBridge?.setPresenter(null);
@@ -737,6 +843,15 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
   private async handleSendPrompt(sessionId: string, text: string): Promise<void> {
     const session = sessionOf(this.sessionManager, sessionId);
     if (!session) { return; }
+
+    // [CUSTOM-20261001-164] 第二次发言 = 第一次对话已经结束：此刻的标题就是它的名字，冻住。
+    // 放在这里而不是"第一轮结束时"：adapter 是在 idle（轮次结束）那一刻才去推标题的，两者几乎
+    // 同时到达 —— 在轮次结束处冻结会把刚刚生成的自动命名一起挡在门外（那是它唯一该被采纳的时机）。
+    // 等到下一条消息发出时再判，既不抢跑也不迟到。
+    if (this.turnsDone.has(sessionId) && !this.titleFrozen.has(sessionId)) {
+      this.titleFrozen.add(sessionId);
+      log(`${LOG_PREFIX}: session ${sessionId} keeps the title it had after the first exchange`);
+    }
 
     // [CUSTOM-20260928-109] 注入块（<task-notification> 等）虽然是从输入框发出去的，
     // 但仍然是注入块——渲染成蓝色用户气泡一样会误导。发送路径与 replay 路径用同一个
@@ -801,10 +916,17 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       }
     }
 
+    // [CUSTOM-20261001-157] How this turn ended, for the turn-done notification
+    // (filled in below; `finalizeTurn` runs in the finally, so it has to be declared
+    // out here).
+    let outcome: TurnOutcome = {};
+
     try {
       // Start the turn and only THEN refresh: `sendPrompt` registers the
       // in-flight turn synchronously before its first await, so refreshing
       // beforehand would always report `running: false` (no Stop button).
+      // [CUSTOM-20261001-162] 新轮次开始：不必再替后台任务"占着"运行中（轮次自己就会报告）。
+      this.endBackgroundTask(sessionId, 'turn');
       const pending = this.sessionManager.sendPrompt(sessionId, blocks);
       this.finalizeEntries(sessionId, { only: 'thought' });
       this.refreshSessions();
@@ -813,10 +935,13 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       const response = await pending;
       this.applyStopReason(sessionId, response.stopReason);
       this.applyResponseUsage(sessionId, (response as { usage?: unknown }).usage);
+      // [CUSTOM-20261001-157] 这一轮怎么结束的，决定要不要（以及怎么）通知。
+      outcome = turnOutcome(response.stopReason);
     } catch (e: any) {
       this.reportError(sessionId, e);
+      outcome = { failed: true, detail: e?.message ?? String(e) };
     } finally {
-      this.finalizeTurn(sessionId);
+      this.finalizeTurn(sessionId, outcome);
     }
   }
 
@@ -826,14 +951,10 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
    * show it rather than ending silently.
    */
   private applyStopReason(sessionId: string, stopReason: string | undefined): void {
-    if (!stopReason || stopReason === 'end_turn' || stopReason === 'cancelled') { return; }
-    const message = stopReason === 'refusal'
-      ? 'The agent refused to continue. This turn will not be included in the next prompt.'
-      : stopReason === 'max_tokens'
-        ? 'The turn was cut short by the token limit.'
-        : stopReason === 'max_turn_requests'
-          ? 'The turn was cut short by the agent-request limit.'
-          : `Turn ended with reason: ${stopReason}`;
+    // [CUSTOM-20261001-157] The wording lives in `stopReasonText` (shared with the
+    // turn-done notification) so the record and the toast cannot tell two stories.
+    const message = stopReasonText(stopReason);
+    if (!message) { return; }
     const entry = this.transcripts.appendNotice(sessionId, 'warn', message);
     if (entry) { this.post({ type: 'append', sessionId, entries: [entry] }); }
   }
@@ -894,18 +1015,29 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
   }
 
   /**
-   * [CUSTOM-20260926-075] Announce a RENAME — not a title being assigned for the
-   * first time. The first `session_info_update` of a session is normally the
-   * auto-generated title ("Fix the parser bug"), and printing a line for it would
-   * add noise to every single session. So the baseline is seeded from the title the
-   * session already had, and only a later, different title is announced.
+   * [CUSTOM-20260926-075] Keep the session's title map in step with the agent.
+   *
+   * [CUSTOM-20261001-163] …but **without announcing the change in the transcript**
+   * (user report: 会话进行中会自己改名，跳出一行 `Session renamed to “…”`).
+   *
+   * [CUSTOM-20261001-164] …and (user rule) **only until the first exchange is over**:
+   * the name is decided by the first exchange — the auto-title if it landed by then,
+   * otherwise the first user message — and NOTHING may rename the session afterwards.
+   *
+   * Why: the adapter pulls the SDK title at every turn end (`maybeUpdateSessionTitle`)
+   * and the SDK generates it in a background task, so it can land several turns later —
+   * by which time it describes what the conversation drifted INTO, not what it is
+   * (user's words: 这时候对话信息已经脱离第一次对话内容了). Late is not "an update",
+   * it is a different name for a different thing.
    */
-  private announceRename(sessionId: string, title: string): void {
-    const previous = this.sessionTitles.get(sessionId) ?? '';
+  private trackTitle(sessionId: string, title: string): boolean {
+    if (!title) { return false; }
+    if (this.titleFrozen.has(sessionId)) {
+      log(`${LOG_PREFIX}: ignoring a late title for ${sessionId} (the name is fixed by the first exchange)`);
+      return false;
+    }
     this.sessionTitles.set(sessionId, title);
-    if (!title || !previous || title === previous) { return; }
-    const entry = this.transcripts.appendNotice(sessionId, 'info', `Session renamed to “${title}”`);
-    if (entry) { this.post({ type: 'append', sessionId, entries: [entry] }); }
+    return true;
   }
 
   /**
@@ -926,7 +1058,9 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
   }
 
   /** Close streaming entries and ask the webview to render markdown. */
-  private finalizeTurn(sessionId: string): void {
+  private finalizeTurn(sessionId: string, outcome: TurnOutcome = {}): void {
+    // [CUSTOM-20261001-164] 一轮跑完 ⇒ 下一次发言到来时标题就该冻住了。
+    this.turnsDone.add(sessionId);
     this.finalizeEntries(sessionId);
     this.sessionManager.touchHistory(sessionId);
     this.refreshSessions();
@@ -940,6 +1074,20 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
     const stats = this.outbox.stats();
     log(`${LOG_PREFIX}: outbox sent=${stats.sent} merged=${stats.merged} queued=${stats.queued}`);
     this.outbox.resetStats();
+    // [CUSTOM-20261001-157] 后台会话跑完一轮就通知一声。这里是**唯一**的轮次结束收敛点
+    // （finalizeTurn 全仓只有 handleSendPrompt 的 finally 一处调用），所以"这一轮结束了吗"
+    // 不需要第二份状态（pitfall #34）。
+    if (!outcome.silent) {
+      const turn = (this.turnSeq.get(sessionId) ?? 0) + 1;
+      this.turnSeq.set(sessionId, turn);
+      this.notifySession({
+        kind: 'turn-done',
+        sessionId,
+        token: String(turn),
+        detail: outcome.detail,
+        failed: outcome.failed,
+      });
+    }
   }
 
   // --- Session update → transcript ----------------------------------------
@@ -958,6 +1106,14 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
     if (!this.choices.has(sessionId)) { this.syncChoices(sessionId); }
     // [CUSTOM-20260926-075] ...and the rename baseline, for the same reason.
     if (!this.sessionTitles.has(sessionId)) { this.sessionTitles.set(sessionId, session.title ?? ''); }
+
+    // [CUSTOM-20261001-162] 后台子任务：进入 / 续期"轮次之外仍在工作"（见 noteBackgroundTask）。
+    // 放在 switch 之前：这两条判据只看通告本身，与具体分支无关。
+    if (isBackgroundLaunch(data.rawInput)) {
+      this.noteBackgroundTask(sessionId, 'a background task was launched');
+    } else if (this.backgroundTasks.has(sessionId) && isWorkUpdate(data)) {
+      this.noteBackgroundTask(sessionId, 'still producing output');
+    }
 
     switch (data.sessionUpdate) {
       case 'agent_message_chunk': {
@@ -1025,6 +1181,8 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
         // 却走同一个 user chunk 通道 —— 渲染成蓝色用户气泡会把"agent 的回报"误读成
         // "我说过这句话"。分流成 meta 提示条，正文截断一行。
         if (isInjectedChunk(text)) {
+          // [CUSTOM-20261001-162] 后台任务汇报完毕：等的就是它（见 noteBackgroundTask）。
+          if (isTaskNotification(text)) { this.endBackgroundTask(sessionId, 'reported'); }
           const preview = firstLineOf(stripInjectionWrapper(text));
           const entry = this.transcripts.appendNotice(sessionId, 'meta', preview);
           if (entry) { this.post({ type: 'append', sessionId, entries: [entry] }); }
@@ -1115,13 +1273,15 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       }
 
       default: {
-        // [CUSTOM-20260928-097] session_info_update must APPLY the title here. The
-        // comment below used to claim SessionManager handled it, but
-        // applySessionInfoUpdate was only ever called from the LEGACY provider — so
-        // in the new panel the tab strip never learned a session's title.
-        if (data.sessionUpdate === 'session_info_update') {
+        // [CUSTOM-20261001-164] 标题的**单一判定点**：`trackTitle` 说收下，SessionManager 才写。
+        // 拆成两处会漏 —— 第一版只挡了宿主那份 map，而 tab 的标题读的是 `session.title`
+        // （`applySessionInfoUpdate` 写的），于是"迟到几轮的自动命名"照样改掉了名字。
+        const titleAccepted = data.sessionUpdate === 'session_info_update'
+          ? this.trackTitle(sessionId, typeof data.title === 'string' ? data.title : '')
+          : false;
+        if (titleAccepted) {
           this.sessionManager.applySessionInfoUpdate(sessionId, {
-            title: typeof data.title === 'string' ? data.title : (data.title === null ? null : undefined),
+            title: data.title as string,
             updatedAt: typeof data.updatedAt === 'string' ? data.updatedAt : undefined,
           });
         }
@@ -1134,11 +1294,8 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
           this.pushMeta(sessionId);
           this.refreshSessions();
         }
-        // [CUSTOM-20260926-075] A rename notice does not depend on the switch
-        // baseline, so it is handled before the guard below.
-        if (data.sessionUpdate === 'session_info_update') {
-          this.announceRename(sessionId, typeof data.title === 'string' ? data.title : '');
-        }
+        // [CUSTOM-20260926-075] 标题的记账已经在上面的 default 分支里做完（163/164 起静默、
+        // 且只认第一次对话里的那一条），这里不再重复。
         // [CUSTOM-20260926-073] A switch the agent pushed (or that another surface
         // triggered). The PAYLOAD is used rather than SessionManager's copy: our
         // listener may run before SessionManager's, in which case its state is still
@@ -1356,22 +1513,167 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
   // --- Permission presenter (CUSTOM-20260924-020) --------------------------
 
   /**
-   * Can this prompt be answered on a card the user will actually see?
+   * Whether this prompt belongs to the modern panel — i.e. whether the panel can
+   * eventually render it and the user can answer it there.
    *
-   * Three conditions, all required: the prompt belongs to the focused session
-   * (a card for another session would be filtered out client-side and the
-   * agent would wait on an invisible button), the agent is a modern-panel one
-   * (legacy sessions have no transcript here), and some surface exists. A
-   * hidden surface is raised — without stealing focus — because the agent is
-   * blocked until this is answered.
+   * [CUSTOM-20261001-156] This used to require the prompt's session to be the
+   * FOCUSED one, which handed every background session's request to the window-level
+   * QuickPick. That is wrong for a multi-session panel: the user's screenshot shows
+   * the result — a modal question at the top of the window about a session they were
+   * not looking at. A record is now created for any modern session (the client
+   * filters by focused session, and the focus/boot snapshot brings it back), and when
+   * it is NOT on screen the host sends a notification instead (see notifySession).
+   *
+   * Three conditions, all required: the session exists and its OWN agent is a modern
+   * one (matching the focused agent's name was a latent bug — with only one modern
+   * agent configured it never showed), and some surface exists to draw on. A hidden
+   * surface is raised only for the FOCUSED session — the agent is blocked until this
+   * is answered, and that is the session the user is working in. A background
+   * session never steals the view; its notification does the telling.
+   *
+   * "No surface" still returns false on purpose: nothing can render, so the bridge's
+   * dialog fallback stays the exit that cannot hang the agent (pitfall #14).
    */
   canPresent(sessionId: string): boolean {
-    if (this.focused.sessionId !== sessionId) { return false; }
-    if (!isModernAgent(this.focused.agentName)) { return false; }
-    const surface = this.surfaces.get(this.lastActive ?? 'view') ?? this.surfaces.values().next().value;
+    const session = sessionOf(this.sessionManager, sessionId);
+    if (!session || !isModernAgent(session.agentName)) { return false; }
+    const surface = this.activeSurface();
     if (!surface) { return false; }
-    if (!surface.visible) { surface.reveal(true); }
+    if (this.focused.sessionId === sessionId && !surface.visible) { surface.reveal(true); }
     return true;
+  }
+
+  /** The surface a prompt would be drawn on (last active, else any). */
+  private activeSurface(): ChatSurface | undefined {
+    return this.surfaces.get(this.lastActive ?? 'view') ?? this.surfaces.values().next().value;
+  }
+
+  /**
+   * [CUSTOM-20261001-156] True when the user is actually looking at this session:
+   * it is the focused one AND a visible surface shows it. Everything else gets a
+   * notification instead (the panel may be closed, hidden behind an editor, or
+   * showing a different session entirely).
+   */
+  private isSessionOnScreen(sessionId: string): boolean {
+    if (this.focused.sessionId !== sessionId) { return false; }
+    const surface = this.activeSurface();
+    return !!surface && surface.visible;
+  }
+
+  /**
+   * [CUSTOM-20261001-156] Tell the user about a session they are not looking at.
+   * The on-screen check lives HERE rather than inside SessionNotifier: the host owns
+   * `focused`/`surfaces`, and keeping the notifier free of host state is what makes
+   * it testable with two lines (see SessionNotifier).
+   */
+  private notifySession(input: {
+    kind: 'waiting-permission' | 'waiting-form' | 'turn-done' | 'background-stalled';
+    sessionId: string;
+    token: string;
+    detail?: string;
+    failed?: boolean;
+  }): void {
+    if (this.isSessionOnScreen(input.sessionId)) { return; }
+    const label = this.sessionLabel(input.sessionId);
+    const sent = this.notifier.notify({ ...input, label });
+    // The persisted log is the debugging entry point (docs/dev-workflow.md): "did we
+    // notify, and about what" must be answerable without a screenshot. The wording
+    // itself is `composeNotice`'s; this line carries the identity.
+    log(`${LOG_PREFIX}: notify ${input.kind} ${input.sessionId} ${sent ? 'sent' : 'duplicate'} (${label})`);
+  }
+
+  /**
+   * "Claude Code · 修复登录 bug" — the same fallback chain `toSummary` uses for the tab
+   * title, so a session named after its first message is called the same thing in a
+   * notification as in the strip (078/164).
+   */
+  private sessionLabel(sessionId: string): string {
+    const session = sessionOf(this.sessionManager, sessionId);
+    if (!session) { return sessionId.slice(0, 8); }
+    const title = this.sessionTitles.get(sessionId)
+      || session.title
+      || this.sessionManager.getHistoryStore()?.get(session.agentName, sessionId)?.firstPrompt
+      || '';
+    return title ? `${session.agentDisplayName} · ${title}` : session.agentDisplayName;
+  }
+
+  // [CUSTOM-BEGIN] CUSTOM-20261001-162 - 轮次之外的 agent 工作（后台子任务）。
+  //
+  // 现象（用户报）：任务还在跑（在等子 agent），发送按钮却已经变回普通状态。
+  // 根因：`running` 只由"`session/prompt` 请求还没返回"决定，而后台子任务**在轮次结束后继续
+  // 干活**——轮次一结束，面板就让它看起来"空闲"了。
+  //
+  // 状态机（三条进出条件都要求**有证据**，不猜）：
+  //   · 进入：某个 tool call 的 `rawInput.run_in_background` 为真 —— 这是 agent 明说"我在后台
+  //     起了个任务"，也是唯一能提前知道的信号（轮次还在飞时就要记下来，因为任务会比轮次活得久）；
+  //   · 保持：该会话还有**产出型**通知（助手/思考分片、工具调用/更新）⇒ 看门狗重新武装；
+  //   · 退出：① 收到 `<task-notification>` 注入块（后台任务汇报完毕，109 已经在处理这类块）
+  //     ② 新轮次开始（轮次自己就报告 running）③ 看门狗超时 —— 此刻**发一条通知**再恢复：
+  //     静默地变回"可以发消息"正是用户看到的那种"没人告诉我发生了什么"。
+  // [CUSTOM-END] CUSTOM-20261001-162
+
+  /**
+   * [CUSTOM-20261001-162] This session keeps working outside the turn: stay "running"
+   * until it reports back or goes quiet (see the block above).
+   */
+  private noteBackgroundTask(sessionId: string, reason: string): void {
+    const existing = this.backgroundTasks.get(sessionId);
+    if (existing) { clearTimeout(existing); }
+    this.backgroundTasks.set(sessionId, setTimeout(
+      () => this.endBackgroundTask(sessionId, 'quiet'),
+      this.backgroundQuietMs,
+    ));
+    if (existing) { return; }
+    log(`${LOG_PREFIX}: session ${sessionId} keeps running outside the turn (${reason})`);
+    this.refreshSessions();
+  }
+
+  /** Stop waiting on background work (cause is for the log; `quiet` also notifies). */
+  private endBackgroundTask(sessionId: string, cause: 'reported' | 'quiet' | 'turn' | 'closed'): void {
+    const timer = this.backgroundTasks.get(sessionId);
+    if (!timer) { return; }
+    clearTimeout(timer);
+    this.backgroundTasks.delete(sessionId);
+    log(`${LOG_PREFIX}: session ${sessionId} is no longer waiting on background work (${cause})`);
+    this.refreshSessions();
+    if (cause === 'quiet') {
+      // The wait is over, but not silently: "the button came back and nobody said why"
+      // is exactly the experience this whole state exists to remove.
+      this.notifySession({
+        kind: 'background-stalled',
+        sessionId,
+        token: String(Date.now()),
+        detail: `已 ${Math.round(this.backgroundQuietMs / 1000)} 秒没有输出`,
+      });
+    }
+  }
+
+  /** [CUSTOM-20261001-162] "running" for the summary: a turn in flight OR background work. */
+  private isSessionRunning(sessionId: string): boolean {
+    return this.sessionManager.isTurnInFlight(sessionId) || this.backgroundTasks.has(sessionId);
+  }
+
+  /**
+   * [CUSTOM-20261001-156] Clicking a notification: bring that session up.
+   *
+   * `force` is the established way to focus a session the host already considers
+   * active (080/087) — without it the focus event never fires and the panel would
+   * stay where it was. A visible surface is raised WITH focus (this is an explicit
+   * user action, unlike canPresent's reveal); with no surface at all, the sidebar
+   * is opened through the same command extension.ts already uses.
+   */
+  private revealSession(sessionId: string, label: string): void {
+    if (!this.sessionManager.getSession(sessionId)) {
+      // The notification outlived its session (it was closed meanwhile). Silence
+      // here would look like a dead button (pitfall #29).
+      log(`${LOG_PREFIX}: notification clicked for a session that is gone (${sessionId})`);
+      return;
+    }
+    log(`${LOG_PREFIX}: notification clicked — revealing ${label} (${sessionId})`);
+    this.sessionManager.focusSession(sessionId, { force: true });
+    const surface = this.activeSurface();
+    if (surface) { surface.reveal(false); return; }
+    void vscode.commands.executeCommand('acpc-chat.focus');
   }
 
   // [CUSTOM-BEGIN] CUSTOM-20260929-119 - PermissionPresenter + ElicitationPresenter 共用
@@ -1384,10 +1686,18 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
     this.refreshSessions();
     if (isElicitationState(state)) { this.showElicitation(state); return; }
     const session = sessionOf(this.sessionManager, state.sessionId);
-    if (!session) { return; }
+    if (!session) {
+      // [CUSTOM-20261001-156] Reachable for a request whose session went away in the
+      // same tick; silence here would be a request nobody ever heard about (#29).
+      log(`${LOG_PREFIX}: permission prompt for unknown session ${state.sessionId} (dropped)`);
+      return;
+    }
     this.transcripts.ensureSession(state.sessionId, session.agentName);
     const entry = this.transcripts.appendPermission(state.sessionId, state);
     if (entry) { this.post({ type: 'append', sessionId: state.sessionId, entries: [entry] }); }
+    // [CUSTOM-20261001-156] Not on screen ⇒ tell the user (the record is there for
+    // when they jump over; the notification is the way they learn about it).
+    this.notifySession({ kind: 'waiting-permission', sessionId: state.sessionId, token: state.promptId, detail: state.title });
   }
 
   update(state: PermissionState | ElicitationState): void {
@@ -1409,10 +1719,16 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
   // 切走再切回、两个 surface 切换都不需要额外机制），回答走 elicitationAnswer 消息。
   showElicitation(state: ElicitationState): void {
     const session = sessionOf(this.sessionManager, state.sessionId);
-    if (!session) { return; }
+    if (!session) {
+      // [CUSTOM-20261001-156] Same reasoning as the permission branch above.
+      log(`${LOG_PREFIX}: form for unknown session ${state.sessionId} (dropped)`);
+      return;
+    }
     this.transcripts.ensureSession(state.sessionId, session.agentName);
     const entry = this.transcripts.appendElicitation(state.sessionId, state);
     if (entry) { this.post({ type: 'append', sessionId: state.sessionId, entries: [entry] }); }
+    // [CUSTOM-20261001-156] "会话等待选项确认" —— 与权限同一条通知纪律。
+    this.notifySession({ kind: 'waiting-form', sessionId: state.sessionId, token: state.promptId, detail: state.message });
   }
 
   updateElicitation(state: ElicitationState): void {
@@ -1566,8 +1882,12 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
    * the agent-side list wins: it is authoritative and includes sessions this
    * window never saw.
    */
-  private async handleListHistory(agentName?: string): Promise<void> {
+  private async handleListHistory(agentName?: string, cwd?: string): Promise<void> {
     const agent = this.panelAgent(agentName);
+    // [CUSTOM-20261001-155] The client's address-bar directory, when it sent one. It is
+    // what the filter's default is derived from (see postHistory); an empty or missing
+    // value falls back to the host-side guess, which keeps older clients working.
+    const askedCwd = typeof cwd === 'string' && cwd.trim().length > 0 ? cwd : undefined;
     if (!agent) {
       this.post({ type: 'history', agentName: '', sessions: [], source: 'local', error: 'No agent selected.' });
       return;
@@ -1621,14 +1941,14 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
         // [CUSTOM-20260927-094] …and with the agent's own transcript directory, which is
         // the only source that also covers sessions this workspace never opened (the
         // official Claude Code panel reads exactly that directory).
-        this.postHistory(agent, 'merged', mergeHistoryRows(fromAgent, await this.readDiskHistory(agent), local()));
+        this.postHistory(agent, 'merged', mergeHistoryRows(fromAgent, await this.readDiskHistory(agent), local()), askedCwd);
         return;
       }
       // Not connected: the cache plus (for Claude Code) the transcripts on disk.
-      this.postHistory(agent, 'merged', mergeHistoryRows(await this.readDiskHistory(agent), local()));
+      this.postHistory(agent, 'merged', mergeHistoryRows(await this.readDiskHistory(agent), local()), askedCwd);
     } catch (e: any) {
       // An agent-side failure still has the cache as a usable answer.
-      this.postHistory(agent, 'local', local(),
+      this.postHistory(agent, 'local', local(), askedCwd,
         `Could not query the agent (${e?.message ?? e}); showing the local cache.`);
     }
   }
@@ -1700,6 +2020,7 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
     agent: string,
     source: 'agent' | 'local' | 'merged',
     sessions: Array<Omit<HistorySessionSummary, 'dirKey'>>,
+    currentCwd?: string,
     error?: string,
   ): void {
     const rows: HistorySessionSummary[] = sessions.map(s => {
@@ -1711,13 +2032,20 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       agentName: agent,
       source,
       sessions: rows,
-      directories: directoryOptions(rows, this.historyFilterCwd(agent)),
+      // [CUSTOM-20261001-155] `currentCwd` is the CLIENT's address-bar directory when it
+      // sent one; the host-side guess is the fallback.
+      directories: directoryOptions(rows, currentCwd ?? this.historyFilterCwd(agent)),
       ...(error ? { error } : {}),
     });
   }
 
   /**
    * [CUSTOM-20260926-079] The directory the history filter defaults to.
+   *
+   * [CUSTOM-20261001-155] Now only the FALLBACK (see postHistory): the panel's client
+   * sends the directory its address bar is showing, which is the correct answer on a
+   * draft page (drafts are client-local, 058) and is what the user actually sees. This
+   * guess stays for callers that send none.
    *
    * The focused session's OWN directory, when that session belongs to the agent
    * being listed — the picker is per-agent and the focused session may belong to a
@@ -1836,6 +2164,92 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
   }
 
   /**
+   * [CUSTOM-20261001-159] The mode the user just picked, remembered per agent.
+   *
+   * Only USER actions call this (the three setters below) — never an agent-reported
+   * change: a mode the agent switched to on its own (plan mode activating itself) is
+   * not a preference, and letting those in would make the "default" silently follow
+   * whatever the last session happened to do.
+   *
+   * The value is read from the config option (`category === 'mode'`), never from
+   * `session.modes.currentModeId` — 128's rule: the option is the authoritative copy,
+   * the other is a mirror only `applyConfigOptions` writes.
+   */
+  private rememberUserMode(sessionId: string): void {
+    const session = sessionOf(this.sessionManager, sessionId);
+    if (!session) { return; }
+    const option = modeOptionOf(session.configOptions);
+    if (!option) { return; }
+    const value = String((option as { currentValue?: unknown }).currentValue ?? '');
+    if (!value) { return; }
+    const previous = this.lastMode.get(session.agentName);
+    if (previous && previous.configId === option.id && previous.value === value) { return; }
+    this.lastMode.set(session.agentName, { configId: option.id, value });
+    const store: LastModeStore = {};
+    for (const [agentName, mode] of this.lastMode) { store[agentName] = mode; }
+    void this.globalState?.update(LAST_MODE_KEY, store);
+    log(`${LOG_PREFIX}: remembered mode ${option.id}=${value} for ${session.agentName}`);
+  }
+
+  /**
+   * [CUSTOM-20261001-159] Apply the remembered mode to a BRAND NEW session.
+   *
+   * Same three gates as a draft selection (the shape is deliberately the same — this
+   * IS "the value the user chose, applied to a session that did not exist yet"):
+   * the option must still be offered, the value must still be a candidate, and an
+   * equal current value is skipped (no round trip, no chance for a spurious notice).
+   *
+   * Unlike a draft selection, a failure is logged and NOT announced in the record: a
+   * default is not a request. The user never asked for this particular value here, so
+   * a line about it failing would be noise about something they cannot see.
+   */
+  private async applyRememberedMode(sessionId: string): Promise<void> {
+    const session = sessionOf(this.sessionManager, sessionId);
+    if (!session) { return; }
+    const remembered = this.lastMode.get(session.agentName);
+    if (!remembered) { return; }
+    const option = (session.configOptions ?? []).find(o => o.id === remembered.configId);
+    if (!option || (option as { category?: string }).category !== 'mode') {
+      log(`${LOG_PREFIX}: remembered mode ${remembered.configId} is not offered by ${sessionId} (agent ${session.agentName}); skipped`);
+      return;
+    }
+    if (String((option as { currentValue?: unknown }).currentValue ?? '') === remembered.value) { return; }
+    const valid = option.type === 'boolean'
+      ? remembered.value === 'true' || remembered.value === 'false'
+      : selectValues(option).includes(remembered.value);
+    if (!valid) {
+      log(`${LOG_PREFIX}: remembered mode value ${remembered.value} is no longer a candidate; skipped`);
+      return;
+    }
+    try {
+      await this.sessionManager.setConfigOption(sessionId, remembered.configId, remembered.value);
+      // Seed the switch baseline: our own setter has already written the authoritative
+      // copy, so the agent's next notification about the same state diffs to nothing.
+      // Without it the application would be announced as a switch the user never made
+      // (the same trap applyDraftSelections documents at length).
+      const state = this.choiceState(sessionId);
+      if (state) { this.choices.set(sessionId, state); }
+      this.pushMeta(sessionId);
+      log(`${LOG_PREFIX}: applied remembered mode ${remembered.configId}=${remembered.value} to ${sessionId}`);
+    } catch (e: any) {
+      log(`${LOG_PREFIX}: applying the remembered mode failed (ignored): ${e?.message ?? e}`);
+    }
+  }
+
+  /**
+   * [CUSTOM-20261001-159] Wait for the mode application `session-created` kicked off.
+   *
+   * The draft page must run its OWN selections after the default: both land as
+   * `session/set_config_option` on one connection, and the one that arrives last wins
+   * — the user's explicit pick may not be overwritten by a default.
+   */
+  private async awaitModeApply(sessionId: string): Promise<void> {
+    const pending = this.modeApply.get(sessionId);
+    this.modeApply.delete(sessionId);
+    if (pending) { await pending; }
+  }
+
+  /**
    * [CUSTOM-20260930-151] 草稿页问"这个 agent 的输入卡该显示什么"。
    *
    * 必须**无条件回话**（哪怕是空的）：客户端要靠这条应答才把选择器/斜杠列表布置好，让它在
@@ -1849,7 +2263,10 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       type: 'draftOptions',
       draftId,
       agentName: agent,
-      configOptions: snapshot?.configOptions ?? [],
+      // [CUSTOM-20261001-160] 模式那一项显示**记住的值**而不是上一条会话快照里的值：草稿页
+      // 显示的就是"你不改的话会建成什么样"，而新建会话套用的正是记住的那个（159）。两处读的
+      // 是同一条记录 —— 不是两份真相（pitfall #19）。
+      configOptions: withRememberedMode(snapshot?.configOptions ?? [], agent ? this.lastMode.get(agent) : undefined),
       availableCommands: snapshot?.availableCommands ?? [],
     }, to);
   }
@@ -1961,6 +2378,10 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       // whole turn (it is what carries the stop reason back), and the client must
       // be able to swap its draft tab for the real one immediately.
       this.post({ type: 'draftResolved', draftId, sessionId: session.sessionId }, to);
+      // [CUSTOM-20261001-159] 先等"记住的默认模式"落地（session-created 那次应用），再应用用户
+      // 在草稿页显式选过的值：两个都是同一条连接上的 setConfigOption，后到的赢 —— 顺序反了
+      // 的话用户刚选的模式会被默认值盖回去。
+      await this.awaitModeApply(session.sessionId);
       // [CUSTOM-20260930-151] 草稿页上选过的模式/模型只能在这里落到会话上（会话存在之前没有
       // 地方可下发），而且必须在首条消息**之前**——第一轮就该跑在用户选的设置上。
       await this.applyDraftSelections(session, selections);
@@ -2009,6 +2430,11 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       try {
         await this.sessionManager.setConfigOption(session.sessionId, configId, value);
         applied += 1;
+        // [CUSTOM-20261001-159] 用户在草稿页显式选过的模式，也算"用户的选择"——下次新建会话
+        // 的默认值就是它（否则这里选一次、下个会话又弹回旧值，看起来就是没记住）。
+        if ((option as { category?: string }).category === 'mode') {
+          this.rememberUserMode(session.sessionId);
+        }
       } catch (e: any) {
         const message = e?.message ?? String(e);
         log(`${LOG_PREFIX}: draft selection ${configId}=${value} failed: ${message}`);
@@ -2183,7 +2609,9 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       cwd: session.cwd,
       createdAt: session.createdAt,
       loading: this.sessionManager.isLoading(session.sessionId),
-      running: this.sessionManager.isTurnInFlight(session.sessionId),
+      // [CUSTOM-20261001-162] A turn in flight OR background work still reporting (see
+      // noteBackgroundTask) — the composer's Send/Stop follows this.
+      running: this.isSessionRunning(session.sessionId),
       // [CUSTOM-20260925-063] Drives the tab-strip "attention" dot. NOTE:
       // refreshSessions()'s signature string must include it too, or the strip
       // would never be told this changed (022's signature de-dup trap).
@@ -2286,6 +2714,24 @@ export function vscodePanelPrefs(): PanelPrefsIO {
   };
 }
 
+/**
+ * [CUSTOM-20261001-156] Default implementation: a real VS Code notification.
+ *
+ * Lives here rather than in SessionNotifier for the same reason `vscodePanelPrefs`
+ * lives here: that module must not import vscode, or its unit test could not run
+ * outside the Extension Host. `Promise.resolve` adopts the extension API's own
+ * thenable, so the seam stays a plain Promise.
+ */
+export function vscodeNoticeChannel(): NoticeChannel {
+  return {
+    show: (level, message, action) => Promise.resolve(
+      level === 'warning'
+        ? vscode.window.showWarningMessage(message, action)
+        : vscode.window.showInformationMessage(message, action),
+    ),
+  };
+}
+
 /** [CUSTOM-20260930-125] Exported for its table test: only the boolean true is true. */
 export function resolveAutoConnect(raw: unknown): boolean {
   return raw === true;
@@ -2298,6 +2744,78 @@ export function resolveAutoConnect(raw: unknown): boolean {
  */
 function isElicitationState(state: PermissionState | ElicitationState): state is ElicitationState {
   return Array.isArray((state as ElicitationState).fields);
+}
+
+/**
+ * [CUSTOM-20261001-157] How a turn ended, for the turn-done notification.
+ * `silent` is the third state on purpose: a turn the USER cancelled needs no toast
+ * ("你可真行，你按的 Stop 你自己知道") — but it also must not read as "已完成".
+ */
+interface TurnOutcome {
+  silent?: boolean;
+  failed?: boolean;
+  detail?: string;
+}
+
+/**
+ * [CUSTOM-20261001-157] The one wording for a non-normal stop reason, or null when
+ * there is nothing to say (`end_turn` = normal, `cancelled` = the user did it).
+ *
+ * Two consumers render it — the transcript notice (`applyStopReason`) and the
+ * turn-done notification — so it lives in exactly one place; two hand-written
+ * copies is precisely how the record and the toast end up disagreeing (#19).
+ */
+export function stopReasonText(stopReason: string | undefined): string | null {
+  if (!stopReason || stopReason === 'end_turn' || stopReason === 'cancelled') { return null; }
+  return stopReason === 'refusal'
+    ? 'The agent refused to continue. This turn will not be included in the next prompt.'
+    : stopReason === 'max_tokens'
+      ? 'The turn was cut short by the token limit.'
+      : stopReason === 'max_turn_requests'
+        ? 'The turn was cut short by the agent-request limit.'
+        : `Turn ended with reason: ${stopReason}`;
+}
+
+/** [CUSTOM-20261001-157] A finished turn → what (if anything) the notification says. */
+export function turnOutcome(stopReason: string | undefined): TurnOutcome {
+  if (stopReason === 'cancelled') { return { silent: true }; }
+  const detail = stopReasonText(stopReason);
+  return detail ? { failed: true, detail } : {};
+}
+
+/**
+ * [CUSTOM-20261001-159] The session's mode, as the config option list spells it
+ * (`category === 'mode'`), or undefined when this agent does not offer one.
+ *
+ * One place answers "which option is the mode": the picker, the remember step and
+ * the apply step all ask this, and three copies of the predicate is how they drift
+ * (pitfall #19). Note it is the OPTION's own id that is returned — never the literal
+ * string 'mode' — because that id is what `setConfigOption` needs.
+ */
+export function modeOptionOf(
+  options: readonly SessionConfigOption[] | null | undefined,
+): SessionConfigOption | undefined {
+  return (options ?? []).find(o => (o as { category?: string }).category === 'mode');
+}
+
+/**
+ * [CUSTOM-20261001-160] The draft page's option list, with the remembered mode shown
+ * as the current value (see handleListDraftOptions).
+ *
+ * A pure copy: the snapshot in `draftOptions` is the agent's own last-seen state and
+ * must not be rewritten with a preference — the next session's real configOptions
+ * (not this display copy) is what `applyRememberedMode` validates against.
+ */
+export function withRememberedMode(
+  options: readonly SessionConfigOption[],
+  remembered: RememberedMode | undefined,
+): SessionConfigOption[] {
+  if (!remembered) { return options as SessionConfigOption[]; }
+  return options.map(option => (option.id === remembered.configId
+    // The union (select | boolean) does not survive a spread — the cast is the shape
+    // the spread cannot express, not a lie about the value.
+    ? { ...option, currentValue: remembered.value } as SessionConfigOption
+    : option));
 }
 
 function sessionOf(manager: SessionManager, sessionId: string): SessionInfo | undefined {
@@ -2367,6 +2885,44 @@ function isInjectedChunk(text: string): boolean {
   const t = text.trimStart();
   for (const p of INJECTED_PREFIXES) { if (t.startsWith(p)) { return true; } }
   return false;
+}
+
+/**
+ * [CUSTOM-20261001-162] A background task reporting back (Claude Code injects these
+ * into the session when a `run_in_background` sub-agent finishes).
+ *
+ * Separate from `isInjectedChunk` on purpose: that one answers "is this the user
+ * speaking" (five prefixes), this one answers "did the work we were waiting for
+ * finish" (one). Reusing the wider predicate would end the wait on any injection.
+ */
+function isTaskNotification(text: string): boolean {
+  return text.trimStart().startsWith('<task-notification');
+}
+
+/** [CUSTOM-20261001-162] The agent just launched a background task (Task 工具的 run_in_background)。 */
+function isBackgroundLaunch(rawInput: unknown): boolean {
+  if (!rawInput || typeof rawInput !== 'object') { return false; }
+  const flag = (rawInput as Record<string, unknown>).run_in_background;
+  return flag === true || flag === 'true';
+}
+
+/**
+ * [CUSTOM-20261001-162] Which updates count as "still working".
+ *
+ * Deliberately NOT every notification: `session_info_update` / `available_commands_update` /
+ * `current_mode_update` / `usage_update` are housekeeping and can arrive while the agent
+ * is idle — counting them would pin a Stop button onto a session with nothing running.
+ */
+function isWorkUpdate(update: { sessionUpdate?: string }): boolean {
+  switch (update?.sessionUpdate) {
+    case 'agent_message_chunk':
+    case 'agent_thought_chunk':
+    case 'tool_call':
+    case 'tool_call_update':
+      return true;
+    default:
+      return false;
+  }
 }
 
 /** 剥掉外层 <tag>…</tag>，取第一行可见内容。 */

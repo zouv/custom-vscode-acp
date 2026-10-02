@@ -19,6 +19,9 @@ import { domClient } from '../ui/chat/html/client/dom';
 import { iconsClient } from '../ui/chat/html/client/icons';
 import { linksClient } from '../ui/chat/html/client/links';
 import { sessionMenuClient } from '../ui/chat/html/client/sessionMenu';
+// [CUSTOM-20261001-158] 权限卡（记录行）+ 权限抽屉（悬浮浮层）。
+import { permissionViewClient } from '../ui/chat/html/client/permissionView';
+import { permissionDrawerClient } from '../ui/chat/html/client/permissionDrawer';
 // [CUSTOM-20260929-119] Form cards (ACP elicitation / AskUserQuestion).
 import { elicitationViewClient } from '../ui/chat/html/client/elicitationView';
 import { composerClient } from '../ui/chat/html/client/composer';
@@ -91,6 +94,11 @@ class StubNode {
   }
 
   insertBefore<T extends StubNode>(child: T, before: StubNode | null): T {
+    // [CUSTOM-20261002-172] 真 DOM 的 insertBefore 会**先把已在树里的节点摘下来**（它是"移动"，
+    // 不只是"插入"）：不建模这一条，任何"重排已有子节点"的客户端代码在这里都会拿到一份重复
+    // 引用，随后按 indexOf 删掉的又是另一个 —— 症状是子节点顺序静默错乱（stickyUser 的卡堆
+    // 重排就是这么被坑的，见 pitfalls #41）。
+    if (child.parentNode) { child.parentNode.removeChild(child); }
     child.parentNode = this;
     const at = before ? this.childNodes.indexOf(before) : -1;
     if (at < 0) { this.childNodes.push(child); } else { this.childNodes.splice(at, 0, child); }
@@ -291,7 +299,7 @@ function loadClient(
     addEventListener: () => {},
     removeEventListener: () => {},
   };
-  const doc = {
+  const doc: Record<string, unknown> = {
     // 'loading' keeps boot's init() from running: this suite exercises the record
     // layer, and boot's init wires a dozen elements that body.ts supplies (and that a
     // stub would only pretend to have - a fake DOM is not the thing under test here).
@@ -307,6 +315,12 @@ function loadClient(
     removeEventListener: () => {},
     body: new StubNode('body'),
   };
+  // [CUSTOM-20261001-158] Document-level lookups resolve against the body: the permission
+  // view disables a prompt's buttons wherever they are (the drawer lives on the body), so
+  // a stub without these two would silently disable nothing.
+  const body = doc.body as StubNode;
+  doc.querySelector = (sel: string) => body.querySelector(sel);
+  doc.querySelectorAll = (sel: string) => body.querySelectorAll(sel);
   // 只加载**被测链路**：dom（工具）→ icons（图标，用于断言挂载顺序）→ links（装饰）
   // → toolCallView → transcriptView。
   //
@@ -336,7 +350,7 @@ function loadClient(
   // [CUSTOM-20260926-079] `sessionMenu` joined the list for its own suite: unlike
   // boot, its IIFE runs nothing at load time (init() is called by boot, and here by
   // the test), so loading it costs the record-layer tests nothing.
-  for (const source of [domClient, iconsClient, linksClient, toolCallViewClient, transcriptViewClient, outlineClient, sessionMenuClient, composerClient, tabsClient, stickyUserClient, elicitationViewClient, stateCardClient]) {
+  for (const source of [domClient, iconsClient, linksClient, toolCallViewClient, transcriptViewClient, permissionViewClient, permissionDrawerClient, outlineClient, sessionMenuClient, composerClient, tabsClient, stickyUserClient, elicitationViewClient, stateCardClient]) {
     new Function('window', 'document', source)(win, doc);
   }
   return { NS, metrics, doc, docListeners, jumps, timers };
@@ -1175,10 +1189,25 @@ suite('chat client logic: history picker filter (stub DOM)', () => {
     { key: '/git/beta', cwd: '/git/beta', name: 'beta', count: 1, current: false },
   ];
 
-  /** An open drawer with a filled list, exactly as boot would leave it. */
-  function openedPicker(overrides: Record<string, unknown> = {}): { NS: Record<string, any>; docListeners: Record<string, Array<(e: any) => void>>; tree: ReturnType<typeof historyDrawer> } {
+  /**
+   * An open drawer with a filled list, exactly as boot would leave it.
+   *
+   * [CUSTOM-20261001-155] `opts` seeds the two inputs the default filter now reads:
+   * `tabCwd` = the directory the ADDRESS BAR shows (`NS.tabs.currentCwd`, the only
+   * collaborator sessionMenu reads it from) and `uiState` = the persisted UI
+   * preferences (`NS.boot.recallUi`). Both default to "nothing", which is the
+   * state the 079-era tests were written against.
+   */
+  function openedPicker(
+    overrides: Record<string, unknown> = {},
+    opts: { tabCwd?: string | null; uiState?: Record<string, unknown> } = {},
+  ): { NS: Record<string, any>; docListeners: Record<string, Array<(e: any) => void>>; tree: ReturnType<typeof historyDrawer>; posted: Array<Record<string, any>> } {
     const tree = historyDrawer();
     const { NS, docListeners } = loadClient(tree.elements);
+    NS.tabs = { currentCwd: () => opts.tabCwd ?? null };
+    if (opts.uiState) { NS.boot.recallUi = () => ({ ...opts.uiState }); }
+    const posted: Array<Record<string, any>> = [];
+    NS.bridge.post = (m: Record<string, any>) => { posted.push(m); };
     NS.sessionMenu.init();
     dispatchClick(tree.elements.historyBtn, docListeners);   // the ↺ button opens it
     // ...and the host's reply fills the list (this is what `setHistory` sees).
@@ -1187,7 +1216,7 @@ suite('chat client logic: history picker filter (stub DOM)', () => {
       sessions: SESSIONS, directories: DIRECTORIES,
       ...overrides,
     });
-    return { NS, docListeners, tree };
+    return { NS, docListeners, tree, posted };
   }
 
   function filterRows(menu: StubNode): StubNode[] {
@@ -1303,6 +1332,66 @@ suite('chat client logic: history picker filter (stub DOM)', () => {
     assert.strictEqual(items[0].getAttribute('data-open-session'), 'c1',
       'and the newest row is sorted to the top, not appended at the bottom');
   });
+
+  // [CUSTOM-20261001-155] The drawer's folder filter now defaults to the directory the
+  // ADDRESS BAR is showing, and the on/off preference flips to ON.
+
+  test('the request carries the address bar directory, and the list opens filtered to it (155)', () => {
+    const { posted, tree } = openedPicker({}, { tabCwd: '/git/alpha' });
+    assert.strictEqual(posted.find(m => m.type === 'listHistory')!.cwd, '/git/alpha',
+      'the address bar directory rides along with the request');
+    assert.strictEqual(tree.list.querySelectorAll('.outline-item').length, 2,
+      'only the sessions of that directory are listed');
+    assert.ok(tree.chip.querySelector('.picker-label')!.textContent.includes('alpha'),
+      'and the chip says which folder is filtering');
+  });
+
+  test('no directory in the address bar = the whole list (155)', () => {
+    // The rule is conditional: nothing focused, so there is nothing to filter by —
+    // NOT a folder picked on the user's behalf.
+    const { posted, tree } = openedPicker({}, { tabCwd: null });
+    assert.strictEqual(posted.find(m => m.type === 'listHistory')!.cwd, undefined,
+      'nothing to send');
+    assert.strictEqual(tree.list.querySelectorAll('.outline-item').length, 3, 'every session is listed');
+  });
+
+  test('the default is ON even when no preference was ever stored (155)', () => {
+    // The behavior change: 079 only filtered after the user had turned it on once.
+    const { tree } = openedPicker({}, { tabCwd: '/git/alpha', uiState: {} });
+    assert.strictEqual(tree.list.querySelectorAll('.outline-item').length, 2);
+  });
+
+  test('a remembered "All folders" keeps the next open unfiltered (155)', () => {
+    // The user's decision sticks, including across a webview reload (this is the
+    // state recallUi hands back).
+    const { tree } = openedPicker({}, { tabCwd: '/git/alpha', uiState: { historyFolderFilter: false } });
+    assert.strictEqual(tree.list.querySelectorAll('.outline-item').length, 3, 'the remembered choice wins');
+  });
+
+  test('choosing "All folders" is persisted as the preference (155)', () => {
+    const { NS, docListeners, tree } = openedPicker({}, { tabCwd: '/git/alpha' });
+    const patches: Array<Record<string, unknown>> = [];
+    NS.boot.persistUi = (p: Record<string, unknown>) => { patches.push(p); };
+    dispatchClick(tree.chip, docListeners);
+    const all = filterRows(tree.menu).find(r => r.getAttribute('data-filter-key') === '');
+    dispatchClick(all!, docListeners);
+    assert.strictEqual(tree.list.querySelectorAll('.outline-item').length, 3, 'all folders now');
+    assert.deepStrictEqual(patches, [{ historyFolderFilter: false }], 'and the choice is recorded');
+  });
+
+  test('the default folder also gets its disk supplement requested (155/095)', () => {
+    // A default folder that is not the first workspace folder would otherwise show a
+    // list missing exactly the disk-only sessions 094 was built for. The reply mirrors
+    // what the host sends when asked about beta: THAT candidate is the current one.
+    const { posted } = openedPicker({
+      directories: [
+        { key: '/git/alpha', cwd: '/git/alpha', name: 'alpha', count: 2, current: false },
+        { key: '/git/beta', cwd: '/git/beta', name: 'beta', count: 1, current: true },
+      ],
+    }, { tabCwd: '/git/beta' });
+    assert.deepStrictEqual(posted.filter(m => m.type === 'supplementHistory'),
+      [{ type: 'supplementHistory', cwd: '/git/beta' }]);
+  });
 });
 
 // [CUSTOM-20260928-096] 输入区四项优化里可落到桩 DOM 测的三条逻辑：上下文计量、
@@ -1331,6 +1420,21 @@ suite('chat client logic: composer input bar (stub DOM)', () => {
   const session = (id: string) => ({
     sessionId: id, agentName: 'Claude Code', title: null, cwd: '/tmp',
     createdAt: '', loading: false, running: false, unread: false,
+  });
+
+  // [CUSTOM-20261001-165] 新建会话（草稿页）不该显示上一个会话的上下文数字。
+  test('a new session starts with the meter cleared, not with the last session\'s numbers (165)', () => {
+    const { NS, contextMeter } = composerBar();
+    NS.composer.setMeta({ availableCommands: [], configOptions: [], usage: { used: 450000, size: 1000000 } });
+    assert.strictEqual(contextMeter.hidden, false, 'the session has usage');
+
+    // The user presses '+' — a draft has no session, so it has no usage either.
+    NS.composer.setDraft({ draftId: 'd1', cwd: '/tmp' });
+    assert.strictEqual(contextMeter.hidden, true, 'a fresh session must not show the previous one\'s ring');
+
+    // …and the same holds when switching to a session that never reported usage.
+    NS.composer.setFocus(session('s-2'), null);
+    assert.strictEqual(contextMeter.hidden, true, 'no usage ⇒ no meter (the old one is not carried over)');
   });
 
   test('the context meter is a ring with the percentage inside it', () => {
@@ -1699,271 +1803,453 @@ suite('chat client logic: image chip and pinned question (stub DOM)', () => {
     assert.strictEqual(node.querySelector('.content-image-name').textContent, 'shot.png');
   });
 
-  /** The three elements the bar is built from, plus the messages list it watches. */
+  /**
+   * [CUSTOM-20261002-172] host 就是那个定位层。卡片（.sticky-card > .sticky-body > 克隆体）由
+   * 客户端**按条动态建** —— 卡堆里同时可能有两张，固定 id 的 #stickyCard / #stickyBody 会撞成
+   * 重复 id，所以 body.ts 只留了空容器（169 删掉的那个 #stickyToggle 也已不在标记里）。
+   */
   function pinnedNodes() {
     const messages = new StubNode('div');
     const host = new StubNode('div');
-    const card = new StubNode('div');
-    const body = new StubNode('div');
-    const toggle = new StubNode('button');
     host.hidden = true;
-    toggle.hidden = true;
-    // body.ts's structure, spelled out:
-    //   #stickyUser > (#stickyToggle, .sticky-card > #stickyBody)
-    // Two things depend on it being real rather than flat — the copy has to be reachable
-    // through the host (assertions read textContent from there), and the click on the button
-    // has to travel a path that includes the host for "stopPropagation keeps the jump from
-    // firing" to assert anything at all. Since 105 the button is a SIBLING of the card (the
-    // messages fill the card, so an inside button would sit on the text).
-    host.appendChild(toggle);
-    host.appendChild(card);
-    card.appendChild(body);
-    return { messages, host, body, toggle };
+    return { messages, host };
   }
 
-  function pinnedSetup(): {
-    NS: Record<string, any>; messages: StubNode; host: StubNode; body: StubNode;
-    toggle: StubNode; jumps: Array<{ node: StubNode | null; clearance?: number }>;
+  /** stickyUser.ts 里唯一的常量：既是 host 的 padding-top，也是"本体让位"的交接窗口。 */
+  const TOP_GAP = 3;
+  /** 卡片的 2px 描边（border-box）：卡片比它复制的那条记录高这么多。 */
+  const CARD_BORDER = 4;
+
+  function cardsOf(host: StubNode): StubNode[] {
+    return host.childNodes.filter((c: StubNode) => c.nodeType === 1);
+  }
+
+  function cardOf(host: StubNode, id: string): StubNode | null {
+    return cardsOf(host).find((c: StubNode) => c.getAttribute('data-sticky-id') === id) ?? null;
+  }
+
+  function copyOf(host: StubNode, id: string): StubNode {
+    return (cardOf(host, id) as StubNode).querySelector('.entry-user') as StubNode;
+  }
+
+  /**
+   * [CUSTOM-20261002-172] 桩里没有布局，所以按客户端**写下的** marginTop 自己把流推一遍 ——
+   * 这正是那张契约：卡片留在文档流里（host 是 flex 列），第 0 张的 marginTop 相对 host 的
+   * padding-top（TOP_GAP），之后每张相对前一张的实际底边。卡高用"记录高 + 边框"：桩里
+   * element.offsetHeight 恒为 0，客户端量不到就走这条退路（stickyUser.ts 的 measure()）。
+   * **能测的只有逻辑**，所以这里量的是"客户端认为它落在哪"，不是像素（文件头的那条边界）。
+   */
+  function flowOf(
+    host: StubNode, nodes: Record<string, StubNode>,
+  ): Array<{ id: string; top: number; bottom: number; h: number }> {
+    let cursor = TOP_GAP;
+    return cardsOf(host).map((card: StubNode) => {
+      const id = String(card.getAttribute('data-sticky-id'));
+      const h = nodes[id].offsetHeight + CARD_BORDER;
+      const top = cursor + parseFloat(card.style.marginTop || '0');
+      cursor = top + h;
+      return { id, top: top, bottom: top + h, h: h };
+    });
+  }
+
+  /**
+   * 一屏消息：每条提问后面跟一条助手回答（撑开提问之间的距离，模拟真实轮次）。
+   * `top` 是这条提问在滚动内容里的 offsetTop，`height` 是它的记录高。
+   */
+  function stickySetup(questions: Array<{ id: string; top: number; height: number; text?: string }>): {
+    NS: Record<string, any>; messages: StubNode; host: StubNode; nodes: Record<string, StubNode>;
+    jumps: Array<{ node: StubNode | null; clearance?: number }>;
     docListeners: Record<string, Array<(event: any) => void>>;
+    scrollTo: (top: number) => void;
   } {
-    const { messages, host, body, toggle } = pinnedNodes();
-    const loaded = loadClient(
-      { messages, stickyUser: host, stickyBody: body, stickyToggle: toggle },
-      { syncFrames: true },
-    );
-    const { NS, docListeners, jumps } = loaded;
+    const { messages, host } = pinnedNodes();
+    const { NS, jumps, docListeners } = loadClient({ messages, stickyUser: host }, { syncFrames: true });
     NS.transcriptView.init(messages);
-    NS.transcriptView.append({ id: 'u1', kind: 'user', at: 1, text: 'the question' }, undefined);
-    NS.transcriptView.append({ id: 'a1', kind: 'assistant', at: 2, text: 'an answer' }, undefined);
+    for (const q of questions) {
+      NS.transcriptView.append({ id: q.id, kind: 'user', at: 1, text: q.text || ('question ' + q.id) }, undefined);
+      NS.transcriptView.append({ id: q.id + '-a', kind: 'assistant', at: 2, text: 'the answer' }, undefined);
+    }
+    NS.stickyUser.setSession('s-1');
     NS.stickyUser.init();
-    // [CUSTOM-20260928-103] A viewport tall enough for "on screen" to mean something:
-    // with the default 0 every message reads as visible and nothing could ever be pinned.
+    // [CUSTOM-20260928-103] 视口高 > 0 才"量得出来"：0 表示还没排布，sync 整帧放弃（那是刻意的）。
     messages.clientHeight = 600;
-    // The user bubble occupies 8..48 of the scroll content — 8 is `.messages`' padding-top,
-    // and modelling it matters: it is what keeps a question resting at the very top from
-    // being taken over (its top sits AT the handoff window's edge, not inside it).
-    const nodes = messages.childNodes.filter((c: StubNode) => c.nodeType === 1);
-    nodes[0].offsetTop = 8;
-    nodes[0].offsetHeight = 40;
-    return { NS, messages, host, body, toggle, jumps, docListeners };
+    const kids = messages.childNodes.filter((c: StubNode) => c.nodeType === 1);
+    const nodes: Record<string, StubNode> = {};
+    questions.forEach((q, i) => {
+      const node = kids[i * 2];
+      node.offsetTop = q.top;
+      node.offsetHeight = q.height;
+      nodes[q.id] = node;
+    });
+    const scrollTo = (top: number): void => { messages.scrollTop = top; messages.dispatch('scroll', {}); };
+    return { NS, messages, host, nodes, jumps, docListeners, scrollTo };
   }
 
-  /** [CUSTOM-20260928-103] Two questions: u1 at 8..48, u2 at 1000..1040. */
-  function twoQuestionSetup(): { NS: Record<string, any>; messages: StubNode; host: StubNode } {
-    const { messages, host, body, toggle } = pinnedNodes();
-    const { NS } = loadClient(
-      { messages, stickyUser: host, stickyBody: body, stickyToggle: toggle },
-      { syncFrames: true },
-    );
-    NS.transcriptView.init(messages);
-    NS.transcriptView.append({ id: 'u1', kind: 'user', at: 1, text: 'first question' }, undefined);
-    NS.transcriptView.append({ id: 'a1', kind: 'assistant', at: 2, text: 'first answer' }, undefined);
-    NS.transcriptView.append({ id: 'u2', kind: 'user', at: 3, text: 'second question' }, undefined);
-    NS.transcriptView.append({ id: 'a2', kind: 'assistant', at: 4, text: 'second answer' }, undefined);
-    NS.stickyUser.init();
-    messages.clientHeight = 600;
-    const nodes = messages.childNodes.filter((c: StubNode) => c.nodeType === 1);
-    nodes[0].offsetTop = 8; nodes[0].offsetHeight = 40;
-    nodes[2].offsetTop = 1000; nodes[2].offsetHeight = 40;
-    return { NS, messages, host };
+  /** 两条提问，隔着一段助手回答（u1 在 8..48，u2 在 1000..1040）。 */
+  function twoQuestions() {
+    return stickySetup([
+      { id: 'u1', top: 8, height: 40, text: 'first question' },
+      { id: 'u2', top: 1000, height: 40, text: 'second question' },
+    ]);
   }
 
-  /** [CUSTOM-20260928-104] One long (folded) question, so the bar has something to shrink to. */
-  function foldedPinnedSetup(): {
-    NS: Record<string, any>; messages: StubNode; host: StubNode; body: StubNode;
-    toggle: StubNode; jumps: Array<{ node: StubNode | null; clearance?: number }>;
-    docListeners: Record<string, Array<(event: any) => void>>;
-  } {
-    const { messages, host, body, toggle } = pinnedNodes();
-    const loaded = loadClient(
-      { messages, stickyUser: host, stickyBody: body, stickyToggle: toggle },
-      { syncFrames: true },
-    );
-    const { NS, docListeners, jumps } = loaded;
-    NS.transcriptView.init(messages);
-    // 240 characters, no newline anywhere: twelve lines in the stub's 20-chars-per-line model.
-    NS.transcriptView.append({ id: 'u1', kind: 'user', at: 1, text: 'q '.repeat(120) }, undefined);
-    NS.stickyUser.init();
-    messages.clientHeight = 600;
-    const nodes = messages.childNodes.filter((c: StubNode) => c.nodeType === 1);
-    nodes[0].offsetTop = 8;
-    nodes[0].offsetHeight = 40;
-    return { NS, messages, host, body, toggle, jumps, docListeners };
+  /** 两条都能折叠的提问（240 字无换行 = 桩里 12 行），用来验"收缩按卡各记各的"。 */
+  function twoFoldedQuestions() {
+    const long = 'q '.repeat(120);
+    return stickySetup([
+      { id: 'u1', top: 8, height: 40, text: long },
+      { id: 'u2', top: 1000, height: 40, text: long },
+    ]);
+  }
+
+  /** 桩 DOM 没有原生 details 行为：照浏览器那样改 open 再派发 toggle。 */
+  function collapseCard(host: StubNode, id: string): void {
+    const card = cardOf(host, id) as StubNode;
+    const det = card.querySelector('details') as unknown as { open: boolean; dispatch: (t: string) => void };
+    det.open = false;
+    det.dispatch('toggle');
+  }
+
+  function detailsOpen(host: StubNode, id: string): boolean {
+    const card = cardOf(host, id) as StubNode;
+    return (card.querySelector('details') as unknown as { open: boolean }).open;
   }
 
   test('the question is taken over as soon as its top reaches the top edge', () => {
-    const { messages, host, body } = pinnedSetup();
-    messages.scrollTop = 100;   // 0 - 100 is inside the handoff window
-    messages.dispatch('scroll', {});
+    const { host, scrollTo } = stickySetup([{ id: 'u1', top: 8, height: 40, text: 'the question' }]);
+    scrollTo(100);   // 0 - 100 is inside the handoff window
 
-    assert.strictEqual(host.hidden, false, 'the floating bar appears');
-    assert.strictEqual(host.getAttribute('data-jump-target'), 'u1');
-    assert.ok(body.textContent.includes('the question'), 'it keeps the message rendering verbatim');
+    assert.strictEqual(host.hidden, false, 'the floating card appears');
+    assert.ok(cardOf(host, 'u1'), 'as a card of its own');
+    assert.ok(host.textContent.includes('the question'), 'it keeps the message rendering verbatim');
   });
 
   test('nothing is pinned while the question still sits below the top edge', () => {
-    const { messages, host } = pinnedSetup();
-    messages.scrollTop = 0;
-    messages.dispatch('scroll', {});
+    const { host, scrollTo } = stickySetup([{ id: 'u1', top: 8, height: 40 }]);
+    scrollTo(0);
     assert.strictEqual(host.hidden, true, 'the message itself is visible — no copy needed');
+    assert.strictEqual(cardsOf(host).length, 0);
 
     // …and it takes over once the reader scrolls it up to the edge.
-    messages.scrollTop = 100;
-    messages.dispatch('scroll', {});
+    scrollTo(100);
     assert.strictEqual(host.hidden, false);
   });
 
-  // [CUSTOM-20260928-104] The bar is a COPY, so the original has to stand back — otherwise
+  // [CUSTOM-20261002-172] 判定线是严格的 `<`：一条正好停在顶（natural == TOP_GAP）的提问不接管
+  // —— 接管了也什么都得不到，而"停在顶"是滚到最上面时的常态。
+  test('a question resting exactly on the line is not taken over yet', () => {
+    const { host, scrollTo, nodes } = stickySetup([{ id: 'u1', top: 8, height: 40 }]);
+    scrollTo(5);   // natural = 8 - 5 = 3 == TOP_GAP
+    assert.strictEqual(host.hidden, true);
+    scrollTo(6);   // 越线一像素
+    assert.strictEqual(host.hidden, false);
+    assert.ok(nodes.u1.classList.contains('sticky-source'), 'and the original steps aside');
+  });
+
+  // [CUSTOM-20260928-104] The card is a COPY, so the original has to stand back — otherwise
   // the handoff itself would show the same question twice, which is exactly what 102/103
   // avoided by waiting for it to leave the screen entirely. `visibility`, not `display`:
   // the geometry has to survive (rail markers, jumpTo's offsetTop).
-  test('the original stands back while the bar stands in for it', () => {
-    const { messages, host } = pinnedSetup();
-    const u1 = messages.childNodes.filter((c: StubNode) => c.nodeType === 1)[0];
-    messages.scrollTop = 100;
-    messages.dispatch('scroll', {});
-    assert.ok(u1.classList.contains('sticky-source'), 'hidden in place, right where it was');
+  test('the original stands back while the card stands in for it', () => {
+    const { host, scrollTo, nodes } = stickySetup([{ id: 'u1', top: 8, height: 40 }]);
+    scrollTo(100);
+    assert.ok(nodes.u1.classList.contains('sticky-source'), 'hidden in place, right where it was');
     assert.strictEqual(host.hidden, false);
 
-    messages.scrollTop = 0;
-    messages.dispatch('scroll', {});
-    assert.ok(!u1.classList.contains('sticky-source'), 'and it is handed back on the way up');
+    scrollTo(0);
+    assert.ok(!nodes.u1.classList.contains('sticky-source'), 'and it is handed back on the way up');
     assert.strictEqual(host.hidden, true);
   });
 
   // [CUSTOM-20260928-104] The class that hides the source is copied along by cloneNode, so a
   // RE-render clones an already-hidden node. That failure is silent — the bar just comes up
   // empty — so it gets its own case rather than riding along on the one above.
-  test('a re-render never clones the hiding class into the bar', () => {
-    const { NS, messages, body } = pinnedSetup();
-    messages.scrollTop = 100;
-    messages.dispatch('scroll', {});
-    assert.ok((NS.transcriptView.node('u1') as StubNode).classList.contains('sticky-source'),
-      'the original carries the class by now');
+  test('a re-render never clones the hiding class into the card', () => {
+    const { NS, host, scrollTo, nodes } = stickySetup([{ id: 'u1', top: 8, height: 40 }]);
+    scrollTo(100);
+    assert.ok(nodes.u1.classList.contains('sticky-source'), 'the original carries the class by now');
 
     NS.stickyUser.refresh();
-    const copy = body.childNodes.find((c: StubNode) => c.nodeType === 1) as StubNode;
-    assert.ok(copy, 'the bar was rebuilt');
+    const copy = copyOf(host, 'u1');
+    assert.ok(copy, 'the card was rebuilt');
     assert.ok(!copy.classList.contains('sticky-source'),
-      'the copy stays visible: it is not inside .messages, and render() strips the class anyway');
+      'the copy stays visible: it is not inside .messages, and buildCard strips the class anyway');
   });
 
-  test('the bar takes over the instant the question reaches the edge, not when it is gone', () => {
-    const { messages, host } = twoQuestionSetup();
-    const nodes = messages.childNodes.filter((c: StubNode) => c.nodeType === 1);
+  test('the card takes over the instant the question reaches the edge, not when it is gone', () => {
+    const { host, scrollTo, nodes } = twoQuestions();
     // u2 spans 1000..1040: at 1001 it has moved up one pixel and is still 39px on screen.
     // 103 waited for all 40 of them to leave — that wait is what felt abrupt.
-    messages.scrollTop = 1001;
-    messages.dispatch('scroll', {});
+    scrollTo(1001);
 
-    assert.strictEqual(host.getAttribute('data-jump-target'), 'u2');
-    assert.ok(nodes[2].classList.contains('sticky-source'), 'and u2 itself stands back');
-    assert.ok(!nodes[0].classList.contains('sticky-source'), 'the one it replaced is released');
+    assert.ok(cardOf(host, 'u2'), 'u2 has a card of its own');
+    assert.ok(nodes.u2.classList.contains('sticky-source'), 'and u2 itself stands back');
+    assert.strictEqual(Math.round(flowOf(host, nodes).find(f => f.id === 'u2')!.top), TOP_GAP,
+      'resting exactly on the line');
   });
 
-  // [CUSTOM-20260928-103] The rule the user asked for: a question that is still on screen
-  // must not be preceded by a pinned older one. Before this change the walk simply took
-  // "the last question above the fold", so scrolling back up to u2 pinned u1 above it —
-  // two questions on screen at once.
-  test('a question on screen is not preceded by a pinned older one', () => {
-    const { messages, host } = twoQuestionSetup();
-    messages.scrollTop = 500;   // viewport 500..1100: u1 is gone, u2 (1000..1040) is visible
-    messages.dispatch('scroll', {});
-    assert.strictEqual(host.hidden, true, 'u2 is right there — pinning u1 would show two');
+  // [CUSTOM-20261001-166] 撤销 103 的「视口里有提问就不置顶」：视口中间摆着 u2 时，
+  // 更早滚上去的 u1 仍要钉住 —— 读者要找的正是「我上一条问的是什么」。
+  test('a question on screen still leaves the previous one pinned above it (166)', () => {
+    const { host, scrollTo } = twoQuestions();
+    scrollTo(500);   // viewport 500..1100: u1 (8..48) is gone, u2 (1000..1040) is visible
+    assert.strictEqual(host.hidden, false, 'the older question is off-screen — it gets pinned');
+    assert.ok(cardOf(host, 'u1'));
+    assert.ok(host.textContent.includes('first question'));
   });
 
   test('the next question takes over once it reaches the top edge', () => {
-    const { messages, host } = twoQuestionSetup();
-    messages.scrollTop = 1100;  // both questions are above the fold
-    messages.dispatch('scroll', {});
+    const { host, scrollTo, nodes } = twoQuestions();
+    scrollTo(1100);  // both questions are above the fold
 
+    const flow = flowOf(host, nodes);
     assert.strictEqual(host.hidden, false);
-    assert.strictEqual(host.getAttribute('data-jump-target'), 'u2', 'the newest one wins');
+    assert.strictEqual(flow.length, 1, 'only the newest one is still on screen');
+    assert.strictEqual(flow[0].id, 'u2', 'the pinned one is the LAST of them');
     assert.ok(host.textContent.includes('second question'));
   });
 
-  test('scrolling back up clears the pin instead of falling back to an older one', () => {
-    const { messages, host } = twoQuestionSetup();
-    messages.scrollTop = 1100;
-    messages.dispatch('scroll', {});
-    assert.strictEqual(host.getAttribute('data-jump-target'), 'u2');
+  test('scrolling back up hands the turn to the previous question, not to nothing (166)', () => {
+    const { host, scrollTo, nodes } = twoQuestions();
+    scrollTo(1100);
+    assert.ok(cardOf(host, 'u2'));
 
-    // u2 is on screen again (its top 100px below the edge) — the bar lets go of the turn,
-    // and does NOT hand it to u1: that one is nowhere near.
-    messages.scrollTop = 900;
-    messages.dispatch('scroll', {});
-    assert.strictEqual(host.hidden, true, 'not u1 — the reader is looking at u2');
+    // u2 is on screen again (its top 100px below the edge): u2 is handed back to the list,
+    // and u1 — the question above it, still out of sight — takes over (166).
+    scrollTo(900);
+    const flow = flowOf(host, nodes);
+    assert.strictEqual(flow.length, 1);
+    assert.strictEqual(flow[0].id, 'u1',
+      'the reader came back up to u2; u1 is the one they can no longer see');
   });
 
-  test('clicking the bar hands the question back to the transcript', () => {
-    const { NS, messages, host, jumps, docListeners } = pinnedSetup();
-    messages.scrollTop = 100;
-    messages.dispatch('scroll', {});
-    dispatchClick(host, docListeners);
+  // [CUSTOM-20261002-172] 用户要的「推挤」：新卡顶边碰到旧卡底边时，旧卡就跟着**下一条提问的
+  // 自然位置**往上走。它的底边压在 u2 的顶边上 —— 这就是用户说的那条"判定线"，而这一刻 u2
+  // 还是列表里的**本体**（不需要副本：它还在自己的位置上）。
+  test('the older card is pushed out of the top, its bottom edge riding the next question', () => {
+    const { host, scrollTo, nodes } = twoQuestions();
+    scrollTo(970);   // u2 的自然位置 30：旧卡已经被顶到只剩 0..30
+    const pushed = flowOf(host, nodes);
+    assert.strictEqual(pushed.length, 1, 'u2 needs no copy yet — it is still the record itself');
+    assert.strictEqual(pushed[0].id, 'u1');
+    assert.strictEqual(Math.round(pushed[0].bottom), 30, 'the bottom edge sits exactly on u2\'s top');
+    assert.strictEqual(cardOf(host, 'u2'), null);
+
+    // 继续滚到 u2 越线：两张卡同时在，u2 停在判定线上，u1 只剩一条边。
+    scrollTo(998);   // u2 的自然位置 2
+    const both = flowOf(host, nodes);
+    assert.strictEqual(both.length, 2, 'both are floating at once');
+    assert.strictEqual(both[0].id, 'u1', 'the older one is on top');
+    assert.strictEqual(both[1].id, 'u2');
+    assert.strictEqual(Math.round(both[1].top), TOP_GAP, 'the newest rests on the line');
+    assert.ok(both[0].bottom > 0 && both[0].bottom <= TOP_GAP,
+      'and the older one is down to the last few pixels, never below them');
+
+    // 再往下滚：u1 整条出界，就此**不再渲染**（它参与过的上夹已经用完）。
+    scrollTo(1100);
+    assert.strictEqual(cardOf(host, 'u1'), null, 'pushed out entirely: nothing left to draw');
+    assert.ok(cardOf(host, 'u2'));
+  });
+
+  // [CUSTOM-20261002-172] 用户要的「抽回」：反向滚动时被顶出去的那张从上沿降回来，
+  // 新卡往下让位 —— 与正向滚到同一画面**必须给出同一个结果**（判据只依赖当前画面）。
+  test('scrolling back up pulls the older card out of the top edge again', () => {
+    const { host, scrollTo, nodes } = twoQuestions();
+    scrollTo(1100);
+    assert.strictEqual(flowOf(host, nodes)[0].id, 'u2');
+
+    scrollTo(970);   // u2 的自然位置 30
+    const pulled = flowOf(host, nodes);
+    assert.strictEqual(pulled.length, 1);
+    assert.strictEqual(pulled[0].id, 'u1', 'u2 is handed back to the transcript');
+    assert.strictEqual(Math.round(pulled[0].bottom), 30, 'u1\'s bottom == u2\'s top, same as scrolling down');
+
+    scrollTo(900);   // u2 的自然位置 100：旧卡完整回到位
+    const settled = flowOf(host, nodes);
+    assert.strictEqual(settled[0].id, 'u1');
+    assert.strictEqual(Math.round(settled[0].top), TOP_GAP);
+  });
+
+  test('the same scroll position gives the same picture from either direction', () => {
+    const down = twoQuestions();
+    down.scrollTo(1100);
+    down.scrollTo(970);
+    const up = twoQuestions();
+    up.scrollTo(300);   // u2 的自然位置 700：此刻只有 u1 在钉
+    up.scrollTo(970);
+
+    assert.deepStrictEqual(
+      flowOf(down.host, down.nodes).map(f => [f.id, Math.round(f.top)]),
+      flowOf(up.host, up.nodes).map(f => [f.id, Math.round(f.top)]),
+    );
+    assert.strictEqual(down.host.textContent, up.host.textContent);
+  });
+
+  // [CUSTOM-20261002-172] 同时钉两张时，**两张的**本体都要让位（104 起靠的是"本体让位"，
+  // 集合式 diff 要保证既贴得全、也摘得干净）。
+  test('every card in the stack keeps its own original out of the picture', () => {
+    const { scrollTo, nodes } = twoQuestions();
+    scrollTo(998);
+    assert.ok(nodes.u1.classList.contains('sticky-source'));
+    assert.ok(nodes.u2.classList.contains('sticky-source'));
+
+    scrollTo(900);   // 只剩 u1 在钉：u2 交还列表
+    assert.ok(nodes.u1.classList.contains('sticky-source'));
+    assert.ok(!nodes.u2.classList.contains('sticky-source'), 'handed back');
+  });
+
+  // [CUSTOM-20261002-172] 公式的骨架（比逐帧像素断言耐改）：卡片**永不低于自己的自然位置**
+  //（否则它会凭空往上跑），也**永不低于判定线**。
+  test('no card ever floats above its own place in the transcript, or below the line', () => {
+    const { host, scrollTo, nodes } = stickySetup([
+      { id: 'u1', top: 8, height: 40 },
+      { id: 'u2', top: 700, height: 60 },
+      { id: 'u3', top: 1400, height: 40 },
+    ]);
+    for (const scrollTop of [0, 5, 40, 300, 660, 700, 740, 1000, 1400, 1500, 2000]) {
+      scrollTo(scrollTop);
+      for (const f of flowOf(host, nodes)) {
+        const natural = nodes[f.id].offsetTop - scrollTop;
+        assert.ok(f.top >= natural - 0.001,
+          `card ${f.id} at ${f.top} must not float above its natural position ${natural} (scrollTop ${scrollTop})`);
+        assert.ok(f.top <= TOP_GAP + 0.001,
+          `card ${f.id} at ${f.top} must never rest below the line (scrollTop ${scrollTop})`);
+      }
+    }
+  });
+
+  test('clicking a card hands the question back to the transcript', () => {
+    const { NS, host, scrollTo, jumps, docListeners } = stickySetup([{ id: 'u1', top: 8, height: 40 }]);
+    scrollTo(100);
+    dispatchClick(cardOf(host, 'u1') as StubNode, docListeners);
 
     assert.strictEqual(jumps.length, 1, 'the click jumps back to the original');
     assert.strictEqual(jumps[0].node, NS.transcriptView.node('u1'));
-    assert.strictEqual(jumps[0].clearance, 9,
-      'landing clear of the handoff window: exactly on it would give the message straight back');
+    // [CUSTOM-20261002-171] 落点是 0：顶边一碰到交接线就交棒，消息**就地接管悬浮条的位置**
+    //（本体让位），既不重叠也不会被挤到下面去。170 那次"让开悬浮条高度"是解反了。
+    assert.strictEqual(jumps[0].clearance, 0,
+      'the jump lands ON the handoff line, so the original takes over that spot');
   });
 
-  test('the pinned copy mirrors the list rendering toggles', () => {
-    const { NS, messages, host } = pinnedSetup();
-    messages.scrollTop = 100;
-    messages.dispatch('scroll', {});
-    assert.ok(!host.className.includes('show-times'), 'times off: no stamp in the copy either');
+  test('the cards mirror the list rendering toggles without losing their entry animation', () => {
+    const { NS, messages, host, scrollTo } = stickySetup([{ id: 'u1', top: 8, height: 40 }]);
+    scrollTo(100);
+    assert.ok(!host.className.includes('show-times'), 'times off: no stamp in the copies either');
 
     messages.classList.add('show-times');
     NS.stickyUser.refresh();
-    assert.ok(host.className.includes('show-times'), 'times on: the copy follows the list');
+    assert.ok(host.className.includes('show-times'), 'times on: the copies follow the list');
+    // [CUSTOM-20261002-172] 状态类要**增量**写（classList.toggle）：整体重写 host.className 会把
+    // 各卡身上的 .entering 一起抹掉，而那正是入场动画的标记。
+    assert.ok((cardOf(host, 'u1') as StubNode).className.includes('entering'),
+      'the entry animation marker survives the toggle');
   });
 
   // [CUSTOM-20260928-104] The bar sticks for as long as the turn lasts, so a long question
-  // would eat the screen — hence the shrink button. It is offered only when there is a fold
+  // would eat the screen — hence the shrink control. It is offered only when there is a fold
   // to shrink: a one-line bubble is already one line.
   // [CUSTOM-20260928-105] Alignment the user can see: the messages sit inside a scroll
   // container, so their content box is narrower than the column by the scrollbar — the bar
   // is not a scroll container and would otherwise hang that far to the right.
-  test('the bar ends where the messages end, scrollbar included', () => {
-    const { messages, host } = pinnedSetup();
-    messages.scrollTop = 100;
-    messages.dispatch('scroll', {});
+  test('the stack ends where the messages end, scrollbar included', () => {
+    const { messages, host, scrollTo } = stickySetup([{ id: 'u1', top: 8, height: 40 }]);
+    scrollTo(100);
     assert.strictEqual(host.style.right, '0px', 'no scrollbar: nothing to give way to');
 
     messages.offsetWidth = 610;
     messages.clientWidth = 600;
-    messages.dispatch('scroll', {});
+    scrollTo(100);
     assert.strictEqual(host.style.right, '10px', 'the thin scrollbar is part of the layout');
 
     messages.offsetWidth = 600;
-    messages.dispatch('scroll', {});
+    scrollTo(100);
     assert.strictEqual(host.style.right, '0px', 'and it goes back when the scrollbar does');
   });
 
-  test('the bar shrinks to one line — and is offered only when there is more than one', () => {
-    const { messages, host, body, toggle, jumps, docListeners } = foldedPinnedSetup();
-    messages.scrollTop = 100;
-    messages.dispatch('scroll', {});
+  // [CUSTOM-20261002-169] 收缩控件只剩卡片里的折叠三角（左侧通道那个小方块按用户要求删除）。
+  // 单行消息没有可收的东西：克隆体里不会出现 .fold-body（那个元素就是"后面还藏着字"的标记）。
+  test('only a message with a hidden remainder carries something to collapse', () => {
+    const folded = stickySetup([{ id: 'u1', top: 8, height: 40, text: 'q '.repeat(120) }]);
+    folded.scrollTo(100);
+    assert.ok(folded.host.querySelector('.fold-body'), 'a wrapped question has a remainder behind the caret');
 
-    assert.strictEqual(host.hidden, false);
-    assert.ok(body.querySelector('.user-fold'), 'a wrapped question folds (measured, CUSTOM-20260925-071)');
-    assert.strictEqual(toggle.hidden, false, 'a multi-line message can be shrunk');
-
-    dispatchClick(toggle, docListeners);
-    assert.ok(host.classList.contains('collapsed'), 'the bar collapses to a single line');
-    assert.strictEqual(toggle.getAttribute('aria-expanded'), 'false');
-    assert.strictEqual(jumps.length, 0, 'shrinking is not the host click — the bar must not also jump');
-
-    dispatchClick(toggle, docListeners);
-    assert.ok(!host.classList.contains('collapsed'), 'and it opens again');
-    assert.strictEqual(toggle.getAttribute('aria-expanded'), 'true');
+    const plain = stickySetup([{ id: 'u1', top: 8, height: 40, text: 'one line' }]);
+    plain.scrollTo(100);
+    assert.strictEqual(plain.host.querySelector('.fold-body'), null,
+      'a one-line message has nothing to shrink — and no dead control to offer');
   });
 
-  test('a one-line question gets no shrink button (a dead control is worse than none)', () => {
-    const { messages, toggle } = pinnedSetup();
-    messages.scrollTop = 100;
-    messages.dispatch('scroll', {});
-    assert.strictEqual(toggle.hidden, true);
+  // [CUSTOM-20261002-170/171] 用户先后报了两件事："两条气泡重叠"与"定位偏下"。两者是同一个数的两面 ——
+  // 落点必须**在交接窗口之内**（0 < TOP_GAP）：消息就地接管悬浮条的位置、本体让位 ⇒ 不重叠也不偏下。
+  test('the jump lands the message on the handoff line, never below or under (170/171)', () => {
+    // 高一点的提问（卡高 = 44 + 4）：170 让悬浮条高度参与过落点计算，171 撤销 —— 不该再影响。
+    const { NS, host, scrollTo, jumps, docListeners } = stickySetup([{ id: 'u1', top: 8, height: 60 }]);
+    scrollTo(100);
+    dispatchClick(cardOf(host, 'u1') as StubNode, docListeners);
+    assert.strictEqual(jumps.length, 1);
+    assert.strictEqual(jumps[0].clearance, 0, 'inside the handoff window, so the original gives way');
+    assert.strictEqual(jumps[0].node, NS.transcriptView.node('u1'));
+  });
+
+  // [CUSTOM-20261002-172] 卡堆里每张卡各代表一条消息：点击的目标必须取自**被点的那张**。
+  test('clicking a card jumps to the message THAT card stands for', () => {
+    const { NS, host, scrollTo, jumps, docListeners } = twoQuestions();
+    scrollTo(998);   // u1 与 u2 同时钉着
+    dispatchClick(cardOf(host, 'u1') as StubNode, docListeners);
+    assert.strictEqual(jumps.length, 1);
+    assert.strictEqual(jumps[0].node, NS.transcriptView.node('u1'), 'the older card, not the newest');
+    assert.strictEqual(jumps[0].clearance, 0);
+
+    // 空定位层本身不该吃掉点击（真面板靠 pointer-events: none，这里靠"找不到卡就不跳"）。
+    dispatchClick(host, docListeners);
+    assert.strictEqual(jumps.length, 1, 'a click on the transparent layer is not a jump');
+  });
+
+  test('the caret inside a card collapses it instead of jumping (166)', () => {
+    const { host, scrollTo, jumps, docListeners } = stickySetup([{ id: 'u1', top: 8, height: 40, text: 'q '.repeat(120) }]);
+    scrollTo(100);
+    const card = cardOf(host, 'u1') as StubNode;
+    const caret = card.querySelector('.fold-caret') as StubNode;
+    assert.ok(caret, 'a folded message carries a caret in the copy');
+    assert.ok(String(caret.title || '').length > 0, 'and it says what clicking it does');
+
+    // [CUSTOM-20261002-171] 折叠 = 克隆体那个原生 details 的 open 状态（与界面同一套逻辑）。
+    const copyDetails = card.querySelector('details') as unknown as { open: boolean };
+    assert.strictEqual(copyDetails.open, true, 'starts expanded');
+    dispatchClick(caret, docListeners);
+    assert.deepStrictEqual(jumps, [], 'the caret must NOT jump back to the original');
+  });
+
+  // [CUSTOM-20261001-166] 收缩状态**按会话**记（用户报：切一次 tab 就弹回展开）。
+  // [CUSTOM-20261002-172] 卡堆之后还要**再按卡**分（用户拍板：点哪张收哪张）—— 于是它成了
+  // sessionId -> { entryId: true }：先问"它属于谁"，再问"是哪一张"（pitfalls #38）。
+  test('the collapse state belongs to the session AND to the card', () => {
+    const { NS, host, scrollTo } = twoFoldedQuestions();
+    scrollTo(998);   // 两张卡同时钉着
+    collapseCard(host, 'u1');
+    assert.strictEqual(detailsOpen(host, 'u1'), false, 'the older card is collapsed');
+    assert.strictEqual(detailsOpen(host, 'u2'), true, 'and only that one — its neighbour stays open');
+
+    // Switching away and back is what boot does: setSession() then reset().
+    NS.stickyUser.setSession('s-2');
+    NS.stickyUser.reset();
+    scrollTo(998);
+    assert.strictEqual(detailsOpen(host, 'u1'), true, 's-2 has its own state — it opens expanded');
+
+    NS.stickyUser.setSession('s-1');
+    NS.stickyUser.reset();
+    scrollTo(998);
+    assert.strictEqual(detailsOpen(host, 'u1'), false, 'coming back to s-1 restores the collapsed card');
+    assert.strictEqual(detailsOpen(host, 'u2'), true, 'and its neighbour is still open');
+  });
+
+  // 没排布的帧（面板隐藏）什么都不做：否则会把一屏 0 高的卡"量"进缓存，之后所有位置都是错的。
+  test('nothing is placed while the panel has no layout', () => {
+    const { host, messages, scrollTo } = stickySetup([{ id: 'u1', top: 8, height: 40 }]);
+    messages.clientHeight = 0;
+    scrollTo(100);
+    assert.strictEqual(host.hidden, true);
+    assert.strictEqual(cardsOf(host).length, 0);
   });
 });
 
@@ -2149,14 +2435,17 @@ suite('chat client logic: form record + drawer (stub DOM, CUSTOM-20260929-119/20
     assert.strictEqual(box().hidden, true, 'and the box hides with the answer');
   });
 
-  test('picking the Other row opens the box under it, with the honest explanation', () => {
+  // [CUSTOM-20261002-168] 那条"替换上面所选"的说明行删了（用户报"描述不对"，而且我们确实改成追加了）：
+  // 说明只留在输入框的 tooltip 里，不单占一行。
+  test('picking the Other row opens the box under it, explained by a tooltip only (168)', () => {
     const { drawer } = mount();
     const rows = drawer.querySelectorAll('.elic-option-row');
     pickRow(rows[2]);   // Other
     const box = byAttr(drawer, 'data-elic-custom', 'question_0_custom')!;
     assert.ok(rows[2].contains(box), 'the free-form box opens under the Other row');
-    assert.match(box.textContent, /replacing the option picked above/,
-      'the adapter lets a typed answer REPLACE the pick — saying only "add" would be a lie');
+    assert.strictEqual(box.querySelector('.elic-custom-hint'), null, 'no extra line under the box');
+    const input = box.querySelector('input') as StubNode;
+    assert.ok(String(input.title || '').length > 0, 'the explanation lives in the tooltip');
   });
 
   test('the progress line, the tab dots and the unanswered hint all follow the answers', () => {
@@ -2190,8 +2479,10 @@ suite('chat client logic: form record + drawer (stub DOM, CUSTOM-20260929-119/20
       type: 'elicitationAnswer',
       promptId: 's1:1',
       action: 'accept',
-      content: { question_0: 'Astro 官方模板', question_0_custom: '我自己的方案' },
-    }, 'keys are the field names, values are what the tool records');
+      // [CUSTOM-20261002-168] 追加语义：合成**一个**答案。adapter 是 custom 优先并 return
+      // （有它就丢掉所选项），所以那个 custom 字段**不能再单独发**——否则等于替换。
+      content: { question_0: 'Astro 官方模板 — 我自己的方案' },
+    }, 'the picked option and the note travel as one merged answer');
   });
 
   test('skip and cancel are decisions, and carry no content', () => {
@@ -2256,6 +2547,71 @@ suite('chat client logic: form record + drawer (stub DOM, CUSTOM-20260929-119/20
     assert.strictEqual(drawer.hidden, false, 'and switching back brings it back');
   });
 
+  // [CUSTOM-20261001-166] 收起态属于**那张表单**（dismissed 按 promptId 记），不该跟着抽屉
+  // 走到下一张表单上：用户从没对新表单按下过那个按钮，它却一冒出来就是收起的。
+  test('a form replacing a collapsed one starts expanded (166)', () => {
+    const { NS, drawer } = mount([TWO, SINGLE]);
+    NS.elicitationView.setCollapsed(true);
+    assert.ok(drawer.className.includes('collapsed'), 'the first form is pushed aside');
+
+    // The first form settles (submitted) — the drawer moves on to the second one.
+    NS.transcriptView.patch('e0', { elicitation: { ...TWO, status: 'accepted' } });
+    NS.elicitationView.sync();
+    assert.ok(!drawer.className.includes('collapsed'),
+      'a form the user never collapsed must not inherit the collapsed state of the previous one');
+  });
+
+  // [CUSTOM-20261002-168] 用户四条：追加语义 / 提示改 tooltip / 可取消选择 / 多选逐项补充框。
+  test('every option keeps its description, for select and multi (168)', () => {
+    const single = mount([SINGLE]);
+    const selectDescs = single.drawer.querySelectorAll('.elic-option-desc').map(n => n.textContent);
+    assert.ok(selectDescs.some(t => t.indexOf('以官方 blog 模板为底') >= 0),
+      'select options show their explanation, got: ' + selectDescs.join(' | '));
+    const multi = mount([TWO]);
+    const panes = multi.drawer.querySelectorAll('.elic-field');
+    const multiDescs = panes[1].querySelectorAll('.elic-option-desc').map(n => n.textContent);
+    assert.ok(multiDescs.some(t => t.indexOf('新建文章') >= 0),
+      'multi options show theirs too, got: ' + multiDescs.join(' | '));
+  });
+
+  test('a note on one multi option is appended to THAT option (168)', () => {
+    const { NS, drawer, posted, docListeners } = mount([TWO]);
+    const boxes = inputsNamed(drawer, 'question_1');
+    for (const box of [boxes[0], boxes[1]]) {
+      (box as unknown as { checked: boolean }).checked = true;
+      dispatchBubbling(box, 'change');
+    }
+    const row = boxes[0].closest('.elic-option-row')!;
+    const noteInput = row.querySelector('.elic-note-box')!.querySelector('input') as unknown as { value: string };
+    noteInput.value = '补充说明';
+    // 161: Submit 只在最后一题那一页可点 —— 多选题正是第二题（tab 1）。
+    NS.elicitationView.selectTab(1);
+
+    dispatchClick(byAction(drawer, 'submit')!, docListeners);
+    const content = (posted[0] as { content: { question_1: string[] } }).content;
+    assert.strictEqual(content.question_1.length, 2, 'both picked options travel');
+    assert.ok(content.question_1.indexOf('new — 补充说明') >= 0,
+      'the noted option reads "option — note", got: ' + content.question_1.join(' | '));
+    assert.strictEqual(content.question_1.filter(t => t.indexOf('—') >= 0).length, 1,
+      'only the option that was annotated is merged');
+  });
+
+  test('clicking the picked row again clears it, and Submit still works (168)', () => {
+    const { drawer, posted, docListeners } = mount();
+    const radio = inputsNamed(drawer, 'question_0')[0];
+    pickRow(drawer.querySelectorAll('.elic-option-row')[0]);
+    assert.strictEqual((radio as unknown as { checked: boolean }).checked, true, 'picked');
+
+    // A second click on the same row: the browser sets checked first, then dispatches click.
+    dispatchBubbling(radio, 'click');
+    assert.strictEqual((radio as unknown as { checked: boolean }).checked, false, 'the pick is cleared');
+    assert.match(drawer.querySelector('.elic-progress')!.textContent!, /Answered 0\/1/);
+
+    dispatchClick(drawer.querySelector('.elic-submit')!, docListeners);
+    assert.strictEqual(posted.length, 1, 'an unanswered question does not block Submit');
+    assert.deepStrictEqual((posted[0] as { content?: unknown }).content, {});
+  });
+
   test('with no drawer in the page the module still renders records (stub-DOM safety)', () => {
     // #elicDrawer is absent whenever a test loads the client without it — the record path
     // must not depend on the drawer existing.
@@ -2266,8 +2622,158 @@ suite('chat client logic: form record + drawer (stub DOM, CUSTOM-20260929-119/20
     NS.elicitationView.sync();
     assert.ok(true, 'init/sync tolerate a missing container');
   });
+
+  // [CUSTOM-20261001-161] 多题时 Submit 只在**最后一题**那一页可点（用户要求防误提交：
+  // 翻页看看后面还有没有时，第一页的提交按钮就在手边，很容易顺手点掉）。
+  test('Submit waits for the last question (161)', () => {
+    const { drawer, posted, docListeners } = mount([TWO]);
+    const tabs = drawer.querySelectorAll('.elic-tab');
+    assert.ok(tabs.length > 1, 'this fixture has more than one question');
+
+    const submit = byAction(drawer, 'submit')!;
+    assert.strictEqual(submit.disabled, true, 'on the first question the submit button is not live');
+    assert.ok(String(submit.title || '').length > 0, 'and it says why (a disabled button with no reason is a riddle)');
+    dispatchClick(submit, docListeners);
+    assert.deepStrictEqual(posted, [], 'clicking it there must not answer');
+
+    dispatchClick(tabs[tabs.length - 1], docListeners);
+    assert.strictEqual(byAction(drawer, 'submit')!.disabled, false, 'on the LAST question it is live');
+
+    dispatchClick(tabs[0], docListeners);
+    assert.strictEqual(byAction(drawer, 'submit')!.disabled, true, 'and going back disarms it again');
+  });
+
+  test('a single-question form submits from its only page (161)', () => {
+    const { drawer } = mount([SINGLE]);
+    const submit = byAction(drawer, 'submit')!;
+    assert.strictEqual(submit.disabled, false, 'there is no "last question" to wait for');
+
+    // …and Skip/Cancel are escape hatches, live on every page.
+    assert.strictEqual(byAction(drawer, 'skip')!.disabled, false);
+    assert.strictEqual(byAction(drawer, 'cancel')!.disabled, false);
+  });
 });
 
+
+// [CUSTOM-20261001-158] 权限请求的客户端逻辑：记录行 + 悬浮抽屉。
+// 与表单（152）**逐条同构**：pending 时记录里只留一行（⏳ + 标题 + Review），作答按钮在输入框
+// 上方的抽屉里；显示由记录驱动（sync），结算 / 切会话都靠对账。不同的一条：两个抽屉可以**同时**
+// 存在（同一会话先来表单又来权限），所以各有自己的容器与高度变量。
+suite('chat client logic: permission record + drawer (stub DOM, CUSTOM-20261001-158)', () => {
+  function perm(promptId: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      promptId,
+      sessionId: 's1',
+      toolCallId: 't-' + promptId,
+      title: 'cd /repo && npm test',
+      kind: 'execute',
+      status: 'pending',
+      options: [
+        { optionId: 'allow-once', name: 'Yes', kind: 'allow_once' },
+        { optionId: 'reject', name: 'No', kind: 'reject_once' },
+      ],
+      ...overrides,
+    };
+  }
+
+  /** The stub's selector support is deliberately minimal — value lookups filter here. */
+  function byAttr(root: StubNode, attr: string, value: string): StubNode | null {
+    return root.querySelectorAll(`[${attr}]`).find(n => n.getAttribute(attr) === value) ?? null;
+  }
+
+  function mount(states = [perm('p1')]) {
+    const messages = new StubNode('div');
+    const drawer = new StubNode('div');
+    drawer.className = 'perm-drawer';
+    drawer.hidden = true;
+    const { NS, doc, docListeners } = loadClient({ permDrawer: drawer, messages });
+    const posted: Array<Record<string, unknown>> = [];
+    NS.bridge.postForSession = (m: Record<string, unknown>) => { posted.push(m); };
+    // The real delegated click path (boot installs it on body): that is what carries
+    // data-perm-option from a click to permissionView.answer, including the drawer lookup.
+    NS.links.installDelegatedHandlers(doc.body);
+    doc.body.appendChild(drawer);
+    NS.transcriptView.init(messages);
+    NS.transcriptView.hydrate({
+      sessionId: 's1',
+      entries: states.map((permission, index) => ({ id: 'e' + index, kind: 'permission', at: index, permission })),
+    });
+    NS.permissionDrawer.init();
+    NS.permissionDrawer.setSession('s1');
+    NS.permissionDrawer.sync();
+    return { NS, drawer, messages, posted, docListeners, doc };
+  }
+
+  test('a pending prompt leaves ONE row in the record — the buttons are in the drawer', () => {
+    const { messages, drawer } = mount();
+    const record = messages.querySelector('.entry-permission')!;
+    assert.ok(record.querySelector('.perm-pending-row'), 'the record says something is waiting');
+    assert.ok(record.querySelector('.perm-open'), '...and offers a way into it');
+    assert.strictEqual(record.querySelector('.perm-btn'), null,
+      'the buttons are NOT drawn in the record — they would push the conversation around');
+    assert.strictEqual(drawer.hidden, false, 'the drawer holds them instead');
+    assert.strictEqual(drawer.querySelectorAll('.perm-btn').length, 2, 'one button per option');
+  });
+
+  test('clicking an option answers once and disables the buttons until the host replies', () => {
+    const { drawer, posted, docListeners } = mount();
+    const allow = byAttr(drawer, 'data-perm-option', 'allow-once');
+    assert.ok(allow, 'the allow button is there');
+
+    dispatchClick(allow!, docListeners);
+    assert.deepStrictEqual(posted, [{ type: 'permissionAnswer', promptId: 'p1', optionId: 'allow-once' }],
+      'the answer carries the prompt id and the option id — session stamping is postForSession\'s job');
+
+    // A second click before the host answers must not send a duplicate (the bridge is
+    // idempotent, but the UI should not look like nothing happened either).
+    const reject = byAttr(drawer, 'data-perm-option', 'reject')!;
+    assert.strictEqual(reject.disabled, true, 'every button for that prompt is disabled while sending');
+    dispatchClick(reject, docListeners);
+    assert.strictEqual(posted.length, 1, 'exactly one answer');
+  });
+
+  test('a settled prompt closes the drawer and leaves a read-only card behind', () => {
+    const { NS, drawer, messages } = mount();
+    NS.transcriptView.patch('e0', { permission: perm('p1', { status: 'selected', selectedOptionId: 'allow-once' }) });
+    NS.permissionDrawer.sync();
+
+    assert.strictEqual(drawer.hidden, true, 'nothing is waiting any more');
+    const record = messages.querySelector('.entry-permission')!;
+    assert.strictEqual(record.querySelector('.perm-btn'), null, 'no buttons on history');
+    assert.ok(record.querySelector('.perm-note')!.textContent.includes('Allowed'), 'the outcome is recorded');
+  });
+
+  test('a deferred prompt closes the drawer too — the dialog owns it now', () => {
+    const { NS, drawer, messages } = mount();
+    NS.transcriptView.patch('e0', { permission: perm('p1', { status: 'deferred' }) });
+    NS.permissionDrawer.sync();
+
+    assert.strictEqual(drawer.hidden, true, 'a second answer path would race the QuickPick');
+    assert.ok(messages.querySelector('.entry-permission')!.textContent.includes('dialog'),
+      'and the record says where it went');
+  });
+
+  test('a prompt belonging to another session never opens the drawer', () => {
+    const { NS, drawer } = mount([perm('p1', { sessionId: 's2' })]);
+    assert.strictEqual(drawer.hidden, true, 'this panel is on s1 — that request is not ours to answer here');
+    // ...and it comes back when the user switches to it (the record is what remembers).
+    NS.permissionDrawer.setSession('s2');
+    NS.permissionDrawer.sync();
+    assert.strictEqual(drawer.hidden, false);
+  });
+
+  test('two pending prompts: the row\'s Review opens the one it points at', () => {
+    const { drawer, messages, docListeners } = mount([perm('p1'), perm('p2', { title: 'rm -rf build' })]);
+    assert.ok(byAttr(drawer, 'data-perm-id', 'p1'), 'the first one is shown by default');
+
+    const rows = messages.querySelectorAll('.entry-permission');
+    const openSecond = byAttr(rows[1], 'data-perm-open', 'p2');
+    assert.ok(openSecond, 'the second row has its own Review button');
+    dispatchClick(openSecond!, docListeners);
+    assert.ok(byAttr(drawer, 'data-perm-id', 'p2'), 'and it brings THAT prompt into the drawer');
+    assert.ok(drawer.textContent!.includes('rm -rf build'), 'with its own title');
+  });
+});
 
 // [CUSTOM-20260930-123] 连接状态卡（client/stateCard.ts）。
 //

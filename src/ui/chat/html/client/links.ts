@@ -117,15 +117,21 @@ export const linksClient = `
 
       // [CUSTOM-BEGIN] CUSTOM-20260924-020 - 权限卡按钮。放在最前面：它们是
       // session 作用域的消息，且按钮上同时带 data-perm-id 与 data-perm-option。
+      // [CUSTOM-20261001-158] 两处宿主（记录里的内联卡 .perm 与悬浮抽屉 .perm-drawer，
+      // 与表单 152 逐条同构）：这里只把按钮解析到宿主，发送与"发送中"守卫都在
+      // permissionView.answer —— 两处各自发送就是两份知识（pitfall #19）。
       var permBtn = closestWithAttr(target, 'data-perm-option');
       if (permBtn) {
         event.preventDefault();
         if (permBtn.disabled) { return; }
-        NS.bridge.postForSession({
-          type: 'permissionAnswer',
-          promptId: permBtn.getAttribute('data-perm-id'),
-          optionId: permBtn.getAttribute('data-perm-option')
-        });
+        var permHost = target.closest
+          ? (target.closest('.perm') || target.closest('.perm-drawer'))
+          : null;
+        NS.permissionView.answer(
+          permHost,
+          permBtn.getAttribute('data-perm-id'),
+          permBtn.getAttribute('data-perm-option')
+        );
         return;
       }
       // [CUSTOM-END] CUSTOM-20260924-020

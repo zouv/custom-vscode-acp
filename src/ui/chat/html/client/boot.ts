@@ -92,6 +92,9 @@ export const bootClient = `
     // DOM is replaced - the same session may come back later (tab switch).
     NS.scroll.remember(currentSessionId);
     currentSessionId = summary ? summary.sessionId : null;
+    // [CUSTOM-20261001-166] 置顶条按会话记着自己的收缩状态 —— 在重置它之前把会话同步过去
+    // （这是焦点变化唯一的咽喉点，与 elicitationView.setSession 同一形态）。
+    if (NS.stickyUser && NS.stickyUser.setSession) { NS.stickyUser.setSession(currentSessionId); }
     NS.tabs.setFocus(summary);
     NS.composer.setFocus(summary, meta);
     // [CUSTOM-20260930-129] 这里原有一行 NS.tabs.renderUsage(meta)（顶部那条进度条）。
@@ -139,10 +142,15 @@ export const bootClient = `
     // first frame after a switch is right even if it does not).
     if (NS.stickyUser) {
       NS.stickyUser.reset();
-      NS.dom.schedule(function () { NS.stickyUser.sync(); });
+      // [CUSTOM-20261002-172] 走 schedule() 而不是 dom.schedule(sync)：卡堆的重排现在也会被
+      // 流式 chunk 触发，两条来源必须共用一个去重守卫（syncQueued）。
+      NS.stickyUser.schedule();
     }
     // [CUSTOM-20260925-033] The history list belongs to the previous agent.
     NS.sessionMenu.reset();
+    // [CUSTOM-20261001-165] 图片放大浮层里是**上一个会话**的图：切走就收起来
+    // （154 的规矩：浮层属于它打开时那个会话）。
+    if (NS.lightbox && NS.lightbox.close) { NS.lightbox.close(); }
     // [CUSTOM-20260925-058] The directory drawer belonged to the previous
     // session/draft too.
     NS.directoryMenu.reset();
@@ -418,7 +426,8 @@ export const bootClient = `
         syncFocusedState(message.sessions || []);
         // [CUSTOM-20260930-152] 表单抽屉跟着记录走：快照重建后重新对账（切会话、重挂载、
         // 双 surface 都靠这一步，不需要宿主知道有抽屉这回事）。
-        syncElicitations();
+        // [CUSTOM-20261001-158] 权限抽屉同一条路由（syncDrawers = 两个抽屉的唯一入口）。
+        syncDrawers();
         break;
 
       // [CUSTOM-20260926-077] Outline pin/width prefs come back with boot.
@@ -442,7 +451,7 @@ export const bootClient = `
         applyEmptyState(message.agentConnected);
         applyFocus(message.summary, message.snapshot, message.meta);
         // [CUSTOM-20260930-152] 另一个会话的表单不该跟着你走，也不该被丢掉：重新对账。
-        syncElicitations();
+        syncDrawers();
         break;
 
       case 'sessionClosed':
@@ -459,15 +468,17 @@ export const bootClient = `
         // [CUSTOM-20260925-050] Same for its draft.
         NS.composer.forgetDraft(message.sessionId);
         // [CUSTOM-20260930-152] 关掉的是聚焦会话时记录已清空 ⇒ 抽屉必须跟着消失。
-        syncElicitations();
+        syncDrawers();
         break;
 
       case 'append': {
         if (message.sessionId !== currentSessionId) { break; }
         var entries = message.entries || [];
         var appendedForm = false;
+        var appendedPermission = false;
         for (var i = 0; i < entries.length; i++) {
           if (entries[i].kind === 'elicitation') { appendedForm = true; }
+          if (entries[i].kind === 'permission') { appendedPermission = true; }
           NS.transcriptView.append(entries[i], entries[i].toolView);
         }
         if (entries.length > 0) { showEmpty(false); }
@@ -478,8 +489,12 @@ export const bootClient = `
         // [CUSTOM-20260924-023] The rail self-checks its marker signature, so a
         // chunk on an existing entry costs one cheap comparison and no layout read.
         NS.rail.invalidate();
-        // [CUSTOM-20260930-152] 只在真的带了表单时对账：流式的每一条 chunk 都走这里。
-        if (appendedForm) { syncElicitations(); }
+        // [CUSTOM-20261002-172] 转录变了 ⇒ 置顶卡堆要重排：下游内容一变高，被顶出的那张卡的
+        // 上夹（下一条用户消息的自然位置）就跟着变；追加的又正是新的用户消息本身。
+        // 走 schedule（一帧一次 + syncQueued 去重）—— 流式的每条 chunk 都会到这里。
+        NS.stickyUser.schedule();
+        // [CUSTOM-20260930-152] 只在真的带了表单/权限时对账：流式的每一条 chunk 都走这里。
+        if (appendedForm || appendedPermission) { syncDrawers(); }
         break;
       }
 
@@ -488,9 +503,12 @@ export const bootClient = `
           NS.transcriptView.patch(message.entryId, message.patch);
           NS.outline.invalidate();
           NS.rail.invalidate();
+          // [CUSTOM-20261002-172] 同 append：那条记录的高度可能变了（折叠结构/内容）。
+          NS.stickyUser.schedule();
           // [CUSTOM-20260930-152] 表单结算（accepted/declined/cancelled）或转到弹框
           // （deferred）都走这条 revise —— 抽屉据此收起。
-          if (message.patch && message.patch.elicitation) { syncElicitations(); }
+          // [CUSTOM-20261001-158] 权限结算（selected/cancelled）或 deferred 同理。
+          if (message.patch && (message.patch.elicitation || message.patch.permission)) { syncDrawers(); }
         }
         break;
 
@@ -499,6 +517,8 @@ export const bootClient = `
           NS.transcriptView.updateTool(message.entryId, message.tool);
           // [CUSTOM-20260924-023] A tool's status is what colours its rail dot.
           NS.rail.invalidate();
+          // [CUSTOM-20261002-172] 工具卡的收展会改变它下面那些用户消息的自然位置。
+          NS.stickyUser.schedule();
         }
         break;
 
@@ -522,6 +542,8 @@ export const bootClient = `
         // [CUSTOM-20260924-023] ...and the rail's cached dot positions are stale
         // (text became HTML, heights changed). Measure-only, no rebuild.
         NS.rail.reflow();
+        // [CUSTOM-20261002-172] 同理：回填 markdown 会长高下方内容。
+        NS.stickyUser.schedule();
         break;
       }
 
@@ -775,15 +797,35 @@ export const bootClient = `
   }
 
   /**
-   * [CUSTOM-20261001-154] 清空记录 —— 表单抽屉必须跟着对账。
+   * [CUSTOM-20261001-158] 让权限抽屉与记录对账。与 syncElicitations 逐条同构（同一份理由：
+   * 抽屉不是真相，pending 的权限就是转录里的一条记录），两个抽屉各有自己的模块与容器。
+   */
+  function syncPermissions() {
+    if (!NS.permissionDrawer) { return; }
+    if (NS.permissionDrawer.setSession) { NS.permissionDrawer.setSession(currentSessionId); }
+    if (NS.permissionDrawer.sync) { NS.permissionDrawer.sync(); }
+  }
+
+  /**
+   * [CUSTOM-20261001-158] 两个抽屉的**唯一**对账入口。所有"记录可能变了"的地方都调它，
+   * 而不是分别记着"这里要同步表单、那里要同步权限"——那正是"漏了一处"的写法（pitfall #19）。
+   */
+  function syncDrawers() {
+    syncElicitations();
+    syncPermissions();
+  }
+
+  /**
+   * [CUSTOM-20261001-154] 清空记录 —— 抽屉必须跟着对账。
    *
-   * 表单是**记录的一部分**，所以记录被清掉就等于抽屉该收起来了。这个包装存在的理由是一次
-   * 真实的漏修：切到草稿页（focusDraft）只调了 reset，抽屉于是留在屏幕上（用户 2026-10-01 的图2
-   * 就是那个状态 —— 面板停在草稿页，浮框还在）。以后凡是清记录的地方都走这里，别再单独调 reset。
+   * 抽屉是**记录的一部分**（记录驱动），所以记录被清掉就等于抽屉该收起来了。这个包装存在的
+   * 理由是一次真实的漏修：切到草稿页（focusDraft）只调了 reset，抽屉于是留在屏幕上
+   * （用户 2026-10-01 的图2 就是那个状态 —— 面板停在草稿页，浮框还在）。以后凡是清记录的地方
+   * 都走这里，别再单独调 reset。
    */
   function resetTranscript() {
     NS.transcriptView.reset();
-    syncElicitations();
+    syncDrawers();
   }
 
   function init() {
@@ -800,6 +842,8 @@ export const bootClient = `
     if (NS.stateCard) { NS.stateCard.init(); }
     // [CUSTOM-20260930-152] 表单抽屉：接管 #elicDrawer 的委托点击 / Escape / 高度让位。
     if (NS.elicitationView) { NS.elicitationView.init(); }
+    // [CUSTOM-20261001-158] 权限抽屉：接管 #permDrawer 的 Review 委托与高度让位。
+    if (NS.permissionDrawer) { NS.permissionDrawer.init(); }
     // [CUSTOM-20260925-032/033] Connect button (empty state) + history picker.
     NS.sessionMenu.init();
     // [CUSTOM-20260925-058] Directory drawer for the draft page.

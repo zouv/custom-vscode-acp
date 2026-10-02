@@ -176,8 +176,8 @@ ACP 没有"改会话 cwd"的请求——cwd 只在 `session/new` / `session/load
 | **点击落在哪里，要问派发时的路径** | 关闭判定用 `event.composedPath()`，**不是 `drawer.contains(event.target)`**：选中目录会重建菜单行，把正在冒泡的那个按钮摘下来，而 `contains` 对游离节点恒为 false ⇒ 这次点击被判成"点了外面"、**整个列表关掉**（用户复验当场发现的那个 bug）。派发路径在事件派发瞬间就固定了，所以它仍然答得出"这次点击在不在抽屉里"。完整教训见 `pitfalls.md` #28 |
 | 目录同一性 | `historyDirs.directoryKey`：反斜杠→正斜杠、去尾分隔符（`D:\x\` = `D:\x`；`C:\`/`C:`/`C:/` 都折成 `c:`）、**大小写只在 win32/darwin 折叠**（linux 的 `/Home` 与 `/home` 是两个目录）。**刻意不用 `path.normalize`**：它在不同平台上行为不同，会让行为与测试都变成环境相关的 |
 | 谁算 key | **宿主**。客户端只比较两个 key —— 于是"这两个路径算不算同一个目录"只有一个地方需要想清楚。列表本来就在客户端，**换目录不产生任何往返**（那会是一次 `session/list`） |
-| 记忆策略 | **开关持久化**（`vscode.setState`，同 `Times`/`Sub-agents`）；**目录每次打开都回到当前会话的工作目录**。记住目录会在切到别的项目后继续过滤一个已无关的文件夹 |
-| 默认目录 | 聚焦会话**属于本次查询的那个 agent** 时用它的 cwd（picker 是按 agent 查的，聚焦会话可能属于另一个 agent），否则第一个工作区文件夹。取不到 ⇒ 未过滤（草稿、或 agent 没报 cwd），这是诚实的答案 |
+| 记忆策略 | **开关持久化**（`vscode.setState`，同 `Times`/`Sub-agents`）；**[155] 默认值为"开"**——只有用户显式选过一次 `All folders`（存成 `historyFolderFilter: false`）才不再自动筛，那次选择会被记住；**目录每次打开都重新取**。记住目录会在切到别的项目后继续过滤一个已无关的文件夹 |
+| 默认目录 | **[155] 来自地址栏**：客户端把 header 的 `#cwdBtn` 正显示的目录（聚焦草稿的 `cwd`，否则聚焦会话的）随 `listHistory { cwd }` 送上来，宿主按它标记 `current` 候选，客户端据此设默认过滤 —— **"用户看到的"与"默认筛的"同源**（草稿的目录是客户端私有的，宿主本来猜不到，058）。客户端没送（没有聚焦会话 / 会话没有 cwd）⇒ 未过滤，**不会**替用户挑一个目录；宿主侧的 `historyFilterCwd`（聚焦会话属于该 agent 时用它的 cwd，否则第一个工作区文件夹）**降级为兜底**，只为不带 `cwd` 的调用保留。默认筛到某个目录时**同样会按需补扫磁盘**（`requestSupplement`，与手动选目录同一入口）——否则"默认目录不是第一个工作区文件夹"时会缺掉 094 补出来的那些磁盘会话 |
 | 计数行 | 未过滤：`232 sessions · from the agent`（不变）；过滤：`12 of 232 sessions · from the agent`——**总数不能省**，只写"12 sessions"会像 agent 丢了两百多条 |
 | **列表来源是并集（092）** | `source: 'agent' \| 'local' \| 'merged'`（`merged` = 有多个来源贡献）。连上 agent 时是 **agent 列表 ∪ 转录目录 ∪ 本地缓存**：靠前者优先（agent 是"会话还在不在"的权威），只有后面来源知道的行带 `fromDisk` / `fromCache` 标记（tooltip 里说明），按 `updatedAt` 倒序。**为什么必须并集**：agent 的 `session/list` **不是全集**——实测（091 的探针）227 条里没有缺 cwd 的，但本项目磁盘上 8 个会话只报了 6 个，少掉的正是**仍在其他窗口开着的**那些 |
 | **第三个来源：转录目录（094）** | Claude Code 把每个工作目录的会话放在 `<CLAUDE_CONFIG_DIR 或 ~/.claude>/projects/<路径里非字母数字都换成 '-' 的 slug>/<sessionId>.jsonl`。**官方插件看到的就是这个目录**，所以这里补上它（`diskSessions.ts`）。三条硬约束：**只对 Claude Code**（`CLAUDE_CODE_AGENT`，与 `MODERN_AGENTS` 分开——那是"用哪个面板"，这是"愿意读谁的私有存储"）；**初始只扫当前工作目录对应的那一个 slug**（与本地缓存同作用域）；**095 起按过滤目录按需补扫**——客户端过滤到具体目录时发 `supplementHistory { cwd }`，宿主 `readDiskHistory(agent, cwd?)` 按该目录扫描并增量返回（`historySupplement`），解决多根/跨目录场景下扫错目录的问题；**任何失败都只是"没有补充"**，绝不影响 agent 的那份列表。读取用**按行流式**、超长行跳过（转录能到几十 MB，且**第一行本身就可能很大**——按字符切一刀会读不到任何记录，探针的第一版就是这么错的） |
@@ -188,7 +188,7 @@ ACP 没有"改会话 cwd"的请求——cwd 只在 `session/new` / `session/load
 | **菜单用 `.open` 类，不是 `hidden` 属性** | `.picker-menu` 自带 `display: none`，与 `.open` 的 `display` 是同一层级的竞争。写错的表现是"菜单永远不出现"，而它看起来像 JS 没跑——正是 pitfall #13 的反面 |
 | 选中后菜单**不关闭** | 换目录通常是**连着比几个**（比较两个、或再试下一个），关掉就变成"重开→选→重开→选"。选中后菜单**原地刷新**：计数行、列表、以及菜单里那一项的激活标记都跟着变（这是用户 F5 复验时提的第一条修改）。焦点要还给新激活的那一行——重建会销毁刚点的按钮，焦点掉回文档后下一次 Tab 会从面板顶部重新开始。**点击抽屉里的别处**才收起它（标准下拉行为；chip 自己 stopPropagation，菜单行当然不能收起自己所在的菜单） |
 | Esc | **分层**：菜单开着时只收菜单，再按一次才收抽屉。否则一次 Esc 会把整份列表连同浏览位置一起丢掉 |
-| 宿主回复 | `handleListHistory` 的三条路径（agent / 本地缓存 / 出错回退）合并成一个 `postHistory`——三处各自拼装正是"其中一处漏了 `dirKey`"的写法，而漏掉的表现是**那些行在过滤后凭空消失**。协议只做追加（`dirKey?` / `directories?`），`directories` 里 `current: true` 的那条即默认目录，不需要另开字段 |
+| 宿主回复 | `handleListHistory` 的三条路径（agent / 本地缓存 / 出错回退）合并成一个 `postHistory`——三处各自拼装正是"其中一处漏了 `dirKey`"的写法，而漏掉的表现是**那些行在过滤后凭空消失**。协议只做追加（请求侧 `cwd?`（[155] 地址栏目录）、回复侧 `dirKey?` / `directories?`），`directories` 里 `current: true` 的那条即默认目录，不需要另开字段 |
 
 **已知边界（本轮不做）**：
 

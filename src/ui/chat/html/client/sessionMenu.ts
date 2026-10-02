@@ -13,6 +13,13 @@
 //   · 过滤是**纯客户端的 key 比较**——列表本来就在客户端，换目录不该再问一次 agent；
 //   · key 由宿主算好（目录同一性依赖平台：win32/darwin 折叠大小写，linux 不折叠）。
 //
+// [CUSTOM-20261001-155] 过滤的**默认目录改为来自地址栏**（用户要求：地址栏已经选好地址时，
+// 打开历史就默认筛到那个目录）。宿主原先自己猜（聚焦会话属于该 agent 就用它的 cwd，否则用
+// 第一个工作区文件夹）——草稿页猜不到（草稿在客户端，058），所以改由客户端把地址栏**当前
+// 显示的那个目录**随请求送上去。**开关的默认值同时翻转为开**（`historyFolderFilter !== false`）：
+// 打开历史看到的是当前目录的会话，而不是全部；用户手动选过一次 `All folders` 就记住
+// （用户选定），此后打开不再自动筛。
+//
 // 注意：本文件是嵌在模板字符串里的客户端代码，**每个反斜杠都要写成 `\\`**，禁用反引号。
 // [CUSTOM-END] CUSTOM-20260925-032/033
 export const sessionMenuClient = `
@@ -38,7 +45,13 @@ export const sessionMenuClient = `
   // The on/off PREFERENCE, persisted (vscode.setState, same as Times/Sub-agents).
   // Only the toggle survives; the directory is re-derived on each open — a remembered
   // directory would filter by a folder that has nothing to do with where the user is.
-  var filterOn = false;
+  // [CUSTOM-20261001-155] Defaults to ON: unless the user explicitly chose 'All folders',
+  // opening the list means "the sessions here" (see setHistory).
+  var filterOn = true;
+  // [CUSTOM-20261001-155] The directory the ADDRESS BAR showed when this open asked for
+  // the list (null = it showed none). It is what gates the default filter: the match
+  // itself is still the host's 'current' mark, never a client-side path comparison.
+  var askedCwd = null;
   // [CUSTOM-20260928-095] Directories whose disk supplement has already been requested
   // (keyed by dirKey), so filtering back and forth does not re-scan the same folder.
   var supplementedDirs = {};
@@ -359,8 +372,13 @@ export const sessionMenuClient = `
     filterKey = null;
     supplementedDirs = {};
     menuOpen = false;
+    // [CUSTOM-20261001-155] Ask the ADDRESS BAR for the filter's default directory. The
+    // host cannot guess it: a draft's directory is client-local (058), and even for a
+    // session it is the button up there — not the host's bookkeeping — that says which
+    // directory the user is looking at.
+    askedCwd = NS.tabs && NS.tabs.currentCwd ? NS.tabs.currentCwd() : null;
     render();
-    NS.bridge.post({ type: 'listHistory' });
+    NS.bridge.post({ type: 'listHistory', cwd: askedCwd || undefined });
   }
 
   function close() {
@@ -380,12 +398,17 @@ export const sessionMenuClient = `
     if (!open) { return; }
     pending = false;
     dirOptions = (message && message.directories) || [];
-    // The filter defaults to the CURRENT session's directory — the host marks it
-    // 'current' (the focused session when it belongs to this agent, else the first
-    // workspace folder). No 'current' option (a draft, a session without a
-    // directory) means an unfiltered list, which is the honest answer.
+    // [CUSTOM-20261001-155] The filter defaults to the directory the ADDRESS BAR was
+    // showing when we asked — the client sent it along, so the host marked the matching
+    // candidate 'current' (the match itself stays a host-computed key: see the file
+    // header). Two gates, both deliberate:
+    //   · 'filterOn' — the persisted preference; ON unless the user once chose
+    //     'All folders', which is a decision and sticks;
+    //   · 'askedCwd' — a default folder is only claimed when the address bar actually
+    //     showed one. With nothing focused (or a session whose directory is unknown) the
+    //     honest answer is the unfiltered list, not a folder picked on the user's behalf.
     filterKey = null;
-    if (filterOn) {
+    if (filterOn && askedCwd) {
       for (var i = 0; i < dirOptions.length; i++) {
         if (dirOptions[i].current) { filterKey = dirOptions[i].key; break; }
       }
@@ -393,6 +416,12 @@ export const sessionMenuClient = `
     renderChip();
     renderMenu();
     renderList(message);
+    // [CUSTOM-20261001-155] A folder can now be filtering by default, so its disk
+    // supplement has to be asked for HERE too (applyFilter's call only covers manual
+    // picks). Otherwise a default folder that is not the first workspace folder — a
+    // draft elsewhere, say — shows a list missing exactly the disk-only sessions 094
+    // was built for.
+    if (filterKey && filterKey !== UNKNOWN_KEY) { requestSupplement(filterKey); }
   }
 
   function onClick(event) {
@@ -469,8 +498,10 @@ export const sessionMenuClient = `
     }
     // The on/off preference survives a reload of this webview (the same mechanism
     // Times / Sub-agents use). The DIRECTORY deliberately does not — see show().
+    // [CUSTOM-20261001-155] Only an EXPLICIT 'All folders' (false) turns it off now;
+    // never having touched it means ON (the default flip described in the file header).
     var ui = NS.boot && NS.boot.recallUi ? NS.boot.recallUi() : {};
-    filterOn = ui.historyFolderFilter === true;
+    filterOn = ui.historyFolderFilter !== false;
     if (button) {
       // [CUSTOM-20260925-035] Swap the placeholder glyph for the clock icon.
       // The markup ships a text glyph so the button is never empty if scripts

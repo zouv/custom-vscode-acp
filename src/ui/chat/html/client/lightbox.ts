@@ -77,6 +77,9 @@ export const lightboxClient = `
     });
   }
 
-  NS.lightbox = { install: install };
+  // [CUSTOM-20261001-165] 'install' 之外也把 'close' 交出去：切会话时 boot 要把它收起来
+  // （浮层里是**上一个会话**的图，留着就盖住了新会话的内容 —— 与 154 那次"切走了浮框还在"
+  // 同一条规矩：浮层属于它打开时的那个会话）。
+  NS.lightbox = { install: install, close: close };
 })(window.__acpc = window.__acpc || {});
 `;

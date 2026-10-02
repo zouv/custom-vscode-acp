@@ -200,7 +200,10 @@ export type ChatToExt =
   // 都**不是会话作用域**（可能根本没有聚焦会话——正是要用它们的时候），
   // 因此必须在 verifySession 守卫**之前**处理。
   | { type: 'connectAgent'; agentName?: string }
-  | { type: 'listHistory'; agentName?: string }
+  // [CUSTOM-20261001-155] `cwd` = 客户端**地址栏当前显示**的目录（草稿的目录在客户端，
+  // 宿主猜不到，058）。宿主用它标记 `directories` 里 `current: true` 的候选，客户端据此
+  // 把过滤器的默认目录设成它。缺省时宿主仍按自己的规则猜（见 historyFilterCwd）。
+  | { type: 'listHistory'; agentName?: string; cwd?: string }
   // [CUSTOM-BEGIN] CUSTOM-20260928-095 - 按过滤目录补扫磁盘转录目录。094 的磁盘补充只扫
   // workspaceFolders[0]，多根/跨目录场景下扫错目录。客户端过滤到具体目录时请求，宿主
   // 扫该目录并增量返回（非会话作用域，在 verifySession 守卫之前处理）。

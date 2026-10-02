@@ -27,6 +27,8 @@ import * as vscode from 'vscode';
 import type { SessionNotification } from '@agentclientprotocol/sdk';
 
 import type { PromptResponse, SessionConfigOption } from '@agentclientprotocol/sdk';
+// [CUSTOM-20261001-156] The background-form test builds a real AskUserQuestion request.
+import type { CreateElicitationRequest } from '@agentclientprotocol/sdk';
 
 import { AgentManager } from '../core/AgentManager';
 import { ConnectionManager, type ConnectionInfo } from '../core/ConnectionManager';
@@ -46,6 +48,9 @@ import type { ChatSurface, SurfaceKey } from '../ui/chat/ChatSurface';
 // [CUSTOM-20260930-124/125] `resolveAutoConnect` / `PanelPrefsIO` are exported so this
 // file can drive the settings seam with a stub instead of the developer's settings.json.
 import { ChatPanelHost, resolveAutoConnect, type PanelPrefsIO } from '../ui/chat/ChatPanelHost';
+// [CUSTOM-20261001-156] The notification seam (see RecordingChannel).
+import type { NoticeChannel } from '../ui/chat/SessionNotifier';
+import { stopReasonText, turnOutcome } from '../ui/chat/ChatPanelHost';
 import type { ExtToChatMessage, TranscriptSnapshotWire } from '../ui/chat/protocol';
 import type { TranscriptEntry } from '../ui/chat/transcript/types';
 
@@ -87,6 +92,9 @@ class RecordingSurface implements ChatSurface {
   readonly sent: ExtToChatMessage[] = [];
   html = '';
   reveals = 0;
+  // [CUSTOM-20261001-156] Settable so a test can hide the panel behind an editor:
+  // "the user is not looking at it" is now what decides card-vs-notification.
+  visibleFlag = true;
   readonly webview = {
     options: {} as vscode.WebviewOptions,
     cspSource: 'vscode-webview://chat-panel-test',
@@ -96,7 +104,7 @@ class RecordingSurface implements ChatSurface {
     },
   } as unknown as vscode.Webview;
 
-  get visible(): boolean { return true; }
+  get visible(): boolean { return this.visibleFlag; }
   setHtml(html: string): void { this.html = html; }
   reveal(): void { this.reveals++; }
   onDidDispose(): vscode.Disposable { return new vscode.Disposable(() => { /* nothing */ }); }
@@ -172,6 +180,32 @@ interface Harness {
   agentName: string;
   /** [CUSTOM-20260930-125] The settings seam the host was given. */
   prefs: StubPrefs;
+  /** [CUSTOM-20261001-156] The notification seam the host was given. */
+  notices: RecordingChannel;
+}
+
+/**
+ * [CUSTOM-20261001-156] Captures the notifications the host decided to send.
+ *
+ * The same reason `StubPrefs`/`FakeMemento` exist: this suite must not pop real
+ * VS Code notifications (the test host swallows them, so there would be nothing to
+ * assert). Clicking is driven explicitly — `answer()` is what a user's click does.
+ */
+class RecordingChannel implements NoticeChannel {
+  readonly shown: Array<{ level: string; message: string; action: string }> = [];
+  private readonly resolvers: Array<(choice: string | undefined) => void> = [];
+
+  show(level: 'info' | 'warning', message: string, action: string): Promise<string | undefined> {
+    this.shown.push({ level, message, action });
+    return new Promise(resolve => { this.resolvers.push(resolve); });
+  }
+
+  /** Press the action button on the n-th notification. */
+  async click(index: number): Promise<void> {
+    this.resolvers[index](this.shown[index].action);
+    // The notifier's .then runs on a microtask; give it one turn to reach the host.
+    await Promise.resolve();
+  }
 }
 
 /**
@@ -204,19 +238,25 @@ function makeHarness(
   // [CUSTOM-20260930-151] Optional globalState: the draft page's option snapshot is
   // persisted there, and "survives a window reload" is only testable with one.
   globalState?: vscode.Memento,
+  // [CUSTOM-20261001-162] How long a background task may stay quiet before the panel
+  // stops waiting. Millisecond-scale in tests; the host's default is two minutes.
+  backgroundQuietMs?: number,
 ): Harness {
   const handler = new SessionUpdateHandler();
   const sessionManager = managerFactory
     ? managerFactory(handler)
     : new SessionManager(new AgentManager(), new ConnectionManager(handler), handler);
   registerFakeSession(sessionManager, sessionId, agentName);
+  // [CUSTOM-20261001-156] A recording notification channel: the host's default is
+  // the real VS Code notification, which a test host swallows silently.
+  const notices = new RecordingChannel();
   const host = new ChatPanelHost(
     vscode.Uri.file('/tmp/chat-panel-test'), sessionManager, handler,
-    bridges.permission, globalState, bridges.elicitation, prefs,
+    bridges.permission, globalState, bridges.elicitation, prefs, notices, backgroundQuietMs,
   );
   const surface = new RecordingSurface();
   host.attachSurface(surface, { agentName, sessionId });
-  return { host, surface, handler, sessionManager, sessionId, agentName, prefs };
+  return { host, surface, handler, sessionManager, sessionId, agentName, prefs, notices };
 }
 
 function feed(harness: Harness, notifications: readonly FixtureNotification[]): void {
@@ -1944,6 +1984,87 @@ suite('chat panel: session metadata (CUSTOM-20260928-097)', () => {
     assert.strictEqual(s?.title, 'The session name');
   });
 
+  // [CUSTOM-20261001-163] 标题跟随 agent，但**不再在对话里插一行"改名"提示**（用户报：
+  // 会话进行中会自己改名并跳出一行 `Session renamed to “…”`）。adapter 每轮结束去读 SDK 的标题，
+  // 而那个标题先是"第一条 prompt"、之后才被后台生成的摘要替换 —— 这次跃迁不是用户做的，
+  // 也不在对话的语义里。
+  test('a retitle follows the tab but never writes a record into the conversation (163)', () => {
+    const harness = makeHarness('dummy-session', 'Claude Code');
+    harness.surface.sent.length = 0;
+
+    // The adapter's first title is the first prompt…
+    harness.handler.handleUpdate({
+      sessionId: 'dummy-session',
+      update: { sessionUpdate: 'session_info_update', title: '检查一下文档', updatedAt: '2026-09-20T00:00:00Z' },
+    } as any);
+    // …and the generated summary replaces it a turn later.
+    harness.handler.handleUpdate({
+      sessionId: 'dummy-session',
+      update: { sessionUpdate: 'session_info_update', title: 'Governance sync infrastructure analysis', updatedAt: '2026-09-20T00:01:00Z' },
+    } as any);
+
+    const appends = harness.surface.sent.filter(m => m.type === 'append') as Array<{ entries?: Array<{ kind?: string; text?: string }> }>;
+    const notices = appends.flatMap(m => m.entries ?? []).filter(e => e.kind === 'notice');
+    assert.deepStrictEqual(notices, [], 'a rename the user did not make is not a record in their conversation');
+
+    const changed = harness.surface.sent.filter(m => m.type === 'sessionsChanged');
+    const last = changed[changed.length - 1] as { sessions: Array<{ sessionId: string; title: string | null }> };
+    assert.strictEqual(last.sessions.find(x => x.sessionId === 'dummy-session')?.title,
+      'Governance sync infrastructure analysis',
+      'but the tab still follows the newest title — that is where a name belongs');
+  });
+
+  // [CUSTOM-20261001-164] 标题由**第一次对话**定：那一刻已经拿到的自动命名就是它的名字；
+  // 没拿到就用第一条消息（`toSummary` 的回退链），之后**任何**标题都不再改 —— 包括几轮之后
+  // 才生成的那个"第一个自动命名"（用户规则：那时对话内容已经脱离第一次对话了）。
+  async function settleFor(ms: number): Promise<void> { await new Promise(resolve => setTimeout(resolve, ms)); }
+
+  function titleOf(harness: Harness): string | null | undefined {
+    for (let i = harness.surface.sent.length - 1; i >= 0; i--) {
+      const message = harness.surface.sent[i] as {
+        type?: string; sessions?: Array<{ sessionId: string; title: string | null }>;
+      };
+      if (message.type !== 'sessionsChanged') { continue; }
+      const row = (message.sessions ?? []).find(s => s.sessionId === 'dummy-session');
+      if (row) { return row.title; }
+    }
+    return undefined;
+  }
+
+  test('a title that lands with the first exchange IS the name (164)', async () => {
+    const harness = makeHarness('dummy-session', 'Claude Code');
+    Object.assign(harness.sessionManager, { sendPrompt: () => Promise.resolve({ stopReason: 'end_turn' }) });
+
+    harness.host.onMessage({ type: 'sendPrompt', sessionId: 'dummy-session', text: '第一条消息' });
+    await settleFor(20);
+    // The adapter polls the SDK title at turn end, so this one belongs to the first exchange.
+    harness.handler.handleUpdate({
+      sessionId: 'dummy-session',
+      update: { sessionUpdate: 'session_info_update', title: '自动命名 A' },
+    } as any);
+    assert.strictEqual(titleOf(harness), '自动命名 A');
+  });
+
+  test('a title generated several exchanges later never renames the session (164)', async () => {
+    const harness = makeHarness('dummy-session', 'Claude Code');
+    Object.assign(harness.sessionManager, { sendPrompt: () => Promise.resolve({ stopReason: 'end_turn' }) });
+
+    // Turn 1, and no title by the time it ends.
+    harness.host.onMessage({ type: 'sendPrompt', sessionId: 'dummy-session', text: '第一条消息' });
+    await settleFor(20);
+    assert.strictEqual(titleOf(harness), null, 'nothing named it yet');
+
+    // Turn 2: the name is now fixed (in production the tab falls back to the stored
+    // first prompt — the harness has no history store, so the title simply stays unset).
+    harness.host.onMessage({ type: 'sendPrompt', sessionId: 'dummy-session', text: '第二条消息' });
+    await settleFor(20);
+    harness.handler.handleUpdate({
+      sessionId: 'dummy-session',
+      update: { sessionUpdate: 'session_info_update', title: '几轮之后才生成的标题' },
+    } as any);
+    assert.strictEqual(titleOf(harness), null, 'a late auto-title must not become the name');
+  });
+
   test('upsertNew records the directory, and updates a stale one', () => {
     const store = new SessionHistoryStore(new FakeMemento());
     store.upsertNew('Claude Code', '/dir/x', 's1');
@@ -2615,5 +2736,511 @@ suite('chat panel: the tab dot and the waiting state', () => {
     permission.cancelSession('s-1');
     await waitFor(() => summaries(harness).some(row => row.waiting === false), 'the flag cleared');
     assert.strictEqual(summaries(harness).find(row => row.sessionId === 's-1')?.waiting, false);
+  });
+});
+
+// [CUSTOM-20261001-156] 后台会话的权限 / 表单请求：从"窗口顶部的 QuickPick"改成"面板拥有 +
+// 右下角通知"。用户截图里的那一幕（他在会话 A 里打字，会话 B 的权限请求弹到了窗口顶部）
+// 正是旧判据的产物：canPresent 要求请求会话**必须聚焦**。这一档把"谁拥有请求"与"谁正在看它"
+// 拆开——拥有 = 现代面板 + 有面（记录照建、跳过去就能答）；在不在屏幕上只决定要不要发通知。
+suite('chat panel: background prompts notify instead of interrupting (CUSTOM-20261001-156)', () => {
+  async function waitFor(predicate: () => boolean, label: string): Promise<void> {
+    for (let i = 0; i < 100; i++) {
+      if (predicate()) { return; }
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.fail(`timed out waiting for ${label}`);
+  }
+
+  /** Fire a permission request; returns the dialog-path spy (empty = the panel owns it). */
+  function requestPermission(bridge: PermissionBridge, sessionId: string, title = 'Run the tests'): string[] {
+    const calls: string[] = [];
+    void bridge.request(
+      { sessionId, toolCall: { toolCallId: `t-${sessionId}`, title } } as never,
+      (async () => { calls.push('dialog'); return { outcome: { outcome: 'cancelled' } }; }) as never,
+    );
+    return calls;
+  }
+
+  /** A background session (registered, not focused — the harness focuses its own). */
+  function addBackgroundSession(harness: Harness, sessionId: string, agentName = 'Claude Code'): void {
+    registerFakeSession(harness.sessionManager, sessionId, agentName);
+  }
+
+  /** The permission record the host appended for one session, if any. */
+  function permissionRecord(harness: Harness, sessionId: string): { permission?: { promptId?: string; status?: string } } | null {
+    for (let i = harness.surface.sent.length - 1; i >= 0; i--) {
+      const message = harness.surface.sent[i] as {
+        type?: string; sessionId?: string;
+        entries?: Array<{ kind?: string; permission?: { promptId?: string; status?: string } }>;
+      };
+      if (message.type !== 'append' || message.sessionId !== sessionId) { continue; }
+      const entry = message.entries?.find(e => e.kind === 'permission');
+      if (entry) { return entry; }
+    }
+    return null;
+  }
+
+  /** The last permission status the webview was told about for one session. */
+  function permissionStatus(harness: Harness, sessionId: string): string | undefined {
+    for (let i = harness.surface.sent.length - 1; i >= 0; i--) {
+      const message = harness.surface.sent[i] as {
+        type?: string; sessionId?: string; patch?: { permission?: { status?: string } };
+      };
+      if (message.sessionId !== sessionId) { continue; }
+      if (message.type === 'revise' && message.patch?.permission) { return message.patch.permission.status; }
+      if (message.type === 'append') { return permissionRecord(harness, sessionId)?.permission?.status; }
+    }
+    return undefined;
+  }
+
+  /** Let the async half of a prompt (a resolve on a microtask/macrotask) run out. */
+  async function settleTurns(): Promise<void> {
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+
+  test('a background request is owned by the panel: record + notification, no dialog', async () => {
+    const permission = new PermissionBridge();
+    const harness = makeHarness('s-1', 'Claude Code', undefined, new StubPrefs(), { permission });
+    addBackgroundSession(harness, 's-2');
+    harness.surface.sent.length = 0;
+
+    const dialogCalls = requestPermission(permission, 's-2', 'cd /repo && npm test');
+
+    assert.deepStrictEqual(dialogCalls, [], 'the window-level QuickPick must not open for a session the panel owns');
+    // `append` rides the outbox (coalesced), so the record lands a frame later.
+    await waitFor(() => !!permissionRecord(harness, 's-2'), 'the record');
+    assert.ok(permissionRecord(harness, 's-2'), 'the record is built now — jumping over finds the prompt waiting');
+    assert.strictEqual(harness.notices.shown.length, 1, 'exactly one notification');
+    assert.strictEqual(harness.notices.shown[0].level, 'warning', 'waiting is a warning: it stays on screen');
+    assert.ok(harness.notices.shown[0].message.includes('等待权限确认'), harness.notices.shown[0].message);
+    assert.ok(harness.notices.shown[0].message.includes('npm test'), 'and it says what is being asked for');
+  });
+
+  test('the focused session on a visible surface is NOT notified — the card is right there', async () => {
+    const permission = new PermissionBridge();
+    const harness = makeHarness('s-1', 'Claude Code', undefined, new StubPrefs(), { permission });
+
+    const dialogCalls = requestPermission(permission, 's-1');
+    assert.deepStrictEqual(dialogCalls, []);
+    await waitFor(() => !!permissionRecord(harness, 's-1'), 'the record');
+    assert.deepStrictEqual(harness.notices.shown, [], 'a notification for a card the user is looking at is noise');
+  });
+
+  test('hiding the panel notifies even for the focused session', () => {
+    const permission = new PermissionBridge();
+    const harness = makeHarness('s-1', 'Claude Code', undefined, new StubPrefs(), { permission });
+    harness.surface.visibleFlag = false;
+
+    requestPermission(permission, 's-1');
+    assert.strictEqual(harness.notices.shown.length, 1, 'the panel is behind an editor — the user cannot see the card');
+  });
+
+  test('clicking the notification focuses that session, and the request can then be answered', async () => {
+    const permission = new PermissionBridge();
+    const harness = makeHarness('s-1', 'Claude Code', undefined, new StubPrefs(), { permission });
+    addBackgroundSession(harness, 's-2');
+    requestPermission(permission, 's-2');
+
+    await harness.notices.click(0);
+    await waitFor(() => harness.sessionManager.getActiveSessionId() === 's-2', 'focus moved to the notified session');
+    assert.ok(harness.surface.reveals >= 1, 'and the panel came to the front (an explicit user action may take focus)');
+
+    // The answer path a card/drawer click uses. It must be accepted: the prompt was
+    // owned by the panel all along, so nothing has to be "re-activated" first.
+    const promptId = permissionRecord(harness, 's-2')?.permission?.promptId;
+    assert.ok(promptId, 'the record carries the prompt id the answer needs');
+    harness.host.onMessage({ type: 'permissionAnswer', sessionId: 's-2', promptId, optionId: 'allow-once' });
+    await waitFor(() => permissionStatus(harness, 's-2') === 'selected', 'the prompt settled');
+    assert.strictEqual(harness.notices.shown.length, 1, 'and no second notification appeared');
+  });
+
+  test('a legacy agent still gets the dialog — the panel can never render it', () => {
+    const permission = new PermissionBridge();
+    const harness = makeHarness('s-1', 'Claude Code', undefined, new StubPrefs(), { permission });
+    registerFakeSession(harness.sessionManager, 'legacy-1', 'Gemini CLI');
+
+    const dialogCalls = requestPermission(permission, 'legacy-1');
+    assert.deepStrictEqual(dialogCalls, ['dialog'], 'no modern panel exists for that agent, so the dialog is the only way to answer');
+    assert.strictEqual(permissionRecord(harness, 'legacy-1'), null, 'and nothing was appended to a transcript it does not have');
+  });
+
+  test('with no surface at all the dialog stays the exit that cannot hang the agent', () => {
+    const permission = new PermissionBridge();
+    const harness = makeHarness('s-1', 'Claude Code', undefined, new StubPrefs(), { permission });
+    harness.host.detachSurface('view');
+
+    const dialogCalls = requestPermission(permission, 's-1');
+    assert.deepStrictEqual(dialogCalls, ['dialog'], 'nothing can be drawn, so the request must reach the dialog (pitfall #14)');
+  });
+
+  test('losing the last surface still demotes a parked request (the #14 guard)', async () => {
+    const permission = new PermissionBridge();
+    const harness = makeHarness('s-1', 'Claude Code', undefined, new StubPrefs(), { permission });
+    const dialogCalls = requestPermission(permission, 's-1');
+    assert.deepStrictEqual(dialogCalls, [], 'owned by the panel while a surface exists');
+
+    harness.host.detachSurface('view');
+    await waitFor(() => dialogCalls.length === 1, 'the parked request was demoted');
+    assert.deepStrictEqual(dialogCalls, ['dialog'], 'onPresenterLost keeps its meaning: no surface ⇒ dialog');
+  });
+
+  test('a background form notifies with its question', () => {
+    const elicitation = new ElicitationBridge();
+    const harness = makeHarness('s-1', 'Claude Code', undefined, new StubPrefs(), { elicitation });
+    addBackgroundSession(harness, 's-2');
+
+    void elicitation.request(askRequest('s-2'), async () => { throw new Error('the dialog must not open'); });
+
+    assert.strictEqual(harness.notices.shown.length, 1, 'waiting-form is part of the set');
+    assert.ok(harness.notices.shown[0].message.includes('等待你的回答'), harness.notices.shown[0].message);
+    assert.ok(harness.notices.shown[0].message.includes('Which framework?'), 'the question itself rides along');
+  });
+
+  test('a finished background turn notifies once; a cancelled one stays silent', async () => {
+    const harness = makeHarness('s-1', 'Claude Code');
+    addBackgroundSession(harness, 's-2');
+
+    // Resolve turns without an agent process (same trick as registerFakeSession, one
+    // level up: `sendPrompt` is the only thing that needs a connection here).
+    let stopReason = 'end_turn';
+    Object.assign(harness.sessionManager, {
+      sendPrompt: () => Promise.resolve({ stopReason }),
+    });
+
+    harness.host.onMessage({ type: 'sendPrompt', sessionId: 's-2', text: 'go' });
+    await waitFor(() => harness.notices.shown.length === 1, 'the turn-done notification');
+    assert.strictEqual(harness.notices.shown[0].level, 'info', 'a finished turn is information, not an alarm');
+    assert.ok(harness.notices.shown[0].message.includes('已完成这一轮'), harness.notices.shown[0].message);
+
+    // …and then a turn the user cancelled: they pressed Stop, they know.
+    stopReason = 'cancelled';
+    harness.host.onMessage({ type: 'sendPrompt', sessionId: 's-2', text: 'go' });
+    await settleTurns();
+    assert.strictEqual(harness.notices.shown.length, 1, 'cancelling is not news');
+  });
+
+  test('a failed turn reuses the record\'s wording', async () => {
+    const harness = makeHarness('s-1', 'Claude Code');
+    addBackgroundSession(harness, 's-2');
+    Object.assign(harness.sessionManager, {
+      sendPrompt: () => Promise.resolve({ stopReason: 'refusal' }),
+    });
+
+    harness.host.onMessage({ type: 'sendPrompt', sessionId: 's-2', text: 'go' });
+    await waitFor(() => harness.notices.shown.length === 1, 'the failure notification');
+    // The toast carries the SAME wording the record does, clipped to fit (the detail
+    // is one line by design — see composeNotice). Comparing the head of the string is
+    // what keeps the two from drifting apart (pitfall #19).
+    const expected = stopReasonText('refusal')!;
+    assert.ok(harness.notices.shown[0].message.includes(expected.slice(0, 60)),
+      `the notification and the transcript notice must not tell two stories, got: ${harness.notices.shown[0].message}`);
+  });
+
+  test('the focused, visible session gets no turn-done notification', async () => {
+    const harness = makeHarness('s-1', 'Claude Code');
+    Object.assign(harness.sessionManager, {
+      sendPrompt: () => Promise.resolve({ stopReason: 'end_turn' }),
+    });
+
+    harness.host.onMessage({ type: 'sendPrompt', sessionId: 's-1', text: 'go' });
+    await settleTurns();
+    assert.deepStrictEqual(harness.notices.shown, [], 'the user is watching this one finish');
+  });
+
+  /** An AskUserQuestion-shaped form request (same shape as elicitation-bridge.test.ts). */
+  function askRequest(sessionId: string): CreateElicitationRequest {
+    return {
+      mode: 'form',
+      sessionId,
+      toolCallId: 'call_1',
+      message: 'Which framework?',
+      requestedSchema: {
+        type: 'object',
+        properties: {
+          question_0: {
+            type: 'string',
+            title: 'Base',
+            oneOf: [{ const: 'Astro official', title: 'Astro official' }],
+          },
+        },
+      },
+    } as unknown as CreateElicitationRequest;
+  }
+});
+
+suite('chat panel: turn outcome wording (CUSTOM-20261001-157)', () => {
+  test('a normal turn, a cancelled turn and a failed one are three different things', () => {
+    assert.deepStrictEqual(turnOutcome('end_turn'), {}, 'a normal end says nothing extra');
+    assert.strictEqual(turnOutcome('cancelled').silent, true, 'the user pressed Stop — no toast');
+    assert.strictEqual(turnOutcome('refusal').failed, true);
+    assert.strictEqual(turnOutcome('max_tokens').failed, true);
+    assert.strictEqual(turnOutcome(undefined).silent, undefined, 'a missing reason is not "cancelled"');
+  });
+
+  test('only non-normal reasons have wording (shared by the record and the toast)', () => {
+    assert.strictEqual(stopReasonText('end_turn'), null);
+    assert.strictEqual(stopReasonText('cancelled'), null);
+    assert.strictEqual(stopReasonText(undefined), null);
+    assert.ok(stopReasonText('max_turn_requests')!.includes('agent-request limit'));
+    assert.ok(stopReasonText('something-new')!.includes('something-new'), 'unknown reasons are still reported verbatim');
+  });
+});
+
+// [CUSTOM-20261001-159/160] 记住用户选过的模式：新建会话套用、打开历史**不**套、草稿页显示它。
+// 这条链最容易错的不是"记没记住"，而是**什么时候不该动** —— 把 load/resume 也当成"新会话"，
+// 会改掉用户重新打开的那个会话自己的模式（那个模式是"重新打开它"的一部分）。
+suite('chat panel: the remembered mode (CUSTOM-20261001-159/160)', () => {
+  async function settle(): Promise<void> { await new Promise(resolve => setTimeout(resolve, 20)); }
+
+  const MODE_OPTIONS = [
+    {
+      id: 'mode', name: 'Mode', description: 'Session permission mode', category: 'mode',
+      type: 'select', currentValue: 'default',
+      options: [
+        { value: 'default', name: 'Manual' },
+        { value: 'plan', name: 'Plan' },
+        { value: 'bypassPermissions', name: 'Bypass' },
+      ],
+    },
+    {
+      id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'sonnet',
+      options: [{ value: 'sonnet', name: 'Sonnet' }, { value: 'opus', name: 'Opus' }],
+    },
+  ];
+
+  function modeHarness(remembered?: { configId: string; value: string }): { harness: Harness; memento: FakeMemento } {
+    const memento = new FakeMemento();
+    if (remembered) { void memento.update('acpc.lastMode.v1', { 'Claude Code': remembered }); }
+    return { harness: makeHarness('s-1', 'Claude Code', undefined, new StubPrefs(), {}, memento), memento };
+  }
+
+  /** Record the config-option writes the host makes, and reflect them on the session. */
+  function spyWrites(harness: Harness, sessionId: string): Array<{ configId: string; value: string }> {
+    const calls: Array<{ configId: string; value: string }> = [];
+    Object.assign(harness.sessionManager, {
+      setConfigOption: async (_sid: string, configId: string, value: string) => {
+        calls.push({ configId, value });
+        const session = harness.sessionManager.getSession(sessionId) as unknown as { configOptions?: unknown[] } | undefined;
+        if (session) {
+          session.configOptions = MODE_OPTIONS.map(o => (o.id === configId ? { ...o, currentValue: value } : o));
+        }
+      },
+    });
+    return calls;
+  }
+
+  /** Notice entries the host appended for one session (the switch announcement lands here). */
+  function noticesOf(harness: Harness, sessionId: string): string[] {
+    const out: string[] = [];
+    for (const message of harness.surface.sent as Array<{
+      type?: string; sessionId?: string; entries?: Array<{ kind?: string; text?: string }>;
+    }>) {
+      if (message.type !== 'append' || message.sessionId !== sessionId) { continue; }
+      for (const entry of message.entries ?? []) {
+        if (entry.kind === 'notice') { out.push(String(entry.text ?? '')); }
+      }
+    }
+    return out;
+  }
+
+  test('a NEW session starts on the mode the user last chose', async () => {
+    const { harness } = modeHarness({ configId: 'mode', value: 'bypassPermissions' });
+    registerFakeSession(harness.sessionManager, 's-new', 'Claude Code', { configOptions: MODE_OPTIONS });
+    const calls = spyWrites(harness, 's-new');
+
+    harness.sessionManager.emit('session-created', 's-new', 'Claude Code', 'new');
+    await settle();
+
+    assert.deepStrictEqual(calls, [{ configId: 'mode', value: 'bypassPermissions' }],
+      'the new session is put on the mode the user last chose — the whole point of remembering it');
+    await settle();
+    assert.deepStrictEqual(noticesOf(harness, 's-new'), [],
+      'and it is NOT announced as a switch the user never made (the baseline is seeded, 073/151)');
+  });
+
+  test('reopening a session from history does NOT touch its mode', async () => {
+    const { harness } = modeHarness({ configId: 'mode', value: 'bypassPermissions' });
+    registerFakeSession(harness.sessionManager, 's-old', 'Claude Code', { configOptions: MODE_OPTIONS });
+    const calls = spyWrites(harness, 's-old');
+
+    // load and resume take the same event; an older caller may pass no origin at all.
+    harness.sessionManager.emit('session-created', 's-old', 'Claude Code', 'load');
+    harness.sessionManager.emit('session-created', 's-old', 'Claude Code', 'resume');
+    harness.sessionManager.emit('session-created', 's-old');
+    await settle();
+
+    assert.deepStrictEqual(calls, [], 'a session reopened from history keeps the mode it was left in');
+  });
+
+  test('a remembered value the new session no longer offers is skipped, quietly', async () => {
+    const { harness } = modeHarness({ configId: 'mode', value: 'ghost-mode' });
+    registerFakeSession(harness.sessionManager, 's-new', 'Claude Code', { configOptions: MODE_OPTIONS });
+    const calls = spyWrites(harness, 's-new');
+
+    harness.sessionManager.emit('session-created', 's-new', 'Claude Code', 'new');
+    await settle();
+
+    assert.deepStrictEqual(calls, [], 'a stale default must not become a request the agent would reject');
+    assert.deepStrictEqual(harness.notices.shown, [], 'and nobody is notified about a default that did not apply');
+  });
+
+  test('the mode the user picks is remembered (and persisted for the next window)', async () => {
+    const { harness, memento } = modeHarness();
+    registerFakeSession(harness.sessionManager, 's-2', 'Claude Code', { configOptions: MODE_OPTIONS });
+    spyWrites(harness, 's-2');
+
+    harness.host.onMessage({ type: 'setConfigOption', sessionId: 's-2', configId: 'mode', value: 'plan' });
+    await settle();
+
+    assert.deepStrictEqual(memento.get('acpc.lastMode.v1'), { 'Claude Code': { configId: 'mode', value: 'plan' } },
+      'the value comes from the config option (the authoritative copy), and it survives a reload');
+  });
+
+  test('changing something that is NOT the mode remembers nothing', async () => {
+    const { harness, memento } = modeHarness();
+    registerFakeSession(harness.sessionManager, 's-3', 'Claude Code', { configOptions: MODE_OPTIONS });
+    spyWrites(harness, 's-3');
+
+    harness.host.onMessage({ type: 'setConfigOption', sessionId: 's-3', configId: 'model', value: 'opus' });
+    await settle();
+
+    assert.strictEqual(memento.get('acpc.lastMode.v1'), undefined,
+      'one message carries every option — only the mode one is a remembered preference');
+  });
+
+  test('the draft page shows the remembered mode as the current value (160)', async () => {
+    const { harness } = modeHarness({ configId: 'mode', value: 'bypassPermissions' });
+    // The draft snapshot is the agent's last-seen options; the remembered mode overlays it.
+    registerFakeSession(harness.sessionManager, 'seeded', 'Claude Code', { configOptions: MODE_OPTIONS });
+    harness.sessionManager.emit('config-options-changed', 'seeded');
+    harness.sessionManager.emit('available-commands-changed', 'seeded');
+    harness.surface.sent.length = 0;
+
+    harness.host.onMessage({ type: 'listDraftOptions', draftId: 'd1' });
+    const reply = harness.surface.sent.find(m => m.type === 'draftOptions') as unknown as {
+      configOptions: Array<{ id: string; currentValue: string }>;
+    };
+    assert.ok(reply, 'the draft page always gets an answer (pitfall #29)');
+    assert.strictEqual(reply.configOptions.find(o => o.id === 'mode')?.currentValue, 'bypassPermissions',
+      'what the picker shows is what the new session will get');
+    assert.strictEqual(reply.configOptions.find(o => o.id === 'model')?.currentValue, 'sonnet',
+      'other options stay the agent\'s own last-seen values');
+  });
+});
+
+// [CUSTOM-20261001-162] 轮次之外的 agent 工作（后台子任务）。用户报的现象：任务还在跑（在等
+// 子 agent），发送按钮却已经变回普通状态。判据原本只看"轮次请求还没返回"，而后台子任务会在
+// 轮次结束后继续干活。这里钉住这台状态机的四条边：进入要有证据、产出会续期、汇报即结束、
+// 静默超时要**说出来**（静默复原正是用户看到的那种"没人告诉我发生了什么"）。
+suite('chat panel: background work keeps the session running (CUSTOM-20261001-162)', () => {
+  async function settle(): Promise<void> { await new Promise(resolve => setTimeout(resolve, 15)); }
+
+  async function waitFor(predicate: () => boolean, label: string): Promise<void> {
+    for (let i = 0; i < 100; i++) {
+      if (predicate()) { return; }
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.fail(`timed out waiting for ${label}`);
+  }
+
+  /** The host's picture of one session, as the client receives it. */
+  function runningOf(harness: Harness, sessionId: string): boolean | undefined {
+    for (let i = harness.surface.sent.length - 1; i >= 0; i--) {
+      const message = harness.surface.sent[i] as {
+        type?: string; sessions?: Array<{ sessionId: string; running: boolean }>;
+      };
+      if (message.type !== 'sessionsChanged') { continue; }
+      const row = (message.sessions ?? []).find(s => s.sessionId === sessionId);
+      if (row) { return row.running; }
+    }
+    return undefined;
+  }
+
+  function note(harness: Harness, update: Record<string, unknown>, sessionId = harness.sessionId): void {
+    harness.handler.handleUpdate({ sessionId, update } as never);
+  }
+
+  /** A Task tool call that asks the agent to run it in the background — the only
+   *  evidence we get that work will outlive the turn. */
+  const launch = {
+    sessionUpdate: 'tool_call', toolCallId: 't-task', title: 'Task', kind: 'other',
+    rawInput: { description: 'diff a third file', prompt: '…', run_in_background: true },
+  };
+
+  test('a launched background task keeps the session running', async () => {
+    const harness = makeHarness('s-1', 'Claude Code', undefined, new StubPrefs(), {}, undefined, 60_000);
+    // NOTE: nothing to assert before the launch — until something changes, the host has
+    // not pushed a `sessionsChanged` at all (the harness only attaches a surface).
+
+    note(harness, launch);
+    await settle();
+    assert.strictEqual(runningOf(harness, 's-1'), true,
+      'the agent said it launched background work — the composer must not offer Send');
+  });
+
+  test('housekeeping notifications never arm it', async () => {
+    const harness = makeHarness('s-1', 'Claude Code', undefined, new StubPrefs(), {}, undefined, 20);
+    note(harness, { sessionUpdate: 'session_info_update', title: 'x' });
+    note(harness, { sessionUpdate: 'available_commands_update', availableCommands: [] });
+    note(harness, { sessionUpdate: 'usage_update', used: 1, size: 2 });
+    await settle();
+    assert.strictEqual(runningOf(harness, 's-1'), false,
+      'a title/command/usage notification is not work — a Stop button there would be a lie');
+  });
+
+  test('output keeps the wait alive; silence ends it', async () => {
+    const harness = makeHarness('s-1', 'Claude Code', undefined, new StubPrefs(), {}, undefined, 60);
+    note(harness, launch);
+    await settle();
+    assert.strictEqual(runningOf(harness, 's-1'), true);
+
+    note(harness, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'still going…' } });
+    await settle();
+    assert.strictEqual(runningOf(harness, 's-1'), true, 'a chunk re-arms the watchdog');
+
+    await waitFor(() => runningOf(harness, 's-1') === false, 'the wait to time out');
+  });
+
+  test('the quiet timeout says so instead of silently coming back', async () => {
+    const harness = makeHarness('s-1', 'Claude Code', undefined, new StubPrefs(), {}, undefined, 30);
+    // The user is looking elsewhere: the notice is the only way they learn the wait ended.
+    harness.surface.visibleFlag = false;
+    note(harness, launch);
+
+    await waitFor(() => runningOf(harness, 's-1') === false, 'the wait to time out');
+    assert.strictEqual(harness.notices.shown.length, 1, 'exactly one notice');
+    assert.ok(harness.notices.shown[0].message.includes('后台任务'), harness.notices.shown[0].message);
+    assert.ok(harness.notices.shown[0].message.includes('超时'), harness.notices.shown[0].message);
+  });
+
+  test('the task reporting back ends the wait without a notice', async () => {
+    const harness = makeHarness('s-1', 'Claude Code', undefined, new StubPrefs(), {}, undefined, 60_000);
+    note(harness, launch);
+    await settle();
+    assert.strictEqual(runningOf(harness, 's-1'), true);
+
+    note(harness, {
+      sessionUpdate: 'user_message_chunk',
+      content: { type: 'text', text: '<task-notification>\nBackground task finished.\n</task-notification>' },
+    });
+    await settle();
+    assert.strictEqual(runningOf(harness, 's-1'), false, 'the work we were waiting for reported back');
+    assert.deepStrictEqual(harness.notices.shown, [], 'and the expected end is not news');
+  });
+
+  test('a new turn clears the background wait (no lingering Stop)', async () => {
+    const harness = makeHarness('s-1', 'Claude Code', undefined, new StubPrefs(), {}, undefined, 60_000);
+    note(harness, launch);
+    await settle();
+    assert.strictEqual(runningOf(harness, 's-1'), true);
+
+    Object.assign(harness.sessionManager, {
+      sendPrompt: () => Promise.resolve({ stopReason: 'end_turn' }),
+    });
+    harness.host.onMessage({ type: 'sendPrompt', sessionId: 's-1', text: 'go' });
+    await settle();
+    assert.strictEqual(runningOf(harness, 's-1'), false,
+      'the turn is over and the background wait was already cleared — nothing keeps it "running"');
   });
 });

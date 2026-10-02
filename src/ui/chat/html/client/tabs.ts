@@ -266,6 +266,26 @@ export const tabsClient = `
     cwdBtn.title = (summary.cwd || '') + '\\n' + summary.sessionId;
   }
 
+  /**
+   * [CUSTOM-20261001-155] The directory the header (the "address bar") is showing
+   * right now, or null when it shows none.
+   *
+   * Read off the same state renderHeader/renderDraftHeader render from, so "what
+   * the history filter defaults to" cannot drift away from "what the user sees up
+   * there" (pitfalls #19). A DRAFT's directory is client-local (058), so this is
+   * also the only side that can answer for a draft page at all.
+   */
+  function currentCwd() {
+    var i;
+    for (i = 0; i < state.drafts.length; i++) {
+      if (state.drafts[i].draftId === state.focusedDraftId) { return state.drafts[i].cwd || null; }
+    }
+    for (i = 0; i < state.sessions.length; i++) {
+      if (state.sessions[i].sessionId === state.focusedId) { return state.sessions[i].cwd || null; }
+    }
+    return null;
+  }
+
   /** [CUSTOM-20260925-058] Header for a draft: it shows the directory it WILL use. */
   function renderDraftHeader(draft) {
     // [CUSTOM-20260927-090] A draft HAS a directory to show (and to pick), so the button
@@ -346,7 +366,9 @@ export const tabsClient = `
     setDrafts: setDrafts,
     setDraftFocus: setDraftFocus,
     expectTabFocus: expectTabFocus,
-    focusFirstSession: focusFirstSession
+    focusFirstSession: focusFirstSession,
+    // [CUSTOM-20261001-155] The history picker's filter default comes from here.
+    currentCwd: currentCwd
   };
 })(window.__acpc = window.__acpc || {});
 `;

@@ -23,6 +23,12 @@
 // 承载一切，于是 boot/focus 的全量快照天然把表单带回来，切会话 / 双 surface / 重挂载都不需要
 // 新协议或宿主改动。抽屉只是**同一份 state 的另一种呈现**，它自己不存任何真相。
 //
+// [CUSTOM-20261001-161] 多题时 **Submit 只在最后一题那一页可点**（用户要求防误提交：
+// 在第一页就能点，翻页只是"看看后面还有没有"时很容易顺手点掉）。禁用而不是隐藏，且带一句
+// title 说明为什么；Skip / Cancel 不受影响（它们是逃生门，任何一页都该能用）。
+// `activeTab` 超出新表单的题数时会夹回最后一页 —— 否则会一个 pane 都不显示，而且会让上面那条
+// 判据误判成"已经在最后一题"。
+//
 // 注意：本文件是嵌在模板字符串里的客户端代码，**每个反斜杠都要写成 \\**，禁用反引号。
 // [CUSTOM-END] CUSTOM-20260929-119
 export const elicitationViewClient = `
@@ -188,6 +194,12 @@ export const elicitationViewClient = `
     radio.setAttribute('data-field', field.name);
     radio.setAttribute('data-kind', 'select');
     radio.addEventListener('change', function () { onPick(field.name, value); });
+    // [CUSTOM-20261002-168] 再点一次**已经选中**的那一行 = 取消选择（radio 原生做不到）。
+    // 判据用 data-elic-picked（由 onPick 写）：点击时浏览器已经把它设成 checked 了，
+    // 靠 checked 自己分不出"刚选中"与"再点一次"。
+    radio.addEventListener('click', function () {
+      if (radio.checked && radio.getAttribute('data-elic-picked') === '1') { clearPick(field.name); }
+    });
     label.appendChild(radio);
     var text = el('span', 'elic-option-text');
     text.appendChild(el('span', 'elic-option-label', title));
@@ -232,7 +244,10 @@ export const elicitationViewClient = `
     var state = activeId ? formOf(activeId, pendingForms()) : null;
     if (!form || !state) { return; }
     var inputs = inputsNamed(form, fieldName);
-    for (var i = 0; i < inputs.length; i++) { inputs[i].checked = false; }
+    for (var i = 0; i < inputs.length; i++) {
+      inputs[i].checked = false;
+      inputs[i].setAttribute('data-elic-picked', '0');
+    }
     refresh(form, state);
   }
 
@@ -246,6 +261,14 @@ export const elicitationViewClient = `
    */
   function placeCustomBoxes(root, state) {
     var groups = groupsOf(state);
+    // [CUSTOM-20261002-168] 多选的每个选项行自带一个补充框：跟着**那一行自己的**勾选态
+    // （单选那条在下面 —— 它的框是题目级的，会被移进所选行）。
+    var noteBoxes = root.querySelectorAll('.elic-note-box');
+    for (var nb = 0; nb < noteBoxes.length; nb++) {
+      var owner = noteBoxes[nb].parentNode;
+      var own = owner && owner.querySelector ? owner.querySelector('input[data-field]') : null;
+      noteBoxes[nb].hidden = !(own && own.checked);
+    }
     for (var i = 0; i < groups.length; i++) {
       var group = groups[i];
       if (group.field.kind !== 'select') { continue; }
@@ -281,26 +304,56 @@ export const elicitationViewClient = `
     var state = activeId ? formOf(activeId, pendingForms()) : null;
     if (!form || !state) { return; }
     var inputs = inputsNamed(form, fieldName);
-    for (var i = 0; i < inputs.length; i++) { inputs[i].checked = inputs[i].value === value; }
+    for (var i = 0; i < inputs.length; i++) {
+      inputs[i].checked = inputs[i].value === value;
+      // [168] 记住"这一格是当前选中项"，供"再点一次取消"判定。
+      inputs[i].setAttribute('data-elic-picked', inputs[i].checked ? '1' : '0');
+    }
     refresh(form, state);
   }
 
+  /**
+   * [CUSTOM-20261002-168] 每个选项行自带的「补充说明」框（多选；单选那个由题目级的 extra 框
+   * 移进所选行）。它**不是** schema 里的字段（用 data-elic-note 而不是 data-field）——内容会被
+   * collect() 并进那一项的值里（「选项 — 说明」），所以不单独发送，通用收集循环也看不到它。
+   */
+  function buildOptionNote(value) {
+    var box = el('div', 'elic-custom elic-note-box');
+    box.setAttribute('data-elic-note', value);
+    box.hidden = true;   // shown once THIS row is picked (placeCustomBoxes)
+    var wrap = el('div', 'elic-input-wrap');
+    var input = document.createElement('input');
+    input.className = 'elic-input';
+    input.type = 'text';
+    input.placeholder = 'Add a note (optional)';
+    input.title = 'Adds to this option.';
+    wrap.appendChild(input);
+    box.appendChild(wrap);
+    return box;
+  }
+
   function optionRow(field, option) {
-    var row = el('label', 'elic-option');
+    // [CUSTOM-20261002-168] 与单选的 selectRow 同形：.elic-option-row > label + 补充框。
+    // 包一层是**必须**的 —— 框放 label 里面的话，点进输入框就会顺手勾上/取消这一项。
+    var row = el('div', 'elic-option-row');
+    var label = el('label', 'elic-option');
     var box = document.createElement('input');
     box.type = 'checkbox';
     box.name = field.name;
     box.value = option.value;
     box.setAttribute('data-field', field.name);
     box.setAttribute('data-kind', 'multi');
-    row.appendChild(box);
+    label.appendChild(box);
     var text = el('span', 'elic-option-text');
     text.appendChild(el('span', 'elic-option-label', option.title));
     if (option.description) { text.appendChild(el('span', 'elic-option-desc', option.description)); }
-    row.appendChild(text);
-    if (option.preview) { row.title = option.preview; }
+    label.appendChild(text);
+    if (option.preview) { label.title = option.preview; }
+    row.appendChild(label);
+    row.appendChild(buildOptionNote(option.value));
     return row;
   }
+
 
   function buildMulti(field) {
     var wrap = el('div', 'elic-options');
@@ -341,19 +394,17 @@ export const elicitationViewClient = `
     var box = el('div', 'elic-custom');
     box.setAttribute('data-elic-custom', extra.name);
     box.hidden = true;   // shown by placeCustomBoxes once its question has a pick
-    // The honest sentence is mandatory: the adapter gives a typed answer precedence over the
-    // picked option, so calling it a mere "note" would be a lie the user only discovers from the
-    // model's reply.
-    var hint = 'If you type here, this text is used as the answer for this question \\u2014 replacing the option picked above.';
-    if (!compact) { box.appendChild(el('div', 'elic-custom-label', 'Additional input (optional)')); }
+    // [CUSTOM-20261002-168] 语义改成**追加**：collect() 会把「选项 + 说明」合成**一个**答案发出，
+    // 而且**不再单独发**这个 custom 字段 —— adapter 那边 custom 优先并 return（有它就丢掉所选项），
+    // 单独发就等于替换。所以那条「替换上面所选」的说明行没有了（旧语义遗留，用户报「描述不对」），
+    // 说明只留在输入框的 tooltip 里（用户要求：不单占一行）。
     var wrap = buildInput(extra);
     var input = wrap.querySelector('input');
     if (input) {
       input.placeholder = compact ? 'Notes or other answer\\u2026' : 'Type your own answer';
-      if (compact) { input.title = hint; }
+      input.title = 'Adds to what you picked above.';
     }
     box.appendChild(wrap);
-    box.appendChild(el('div', 'elic-custom-hint', hint));
     return box;
   }
 
@@ -390,6 +441,22 @@ export const elicitationViewClient = `
   function buildForm(state) {
     var form = el('div', 'elic-form');
     var groups = groupsOf(state);
+    // [CUSTOM-20261002-168] 诊断：表单里到底有几项带说明。153 那次"选项说明丢了"两边都证明过
+    // 客户端是好的，于是留下的下一步就是这一行 —— 真机再看时，日志会直接给出答案
+    // （'~/.claude/acp-client-custom.log' 里搜 "form fields"）。
+    // [CUSTOM-20261002-168] 诊断：表单里到底有几项带说明。153 那次'选项说明丢了'两边都证明过
+    // 客户端是好的，留下的下一步就是这一行 —— 真机再看时日志会直接给出答案
+    // （'~/.claude/acp-client-custom.log' 里搜 form fields）。console.warn 会被日志桥转发。
+    var optTotal = 0, optWithDesc = 0;
+    for (var d = 0; d < groups.length; d++) {
+      var opts = groups[d].field.options || [];
+      for (var oi = 0; oi < opts.length; oi++) {
+        optTotal++;
+        if (opts[oi].description) { optWithDesc++; }
+      }
+    }
+    console.warn('[acpc] form fields: ' + groups.length + ' question(s), ' + optTotal +
+      ' option(s), ' + optWithDesc + ' with description');
     // [CUSTOM-20261001-154] 标题行没了（用户要求）：tab 栏、进度与收起按钮合成一条 bar，
     // 进度与箭头**靠右**对齐。收起来时 tab 条隐藏、只留当前题的名字 + 进度 + 箭头。
     var bar = el('div', 'elic-bar');
@@ -429,6 +496,10 @@ export const elicitationViewClient = `
    */
   function refreshChrome(form, state) {
     var groups = groupsOf(state);
+    // [CUSTOM-20261001-161] A form with fewer tabs than the previous one must not leave the
+    // drawer pointing at a tab that no longer exists — that hides every pane AND would fool
+    // the "is this the last question" check below.
+    if (activeTab >= groups.length) { activeTab = Math.max(0, groups.length - 1); }
     var answered = 0;
     var panes = form.querySelectorAll('.elic-field');
     var tabs = form.querySelectorAll('.elic-tab');
@@ -463,7 +534,16 @@ export const elicitationViewClient = `
       clears[c].hidden = !clearField || !fieldAnswered(form, clearField);
     }
     var submit = form.querySelector('.elic-submit');
-    if (submit) { submit.textContent = 'Submit ' + answered + '/' + total; }
+    if (submit) {
+      submit.textContent = 'Submit ' + answered + '/' + total;
+      // [CUSTOM-20261001-161] 多题时 Submit **只在最后一题那一页**可点（用户要求：在
+      // 第一页就能点，容易误提交）。禁用而不是隐藏 —— 看得见的禁用按钮会说明"还差一步"，
+      // 藏起来只会让人以为这个表单没有提交按钮。'sending' 也要算进去：否则提交后一次
+      // input/change 触发的 refresh 会把它重新点亮，又变回两条回答路径。
+      var isLastTab = total <= 1 || activeTab >= total - 1;
+      submit.disabled = sending || !isLastTab;
+      submit.title = isLastTab ? '' : 'Go to the last question to submit';
+    }
     // The custom box follows the pick — after the counts, so a move never fights the tally.
     placeCustomBoxes(form, state);
   }
@@ -594,6 +674,10 @@ export const elicitationViewClient = `
     }
     if (!active) { activeId = null; hide(); return; }
     var sameForm = activeId === active.promptId && !drawer.hidden;
+    // [CUSTOM-20261001-166] 换了一张表单就**从展开态开始**：collapsed 是「那张被收起的表单」
+    // 的属性，而「哪张表单被推开了」另有记录（dismissed，按 promptId）。把布尔留在模块级，
+    // 会让别的会话/别的表单一冒出来就是收起的 —— 用户从没对它按下过那个按钮。
+    if (!sameForm) { collapsed = false; }
     activeId = active.promptId;
     if (sameForm) { refresh(forms[activeId], active); return; }
     show(active);
@@ -630,29 +714,91 @@ export const elicitationViewClient = `
 
   // --- Answers -------------------------------------------------------------
 
-  /** Read the form's current values back out of the DOM (the DOM is the form's state). */
-  function collect(root) {
+  /**
+   * The input of the note box inside one option row (null when absent).
+   *
+   * 分开返回**元素**而不只是文本：collect() 要把它标成"已消费"，而那必须是**同一个节点**
+   * （桩 DOM 的 matches 不支持后代选择器 ''.elic-custom input''，靠选择器再查一次会静默拿到 null ——
+   * 真机没这问题，测试里却会让"已消费"永远为空）。
+   */
+  function noteInputInRow(row) {
+    if (!row || !row.querySelector) { return null; }
+    var box = row.querySelector('.elic-custom');
+    return box && box.querySelector ? box.querySelector('input') : null;
+  }
+
+  /** The typed note inside one option row, trimmed ('' when empty or absent). */
+  function noteInRow(row) {
+    var input = noteInputInRow(row);
+    return input ? String(input.value || '').trim() : '';
+  }
+
+  /** The label shown on an option row ('' when absent). */
+  function labelInRow(row) {
+    var node = row && row.querySelector ? row.querySelector('.elic-option-label') : null;
+    return node ? String(node.textContent || '').trim() : '';
+  }
+
+  /**
+   * [CUSTOM-20261002-168] Read the form's values.
+   *
+   * 与上一版的差别（用户 2026-10-02 的四条要求）：
+   *   · **追加而不是替换**：某选项的补充框里写了字 ⇒ 答案是「选项 \\u2014 说明」这**一个**字符串，
+   *     那个 custom 字段**不再单独发送** —— adapter 那边 custom 优先并 return，单独发就等于替换；
+   *   · 多选的**每个选项**都能带自己的补充框（同上，各自并进自己那一项）；
+   *   · "Other" 行（空值）的答案就是框里的文本；多选的题级 Other 框作为**追加项**并进数组。
+   */
+  function collect(root, state) {
     var out = {};
-    var inputs = root.querySelectorAll('input[data-field]');
-    for (var i = 0; i < inputs.length; i++) {
-      var input = inputs[i];
-      var name = input.getAttribute('data-field');
-      var kind = input.getAttribute('data-kind');
-      if (kind === 'select' || kind === 'multi' || kind === 'boolean') {
+    var consumed = [];   // 已经并进选项值的输入框：通用循环不能再发一次
+    var groups = state ? groupsOf(state) : [];
+    for (var g = 0; g < groups.length; g++) {
+      var group = groups[g];
+      var kind = group.field.kind;
+      if (kind !== 'select' && kind !== 'multi') { continue; }
+      var picks = [];
+      var inputs = inputsNamed(root, group.field.name);
+      for (var i = 0; i < inputs.length; i++) {
+        var input = inputs[i];
         if (!input.checked) { continue; }
-        if (kind === 'multi') {
-          if (!out[name]) { out[name] = []; }
-          out[name].push(input.value);
-        } else if (kind === 'boolean') {
-          out[name] = true;
-        } else {
-          out[name] = input.value;
+        var row = input.closest ? (input.closest('.elic-option-row') || input.closest('.elic-option')) : null;
+        var note = noteInRow(row);
+        if (note) {
+          var boxInput = noteInputInRow(row);
+          if (boxInput) { consumed.push(boxInput); }
         }
+        if (input.value === '') { if (note) { picks.push(note); } continue; }   // "Other" 行
+        picks.push(note ? ((labelInRow(row) || input.value) + ' \\u2014 ' + note) : input.value);
+      }
+      if (kind === 'multi') {
+        var extra = null;
+        for (var e = 0; e < group.extras.length && !extra; e++) {
+          var box = findByAttr(root, 'data-elic-custom', group.extras[e].name);
+          var boxIn = box && box.querySelector ? box.querySelector('input') : null;
+          var text = boxIn ? String(boxIn.value || '').trim() : '';
+          if (text) { extra = { text: text, input: boxIn }; }
+        }
+        if (extra && picks.length > 0) { picks.push(extra.text); consumed.push(extra.input); }
+        if (picks.length > 0) { out[group.field.name] = picks; }
         continue;
       }
-      var text = String(input.value || '').trim();
-      if (text === '') { continue; }
-      out[name] = kind === 'number' ? Number(text) : text;
+      if (picks.length > 0) { out[group.field.name] = picks[0]; }
+    }
+    var rest = root.querySelectorAll('input[data-field]');
+    for (var r = 0; r < rest.length; r++) {
+      var el2 = rest[r];
+      if (consumed.indexOf(el2) >= 0) { continue; }
+      var kind2 = el2.getAttribute('data-kind');
+      if (kind2 === 'select' || kind2 === 'multi') { continue; }   // 上面已处理
+      var name2 = el2.getAttribute('data-field');
+      if (kind2 === 'boolean') {
+        if (el2.checked && out[name2] === undefined) { out[name2] = true; }
+        continue;
+      }
+      if (out[name2] !== undefined) { continue; }   // 别覆盖已合并的答案
+      var text2 = String(el2.value || '').trim();
+      if (text2 === '') { continue; }
+      out[name2] = kind2 === 'number' ? Number(text2) : text2;
     }
     return out;
   }
@@ -686,7 +832,10 @@ export const elicitationViewClient = `
       action: outgoingKind
     };
     // 'accept' carries the answers; the other two are decisions, not data.
-    if (outgoingKind === 'accept') { message.content = collect(root); }
+    // [CUSTOM-20261002-168] 带上 state：合并"选项 + 说明"要知道每个选项属于哪道题。
+    if (outgoingKind === 'accept') {
+      message.content = collect(root, activeId ? formOf(activeId, pendingForms()) : null);
+    }
     // A second click before the host answers would send a duplicate — the bridge is idempotent,
     // but the UI should not look like nothing happened either.
     sending = true;
