@@ -491,12 +491,136 @@ function driver() {
     // dump-dom 报 innerH=808 而截图画布是 900），而菜单是 position: fixed、按视口算坐标。
     // **判定菜单落在哪一侧要用探针读数字**（'#elicmenuprobe' 的 menuBelowBtn / menuTopVsDrawerTop），
     // 不要照着截图改代码 —— 我为此白改了两版规则（pitfall #31）。
-    if (location.hash.indexOf('multi') >= 0) { NS.elicitationView.selectTab(1); }
+    if (location.hash.indexOf('multi') >= 0) {
+      NS.elicitationView.selectTab(1);
+      // [CUSTOM-20261002-168] 勾上第一项，好让"每项自带的补充框"显形（它跟着勾选态）。
+      var firstMulti = document.querySelector('.elic-field input[data-kind="multi"]');
+      // ⚠️ new Event('change') 默认 **不冒泡** —— 委托在抽屉上的 change 处理器收不到，
+      // 于是 placeCustomBoxes 不会重跑（截图里就是"勾了却没长出补充框"）。
+      if (firstMulti) { firstMulti.checked = true; firstMulti.dispatchEvent(new Event('change', { bubbles: true })); }
+    }
     if (location.hash.indexOf('shrunk') >= 0) { NS.elicitationView.setCollapsed(true); }
     // 单选那一档：点第一行（真实路径 —— 点 label 里的 radio 会触发 change）。
     if (location.hash.indexOf('pick') >= 0) {
       var firstRadio = document.querySelector('.elic-option-row input');
       if (firstRadio) { firstRadio.click(); }
+    }
+  }
+  // [CUSTOM-20261001-158] 权限抽屉：记录区只留一行（⏳ + 标题 + Review），作答按钮在输入框
+  // 上方的浮层里 —— 形状与表单抽屉一致（用户要求"跟选项弹框类似"）。
+  // 'both' 档：表单 + 权限**同时** pending（同一会话先来表单又来权限的真实组合），
+  // 两个抽屉上下堆叠，各自的高度变量相加；这一档是量"谁压在谁上面、有没有相交"的唯一现场。
+  if (location.hash.indexOf('permdrawer') >= 0) {
+    var permEntries = [{
+      id: 'preview-perm', kind: 'permission', at: Date.now(),
+      permission: {
+        promptId: 'preview:perm',
+        sessionId: SESSION,
+        toolCallId: 'call_preview',
+        title: 'cd /d/Git/zdev/zdev_ai_goal_loop && ls ai-starter/ 2>/dev/null && echo "--- ai-starter docs ---"',
+        kind: 'execute',
+        status: 'pending',
+        options: [
+          { optionId: 'allow-once', name: 'Yes', kind: 'allow_once' },
+          { optionId: 'allow-with-updates', name: 'Yes, and allow access to zdev_ai_goal_loop and similar commands', kind: 'allow_always' },
+          { optionId: 'reject', name: 'No', kind: 'reject_once' }
+        ]
+      }
+    }];
+    if (location.hash.indexOf('both') >= 0) {
+      permEntries.push({
+        id: 'preview-elic-both', kind: 'elicitation', at: Date.now(),
+        elicitation: {
+          promptId: 'preview:elic-both', sessionId: SESSION, status: 'pending',
+          message: 'Which framework?',
+          fields: [{ name: 'question_0', kind: 'select', title: 'Base',
+            options: [{ value: 'astro', title: 'Astro official' }] }]
+        }
+      });
+    }
+    try {
+      NS.transcriptView.hydrate({ sessionId: SESSION, entries: permEntries });
+    } catch (err) { failed++; console.warn('permission hydrate failed:', err); }
+    // 底栏先初始化：两个抽屉的 bottom 都认 --acpc-composer-h。
+    NS.composer.init();
+    NS.permissionDrawer.init();
+    NS.permissionDrawer.setSession(SESSION);
+    NS.permissionDrawer.sync();
+    if (location.hash.indexOf('both') >= 0) {
+      NS.elicitationView.init();
+      NS.elicitationView.setSession(SESSION);
+      NS.elicitationView.sync();
+    }
+  }
+  // [CUSTOM-20261001-166] 置顶条：规则改成「上方有用户消息就钉住最后那条滚出上沿的」。
+  // 这一档摆出用户报的场景 —— 视口中间还有一条用户消息（u2），而更早的 u1 已经滚上去。
+  // [CUSTOM-20261002-172] 卡堆之后同时可能有**多张**卡（旧卡被顶出上沿的那几帧），所以这一档
+  // 又分出了 stickystack* 三种姿态（相接 / 两卡同钉 / 整条出界），见下面那段。
+  // （169 删掉了卡片左侧那个收缩按钮，原先 stickyshrunk 档的"点一下按钮"随之作废 ——
+  //   现在收缩控件是卡片里的折叠三角，走的是 stickystickyclick 档的真实点击。）
+  if (hash.indexOf('sticky') >= 0) {
+    // 滚动模块必须先 init：悬浮条的点击跳转走 NS.scroll.jumpTo（没 init 就静默不滚，
+    // 探针量到的落点会一直是原位 —— 第一版就是这么白量了一轮）。
+    NS.scroll.init(messages, document.getElementById('jumpToLatest'));
+    NS.stickyUser.init();
+    NS.stickyUser.setSession(SESSION);
+    // 固件记录本身撑不满视口（scrollHeight == clientHeight ⇒ scrollTop 永远是 0），
+    // 补几条把内容顶出去，否则这一档什么都量不到。
+    for (var sx = 0; sx < 6; sx++) {
+      NS.transcriptView.append({ id: 'sx-u' + sx, kind: 'user', at: 9000 + sx * 2,
+        text: '填充提问 ' + (sx + 1) + '：' + '这一条用来把内容撑过视口。'.repeat(2) }, undefined);
+      NS.transcriptView.append({ id: 'sx-a' + sx, kind: 'assistant', at: 9001 + sx * 2,
+        text: '填充回答 ' + (sx + 1) + '：' + '内容 '.repeat(30) }, undefined);
+    }
+    NS.rail.invalidate();
+    NS.outline.invalidate();
+    // 先读一次 scrollHeight 强制布局：驱动脚本跑在解析期，此时还没有布局，
+    // 直接写 scrollTop 会被钳成 0（截图里就表现为"根本没滚"）。
+    void messages.scrollHeight;
+    messages.scrollTop = Number((hash.match(/top=(\d+)/) || [])[1] || 260);
+    messages.dispatchEvent(new Event('scroll'));
+    NS.stickyUser.sync();
+    // 窄档 + 引导条：真面板是窄侧边栏且**引导条的点就在同一条通道里**（x≈0..20），
+    // 只初始化 sticky 而不摆出它们，等于漏掉了唯一的竞争者。
+    if (hash.indexOf('narrow') >= 0) {
+      NS.rail.init(document.getElementById('messages'),
+        document.getElementById('rail'), document.getElementById('railTrack'));
+      NS.rail.invalidate();
+      NS.dom.schedule(function () { NS.rail.reflow(); });
+    }
+  }
+  // [CUSTOM-20261002-172] 卡堆的三种姿态：三条**挨得近**的提问（各带一句短回答），顶边间距一百多
+  // 像素 —— 只有挨得近，才会出现"新卡刚碰到旧卡底边"的那几帧。填充档里问答交替、回答很长，
+  // 相邻提问隔了半屏，永远只钉得到一条。
+  if (hash.indexOf('stickystack') >= 0) {
+    for (var sk = 0; sk < 3; sk++) {
+      NS.transcriptView.append({ id: 'stk-u' + sk, kind: 'user', at: 9500 + sk * 2,
+        text: '紧凑提问 ' + (sk + 1) + '：这一条用来把卡堆撑出来，它是一个单行气泡。' }, undefined);
+      NS.transcriptView.append({ id: 'stk-a' + sk, kind: 'assistant', at: 9501 + sk * 2,
+        text: '一句话回答 ' + (sk + 1) }, undefined);
+    }
+    // 卡堆后面还要垫一大段内容：滚动范围只到 scrollHeight - clientHeight，垫不够的话
+    // "把第二条提问滚到判定线附近"这个目标位置根本到不了 —— scrollTop 会被静默钳到最底，
+    // 三档于是长得一模一样（第一版就是这么白量一轮的）。
+    for (var sf = 0; sf < 8; sf++) {
+      NS.transcriptView.append({ id: 'stk-fill' + sf, kind: 'assistant', at: 9600 + sf,
+        text: '垫底内容 ' + (sf + 1) + '：' + '内容 '.repeat(40) }, undefined);
+    }
+    NS.rail.invalidate();
+    NS.outline.invalidate();
+    // 先读一次 scrollHeight 强制布局（理由同上面那段：驱动脚本跑在解析期，还没有布局）。
+    void messages.scrollHeight;
+    // 姿态由**量出来的**位置定，不猜一个 scrollTop：第二条提问的 offsetTop 只有布局之后才知道。
+    //   push：它的顶边停在判定线下方 30px ⇒ 旧卡的底边应当正好压在它上面（相接，只有一张卡）
+    //   two ：它的顶边只剩 2px      ⇒ 两张卡同时在（新卡钉在判定线上）
+    //   gone：它的顶边已滚过 100px  ⇒ 旧卡整条出界，不再渲染
+    // natural = u2.offsetTop - scrollTop，所以 scrollTop = u2.offsetTop + offset。
+    var stackU2 = NS.transcriptView.node('stk-u1');
+    if (stackU2) {
+      var stackOffset = hash.indexOf('gone') >= 0 ? 100 : (hash.indexOf('two') >= 0 ? -2 : -30);
+      messages.scrollTop = stackU2.offsetTop + stackOffset;
+      messages.dispatchEvent(new Event('scroll'));
+      NS.stickyUser.sync();
     }
   }
   // [CUSTOM-20260930-141] 目录过滤菜单：它挂在历史浮层内部的 .outline-head 里，而浮层原先
@@ -520,6 +644,57 @@ function driver() {
       }
       filterMenuEl2.className = 'picker-menu down filter-menu open';
     }
+  }
+  // [CUSTOM-20261001-155] 历史会话的**默认筛选**：走真路径（真 boot → 真 ↺ → 宿主形状的
+  // history 回复 → 真标记 #history/#historyFilter），桩 DOM 测试测的是逻辑、这里测的是
+  // **接线与真标记**（body.ts 的 id/class 与测试里手抄的那份对不对得上）。
+  // 探针读 askedCwd（请求里带没带地址栏目录）/ rows（默认筛出几行）/ chip（chip 上写的是谁）。
+  //
+  // **必须等真的 DOMContentLoaded / load 之后再驱动**：本档手动派发过一次 DOMContentLoaded
+  // 只是为了**提前**跑 boot，而真的那个事件随后还会到 —— 于是 boot.init 跑第二遍、
+  // sessionMenu.init 的第二遍末尾一次 close() 会把刚打开的抽屉关掉（数字对、图里却没有抽屉）。
+  // 等 load 再点，那个"第二次 init"就已经过去了。
+  function historyDefaultMode() {
+    var histSent = [];
+    var nativeHistPost = NS.bridge.post;
+    NS.bridge.post = function (m) { histSent.push(m); if (nativeHistPost) { nativeHistPost(m); } };
+    var histSummary = { sessionId: 's1', agentName: 'Claude Code', title: 'here', cwd: 'D:/Git/alpha',
+      createdAt: '2026-09-20T00:00:00Z', loading: false, running: false, unread: false };
+    NS.tabs.setSessions([histSummary]);
+    NS.tabs.setFocus(histSummary);
+    document.getElementById('historyBtn').click();
+    NS.sessionMenu.setHistory({
+      type: 'history', agentName: 'Claude Code', source: 'agent',
+      sessions: [
+        { sessionId: 'a1', title: 'alpha one', cwd: 'D:/Git/alpha', dirKey: 'd:/git/alpha', updatedAt: '2026-09-20T00:00:00Z' },
+        { sessionId: 'a2', title: 'alpha two', cwd: 'D:/Git/alpha', dirKey: 'd:/git/alpha', updatedAt: '2026-09-19T00:00:00Z' },
+        { sessionId: 'b1', title: 'beta one', cwd: 'D:/Git/beta', dirKey: 'd:/git/beta', updatedAt: '2026-09-18T00:00:00Z' }
+      ],
+      directories: [
+        { key: 'd:/git/alpha', cwd: 'D:/Git/alpha', name: 'alpha', label: 'alpha', count: 2, current: true },
+        { key: 'd:/git/beta', cwd: 'D:/Git/beta', name: 'beta', label: 'beta', count: 1, current: false }
+      ]
+    });
+    var histList = document.querySelector('#history .outline-list');
+    var histChip = document.getElementById('historyFilter');
+    var histCwdBtn = document.getElementById('cwdBtn');
+    var histLine = JSON.stringify({
+      kind: 'history-default',
+      askedCwd: histSent.filter(function (m) { return m.type === 'listHistory'; }).map(function (m) { return m.cwd; })[0] || null,
+      rows: histList ? histList.querySelectorAll('.outline-item').length : null,
+      firstRow: histList && histList.querySelector('.outline-item') ? String(histList.querySelector('.outline-item').textContent).slice(0, 20) : null,
+      chip: histChip ? String(histChip.textContent) : null,
+      drawerHidden: document.getElementById('history') ? document.getElementById('history').hidden : null,
+      cwdBtn: histCwdBtn ? String(histCwdBtn.textContent) : null
+    });
+    var histPre = document.createElement('pre');
+    histPre.id = 'history-probe';
+    histPre.textContent = histLine;
+    document.body.appendChild(histPre);
+  }
+  if (location.hash.indexOf('historydefault') >= 0) {
+    if (document.readyState === 'complete') { historyDefaultMode(); }
+    else { window.addEventListener('load', historyDefaultMode); }
   }
   // [CUSTOM-20260930-143] 未连接（disconnected / connecting）时底栏应当**整块消失** —— 那时
   // 输入框本来就用不了，露着一个"看得见却打不了字"的框只会让人以为它坏了。相位是 stateCard
@@ -682,6 +857,149 @@ function driver() {
   // 对齐这类问题肉眼判断经常骗人（字体度量、内边距、UA 默认样式各差几像素），量一次最省事。
   if (location.hash.indexOf('probe') >= 0) {
     var out = [];
+    // [CUSTOM-20261001-158] 权限抽屉：贴着输入卡（或表单抽屉）上沿、与输入卡同宽同中线；
+    // 与表单同时 pending 时两者不得相交（gap 期望 0，权限在上）。这些只能量，不能推。
+    // [CUSTOM-20261001-166] 置顶条：钉的是谁、收缩按钮在不在、以及它的**命中测试**
+    // （elementFromPoint 必须命中按钮自己 —— 引导条与它同在左侧那条 18px 通道里）。
+    // [CUSTOM-20261001-166] 真实点击：按 elementFromPoint 的**命中目标**点下去 —— 那就是用户
+    // 的鼠标会落到的东西 —— 并临时挂钩 scroll.jumpTo，看这次点击有没有触发跳转。
+    // 只在 stickyclick 档跑：它会改变状态（点击本来就是有副作用的）。
+    // [CUSTOM-20261002-170/171] 点卡片跳转之后：卡片与"跳到的那个节点"的几何关系。
+    // [CUSTOM-20261002-172] 目标取自**被点的那张卡**（卡堆里每张各代表一条消息），这里点最下面
+    // 那张（最新的、也就是"本轮提问"）。
+    if (location.hash.indexOf('stickyjump') >= 0) { try {
+      var sjHost = document.getElementById('stickyUser');
+      var sjCardEls = sjHost ? sjHost.querySelectorAll('.sticky-card') : [];
+      var sjCard = sjCardEls.length ? sjCardEls[sjCardEls.length - 1] : null;
+      var targetId = sjCard ? sjCard.getAttribute('data-sticky-id') : null;
+      if (sjCard && sjCard.click) { sjCard.click(); }
+      NS.stickyUser.sync();
+      var node = targetId ? NS.transcriptView.node(targetId) : null;
+      var an = node ? node.getBoundingClientRect() : null;
+      // 量**最新那张卡**：用户报的"界面里的和悬浮的两条对话重叠"说的就是它 —— 它代表的正是
+      // 刚跳过去的那条消息，所以两者的矩形不该相交（卡片接管原位、本体让位）。
+      var landedCards = sjHost ? sjHost.querySelectorAll('.sticky-card') : [];
+      var landed = landedCards.length ? landedCards[landedCards.length - 1] : null;
+      var ac = landed ? landed.getBoundingClientRect() : null;
+      out.push(JSON.stringify({
+        kind: 'sticky-jump',
+        target: targetId,
+        scrollTop: Math.round(document.getElementById('messages').scrollTop),
+        targetTop: an ? Math.round(an.top) : null, targetBottom: an ? Math.round(an.bottom) : null,
+        cardTop: ac ? Math.round(ac.top) : null, cardBottom: ac ? Math.round(ac.bottom) : null,
+        // [CUSTOM-20261002-171] 判据是**落点在交接窗口之内**（0 <= natural < 3）且本体让位：
+        // 消息就地接管卡片的位置 ⇒ 画面上只有一张。overlap 会报 true，那是**预期的** ——
+        // 本体的矩形确实在卡片下面，只是它 visibility:hidden（170 的"两条重叠"是本体**可见**）。
+        nodeNatural: node ? Math.round(node.offsetTop - document.getElementById('messages').scrollTop) : null,
+        overlap: (ac && an) ? (an.top < ac.bottom && an.bottom > ac.top) : null,
+        targetVisibility: node ? getComputedStyle(node).visibility : null,
+        stickyVisible: sjHost ? !sjHost.hidden : null
+      }));
+    } catch (e) { out.push(JSON.stringify({ kind: 'sticky-jump-error', message: String((e && e.message) || e) })); } }
+    var stickyHostEl2 = document.getElementById('stickyUser');
+    if (stickyHostEl2 && location.hash.indexOf('stickyclick') >= 0) { try {
+      var jumped = false;
+      var origJump = NS.scroll.jumpTo;
+      NS.scroll.jumpTo = function () { jumped = true; return origJump.apply(NS.scroll, arguments); };
+      var caret2 = stickyHostEl2.querySelector('.fold-caret');
+      var clickCard = caret2 && caret2.closest ? caret2.closest('.sticky-card') : null;
+      // [CUSTOM-20261002-172] 卡片里的折叠三角是**唯一**收缩控件（169 删了左侧那个小方块），
+      // 它走原生 <details>（171）—— 所以量的是那张卡的 details.open 与卡高，不是某个类名。
+      function snap() {
+        var det = clickCard ? clickCard.querySelector('details') : null;
+        var fb0 = clickCard ? clickCard.querySelector('.fold-body') : null;
+        return {
+          open: det ? det.open : null,
+          foldDisplay: fb0 ? getComputedStyle(fb0).display : null,
+          cardH: clickCard ? Math.round(clickCard.getBoundingClientRect().height) : null
+        };
+      }
+      var s0 = snap();
+      if (caret2 && caret2.click) { caret2.click(); }
+      var s1 = snap();
+      if (caret2 && caret2.click) { caret2.click(); }
+      var s2 = snap();
+      NS.scroll.jumpTo = origJump;
+      out.push(JSON.stringify({
+        kind: 'sticky-click', caretFound: !!caret2, caretTitle: caret2 ? String(caret2.title || '') : null,
+        cardId: clickCard ? clickCard.getAttribute('data-sticky-id') : null,
+        jumped: jumped,
+        initial: s0, afterFirstClick: s1, afterSecondClick: s2
+      }));
+    } catch (e) { out.push(JSON.stringify({ kind: 'sticky-click-error', message: String((e && e.message) || e) })); } }
+    var stickyHost = document.getElementById('stickyUser');
+    if (stickyHost) {
+      // [CUSTOM-20261002-172] 卡堆：**逐张**量几何（子节点顺序 = 从旧到新）。判定靠这些数字，不靠
+      // 肉眼。坐标统一用"host 空间"（y=0 就是滚动口顶边）：用户消息的自然位置 = offsetTop -
+      // scrollTop（与客户端同一条算式），卡片则是 rect.top - hostRect.top。
+      var sRect = stickyHost.getBoundingClientRect();
+      var userTops = [];
+      (function () {
+        var ids = NS.transcriptView.ordered();
+        for (var k = 0; k < ids.length; k++) {
+          var e = NS.transcriptView.entry(ids[k]);
+          if (!e || e.kind !== 'user') { continue; }
+          var n = NS.transcriptView.node(e.id);
+          if (!n) { continue; }
+          userTops.push({ id: e.id, top: Math.round(n.offsetTop - messages.scrollTop) });
+        }
+      })();
+      var cardEls = stickyHost.querySelectorAll('.sticky-card');
+      var cardsInfo = [];
+      for (var ci = 0; ci < cardEls.length; ci++) {
+        var cr = cardEls[ci].getBoundingClientRect();
+        var cTop = Math.round(cr.top - sRect.top);
+        var cBottom = Math.round(cr.bottom - sRect.top);
+        // 下一条用户消息的顶边就是用户说的那条"判定线"：被顶出去的卡片底边应当压在它上面。
+        var nextTop = null;
+        for (var ui = 0; ui < userTops.length; ui++) {
+          if (userTops[ui].top >= cTop) { nextTop = userTops[ui].top; break; }
+        }
+        cardsInfo.push({
+          id: cardEls[ci].getAttribute('data-sticky-id'),
+          top: cTop, bottom: cBottom, h: Math.round(cr.height),
+          visible: Math.max(0, Math.round(Math.min(cr.bottom, sRect.bottom) - Math.max(cr.top, sRect.top))),
+          nextUserTop: nextTop,
+          contact: nextTop === null ? null : Math.abs(cBottom - nextTop) <= 1
+        });
+      }
+      var hostStyle = getComputedStyle(stickyHost);
+      out.push(JSON.stringify({
+        kind: 'sticky',
+        hidden: !!stickyHost.hidden,
+        hostTop: Math.round(sRect.top), hostH: Math.round(sRect.height),
+        padTop: hostStyle.paddingTop,
+        // maxHeight 必须是 none（172 去掉了 40% —— 它会裁掉最下面、也就是**最新**的那张卡）。
+        maxHeight: hostStyle.maxHeight, overflowY: hostStyle.overflowY,
+        cards: cardsInfo,
+        dbgScrollTop: Math.round(messages.scrollTop),
+        dbgScrollHeight: messages.scrollHeight, dbgClientHeight: messages.clientHeight,
+        dbgUsers: userTops,
+        text: String(stickyHost.textContent || '').slice(0, 40)
+      }));
+    }
+    var permDrawerEl = document.getElementById('permDrawer');
+    if (permDrawerEl) {
+      var pdRect = permDrawerEl.getBoundingClientRect();
+      var elicEl = document.getElementById('elicDrawer');
+      var elicRect = elicEl && !elicEl.hidden ? elicEl.getBoundingClientRect() : null;
+      var bodyStyle = getComputedStyle(document.body);
+      var composerEl = document.querySelector('.composer-card') || document.querySelector('.composer');
+      var cardRect = composerEl ? composerEl.getBoundingClientRect() : null;
+      out.push(JSON.stringify({
+        kind: 'perm-drawer',
+        hidden: !!permDrawerEl.hidden,
+        permH: bodyStyle.getPropertyValue('--acpc-perm-h').trim(),
+        elicH: bodyStyle.getPropertyValue('--acpc-elic-h').trim(),
+        // 抽屉下沿到输入卡上沿的距离：没有表单时应当就是 0（贴住）。
+        gapToComposer: cardRect ? Math.round(cardRect.top - pdRect.bottom) : null,
+        // 有表单时：权限的下沿应当等于表单的上沿（堆叠，不相交）。
+        gapToElic: elicRect ? Math.round(elicRect.top - pdRect.bottom) : null,
+        overlapsElic: elicRect ? pdRect.bottom > elicRect.top + 1 : null,
+        buttons: permDrawerEl.querySelectorAll('.perm-btn').length,
+        recordRow: !!document.querySelector('.perm-pending-row')
+      }));
+    }
     var segs = messages.querySelectorAll('.tool-seg');
     for (var s2 = 0; s2 < segs.length; s2++) {
       var seg = segs[s2];
@@ -770,6 +1088,28 @@ function driver() {
         // 没选时应当 hidden，选了一行之后应当落在**那一行**里（用户规则 2）。
         progress: document.querySelector('.elic-progress')
           ? document.querySelector('.elic-progress').textContent : null,
+        // [CUSTOM-20261001-161] Submit 的门禁：多题时**第一页必须禁用、最后一页才可点**。
+        // 探针临时把 tab 切一圈再切回来（同 136 的先例：为了量到真实状态，允许摆一下 DOM），
+        // 因为"只看当前这一档"永远量不出另一半。
+        submitGating: (function () {
+          var submit = document.querySelector('.elic-submit');
+          var tabs = document.querySelectorAll('.elic-tab');
+          if (!submit) { return null; }
+          if (tabs.length <= 1) { return { tabs: tabs.length, singleEnabled: submit.disabled === false }; }
+          var current = 0;
+          for (var i = 0; i < tabs.length; i++) {
+            if (tabs[i].getAttribute('aria-selected') === 'true') { current = i; }
+          }
+          NS.elicitationView.selectTab(0);
+          var firstDisabled = document.querySelector('.elic-submit').disabled;
+          NS.elicitationView.selectTab(tabs.length - 1);
+          var lastDisabled = document.querySelector('.elic-submit').disabled;
+          NS.elicitationView.selectTab(current);
+          return {
+            tabs: tabs.length, firstTabDisabled: firstDisabled,
+            lastTabDisabled: lastDisabled, restoredTab: current
+          };
+        })(),
         customHidden: document.querySelector('.elic-custom') ? document.querySelector('.elic-custom').hidden : null,
         customInPickedRow: (function () {
           var rows = document.querySelectorAll('.elic-option-row');
@@ -1095,6 +1435,28 @@ const SHOTS = [
   // 探针读 asked / hasMdClass / droppedNoSession —— 这三项一起看才能判定整条链路。
   ['#bootroundprobe', 'markdown-round', '1440,900'],
   ['#historyfilter', 'history-filter', '1440,900'],
+  // [CUSTOM-20261001-155] 默认筛选（地址栏有目录 ⇒ 列表只出该目录）：截图看列表本身，
+  // 探针（同 hash 带 probe）读 askedCwd / rows / chip —— 数字比肉眼可靠。
+  ['#historydefaultprobe', 'history-default', '1440,900'],
+  // [CUSTOM-20261001-158] 权限抽屉：记录一行 + 输入框上方的浮层（与表单抽屉同形）。
+  // `both` 档把表单与权限**同时**摆出来 —— 两个抽屉上下堆叠，探针量 gapToElic / overlapsElic。
+  ['#permdrawerprobe', 'perm-drawer', '1440,900'],
+  // [CUSTOM-20261001-166] 置顶条：上面那条滚出上沿、视口里还摆着一条（新规则）。
+  ['#stickyprobetop=260', 'sticky-prev', '1440,900'],
+  // [CUSTOM-20261002-172] 卡堆的三种姿态（三条挨得近的提问，档位由脚本**量出来**的 offsetTop 定）：
+  //   push = 旧卡的底边正压在下一条的顶边上（相接，只有一张卡）
+  //   two  = 两张卡同时在（新卡钉在判定线上，旧卡只剩一条边）
+  //   gone = 旧卡整条出界、不再渲染
+  // 探针读 cards[] 的 top/bottom/contact + maxHeight（必须是 none）——
+  // 169 删掉了左侧那个收缩按钮，原先的 sticky-shrunk 档随之作废。
+  ['#stickystackpushprobe', 'sticky-stack-push', '1440,900'],
+  ['#stickystacktwoprobe', 'sticky-stack-two', '1440,900'],
+  ['#stickystackgoneprobe', 'sticky-stack-gone', '1440,900'],
+  // [166] 窄档 + 引导条 + 真实点击：点卡片里的折叠三角，看它折叠了没有、跳转了没有。
+  ['#stickynarrowstickyclickprobetop=260', 'sticky-click-narrow'],
+  // [170] 点卡片跳转后，量与节点的重叠。
+  ['#stickynarrowstickyjumpprobetop=260', 'sticky-jump-narrow'],
+  ['#permdrawerbothprobe', 'perm-drawer-both', '1440,1000'],
   // [CUSTOM-20260930-143] 未连接时底栏应当整块消失。
   ['#phasedisconnected', 'phase-disconnected', '1440,900'],
   // [CUSTOM-20260930-151] 草稿页（点「+」的新会话页）的输入卡：模式/模型/努力度三个选择器

@@ -10,6 +10,9 @@ import { iconsClient } from './icons';
 import { scrollClient } from './scroll';
 import { linksClient } from './links';
 import { permissionViewClient } from './permissionView';
+// [CUSTOM-20261001-158] 权限抽屉：与表单抽屉同形，注册在 permissionView 之后（它用
+// permissionView.buildHead/buildActions 生成内容）。
+import { permissionDrawerClient } from './permissionDrawer';
 // [CUSTOM-20260929-119] Form cards (ACP elicitation / AskUserQuestion) — the permission
 // card's sibling, so it loads next to it.
 import { elicitationViewClient } from './elicitationView';
@@ -39,6 +42,9 @@ const MODULES: ReadonlyArray<string> = [
   // Must precede transcriptView: build() dispatches on entry kind at runtime,
   // which only works once every view module has been registered.
   permissionViewClient,
+  // [CUSTOM-20261001-158] Same reason, one drawer over: it builds its content with
+  // permissionView's head/actions builders.
+  permissionDrawerClient,
   elicitationViewClient,
   toolCallViewClient,
   transcriptViewClient,

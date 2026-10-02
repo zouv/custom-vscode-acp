@@ -598,6 +598,9 @@ export const composerClient = `
     hideSlash();
     renderPickers();
     renderAttachments();
+    // [CUSTOM-20261001-165] 草稿没有会话，也就没有用量：不清的话输入框右侧的上下文表盘会**留着
+    // 上一个会话的数字**（用户截图：新建会话还显示着上一条的百分比）。
+    renderContext(null);
     refreshControls();
     // …and hand back what THIS draft had. Without it, switching drafts carried the
     // previous draft's text across (and a discarded-then-reopened draft came back empty).

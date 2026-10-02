@@ -134,6 +134,8 @@ webpack + ts-loader（不是 esbuild）；ESLint flat config；`@vscode/test-cli
 `SessionManager`：`newConversation` / `loadSession` / `resumeSession` / `listSessions`；
 认证失败是 `-32000` → 走 `showQuickPick` 选 auth method 后重试 `newSession`；
 持久化缓存读写看 `SessionHistoryStore`。
+**新建 vs 打开**：`session-created` 的第三参 `origin`（'new'/'load'/'resume'，159 加）——「记住的模式」
+只对 `'new'` 应用，见 [`docs/arch/chat-panel.md`](./docs/arch/chat-panel.md) §5.36。
 
 ### 2.4 发消息 / 流式更新
 `SessionManager.sendPrompt` → agent 侧 `session/update` 通知 → `SessionUpdateHandler` 扇出 →
@@ -151,6 +153,11 @@ webpack + ts-loader（不是 esbuild）；ESLint flat config；`@vscode/test-cli
 `onSessionUpdate`（`session/update` → transcript）→ `TranscriptStore` → postMessage。
 编辑区面的消息不走 `this.current`，而是 `ChatEditorPanel` 直接转给 `modern` host
 （`onMessage(msg, 'editor')`）——侧边栏此刻可能挂在 legacy 上。
+
+**agent 被挂住时怎么找到人**（156-158）：`ChatPanelHost.canPresent`（请求是否归面板拥有）→
+`show()`（建记录 + `notifySession`）→ `SessionNotifier`（右下角通知，点「打开会话」）→
+`revealSession`；客户端侧 `permissionDrawer` / `elicitationView` 两个抽屉由 boot 的
+`syncDrawers()` 对账。见 [`docs/arch/chat-panel.md`](./docs/arch/chat-panel.md) §5.34/§5.35。
 
 webview→扩展消息类型（**按"要不要带 sessionId"分组——这正是 §5.4 规则二的依据**）：
 - **会话作用域**（带 `sessionId`，在 `verifySession` 守卫**之后**处理）：

@@ -31,7 +31,7 @@
 | 量不出来时（隐藏面板 / 无 `createRange` / 超 2000 字） | 回退 064 的判据，并把节点标成 `data-fold="heuristic"`；等它第一次拿到真实尺寸（`rail` 的 ResizeObserver 正好报这个事件）**只重判一次**，两个方向都要能改（折→不折、不折→折）。**不要每次 resize 都重判**——那会与引导条互相打架 |
 | 折叠态 | summary 占**恰好一行**并省略号截断（`.user-fold:not([open]) > summary`）——**只在折叠态**：展开时若还是 `nowrap`，第一段会被截成"半句话加省略号"，看起来像内容丢了 |
 | 展开态 | body 是 **inline**：切分点只是实现细节，块级 body 会在半句话处凭空多一处换行 |
-| **用户消息的宽度（105）** | `.entry-user { align-self: stretch }`——**靠左、铺满内容盒**。原先是 `flex-end` + `max-width:88%`，气泡宽度 = 内容宽度；于是**折叠后只剩首行、宽度跟着缩短**，面板在折/展时自己变窄（用户报"体验不好"）。宽度现在是常量，折与不折只影响高度。连带：正文与时刻同一起点（`.rec-time` 的右对齐已删）、圆角四角一致（原来的 `8/8/2/8` 缺口指向右下，靠左之后方向反了）。**置顶卡片里的克隆体吃的是同一套规则**，所以"铺满"也决定了卡片里没有空档（收缩按钮因此挪到卡片外，见 §5.25） |
+| **用户消息的宽度（105）** | `.entry-user { align-self: stretch }`——**靠左、铺满内容盒**。原先是 `flex-end` + `max-width:88%`，气泡宽度 = 内容宽度；于是**折叠后只剩首行、宽度跟着缩短**，面板在折/展时自己变窄（用户报"体验不好"）。宽度现在是常量，折与不折只影响高度。连带：正文与时刻同一起点（`.rec-time` 的右对齐已删）、圆角四角一致（原来的 `8/8/2/8` 缺口指向右下，靠左之后方向反了）。**置顶卡片里的克隆体吃的是同一套规则**，所以"铺满"也决定了卡片里没有空档（169 起卡片里那条折叠三角就是**唯一**的收缩控件，位置见 §5.25） |
 | **正文从第二行开始（108）** | summary 第一行只放图标/caret（+图片 chip），正文包进 `.bubble-body`（`display:block`）另起一行。`textNodeOf` 改为在 `.bubble-body` 里找文本节点（图标/caret/chip 都在外面）。`unfoldUser` 重建气泡时把 chip 一并迁过去。折叠态的截断从整个 summary 改到 `.bubble-body` 自己（否则图片 chip 会被一起截掉） |
 | **图片附件进用户气泡（108）** | `UserEntry` 加 `attachments?: ContentBlockView[]`；`handleSendPrompt` 把图片的 `toContentView` 循环提前到 `appendUser` 之前、把 views 一并传入，删掉独立 `content` 条目的 append。**Replay 路径（111）**：replay 把文本与图片分成两条 chunk（100 的教训），气泡里没有可合并的东西——改为在 replay 开始前读转录（`readTranscriptUserImages`），按 `uuid` 建 `messageId → 图片视图` 表，`user_message_chunk` 的文本分支据此并入 `appendUser`，随后的图片 chunk 丢弃。任何失败退化为"没有图片" |
 | **注入块分流（109）** | `<task-notification>`、`<system-reminder>` 等注入块走 `user_message_chunk` 通道，被无条件渲染成蓝色用户气泡。改为**前缀判据**（`isInjectedChunk`），两条入口（replay 分支、`handleSendPrompt`）共用同一个判据，分流成 `notice` 的 `meta` 级别（居中、灰色、小字、无气泡、无图标）。发送路径仍然真的发出去（agent 期待收到），只是不再产生用户气泡 |
@@ -195,7 +195,7 @@ Webview 默认弹 **Chromium 的原生菜单**，它在这个面板上有两个�
 | 做了什么 | 关键点 |
 |---|---|
 | 工具卡显示真实工具名（074） | `kind` 是 ACP 的粗粒度词表（Run / Read），两张 "Run" 卡只能靠标题区分。夹具里 **12/12** 个工具调用都带 `_meta.claudeCode.toolName`，取出来与 kind 标签**并列**（不替换）。**chip 要可加可删可改**：`update` 路径也得调（占位卡靠 update 才拿到真实视图模型）。`_meta` 是厂商私有的，**只认这一种已知形状**、其余静默——猜第二个厂商的键就是把推断当事实（§5.6） |
-| 会话改名提示（075） | `session_info_update` 此前只更新标签栏与会话历史。缓存"上一次的标题"（**宿主独占**：`SessionManager` 可能已先应用新标题，它的状态答不出"旧标题是什么"），**只提示真正的改名**——一条会话的第一次 `session_info_update` 通常是自动生成的标题，为它打印一行等于给每个新会话都加噪声 |
+| 会话标题（075 的提示已废；[163] 静默；[164] 冻结） | `session_info_update` 更新标签栏与会话历史。**075**：缓存上一次的标题、对「真正的改名」插一行 `Session renamed to “…”` —— **[163] 取消**（用户报：会话进行中自己冒出一行改名）。**[164] 标题由第一次对话定死**：① 那一刻已经拿到的自动命名就是它的名字；② 没拿到就用**第一条用户消息**（`toSummary` 的回退链 `session.title ?? stored.title ?? stored.firstPrompt`）；③ **之后任何标题都不再改**，包括几轮之后才生成的「第一个自动命名」。**冻结点 = 第二次发言那一刻**（`handleSendPrompt` 里判 `turnsDone`）——不放在「第一轮结束时」，因为 adapter 正是在 idle（轮次结束）那一刻才去读并推标题（`maybeUpdateSessionTitle` 的注释：「SDK 在后台生成标题，`idle` 是轮次结束信号，也是新标题可能已落地的时刻」），在那儿冻结会把刚生成的自动命名一起挡在门外。**判定只有一处**（`trackTitle` 返回是否收下，SessionManager 的`applySessionInfoUpdate` 跟着它走）：只挡宿主那份 map 是不够的 —— tab 的标题读的是 `session.title`（第一版就是这么漏的，两条测试抓住）。 |
 | 思考块里的非文本内容（075） | `agent_thought_chunk` 带的图片/资源此前直接 `return` 丢掉。现在复用 `postContentNotice`，**但先 `finalizeEntries(only:'thought')`**：记录只并入"最后一条"，不关掉旧思考块的话它会永远停在 `Thinking…`（后续 thought chunk 会另起一条） |
 | **没做**：`available_commands_update` | 斜杠菜单已经消费它，再提示纯属噪声 |
 | **没做**：`usage_update` 的成本数字 / 用户消息里的非文本内容 | 前者令牌条里已有；后者在 replay 路径上从未出现过 |

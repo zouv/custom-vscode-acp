@@ -111,9 +111,17 @@ export type AgentConnectionError =
  *   - `active-session-changed` (sessionId | null, agentName | null)
  *   - `agent-closed`           (agentId, code, agentName?)
  *   - `clear-chat`             (agentName, sessionId)
- *   - `session-created`        (sessionId, agentName)          [new]
+ *   - `session-created`        (sessionId, agentName, origin)  [new]
  *   - `session-closed`         (sessionId, agentName, reason)  [new]
  * All other events are unchanged and already session-scoped.
+ *
+ * [CUSTOM-20261001-159] `session-created` grew a THIRD argument, `origin`
+ * ('new' | 'load' | 'resume'), appended per the contract: subscribers that only
+ * want "a session appeared" keep working, while "this is a BRAND NEW session"
+ * (which is what a remembered default mode may be applied to — never to a session
+ * reopened from history, whose own mode is part of what the user is reopening)
+ * becomes answerable. `undefined` means an older/unknown caller: treat it as NOT
+ * new.
  */
 export interface DefaultCwdDecision {
   cwd: string;
@@ -539,7 +547,8 @@ export class SessionManager extends EventEmitter {
       );
 
       this.addSessionToAgent(agentName, sessionInfo.sessionId);
-      this.emit('session-created', sessionInfo.sessionId, agentName);
+      // [CUSTOM-20261001-159] origin='new': the only path a remembered default mode applies to.
+      this.emit('session-created', sessionInfo.sessionId, agentName, 'new');
       if (focus) { this.focusSession(sessionInfo.sessionId); }
 
       log(`Created session ${sessionInfo.sessionId} for agent ${agentName}`);
@@ -1299,7 +1308,7 @@ export class SessionManager extends EventEmitter {
     this.drainPending(placeholder);
     this.loadingSessionIds.add(sessionId);
     this.addSessionToAgent(agentName, sessionId);
-    this.emit('session-created', sessionId, agentName);
+    this.emit('session-created', sessionId, agentName, 'load');
     // Focus up front so handleSessionUpdate forwards the replayed chunks to
     // the webview during the load. Without this, updates arrive before the
     // focus is set and are dropped.
@@ -1411,7 +1420,7 @@ export class SessionManager extends EventEmitter {
     this.sessions.set(sessionId, sessionInfo);
     this.drainPending(sessionInfo);
     this.addSessionToAgent(agentName, sessionId);
-    this.emit('session-created', sessionId, agentName);
+    this.emit('session-created', sessionId, agentName, 'resume');
     this.focusSession(sessionId, { force: true });
 
     this.historyStore?.upsertNew(agentName, cwd, sessionId);

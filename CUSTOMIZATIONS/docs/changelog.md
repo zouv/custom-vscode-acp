@@ -17,6 +17,247 @@
 
 ---
 
+### 2026-10-02 - CUSTOM-20261002-172
+- **功能**：置顶卡从「只钉一条」改成**整段前缀** —— 卡堆式**推挤 + 抽回**（原生 `position: sticky` 分区头语义）：新提问顶边碰到旧卡底边时两张一起悬浮，旧卡被逐渐顶出上沿直到不再渲染，反向滚动又从上沿抽回；同时补上"消息新增后不同步"的缺口
+- **改动文件**：`src/ui/chat/html/client/stickyUser.ts`（核心重写）、`src/ui/chat/html/body.ts`（`#stickyUser` 留空容器）、`src/ui/chat/html/styles.ts`（删 `max-height:40%`、入场动画改按卡、`.sticky-card` 按卡一份）、`src/ui/chat/html/client/boot.ts`（四条转录变更路径补 `stickyUser.schedule()`、`applyFocus` 改走 `schedule()`）、`src/test/chat-client.test.ts`（夹具与用例改写 + 桩补 `insertBefore` 的移动语义）、`CUSTOMIZATIONS/scripts/preview-records.mjs`（sticky 探针改卡堆口径 + 三个新档）。（文档：`chat-panel.md` §5.25 重写、`pitfalls.md` #40/#41、`chat-panel-records.md` 订正陈旧引用、`dev-workflow.md` 验收 191-199）
+- **来源**：用户第四次复验（"永远只钉一条 / 上滑时旧卡不会从上沿抽回 / 交棒瞬间跳变"），并给出他期望的五步模型 —— 我复算后确认它与原生 sticky 的分区头语义一一对应，路线仍是**保留克隆机制**（导轨 `rail.ts` 按 `getBoundingClientRect` 逐节点测量、滚动时不重测，原生 sticky 会让它漂移）
+- **详细说明**：
+  - **①判据改成整段前缀**：`natural = node.offsetTop - scrollTop`，`natural < TOP_GAP`（严格 3px）的**每一条**用户消息各得一张卡（102/166 只取最后一条）。**落位 `top = min(TOP_GAP, 下一条的 natural - 本卡高)`** —— 上夹锚**布局量**，公式逐条独立、不需要链式递推。
+  - **②"两张一起悬浮"其实是过渡帧**：那一刻新卡**还没进前缀**（它还在自己的自然位置上），根本不需要副本；旧卡被 `下一条的 natural` 顶着往上走，底边正好压在新卡顶边上 —— 用户说的"判定线"在公式里**逐字成立**（`top + 卡高 == 下一条的 natural`）。新卡越线后才接管（≤TOP_GAP 的交接窗，与 104 同一个常量）。
+  - **③为什么上夹必须锚自然位置**：改成锚"下一条**已渲染**的位置"会让旧卡底边永远停在钉住那条的顶上 ⇒ 旧卡**永久残留一条边**、永远"看不到全部消失"。这条是**实现前的复核里验算两卡反例**才发现的（三条以上时它反而正确，所以很难在截图里看出来），已记进 pitfalls #40。
+  - **④结构**：每张卡 = `.sticky-card > .sticky-body > 克隆体`，由客户端动态建 —— `body.ts` 只留空的 `#stickyUser`（固定 id 的 `#stickyCard`/`#stickyBody` 会撞成重复 id）。卡片留在**文档流**里用 `marginTop` 落位（第 0 张可为负 ⇒ 越过上沿被 `overflow: hidden` 裁掉，那就是"被顶出去"），**去掉 `max-height: 40%`**（卡堆里它裁掉的是最下面、也就是**最新**的那张），`markSource` → **集合式 diff**，点击/折叠/入场动画全部**按卡**，收缩状态下到 `collapsedBySession[sessionId][entryId]`（每张卡各记各的），克隆**按条缓存**（只有 `.fold-body` 结构信号变了才重建）。
+  - **⑤补两条缺口**：`boot` 的 append / revise / toolUpdate / markdownRendered 之后补 `stickyUser.schedule()`（流式改变下游高度会让被顶出的卡发飘、新用户消息还会改上一条的上夹），`scheduleSync` 加 `syncQueued` 去重（`dom.schedule` 不去重）；测试桩补 `insertBefore` 的**移动**语义（pitfalls #41 —— 桩里漏了它，卡堆重排静默乱序，白量了一轮）。
+- **验证方式**：`npm test` **298 passing**（改写 15 条 + 新增 9 条：相接/推挤/顶出后不再渲染/抽回/方向无关/集合式 source/按卡跳转/按卡折叠/卡堆不变式/无布局整帧放弃）。`lint` 0、webpack 成功、`check-registry` 六节全绿。**真 Chromium 探针**（`preview-records.mjs`）三档读数：push `cards=[{u0 top:-35,bottom:30,contact:true}]`（底边 == 下一条顶边）、two `[{u0 bottom:2},{u1 top:3}]`（两张同时在，最新那张停在 `padding-top` 上）、gone `cards=[{u1}]`（旧卡整条出界、不渲染）；`maxHeight=none` 已生效；点击档 `{caretFound:true, jumped:false, cardH 113→41→113}`（折叠真的改变卡高）；跳跃档 `{nodeNatural:0, targetVisibility:hidden}`（落点在交接窗口内、本体让位）。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-01 - CUSTOM-20261001-165
+- **修复**：新建会话（草稿页）时输入框的上下文表盘不再留着上一个会话的数字；顺带扫出并修掉两处同类问题（附件 chip、图片浮层）
+- **改动文件**：`src/ui/chat/html/client/composer.ts`（`setDraft` 补 `renderContext(null)`）、`src/ui/chat/ChatPanelHost.ts`（`pushAttachments` + `pushFocus`/`pushBoot` 接线）、`src/ui/chat/html/client/lightbox.ts`（交出 `close`）、`src/ui/chat/html/client/boot.ts`（切会话时收起浮层）、`src/test/chat-panel.test.ts`、`src/test/chat-client.test.ts`。（文档：`chat-panel.md` §5.38、`dev-workflow.md` 验收 190）
+- **来源**：用户报告 + 「请检查下其他还有没有类似的问题」
+- **详细说明**：
+  - **①表盘（用户报的）**：`composer.setFocus` 会用 `renderContext(meta.usage)` 清/填，但 `setDraft` 漏了这一步 —— 草稿没有会话也就没有用量。补上 `renderContext(null)`。
+  - **②附件 chip（同类，且更危险）**：宿主只在"变化时"发 `attachments`，而客户端每次切会话都清空自己的列表 ⇒ 切走再切回，chip 不见了，但宿主仍持有它们、**发送时照样带上**（prompt 是从宿主那份列表拼的）——"看不见却会发出去"比少一个 chip 糟得多。现在 `pushFocus` 与 `pushBoot` 都会补发当前聚焦会话的那一份。
+  - **③图片放大浮层**：浮层里是上一个会话的图，切走还盖着新会话内容。与 154 那次"切走了浮框还在"同一条规矩（浮层属于它打开时的那个会话）⇒ 切会话时 `close()`。
+  - **清单**：架构文档新增 §5.38，把"按会话状态"的收尾点列全（`applyFocus` / `transcriptView.reset`+`syncDrawers` / `composer.setFocus|setDraft`），并写明"先看这些入口，别再加第二个"。
+- **验证方式**：`npm test` **285 passing**（新增 2 条：草稿与"无用量会话"下表盘都是 hidden；切走再切回会补发该会话的附件）。`lint` 0、webpack 成功、`check-registry` 六节全绿。**顺带**：写这段时第 8 次踩 pitfall #11（模板注释里的反引号），照 #11 的纪律**先跑 `--fix`**（4 处一次修完），没有手工改。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-02 - CUSTOM-20261002-171
+- **修复**：置顶条三条 —— 折叠改用**原生 details**（与界面同一套逻辑，字形/单行/图片同行都一致）、跳转落点**回到交接窗口内**（消息就地接管悬浮条的位置）、加入场动画（"被抽出来"）
+- **改动文件**：`src/ui/chat/html/client/stickyUser.ts`、`src/ui/chat/html/styles.ts`（删死掉的 `.collapsed` 规则 + 入场动画）、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（跳跃探针加 `targetVisibility`）。（文档：`chat-panel.md` §5.25、`dev-workflow.md` 验收 196）
+- **来源**：用户第三次复验（折叠按钮状态不变 / 折叠要与界面同逻辑且收成一行 / 定位偏下 + 还是直接闪出）
+- **详细说明**：
+  - **①折叠 = 原生 `<details>`**：`.collapsed` 类*整套删掉*。`render()` 把会话自己的折叠状态写进克隆体的 details，
+    用户点三角时浏览器原生开合（不再 `preventDefault`），`toggle` 事件把状态记回 `collapsedBySession`。
+    这样"与界面对话同一套逻辑"是**字面成立**的：字形（CSS 依 `details[open]`）、收成一行、
+    "图片/文件与文字同行"（`:has(.content-image-chip)` 那两条）全都复用 —— 自造一套的代价 169 已经付过一次。
+  - **②落点回到交接窗口之内**（`clearance 0`）：170 的"让开悬浮条自身高度"把问题解反了 —— 顶边一碰到线就交棒，
+    消息**就地接管悬浮条的位置**（用户预期："定位在悬浮框的位置"），本体同时让位（`visibility:hidden`）。
+    实测：`targetTop 55 ≈ stickyTop 49`、`targetVisibility: hidden`、`targetIdNow: u2`（悬浮条显示的就是它）。
+  - **③入场动画**：`@keyframes acpc-sticky-in`（opacity 0→1 + translateY -6px→0，160ms ease-out），
+    只在 `render()` 加 `.entering`（那只在"换了一条"时跑，sync 每帧跑不会重播），`animationend` 摘掉，
+    `prefers-reduced-motion: reduce` 下关闭。
+- **验证方式**：`npm test` **291 passing**（跳跃落点/折叠/按会话三条改写：落点 0、折叠看 `details.open`、桩里模拟原生 toggle）。
+  `lint` 0、webpack 成功、`check-registry` 六节全绿。**无头探针**（真 Chromium）：跳跃档读数见上。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-02 - CUSTOM-20261002-170
+- **修复**：点悬浮条跳转后，目标消息不再被悬浮条盖住（用户报"界面里的对话和悬浮的对话重叠"）
+- **改动文件**：`src/ui/chat/html/client/stickyUser.ts`（跳转余量改为按悬浮条实测高度）、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（新增 `#stickyjump` 探针）。（文档：`chat-panel.md` §5.25）
+- **来源**：用户报告 + 要求"等消息下移露出空间后悬浮框再出来，别直接闪出来"
+- **详细说明**：
+  - **根因（量出来的）**：跳转的余量还是 104 时代的 `TOP_GAP + 1`（4px），那时悬浮条只在"顶边刚过上沿"时接管、下面几乎没东西；
+    而 166/169 之后它**常驻**且自带高度（实测 124px）⇒ 跳过去的消息落在 y=4，正好被它整个盖住。探针读数：
+    `sticky 55..179 / target 17..126 / overlap:true`。
+  - **改法**：`clearance = host.offsetHeight + TOP_GAP + 2` —— **量出来的**（隐藏时为 0，退化成一个小缝，同一条式子两边都成立）。
+    改后读数：`scrollTop 260→93`（真滚了）、`sticky 55..131 / target 184..293 / overlap:false`；
+    跳转后悬浮条自动换成**上一条**提问（`data-jump-target` 从 u2 变 u1）⇒ 不再同屏两份。
+  - **没有加动画**："直接闪出来"的观感来自"同一段文字同屏两份"，去掉重叠后就没有可闪的东西了；
+    面板里也不引入新动画（现有动画只有 pulse/spin 两处），避免动到测量敏感的布局。若仍想要"抽出来"的过渡，说一声，
+    那是独立的改动（CSS transition + 只在跳转那一次触发）。
+  - **探针先踩了一个坑**：第一版量出来"没滚动"（`scrollTop` 不变），因为预览档里 `NS.scroll` 从未 `init` —— 
+    `jumpTo` 静默不滚。已在 sticky 档补 `NS.scroll.init(...)`（写进脚本注释：否则量到的一直是原位）。
+- **验证方式**：`npm test` **291 passing**（新增"落点在悬浮条下方"、改写"无高度时退化为小缝"）。`lint` 0、webpack 成功、`check-registry` 六节全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-02 - CUSTOM-20261002-169
+- **修复**：置顶条的收缩**真正生效**（此前只加了类、画面没变化）；并按用户要求删掉卡片左侧那个小方块按钮
+- **改动文件**：`src/ui/chat/html/styles.ts`（折叠规则提权 + 删 `.sticky-toggle` 规则）、`src/ui/chat/html/body.ts`（删 `#stickyToggle`）、`src/ui/chat/html/client/stickyUser.ts`（删 toggle 的变量/接线/面），`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（点击探针改为量"折叠有没有看得见"）。（文档：`chat-panel.md` §5.25、`dev-workflow.md` 验收 192/194）
+- **来源**：用户复验（"Tip 能看到了，但点击了无反应（即没折叠，也没触发定位）" + "移除悬浮框左侧外的小三角按钮"）
+- **详细说明**：
+  - **①"点了没反应"的真因**：处理函数其实**跑了**（所以没跳转、类也加上了），但 `.collapsed` 没有任何视觉效果 ——
+    `.entry-user .user-fold .fold-body { display: inline }`（记录列表那条）与 `.sticky-user.collapsed .fold-body { display: none }`
+    **权重同为 0,3,0**，而前者在 styles.ts 里更靠后 ⇒ **它赢**。规则提到 0,4,0（`.sticky-user.collapsed .user-fold .fold-body`）即可。
+    **定位靠数字不靠肉眼**：真浏览器探针在点击前后各量一次 `getComputedStyle(.fold-body).display` 与卡片高度
+    （改前 `inline/inline`、高度 124 不变；改后 `none`、124→76px）。
+  - **②删掉左侧小方块**：`#stickyToggle` 连同它的 CSS、接线、用例一起移除；**卡片里的折叠三角是唯一的收缩控件**
+    （tooltip 仍是 `Collapse message` / `Expand message`）。
+  - **③用例**："收缩"那两条改用三角点击；新增"单行消息没有 `.fold-body` ⇒ 没有可收的东西"。
+- **验证方式**：`npm test` **290 passing**（含改写后的两条 + 新增一条）。`lint` 0、webpack 成功、`check-registry` 六节全绿。
+  **无头探针**（真 Chromium）：`initial{124} → click{foldDisplay:none, cardH:76} → click{inline, 124}`、`jumped:false`。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-02 - CUSTOM-20261002-168
+- **修复/功能**：表单（AskUserQuestion）四条：附加说明改**追加**语义、说明行移进 tooltip、单选可取消选择、多选每项带自己的补充框
+- **改动文件**：`src/ui/chat/html/client/elicitationView.ts`、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（multi 档勾一项让补充框显形）。（文档：`chat-panel.md` §5.33、`dev-workflow.md` 验收 193）
+- **来源**：用户四条要求 + 「单选和多选现在都只有选项文字，没有说明文字…请补上」
+- **详细说明**：
+  - **①追加而不是替换**：先读 adapter 源码定死事实 —— `applyAskElicitationResponse` 里 custom **优先并 early-return**（有自定义文本就丢弃所选项），所以"替换"是如实的、而"追加"必须**在我们这侧合并**：`collect()` 把两者合成一个字符串（`选项 — 说明`，用 label），并且**不再单独发** `question_N_custom`；只有**一个选项都没勾**时那行文字才作为独立答案发送（自由作答）。
+  - **②说明行删掉**：那条 `If you type here … replacing the option picked above.` 是旧语义的遗留（而且现在也确实是错的），说明改到输入框的 `title`（用户要求：不单占一行）。
+  - **③取消选择**：再点一次已选中的单选行即取消（判据 `data-elic-picked`：点击时浏览器已把 checked 置真，靠 checked 分不出"刚选中"与"再点一次"）。**未答不阻塞提交** —— 实测 adapter 的 schema "Nothing is marked required"、空 content 也接受，并新增用例把"未答也能提交"钉住。
+  - **④多选逐项补充框**：每个 multi 选项行都带一个自己的框（`.elic-option-row > label + 框`，勾中才显示，同 154 的规则），值并进那一项（`选项 — 说明`）；题级的 Other 框在勾了选项时作为**追加项**进数组。
+  - **⑤说明文字（用户新提）**：把 153 那条未结案报告的下一步补上 —— 表单构建时打一行诊断 `[acpc] form fields: N question(s), M option(s), K with description`（`console.warn` → 日志桥 → 落盘日志）。**并新增回归用例**证明客户端确实渲染 `option.description`（select 与 multi 各一条断言），预览截图同样可见。
+  - **顺带一条坑**：桩 DOM 的 `matches` **不支持后代选择器**（`'.elic-custom input'` 永不匹配）—— 真机没问题、测试里会让"已消费"永远为空。已改用同一节点复用，并写进 registry。
+- **验证方式**：`npm test` **290 passing**（表单套件新增/改 4 条：Other 行改判 tooltip、答案合并、多选逐项合并、取消选择且未答可提交；说明渲染断言 1 条）。`lint` 0、webpack 成功、`check-registry` 六节全绿。**无头截图**：`#elicmulti` 勾中第一项后该项长出 `Add a note (optional)`，其余项不带；选项说明两行都在。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-01 - CUSTOM-20261001-167
+- **修复**：置顶条的"收缩"真正生效（点卡片里的折叠三角不再跳转）、两个收缩控件都带 tip、置顶条离顶栏 8px → **3px**
+- **改动文件**：`src/ui/chat/html/client/stickyUser.ts`（三角作为收缩控件 + tip + `TOP_GAP = 3`）、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（真实点击探针）。（文档：`chat-panel.md` §5.25、`dev-workflow.md` 验收 192、`pitfalls.md` #39）
+- **来源**：用户第二轮复验（"点了还是触发的定位，收缩没生效" + "补个 tip" + "往上移一些"）
+- **详细说明**：
+  - **真凶**：用户说的"悬浮框**里**的收缩按钮"是**卡片里的折叠三角**（`.fold-caret`），不是我上轮放大的那个左侧小方块。
+    三角上叠了两套机制 —— 原生 `<details>` 开关 + 冒泡到 host 的"点击跳转" ⇒ **点一下既折叠又跳走**，
+    折叠立刻被跳转抹掉，看起来就是"没生效"。现在两条入口都堵上（`preventDefault` 管原生、`stopPropagation` 管冒泡），
+    它只切 `.collapsed`。
+  - **先说清楚**：166 加的那个左侧方块**本来就是好的**（`elementFromPoint` 命中它自己、点击收缩不跳转）—— 
+    所以上一轮的"探针证明它工作"并没有错，错的是**我验证的不是用户点的那个东西**（教训写进 pitfalls #39）。
+  - **tip**：两个控件都有 `Collapse message` / `Expand message`（`applyToggle()` 统一刷新，三角的 tip 也在其中）。
+  - **TOP_GAP 8 → 3**：它同时是卡片的上留白与交棒窗口（一个常量两处用），改一处两边一起动；`jumpTo` 的落点 `TOP_GAP + 1` 也跟着变成 4。
+- **验证方式**：`npm test` **287 passing**（新增/改：点三角收缩且不跳转、再点展开、三角带 tip；交棒落点断言 9 → 4）。
+  **真浏览器探针**（narrow + 引导条在场，按命中目标真实点击）：`{hitChip:"stickyToggle", chipJumped:false, afterChip:true,`
+  `caretFound:true, caretTitle:"Collapse message", caretJumped:false, afterCaret:false}`，宿主 `style="padding-top: 3px"`。
+  `lint` 0、webpack 成功、`check-registry` 六节全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-01 - CUSTOM-20261001-166
+- **修复**：置顶条三处（判据按用户要求再改 / 收缩按钮做成看得见的控件 / 收缩状态按会话），外加扫出的表单抽屉同类问题
+- **改动文件**：`src/ui/chat/html/client/stickyUser.ts`（`pinnedEntry` 去掉 103 的收尾分支 + `setSession`/`collapsedBySession`）、`src/ui/chat/html/client/elicitationView.ts`（换表单复位 `collapsed`）、`src/ui/chat/html/styles.ts`（按钮可见化）、`src/ui/chat/html/client/boot.ts`（同步会话 id）、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（新增置顶条两档 + 探针）。（文档：`chat-panel.md` §5.25/§5.38、`dev-workflow.md` 验收 191、`pitfalls.md` #38）
+- **来源**：用户三条要求 + 「请再检查下还有没有其他…被重置的情况」
+- **详细说明**：
+  - **①判据（用户给的例子）**：视口中间摆着一条用户消息、更早那条已经滚到上方看不见 ⇒ 应当钉住**上面那条**。
+    旧规则（103）在"第一条没进交接窗口的提问**在视口里**"时整条作废，于是这种情形什么都不钉。
+    现在：候选 = 顶边已过交接线的用户消息，取**最后一个**；走到第一个非候选者就收工。
+  - **②收缩按钮**：104 就加了，但 15×16px、透明底、落在左侧引导条通道里 —— 用户报"点了悬浮框就跳走，想收起却点不到按钮"。
+    无头探针（`elementFromPoint` + `getComputedStyle`）证实按钮**没有被遮挡**、点击也确实生效，所以问题只在**可发现性**：
+    现在 16×20、常驻淡底（`--vscode-toolbar-hoverBackground`）+ 1px 描边 + 前景色字形。点击仍然 `stopPropagation`，不触发跳转。
+  - **③收缩状态按会话**：`collapsed` 是模块级布尔 —— 切 tab 后既会串到别的会话、切回来又丢。现在 `collapsedBySession[sessionId]`，
+    会话 id 由 boot 在 `applyFocus`（焦点变化的唯一咽喉点）同步进来。
+  - **④同轮扫出**：表单抽屉的 `collapsed` 同样是模块级 ⇒ 收起过一张表单，**下一张**会以收起态冒出来。
+    现在"哪张被推开了"只由 `dismissed[promptId]` 记，换一张表单就从展开态开始。教训写进 pitfalls #38（"模块级布尔 = 全局状态"）。
+  - **⑤订正 165 的 ②**：`metaOf` 本来就带 `attachments`（`applyFocus` 里 `NS.composer.setAttachments(meta.attachments)` 在用），
+    所以**附件 chip 并不会在切会话时丢** —— 165 那条加发的 `pushAttachments` 是多余的，已连同它的用例一起撤销。
+    （165 的 ① 表盘与 ③ 浮层不受影响，仍然有效。）
+- **验证方式**：`npm test` **286 passing**（置顶条新增/改写 4 条：视口里有提问仍钉住上面那条 / 回滚时交棒给上一条 / 收缩态按会话 / 表单换一张即展开）。
+  **无头截图 + 探针**：`#stickyprobetop=260` 与 `#stickyshrunkprobetop=1400` 两档，读数 `target` / `collapsed` /
+  `toggleBox=[0,63,16,20]` / `hitTest=stickyToggle` / 按钮计算样式；顺带给这两档补了内容填充（固件撑不满视口时 `scrollTop` 会被钳成 0，
+  这一档什么都量不到 —— 已在脚本里写明）。`lint` 0、webpack 成功、`check-registry` 六节全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-01 - CUSTOM-20261001-164
+- **修复**：会话标题改为**由第一次对话定死**（用户补充规则：不要在"聊了几轮之后才生成"的自动命名上改名）
+- **改动文件**：`src/ui/chat/ChatPanelHost.ts`（`titleFrozen`/`turnsDone` + 冻结点 + `trackTitle` 收敛成唯一判定点 + `sessionLabel` 补回退链）、`src/test/chat-panel.test.ts`。（文档：`chat-panel-records.md` 的 075/163/164 行、`dev-workflow.md` 验收 133）
+- **来源**：用户澄清期望 —— 「在第一次用户消息发出后触发了自动命名，那么就始终使用这个自动命名的 title；如果没有触发自动命名，就使用用户第一条消息作为命名。不要再反复对话几轮后，才触发自动命名（哪怕这是第一次自动命名也不应该生效，因为这时候对话信息已经脱离第一次对话内容了）」
+- **详细说明**：
+  - **冻结点 = 第二次发言那一刻**（`handleSendPrompt` 开头判 `turnsDone`）。**刻意不放在"第一轮结束时"**：adapter 的 `maybeUpdateSessionTitle` 正是在 idle（轮次结束）那一刻去读并推标题 —— 在轮次结束处冻结会把"第一次对话真拿到了自动命名"这条唯一的合法采纳时机一起挡掉。
+  - **判定只有一处**：`trackTitle()` 返回"是否收下"，`sessionManager.applySessionInfoUpdate` 跟着它走。第一版只挡住了宿主那份 `sessionTitles` map，而 tab 的标题读的是 `session.title` —— 新写的两条用例当场抓住（"迟到几轮的标题"照样改掉了名字）。
+  - 没有自动命名时不需要额外代码：`toSummary` 的回退链本来就是 `session.title ?? stored.title ?? stored.firstPrompt`（即第一条用户消息）。顺带把 `sessionLabel`（通知文案）补上同一条回退链，免得"按第一条消息命名"的会话在通知里没有名字。
+  - 代价（如实记录）：**CLI 里 `/rename` 之后、第二次发言之后的改名不会被采纳**（面板没有区分 customTitle 与 summary 的信息）。历史列表里的**磁盘** ai-title 也仍是最新值 —— 那是 CLI 的文件，不是我们写的。
+- **验证方式**：`npm test` **283 passing**（新增 2 条：第一次对话里到达的标题被采纳；几轮之后才生成的标题**不**生效）。`lint` 0、webpack 成功、`check-registry` 六节全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-01 - CUSTOM-20261001-163
+- **修复**：会话进行中不再冒出「Session renamed to “…”」那一行（用户报）；标题仍跟随 agent 的最新命名
+- **改动文件**：`src/ui/chat/ChatPanelHost.ts`（`announceRename` → `trackTitle`）、`src/test/chat-panel.test.ts`。（文档：`chat-panel-records.md` §5.23 的 075 行、`dev-workflow.md` 验收 133）
+- **来源**：用户提问「这个是什么机制」并给出预期 —— 「应该是使用第一次对话后的自动命名（如果没有就使用第一个用户对话命名）」
+- **详细说明**：
+  - **机制（读 adapter 源码 `@agentclientprotocol/claude-agent-acp` 的 `maybeUpdateSessionTitle` 定死的）**：它**每轮结束**去读一次 SDK 维护的标题，**变了才**推 `session_info_update`（SDK 没有标题的推送事件，只能轮询）；读到的标题是 `customTitle ?? summary`，注释原话是「`summary` is the auto-generated title (**or first prompt**)」。
+  - ⇒ 实际发生的是：标题先是**首条用户 prompt**，SDK 后台生成摘要后变成真正的自动命名，adapter 于是推一次「变化」，而我们 075 的提示就在这一刻插了一行 —— **这次跃迁不是用户做的、也无从操作**，还正好落在阅读中间。
+  - **改法**：只保留记账（`trackTitle` 更新宿主那份 map，空值不覆盖），**不再写任何记录**。标题**照旧跟随最新** —— tab 与历史列表显示的就是用户预期的那条「第一次对话后的自动命名」。
+- **验证方式**：`npm test` **281 passing**（新增 1 条：两次 `session_info_update` 都不产生任何 notice，而 tab 的标题跟着变到最新的那条）。`lint` 0、webpack 成功、`check-registry` 六节全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-01 - CUSTOM-20261001-162
+- **修复**：轮次结束后，**后台子任务还在跑**时发送按钮不再变回普通状态（用户报：「有时候，有任务还在跑（可能是在等子agent结果？），发送按钮就恢复到普通状态了」）
+- **改动文件**：`src/ui/chat/ChatPanelHost.ts`（`noteBackgroundTask`/`endBackgroundTask`/`isSessionRunning` + 四个挂钩点）、`src/ui/chat/SessionNotifier.ts`（新增 `background-stalled` 一类通知）、`src/test/chat-panel.test.ts`、`src/test/session-notifier.test.ts`。（文档：`chat-panel.md` §5.37、`pitfalls.md` #37）
+- **来源**：用户报告；判据由用户在讨论中定死 —— 「不能普通结束直接返回；后台 agent 在跑就一直等待；超时可以显性通知再返回结束」
+- **详细说明**：
+  - **根因**：`running` 只由「`session/prompt` 请求还没返回」（`inFlightTurns`）决定，而后台子任务在轮次结束后继续干活 —— 轮次一结束面板就显示空闲。日志取证：这类通知带 adapter 的私有标记 `_meta."_claude/origin".kind = "task-notification"`，其完结以 `<task-notification>` 注入块回到会话（109 早在处理这类块）。
+  - **状态机**（三条进出边都要求有证据，不猜）：进入 = tool call 的 `rawInput.run_in_background` 为真（唯一能提前知道的信号，**轮次还在飞时就要记**，因为任务比轮次活得久）；保持 = 该会话还有产出型通知（助手/思考分片、tool_call(_update)）⇒ 看门狗重新武装，**housekeeping 类（session_info / commands / mode / usage）刻意不算**（空闲时也会来，算进去等于给空闲会话钉一个 Stop）；退出 = ① `<task-notification>` 注入块（正常结束，不发通知）② 新轮次开始 ③ 看门狗超时。
+  - **超时必须说出来**：发一条 `background-stalled` 通知（info 级，仅当该会话不在屏幕上 —— 与 156 同一条规则），文案带上等了多久。静默复原正是用户看到的那种「没人告诉我发生了什么」。
+  - **客户端零改动**：`running` 的出处从 `isTurnInFlight` 换成 `isSessionRunning`，发送按钮与标签圆点的外圈都跟着它走。
+  - **可调**：超时窗口是 ctor 的注入参数 `backgroundQuietMs`（默认 120 s，比实测最长静默间隔 57 s 宽裕一倍；测试用毫秒级）。
+- **验证方式**：`npm test` **279 passing**（宿主新增 6 条：启动后台任务后保持运行中 / housekeeping 不触发 / 产出续期且静默后结束 / 超时发一条通知且只发一条 / 任务汇报结束且不打扰 / 新轮次清掉等待；通知器新增 1 条文案与级别）。`lint` 0、webpack 成功、`check-registry` 六节全绿。
+- **诚实边界**：进入信号取自 adapter 的 `rawInput`（本仓库已有先例：074 的 `_meta.claudeCode.toolName`）。若某版本不带这个入参，本机制会安静地不生效（**不误报**）——落盘日志里的 `keeps running outside the turn (a background task was launched)` 就是判据。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-01 - CUSTOM-20261001-161
+- **功能**：多题表单的 `Submit` **只在最后一题那一页可点**（防误提交）
+- **改动文件**：`src/ui/chat/html/client/elicitationView.ts`（`refreshChrome` 的门禁 + `activeTab` 夹回）、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（`submitGating` 探针读数）。（文档：`chat-panel.md` §5.33）
+- **来源**：用户要求（"当有多个选项时，需要切换到最后一个选项界面才能点击 submit（现在第一个选项界面就能点，容易误点）"）
+- **详细说明**：
+  - 画面上是"禁用"而不是"隐藏"：看得见的禁用按钮会说明"还差一步"，藏起来只会让人以为这个表单没有提交按钮；配一句 `title` 说明原因（禁用项比没反应的项诚实，067 的既定态度）。
+  - Skip / Cancel **不受影响**：它们是逃生门，任何一页都该能用。
+  - 判据里带上 `sending` —— 否则提交之后一次 input/change 触发的 `refreshChrome` 会把按钮重新点亮，又变回两条回答路径。
+  - 顺带修一个潜伏边界：`activeTab` 比新表单的题数大时（抽屉开到第二题、又来一个只有一题的表单）会**夹回最后一页** —— 否则一个 pane 都不显示，而且会让上面这条判据误判成"已经在最后一题"。
+- **验证方式**：`npm test` **273 passing**（客户端新增 2 条：多题时第一页禁用/最后一页可点/退回又禁用，且禁用时点击不会发出回答；单题表单直接可提交，Skip/Cancel 始终可用）。`lint` 0、webpack 成功、`check-registry` 六节全绿。**无头截图 + 探针**：`submitGating` 读数 `{tabs:2, firstTabDisabled:true, lastTabDisabled:false}`（两个不同起始 tab 的档都一致），窄档截图可见 `Submit 0/2` 是灰的而 Skip/Cancel 正常。**顺带**：这次写进模板体的反引号（pitfall #11 第 7 次）**第一次真的先跑 `--fix`**，一次通过 —— 教训在文档里躺了半天之后终于被兑现了一次（已回写 #11）。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-01 - CUSTOM-20261001-159/160
+- **功能**：记住用户手动选过的模式，**新建**会话时默认套用（打开历史不套用）；草稿页显示它
+- **改动文件**：`src/core/SessionManager.ts`（`session-created` 追加第三参 `origin`）、`src/ui/chat/ChatPanelHost.ts`（`acpc.lastMode.v1` + `rememberUserMode`/`applyRememberedMode`/`awaitModeApply`/`modeOptionOf`/`withRememberedMode`）、`src/test/chat-panel.test.ts`。（文档：`chat-panel.md` §5.36）
+- **来源**：用户要求（"记住我的模式选择，下次打开新会话时默认使用此模式"）；范围由用户在两个方案里选定 —— **只对新建会话生效**
+- **详细说明**：
+  - **记什么**：`configOptions` 里 `category === 'mode'` 那一项的 `currentValue`（128 的教训：`modes.currentModeId` 只是镜像，只有 config option 会被写）。按 **agent** 存 `acpc.lastMode.v1`（globalState）：模式是各 agent 自己的词表，按会话记等于没记。
+  - **在哪记**：只记**用户动作**——`setConfigOption`（且 configId 就是那个 mode option）、`setMode`、以及草稿页成功应用的模式项。**agent 自己切的模式不记**（plan mode 自动激活不是偏好），否则"默认值"会悄悄跟着上一个会话的际遇走。
+  - **在哪应用**：`session-created` 新增第三参 `origin`（`'new' | 'load' | 'resume'`，按"仅追加尾参"的契约加），**只对 `'new'` 应用**——打开历史/恢复的会话有自己的模式，那是"重新打开它"的一部分。`origin === undefined`（老调用方、既有测试）按**非新建**处理：宁可不动。
+  - **三道闸门**（与草稿选择同一套）：新会话仍提供该 id 且是 mode 项 / 值仍在候选里 / 与当前值相同则跳过；**失败只记日志、不写记录区**（默认值不是用户的请求，为它报错是噪声——草稿选择则相反）。
+  - **不播报**：应用后播种 switch 基线，否则 agent 随后的通知会被当成一次用户从未做过的切换（073/151 的机制）。
+  - **顺序**：草稿页的显式选择必须**后**落地（两个都是同一条连接上的 `setConfigOption`，后到的赢）——`session-created` 启动的那次应用挂在 `modeApply` 上，`handleCreateDraftAndSend` 先 `await awaitModeApply(sessionId)` 再应用用户选的值。
+  - **160**：`handleListDraftOptions` 用 `withRememberedMode()` 把记住的值 overlay 到快照的 mode 项上（**只改这一份拷贝**，`draftOptions` 里那份是 agent 的真实状态）。
+- **验证方式**：`npm test` **271 passing**（新增 6 条：新建会话套用 / load+resume+无 origin 都不动 / 陈旧值静默跳过 / 用户选择被记住并持久化 / 非 mode 选项不改记忆 / 草稿页显示记住的值）。`lint` 0、webpack 成功、`check-registry` 六节全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-01 - CUSTOM-20261001-158
+- **功能**：权限请求的作答界面从记录区内联卡片改成**输入框上方的悬浮抽屉**（与表单抽屉同形）
+- **改动文件**：`src/ui/chat/html/body.ts`（`#permDrawer`）、`src/ui/chat/html/client/permissionDrawer.ts`（新增）、`permissionView.ts`（记录行 + 唯一回答路径）、`links.ts`（宿主解析）、`boot.ts`（`syncDrawers()`）、`index.ts`、`styles.ts`、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`。（文档：`chat-panel.md` §5.35）
+- **来源**：用户要求（"询问权限的弹框…需改为跟选项弹框类似，在输入框上面弹出"）
+- **详细说明**：
+  - **两层**：记录区一行（⏳ + 标题 + `Review`）+ 本体在浮层——与表单（152）逐条同构（两者都是"agent 被挂住等你点一下"）。
+  - **两个抽屉可以同时存在**（同一会话先来表单又来权限）：各有容器与高度变量，`.perm-drawer` 的 `bottom = composer-h + elic-h` ⇒ 权限**贴在表单上面**，不相交、不需要 JS 协调；权限抽屉单独的 `max-height`（权限提示天然短）。
+  - **另起容器而不是并进 `#elicDrawer`**：后者由 elicitationView 端到端拥有（forms/dismissed/tabs/collapsed/ResizeObserver），塞两种 state 要引入"谁拥有 body"的协调器，收益只是一个 CSS 变量。
+  - **回答路径唯一**：发送与"发送中"守卫都收进 `permissionView.answer(host, promptId, optionId)`（`links.ts` 只把按钮解析到 `.perm` 或 `.perm-drawer`）；发送中禁用**全文档**同 promptId 的按钮。这条守卫原先只有表单有——权限卡点两下会发两条（桥虽幂等，界面像没反应）。
+  - **高度让位**：消息区 `padding-bottom` 与 `#jumpToLatest` 把两个变量相加；观察器 + 显式 poke 两条腿（pitfall #27）。
+- **验证方式**：`npm test` **265 passing**（客户端新增 6 条：记录只留一行 / 点击作答且发送中禁用 / 结算关抽屉留只读卡 / deferred 关抽屉 / 别的会话的请求不开抽屉 / 两个 pending 时 Review 打开对应的那条）。**无头截图 + 探针**：`#permdrawerprobe`、`#permdrawerbothprobe` 两档，读数 `permH=131px`、`gapToComposer=6`、`gapToElic=0`、`overlapsElic=false`，截图可见两个抽屉上下堆叠。桩 DOM 顺带补了 `document.querySelectorAll`（原先没有 ⇒ "发送中禁用"会是永远绿的假阴性）。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-01 - CUSTOM-20261001-156/157
+- **功能**：后台会话的权限/表单请求改发**右下角通知**（点击跳转聚焦），不再弹窗口顶部的 QuickPick；顺带把"轮次完成"也做成一类通知
+- **改动文件**：`src/ui/chat/SessionNotifier.ts`（新增）、`src/ui/chat/ChatPanelHost.ts`（`canPresent` 判据重写 + `notifySession`/`isSessionOnScreen`/`revealSession`/`vscodeNoticeChannel`/`stopReasonText`/`turnOutcome`）、`src/handlers/PermissionBridge.ts`（仅契约注释）、`src/test/session-notifier.test.ts`（新增）、`src/test/chat-panel.test.ts`。（文档：`chat-panel.md` §5.8 改写 + §5.34）
+- **来源**：用户在"后台请求怎么呈现"的三个方案里选定 —— **发右下角系统通知 + 点击跳转并聚焦**，并要求把"等待选项确认 / 等待权限确认 / 会话完成"做成一整套
+- **详细说明**：
+  - **根因（日志定死）**：`canPresent` 要求"请求会话必须**是聚焦的那个**"，所以 10:27 那两次（聚焦会话）在面板里 `shown in panel`，而 10:30 那次（他在另一个会话里打字、后台会话请求权限）落到 QuickPick。
+  - **判据改为"归面板拥有"**：modern agent（**用请求会话自己的 agentName，不是聚焦会话的**——那是个潜伏 bug，只有一个 modern agent 时看不出）+ 有 surface 即可；非聚焦照样建记录（客户端按会话过滤增量，切过去时由 focus 快照带回来）。`surface.reveal(true)` 仍只为聚焦会话做，后台会话绝不抢视图。
+  - **`PermissionBridge` 逻辑一行未改**：`owner` 语义变化后，`answer()` 原有的 `owner === 'panel'` 守卫自动覆盖"后台请求等用户跳过来再答"，"每个请求恰好被答一次"原样保留；无 surface / 非 modern 仍走弹框（pitfall #14 的出口，刻意保留）。
+  - **通知规则**：只在该会话"不在屏幕上"时发（`isSessionOnScreen` = 聚焦匹配 **且** surface 可见）；等待类 = warning（VS Code 的 info 会自动消失、warning 会一直挂着）；完成 = info；`cancelled` 静默；失败并入完成。去重键 `sessionId::kind::token` 由通知器自己拼（等待 = promptId，完成 = 每会话自增轮次号），会话关闭时 `forget`。
+  - **点击**：`focusSession(id, { force: true })` + 有面 `reveal(false)`（显式用户动作可以抢焦点）/ 无面 `acpc-chat.focus`；会话已关则记日志、什么都不做。
+  - **模块边界**：`SessionNotifier` 不 import vscode、也不 import Logger（后者会把它拖进 vscode）⇒ 纯 node 可测；真实通道 `vscodeNoticeChannel()` 放在 ChatPanelHost（与 `vscodePanelPrefs()` 并排，同一理由）。
+  - **挂点**：等待类挂在 `show()`（权限与表单共用的那个双形状方法，天然只有一个挂点）；完成挂在 `finalizeTurn`（全仓唯一的轮次结束收敛点）。
+- **验证方式**：`npm test` **259 passing**（新增 10 条通知器单测 + 9 条宿主用例：后台请求建记录且不弹框 / 通知只发给不在屏幕上的 / 点通知后能答 / legacy 仍走弹框 / 无 surface 仍走弹框 / `onPresenterLost` 仍降级 / 表单同款 / 完成发一条而取消不发 / 失败复用记录区文案）。`lint` 0、webpack 成功、`check-registry` 六节全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-01 - CUSTOM-20261001-155
+- **功能**：历史会话按钮的默认筛选改为**跟随地址栏**（用户要求：地址栏已经选好地址时，点 ↺ 弹出的列表默认筛到那个目录）
+- **改动文件**：`src/ui/chat/html/client/tabs.ts`（新增 `currentCwd()`）、`src/ui/chat/html/client/sessionMenu.ts`（请求带 cwd、默认筛选、开关默认值翻转）、`src/ui/chat/protocol.ts`（`listHistory { cwd? }`）、`src/ui/chat/ChatPanelHost.ts`（`handleListHistory` / `postHistory` / `historyFilterCwd` 降级为兜底）、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（`#historydefaultprobe` 档）。（文档：`docs/arch/chat-panel-sessions.md` §5.24、`docs/dev-workflow.md` 验收 178-181）
+- **来源**：用户要求；其中"手动选过 `All folders` 之后要不要记住"由用户在两个方案里选定 —— **记住**
+- **详细说明**：
+  - **为什么不是只改宿主那一处**：`historyFilterCwd` 原本自己猜"当前目录"（聚焦会话属于该 agent 时用它的 cwd，否则第一个工作区文件夹），而**草稿页它猜不到**（草稿是客户端私有的，058），并且它猜的那个与地址栏显示的可以不是同一个（聚焦会话可能属于另一个 agent）。改为**客户端把地址栏当前显示的目录随请求送上去**：`tabs.currentCwd()` 读的就是 `renderHeader` / `renderDraftHeader` 渲染用的同一份状态 ⇒ "用户看到的"与"默认筛的"同源；宿主的 `historyFilterCwd` **降级为兜底**，只为不带 `cwd` 的调用保留。
+  - **开关默认值翻转为开**：`ui.historyFolderFilter !== false`（原先 `=== true`，即默认不筛）。用户选定：手动选过一次 `All folders` 会被记住（`persistUi`），此后打开不再自动筛。
+  - **只在地址栏确实有目录时才套默认**：客户端记下 `askedCwd`，为空（无聚焦会话 / 会话没有 cwd / 草稿还没拿到默认目录）时**不筛** —— 不替用户挑一个目录（宿主兜底猜的工作区目录不会因此变成"默认筛选"）。
+  - **默认筛到某个目录时也补扫磁盘**：`setHistory` 里同样走 `requestSupplement`（原先只有手动选目录那条路调它）—— 否则默认目录不是第一个工作区文件夹时，094 补出来的那些磁盘会话会看不见。
+- **验证方式**：`npm test` **236 passing**（历史选择器套件新增 6 条：请求带 `cwd` 且默认筛到它 / 地址栏没有目录则全量 / 没存过偏好时默认开 / 记住的 `All folders` 生效 / 选 `All folders` 会被持久化 / 默认目录同样请求磁盘补充）。`npm run lint` 0、webpack 成功、`check-registry.mjs` 六节全绿、`normalize-eol` 无需修正。**无头截图 + 探针**：`preview-records.mjs` 新增 `#historydefaultprobe` 档（真 boot → 点真 ↺ → 喂宿主形状的 history 回复），读数 `askedCwd: "D:/Git/alpha"`、`rows: 2`（共 3 条里只剩该目录的 2 条）、`chip: "alpha▾"`、`drawerHidden: false`，截图与地址栏一致。**该档踩到一个坑并已记进登记**：必须等真的 `DOMContentLoaded` / `load` 之后再驱动 —— 预览里手动派发的那次只是提前跑 boot，真事件随后还会到，boot.init 跑第二遍 ⇒ `sessionMenu.init()` 末尾的 `close()` 把刚打开的抽屉关掉（数字全对、图里没有抽屉）。
+- **基于上游版本**：0.2.0（commit e7371659）
+
 ### 2026-10-01 - CUSTOM-20261001-154
 - **修复**：用户第二轮真机复验的四条 —— 单选改平铺（带主/副标题）、自拟框跟着所选行、去掉标题行（进度与箭头挪到 tab 栏右侧）、**切到草稿页/别的会话浮框还在**
 - **改动文件**：`src/ui/chat/html/client/elicitationView.ts`（单选重写 + bar + 自拟框落点 + 删掉整套下拉）、`src/ui/chat/html/styles.ts`、`src/ui/chat/html/client/boot.ts`（`resetTranscript()` 包装）、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（档位与探针读数）。（文档：`docs/arch/chat-panel.md` §5.33）

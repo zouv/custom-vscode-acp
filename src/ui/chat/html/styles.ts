@@ -438,7 +438,7 @@ export function styles(): string {
        --acpc-composer-h（pitfall #27：别去列"什么会让它变高"）。
        [CUSTOM-20260930-152] 表单抽屉（.elic-drawer）也浮在底栏之上，同一个道理再加一段：
        --acpc-elic-h 由 elicitationView.ts 的观察器写（收起成一行时它自己会变小）。 */
-    padding-bottom: calc(24px + var(--acpc-composer-h, 0px) + var(--acpc-elic-h, 0px));
+    padding-bottom: calc(24px + var(--acpc-composer-h, 0px) + var(--acpc-elic-h, 0px) + var(--acpc-perm-h, 0px));
     display: flex;
     flex-direction: column;
     /* 间距交给下面的阶梯控制。统一 gap 会让「同属一组的连续推理」和「跨类型的独立块」
@@ -477,16 +477,23 @@ export function styles(): string {
      [CUSTOM-20260928-104] 改成悬浮卡片。要点是**分成两层**：
        · 这一层只负责定位与内边距，背景透明、pointer-events: none —— 卡片周围要让内容与点击
          都透过去（悬浮，不是盖一层膜）。
-       · 卡片（.sticky-card）才画底色/描边/阴影，而且它必须**不占额外布局**：描边用 box-shadow
-         的 0 0 0 1px 而不是 border，否则内容盒会窄 1px，克隆体就对不上原位。
+       · 卡片（.sticky-card）才画底色/描边/阴影。描边在 104 里用 box-shadow 环画（避开布局
+         位移），**107 已改回真 border** —— 位移由这里的 padding 差 2px 补偿，见下面 .sticky-card
+         那段（pitfall #19 的同一笔账：常量只有一个来源）。
+     [CUSTOM-20261002-172] 这一层的直接子节点现在是**多张** .sticky-card（卡堆）：它们的
+     「marginTop」 由 JS 写（每张按前一张的实际底边落位），所以这里仍然只是 flex 列 + 裁剪。
      padding-top 由 stickyUser.ts 写入（那里的 TOP_GAP）——那 8px 同时是"本体交棒"的阈值，
-     布局与判据必须相等，所以只留一个来源（pitfall #19）。 */
+     布局与判据必须相等，所以只留一个来源（pitfall #19）。
+
+     [CUSTOM-20261002-172] **去掉 max-height: 40%**。卡堆之后它是错的裁法：卡片从下往上数，
+     被裁的正好是**最下面、也就是最新**的那张（读者最需要的那一页）。现在高度由内容决定
+     （最下那张卡的底边），「overflow: hidden」 只负责裁**上沿** —— 那才是"被顶出去"的裁剪来源。 */
   .sticky-user {
     position: absolute; top: 0; left: 0; right: 0; z-index: 6;
     padding: 0 8px 8px 17px;
     display: flex; flex-direction: column;
     pointer-events: none;
-    max-height: 40%; overflow: hidden;
+    overflow: hidden;
   }
   .sticky-user > * { flex: 0 0 auto; pointer-events: auto; }
   /* [CUSTOM-20260928-105] 高亮边框（用户要求"加些高亮/阴影，跟原消息区分开"）。107 起
@@ -501,6 +508,8 @@ export function styles(): string {
        垂直方向的 2px 不补：边框让克隆体的落点比 TOP_GAP 低 2px，交棒那一帧因此有 2px 的
        沉降，肉眼不可见；要抹平就得让交棒窗口跟着 +2，那样这个常量就有了第二个来源
        （pitfall #19），不划算。 */
+  /* [CUSTOM-20261002-172] 卡堆：每张卡一份 .sticky-card > .sticky-body > 克隆体（由 stickyUser.ts
+     动态建）。子节点顺序从旧到新（旧的在上），「marginTop」 由 JS 按前一张的实际底边写。 */
   .sticky-card {
     position: relative;
     display: flex; flex-direction: column;
@@ -515,29 +524,20 @@ export function styles(): string {
   /* 同 .messages > *（037）：克隆体在"列 flex + overflow:hidden"里同样不许被压缩。 */
   .sticky-body { display: flex; flex-direction: column; }
   .sticky-body > * { flex: 0 0 auto; }
-  /* [CUSTOM-20260928-104] 收缩/展开。105 起用户消息铺满整列，卡片里**没有空档了**，
-     所以按钮挪到卡片左侧那条 18px 通道里（那是 .messages 给左侧引导条留的 padding-left，
-     见 .messages 的注释）——位置固定、永不压到正文，也不占内容盒宽度。 */
-  .sticky-toggle {
-    position: absolute; left: 1px; top: 10px; z-index: 1;
-    width: 15px; height: 16px; padding: 0;
-    display: flex; align-items: center; justify-content: center;
-    background: transparent; border: none; border-radius: 4px;
-    color: var(--vscode-descriptionForeground);
-    font-family: inherit; font-size: 0.8em; line-height: 1;
-    cursor: pointer;
+  /* [CUSTOM-20261002-171] 收缩：**不再自造 .collapsed 类** —— 直接开合克隆体里的原生
+     <details>（用户要求：与界面里的折叠同一套逻辑）。于是字形、"收成一行"、
+     "图片/文件与文字同行"这些规则全部复用记录列表那一套，这里一条都不用写。
+     自造一套的代价 169 已经付过：被同权重的记录列表规则压掉，折叠"只加类、不动画面"。 */
+  /* [CUSTOM-20261002-171] 悬浮条"被抽出来"的入场：新建那张卡时加 .entering，
+     动画结束由 host 上的 animationend 委托摘掉 —— 不是每次 sync 都播（sync 每帧都在跑）。
+     [CUSTOM-20261002-172] 选择器从 .sticky-user 改成 .sticky-card：卡堆里是**每张卡**各播一次
+     （新卡进来时），而不是整层播。 */
+  @keyframes acpc-sticky-in {
+    from { opacity: 0; transform: translateY(-6px); }
+    to { opacity: 1; transform: none; }
   }
-  .sticky-toggle:hover {
-    background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
-    color: var(--vscode-foreground);
-  }
-  /* 收缩成一行：多行气泡是 details.user-fold（summary 就是第一行），单行气泡本来就是一行。
-     展开态的那部分（.fold-body）藏掉即可，不用重建节点。 */
-  .sticky-user.collapsed .bubble,
-  .sticky-user.collapsed .user-fold > summary {
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  .sticky-user.collapsed .fold-body { display: none; }
+  .sticky-card.entering { animation: acpc-sticky-in 160ms ease-out; }
+  @media (prefers-reduced-motion: reduce) { .sticky-card.entering { animation: none; } }
   /* [CUSTOM-20260928-103] 时刻的显隐由 .messages.show-times 控制，而克隆体不在 #messages 里
      —— 不同步这个状态就会出现"列表有时刻、置顶副本没有"。show-times 由 render() 从
      #messages 抄到 host 上。
@@ -563,7 +563,7 @@ export function styles(): string {
     /* [CUSTOM-20260930-140] 底栏浮在面板底部，这个按钮要跟着抬起来，否则会被输入卡盖住。
        [CUSTOM-20260930-152] 表单抽屉也浮在同一处，所以再抬一段（同 --acpc-composer-h 的写法）。 */
     position: absolute; left: 50%; transform: translateX(-50%);
-    bottom: calc(12px + var(--acpc-composer-h, 0px) + var(--acpc-elic-h, 0px));
+    bottom: calc(12px + var(--acpc-composer-h, 0px) + var(--acpc-elic-h, 0px) + var(--acpc-perm-h, 0px));
     padding: 3px 10px; border-radius: 12px; cursor: pointer;
     background: var(--vscode-button-background); color: var(--vscode-button-foreground);
     border: none; font-family: inherit; font-size: 0.9em;
@@ -809,19 +809,21 @@ export function styles(): string {
   .elic-note:empty { display: none; }
 
   /* --- [CUSTOM-20260930-152] 记录里的"待回答"条 --------------------------- */
-  .elic-pending-row { display: flex; align-items: center; gap: 6px; }
-  .elic-pending-icon { flex: none; font-size: 0.95em; }
-  .elic-pending-text {
+  /* [CUSTOM-20261001-158] 权限的记录行与它逐条同构（同一个形状、同一份样式），
+     所以选择器并组 —— 两处各写一份就是 pitfall #19 说的那种"迟早只改一边"。 */
+  .elic-pending-row, .perm-pending-row { display: flex; align-items: center; gap: 6px; }
+  .elic-pending-icon, .perm-pending-icon { flex: none; font-size: 0.95em; }
+  .elic-pending-text, .perm-pending-text {
     flex: 1; min-width: 0; font-size: 0.92em;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  .elic-open {
+  .elic-open, .perm-open {
     flex: none; font-family: inherit; font-size: 0.88em; padding: 2px 8px;
     border-radius: 3px; cursor: pointer;
     background: var(--vscode-button-background); color: var(--vscode-button-foreground);
     border: 1px solid var(--vscode-button-border, transparent);
   }
-  .elic-open:hover { background: var(--vscode-button-hoverBackground); }
+  .elic-open:hover, .perm-open:hover { background: var(--vscode-button-hoverBackground); }
 
   /* --- [CUSTOM-20260930-152] 抽屉 ---------------------------------------- */
   /* 定位：与输入卡**同一套居中规则**（用户 2026-10-01 报"没居中"）。输入卡的中心不是面板中心：
@@ -831,7 +833,7 @@ export function styles(): string {
      **不要**用 transform 居中 —— 抽屉里的下拉菜单是 position: fixed，transform 会让它变成
      "相对该元素"定位。bottom 跟着 --acpc-composer-h：浮层叠在底栏之上，两者一起由消息区的
      留白让位。 */
-  .elic-drawer {
+  .elic-drawer, .perm-drawer {
     position: fixed; left: 0; right: var(--acpc-aside-w, 0px); margin: 0 auto;
     bottom: var(--acpc-composer-h, 0px);
     width: min(100% - 16px, var(--acpc-composer-max, 720px));
@@ -843,7 +845,17 @@ export function styles(): string {
     border-radius: 8px;
     box-shadow: 0 -2px 14px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.35));
   }
-  .elic-drawer[hidden] { display: none; }
+  .elic-drawer[hidden], .perm-drawer[hidden] { display: none; }
+  /* [CUSTOM-20261001-158] 权限抽屉：与表单抽屉同形，但**贴在它上面**（两者可能同时 pending：
+ 同一会话先来表单又来权限），所以 bottom 要把表单那一段让出来 —— 各自的高度变量相加，
+    不需要 JS 协调谁在上面。高度上限也单独收小：权限提示天然只有一行标题加几个按钮，
+    两个 70vh 的抽屉叠起来会把面板淹没。 */
+  .perm-drawer {
+    bottom: calc(var(--acpc-composer-h, 0px) + var(--acpc-elic-h, 0px));
+    max-height: min(50vh, 320px);
+  }
+  .perm-drawer-card { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+  .perm-drawer-hint { font-size: 0.85em; color: var(--vscode-descriptionForeground); }
   /* [CUSTOM-20261001-154] 抽屉的头部行没了：tab 条、进度与收起箭头合成一条 bar，
      进度与箭头靠右（用户要求）。收起时 tab 条让位给当前题的名字。 */
   .elic-bar {

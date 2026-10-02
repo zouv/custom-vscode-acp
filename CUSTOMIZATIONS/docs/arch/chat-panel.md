@@ -16,6 +16,12 @@
 > [`chat-panel-sessions.md`](./chat-panel-sessions.md)**（CUSTOM-20260925-060）；
 > 导航与任务路由见 [`../../architecture.md`](../../architecture.md)（§0 架构图 / §0.5 任务路由 / §1 文件职责）；
 > 历史坑点见 [`../pitfalls.md`](../pitfalls.md)；改动账本见 [`../../registry.md`](../../registry.md)。
+>
+> **体量欠账（2026-10-01 记）**：本文件已 **682 行**，远超它自己沿用的「~400 行即拆分」。
+> 下一次拆分的对象是**记录层**那几节（§5.12 面板审计、§5.25 置顶本轮提问）→
+> [`chat-panel-records.md`](./chat-panel-records.md)（它的边界定义正是"记录本身"）。
+> 这次（156-160）没有顺手做：**§5.x 编号被代码注释与文档引用了几十处**，拆分必须与"修掉所有引用"
+> 一起做才有意义（042/060 的先例），塞在功能改动里容易只做一半。
 
 ---
 
@@ -206,9 +212,16 @@ pending ──用户点按钮──► selected        （回答 optionId）
 **回答路径唯一性**：`deferred` 时卡片按钮**禁用**。存在两条回答路径 = 用户以为点了 A 实际生效 B，
 而 `answer()` 对已 deferred 的 prompt 直接拒绝（记日志），不做事后补救。
 
-**`canPresent` 的三个必要条件**（缺一不可）：聚焦会话匹配、modern agent、存在 surface。
-第一个条件是必须的：给非聚焦会话发卡片，客户端会按 `currentSessionId` 过滤掉，
-结果是"agent 在等一个没人看得见的按钮"。
+**`canPresent` = "这条请求归面板拥有"**（[156] 改写了判据，`show()` 里的动作也跟着变了）：
+
+| 条件 | 为什么 |
+|---|---|
+| 该会话的 agent 是 modern | `isModernAgent(session.agentName)` —— **[156] 用请求会话自己的 agent，不是聚焦会话的**（旧代码取 `focused.agentName`，只有一个 modern agent 时看不出错，加了第二个就是 bug）。legacy 会话在面板里根本没有转录可画 ⇒ 必须走弹框 |
+| 存在 surface | 没有面就什么都画不出来 ⇒ 弹框是**唯一**不会挂死 agent 的出口（第 1 条泄漏路径） |
+
+**"聚焦匹配"不再是必要条件**（[156]）：非聚焦会话的请求照建记录（客户端会按会话过滤增量，切过去时靠 focus 快照带回来），宿主在 `show()` 里发现"这条不在屏幕上"就**发通知**（见 §5.34）。旧判据的后果是用户看到的那一幕：他在会话 A 里打字，会话 B 的权限请求弹到窗口顶部。
+
+`surface.reveal(true)` 仍然只为**聚焦**会话做（agent 被挂住，而且那正是用户在用的会话）；后台会话绝不抢视图——那是通知的事。
 
 **协议**：`permissionAnswer` 是**会话作用域**的（带 `sessionId`），因此在 `ChatPanelHost.onMessage`
 里必须放在 `verifySession` 守卫**之后**（§5.4 规则一）。卡片状态本身**不占新消息类型**，
@@ -401,39 +414,51 @@ pending ──用户点按钮──► selected        （回答 optionId）
 
 
 
-### 5.25 置顶本轮提问（CUSTOM-20260928-102，103 收紧判据并修正排版，104 改成吸顶交棒 + 悬浮卡片 + 收缩，105 对齐/高亮边框/用户消息铺满）
+| **收缩控件 = 原生 details（171）** | 卡片里的折叠三角是唯一控件，点它**走原生**：不 `preventDefault`，浏览器开合克隆体自己的 `<details>`（与界面里的折叠**字面同逻辑** —— 字形、收成一行、图片/文件与文字同行全部复用），`toggle` 事件把状态按会话记进 `collapsedBySession`。166/167 自造的 `.collapsed` 类与其 CSS 已整体删除（169 的权重坑就是自造一套的代价）。左侧通道的小方块按钮 169 已按用户要求删除 |
+| **收缩状态按会话（166）** | 用户报"切一次 tab 就弹回展开"。`collapsed` 原先是个模块级布尔：会串会话、切回来又丢。现在 `collapsedBySession[sessionId]`，会话 id 由 boot 在 `applyFocus` 的咽喉点同步进来（`setSession`，与 `elicitationView.setSession` 同一形态）。**同类问题见 §5.38 的清单**，本轮还顺手修了表单抽屉的同一处（换一张表单要从展开态开始） |
 
-**一句话**：**顶边到达视口顶**的那条用户消息就是"本轮提问"，它被 `cloneNode(true)` 到
-`#stickyUser` 的悬浮卡片里、本体让位；**只要视口里看得到更晚的用户消息就不置顶**。
+### 5.25 置顶本轮提问（102 首版，103 收紧判据，104 吸顶交棒 + 悬浮卡片 + 收缩，105 对齐/高亮/铺满，166 判据再改 + 收缩按会话，167 三角真凶 + TOP_GAP=3，169 删左侧小方块，171 折叠走原生 details，**172 改成整段前缀 = 推挤 + 抽回**）
+
+**一句话**：**活动前缀**（顶边越过判定线的**每一条**用户消息）各有一张卡片，每条按"这一轮的结束
+位置"落位 —— 新提问的顶边碰到旧卡底边时两张一起悬浮，继续滚旧卡被逐渐顶出上沿，反向滚动时旧卡
+又从上沿抽回。本体一律让位（`visibility: hidden`），副本接管原处。
 
 | 关注点 | 规则 |
 |---|---|
-| 判据（104 的核心） | `node.offsetTop - scrollTop < TOP_GAP`（严格）⇒ 候选，取最后一个；第一条**没进这个窗口**的：在视口里 ⇒ 不置顶，在视口下方 ⇒ 结束遍历返回候选。103 的"完全离开视口"已被它取代 |
-| **为什么能这么早** | 副本落在**本体当时所在的位置**上（窗口就是 `TOP_GAP`，那 8px 同时是卡片的 padding-top），交棒那一帧画面上没有位移。所以"同屏两份"（102/103 等的理由）不再靠"等它走光"解决，而靠**隐藏本体** |
-| 隐藏本体 | `.messages .sticky-source { visibility: hidden }`。**visibility 不是 display**：几何必须保住 —— rail 的逐节点测量、`NS.scroll.jumpTo` 的 `node.offsetTop` 都还依赖它。**前缀 `.messages` 是承重的**：`cloneNode` 连 `class` 一起复制，去掉前缀，副本也会被藏起来（悬浮条"打不开了"，静默）；`render()` 另有一道同因防线（显式摘类）。`markSource()` 每帧幂等重贴（一次引用比较）；user 条目节点不会被 `replaceChild` 换掉（那条路径只走 plan/content/tool），但仍留了这一层，因为漏掉的代价是"本体和副本同屏"这种静默的错 |
-| 代价（写在这里免得被当成 bug） | 悬浮条会**长时间盖住下方内容**，而且"消息滚走"在视觉上不再发生——它变成"消息停住、下方内容从它下面流过"。收缩按钮与 `max-height: 40%` 是两个出口 |
+| 判据（172 定稿） | `natural = node.offsetTop - scrollTop`；`natural < TOP_GAP`（严格；**167 起 TOP_GAP = 3px**）的是**候选**，取**整段前缀**（102/166 只取最后一条）。
+走到第一条没进窗口的就收工（它之后只会更低），而它的 `natural` 同时是前缀末条的**上夹**（顺手多读一次 offsetTop，与 104 的开销相同）。**103 的两条旧规则都已作废**：
+"完全离开视口"（102）与"视口里有更晚的提问就不置顶"（103）—— 后者被用户推翻，理由是
+反例很常见：视口中间摆着一条提问、更早那条已经滚上去，那时什么都不钉，读者就找不到"我上面那条问的是什么" |
+| 落位（172） | `top = min(TOP_GAP, 上夹 - 本卡高)`；上夹 = **下一条用户消息的 natural**（前缀内取下一候选；前缀末条取那条 follow；没有下一条就没有上夹）。这就是原生 `position: sticky` 分区头的等价式，**逐条独立，不是链式递推** |
+| **为什么上夹锚"自然位置"** | 锚"下一条**已渲染**的位置"会让旧卡底边永远停在钉住那条的顶上 ⇒ 旧卡**永久残留一条边**、永远"看不到全部消失"，与用户"直到卡片 A 看不到"直接冲突（把这条记进 pitfalls #40）。锚自然位置（布局量，随滚动线性减小）才会一路滑成负值、被 `overflow: hidden` 裁掉 |
+| "两张一起悬浮"是怎么来的 | 过渡帧里旧卡被顶着往上走，而新卡**还在自己的自然位置上**（它没进前缀 ⇒ **不需要副本**，本体就在那儿）—— 看上去就是"两张卡相接"，其实只有一张是克隆体。新卡越线后才接管（≤TOP_GAP 的窗口，与 104 的交接窗同一个常量）。用户要的"旧卡底边 == 判定线"在公式里**逐字成立**：`top + 卡高 == 下一条的 natural` |
+| 卡片不再唯一（172） | 每张卡 = `.sticky-card > .sticky-body > 克隆体`，由 `stickyUser.ts` 按条动态建 —— `body.ts` 只留空的 `#stickyUser`（固定 id 的 `#stickyCard`/`#stickyBody` 会撞成重复 id）。折叠仍走克隆体自己的原生 `<details>`（171） |
+| 隐藏本体 | `.messages .sticky-source { visibility: hidden }`。**visibility 不是 display**：几何必须保住 —— rail 按 `getBoundingClientRect` 逐节点测量、`NS.scroll.jumpTo` 的 `node.offsetTop` 都还依赖它。**前缀 `.messages` 是承重的**：`cloneNode` 连 `class` 一起复制，去掉前缀副本也会被藏起来（悬浮条"打不开了"，静默）；`buildCard` 另有一道同因防线（显式摘类）。172 起是**集合式 diff**（同钉两张时两张本体都要让位），每帧幂等重贴；user 条目节点不会被 `replaceChild` 换掉，但仍留这一层，因为漏掉的代价是"本体和副本同屏"这种静默的错 |
+| 位置怎么落地（172） | 卡片留在**文档流**里（host 是 flex 列），每张写 `marginTop = top - 前一张的实际底边`（第 0 张相对 host 的 `padding-top`，可为负 ⇒ 越过上沿被裁掉，那就是"被顶出去"）。按**实际底边**而不是链式累加：卡高含 2px 边框、还可能被收成一行，累加常量会从第二张开始漂（pitfall #24 的正解：锚已经在正确位置的那张） |
+| 高度上限（172） | **去掉了 `max-height: 40%`**：卡堆里它裁掉的是**最下面、也就是最新**的那张（读者最需要的那页）。现在高度由内容决定，`overflow: hidden` 只负责裁上沿 |
 | 为什么**没有阈值** | 用户选定"露出一像素就算在显示区"。单一阈值 ⇒ 同一画面从不同方向到达结果相同、不会闪；"露出超过 X 才不置顶"是量出来的常量，换面板高度/字号就错位（pitfalls #24/#26）。102 的 8px 容差已在 103 去掉 |
 | 为什么不用**滚动方向** | 判据只依赖当前画面。记住方向会让同一画面从不同来向显示不同结果 |
 | 横向范围 | `#stickyUser` 与 `#messages` 同属 **`.messages-column`**（103 新增的定位容器）。102 时它是 `.message-area` 那一 flex 行的兄弟，而该行还有**定宽可拖拽**的大纲栏 ⇒ 覆盖层横跨两段、右边伸进大纲栏下面。挪进容器后由**构造**保证不越界。该列 132 一度限过宽、**137 已撤销**（见 §5.31）：sticky 是列的绝对定位子元素，宽度始终跟着列走；`alignToContent()` 量的仍是滚动条宽（`offsetWidth − clientWidth`，与列宽无关），照旧成立。`#jumpToLatest` 也在 132 搬进了该列 |
-| 三层结构（104） | `.sticky-user`＝定位层（透明、`pointer-events:none`，卡片周围的内容与点击都透过去）→ `.sticky-card`＝外观层（底色/圆角/**1px 高亮边框**/阴影）→ `.sticky-body`＝克隆体的 flex 列（`align-self` 必需） |
-| 对齐（105，用户报"还是没对齐"） | 卡片右缘要让开**滚动条**：`.messages` 是滚动容器，`scrollbar-width: thin` 照样占布局宽度 ⇒ 消息的内容盒比消息列窄几像素，而悬浮条不是滚动容器。`sync()` 里用 `offsetWidth - clientWidth` 量出来写进 host 的 `right`（没有滚动条就是 0）。**别换成常量**——它随滚动条出现/消失、随主题与字号变（pitfall #24 的反面：锚真实几何） |
-| 边框为什么是 border | 高亮边框是真 `border`（1px `--vscode-focusBorder`，本面板「当前项」的既有语义，同 `.outline-item.active` / `.filter-chip.on`），host 水平内边距相应由 19/10 改成 **18/9** 把这 1px 还给内容盒。**不能用环**：环在这个面板里已经是键盘焦点（062 的教训）。也别改回 `box-shadow` 环——104 用它只是为了避开布局位移，有了 padding 补偿就不必了 |
-| 用户消息铺满（105） | `.entry-user { align-self: stretch }`（原 `flex-end` + `max-width:88%`）。气泡宽度=内容宽度时，折叠后只剩首行、宽度随之缩短，面板在折/展时会自己变窄；铺满后宽度是常量，折与不折只影响高度。这**同时决定**了卡片里有没有空档给按钮 |
-| 排版一致性 | 用户气泡的宽度=卡片的内容盒宽度，而卡片的内容盒由"`.messages` 的内边距 + 105 的 1px 边框补偿 + 105 的滚动条让位"三者共同决定；水平内边距必须与 `.messages` 相同（左 19 / 右 10），否则克隆体会整体偏移。103 修的是 flex 基准，105 修的是这层横向几何 |
-| 排版一致性 | 用户气泡的右对齐与 88% 宽度来自 `.entry-user{align-self:flex-end; max-width:88%}`，而 **`align-self` 只在 flex 容器里生效**；水平内边距也必须与 `.messages` 相同（左 19 / 右 10），否则 88% 落在两个不同的基数上。103 修的就是这两条 |
+| 三层结构（104/107） | `.sticky-user`＝定位层（透明、`pointer-events:none`，卡片周围的内容与点击都透过去）→ `.sticky-card`＝外观层（底色/圆角/**2px `--vscode-foreground` 边框**/阴影；107 起描边回到真 `border`，位移由 host 的 padding 差 2px 补偿）→ `.sticky-body`＝克隆体的 flex 列（`align-self` 必需） |
+| 对齐（105，用户报"还是没对齐"） | 卡片右缘要让开**滚动条**：`.messages` 是滚动容器，`scrollbar-width: thin` 照样占布局宽度 ⇒ 消息的内容盒比消息列窄几像素，而悬浮条不是滚动容器。`alignToContent()` 用 `offsetWidth - clientWidth` 量出来写进 host 的 `right`（没有滚动条就是 0）。**别换成常量**——它随滚动条出现/消失、随主题与字号变（pitfall #24 的反面：锚真实几何） |
+| 用户消息铺满（105） | `.entry-user { align-self: stretch }`（原 `flex-end` + `max-width:88%`）。气泡宽度=内容宽度时，折叠后只剩首行、宽度随之缩短，面板在折/展时会自己变窄；铺满后宽度是常量，折与不折只影响高度。这**同时决定**了卡片里有没有空档给内容 |
+| 排版一致性 | 用户气泡的宽度 = 卡片的内容盒宽度，而卡片的内容盒由"`.messages` 的内边距 + 107 的 2px 边框补偿 + 105 的滚动条让位"三者共同决定；水平内边距必须与 `.messages` 相同（左 19 / 右 10），否则克隆体会整体偏移。103 修的是 flex 基准，105 修的是这层横向几何 |
 | `TOP_GAP` 只有一个来源 | 它既是布局（JS 写进 host 的 inline `padding-top`）又是交棒窗口。两者必须相等，否则每次交棒都带一段位移 ⇒ 由 JS 写，CSS 不写 padding-top（pitfall #19） |
-| 收缩按钮 | `#stickyToggle` 是**卡片的兄弟**，钉在卡片左侧那条 18px 通道里（`.messages` 给引导条留的 padding-left）。105 之前它嵌在卡片左上角——消息铺满后那里没有空档了，放里面会压住正文。`.collapsed` 收成一行：多行气泡本就是 `details.user-fold`，`summary` 即第一行；**只在克隆体含 `.fold-body` 时显示**（"后面还有东西"才是可收缩的；113 起每条用户消息都是 `details.user-fold`，所以按 `.user-fold` 判断会变成"每条都配一个没反应的按钮"，而单行气泡配个没反应的按钮更糟）。它的点击必须 `stopPropagation`——宿主的点击是"跳回原处" |
-| 点击交还 | `NS.scroll.jumpTo(node, TOP_GAP + 1)`：落在**窗口之外**，否则消息立刻又被条接管、点击看起来"没反应"。该形参默认 0，既有调用点一行未改 |
-| 渲染状态 | 克隆体不在 `#messages` 里，`.messages.show-times` 这类**状态类选择器够不着它** ⇒ `render()` 把 `show-times` 抄到 host，`boot.applyTimes` 之后调 `NS.stickyUser.refresh()` 重渲染。**再加新的"挂在 `#messages` 上的渲染开关"时，别忘了这里也要抄一份** |
-| 成本 | 克隆一个 markdown 气泡是这面板最贵的事之一 ⇒ `shownId` 去抖（只有"钉住的是哪一条"变化才重建）+ 滚动只标记、`NS.dom.schedule` 一帧一次。`refresh()` 故意绕过去抖，因为它服务的是**用户手动开关**，不是滚动 |
+| 收缩（169/171/172） | 控件是卡片里的折叠三角（169 删掉了卡片左侧那个小方块）。它走**原生 `<details>`**（171）：浏览器开合，"收成一行"、"图片/文件与文字同行"这些规则全是现成的；`toggle` 事件把状态记回 `collapsedBySession[sessionId][entryId]` —— **按会话 + 按卡**（172；判据即 pitfalls #38 的"用户说每个 X 自己保持，代码里就该出现 byX"）。卡的折叠改变卡高 ⇒ 记账后要重量、重排 |
+| 跳转（170/171/172） | 落点 `NS.scroll.jumpTo(node, 0)`：**在交接窗口之内**（0 ≤ natural < TOP_GAP），消息就地接管卡片的位置、本体让位 ⇒ 既不重叠也不偏下。170 的"让开卡高"解反了：那让开的是**别的东西占着的位置**。172 起目标取自**被点那张卡**的 `data-sticky-id`（每张卡各代表一条消息） |
+| 渲染状态 | 克隆体不在 `#messages` 里，`.messages.show-times` 这类**状态类选择器够不着它** ⇒ `sync()` 把 `show-times` 抄到 host（用 `classList.toggle`：整体重写 `host.className` 会抹掉各卡身上的 `.entering`），`boot.applyTimes` 之后调 `NS.stickyUser.refresh()` 重建。**再加新的"挂在 `#messages` 上的渲染开关"时，别忘了这里也要抄一份** |
+| 成本（172） | 一帧一次（`dom.schedule` + `syncQueued` 去重，流式 chunk 也会触发）。热路径**先读后写**：一次读完 scrollTop / 各 offsetTop / 没量过的高度，纯算术算完所有 top，再统一写 `marginTop` 与 class。克隆**按条缓存**，只有 `.fold-body` 这个结构信号变了才重建（拿高度做信号会每帧强制重排）。被顶出上沿、且超出 `KEEP_MARGIN`(24px) 的卡**不渲染**（但仍在上夹计算里 —— 它是上一条的上夹来源）；`KEEP_MARGIN` 只为省掉交界线上的克隆抖动，不改变画面（留着的那张整条在 y<0） |
 | 维护提示 | 判据依赖 `node.offsetTop` 与 `#messages` 的 `scrollTop` **在同一坐标系**。当前靠"节点与 `#messages` 同处 `.messages-column`"成立——**给 `#messages` 或那条链上新加带 `position` 的祖先时要重新核对**（`NS.scroll.jumpTo` 的 `node.offsetTop - container.offsetTop` 是同一个前提） |
 
-案例钉在 `src/test/chat-client.test.ts`「image chip and pinned question」一组的 11 条用例里。
-**桩要如实建模两件事**，否则这几条会假通过/假失败：`#stickyUser > (#stickyToggle, .sticky-card > #stickyBody)`
-的嵌套，以及 `#messages` 的 `padding-top`（首条记录在 `offsetTop = 8`，正是"停在最上面的提问不被接管"
-那条的判据）。做过四次 RED 验证，每次失败的都正好是应该失败的那几条：退回 103 的判据 ⇒"顶边一到就接管"红；
-`markSource` 改空实现 ⇒ 断言 `sticky-source` 的两条红；去掉 `render()` 里摘类那一行 ⇒"重渲染不得把隐藏类
-克隆进条里"红；去掉 `alignToContent()` ⇒"the bar ends where the messages end"红。
+案例钉在 `src/test/chat-client.test.ts`「image chip and pinned question」一组里（172 起含：相接、
+推挤、顶出后不再渲染、抽回、方向无关、集合式 source、按卡跳转、按卡折叠、卡堆不变式）。**桩要如实
+建模三件事**，否则这些会假通过/假失败：①卡片由客户端动态建（`#stickyUser > .sticky-card >
+.sticky-body > 克隆体`；不再有固定的 `#stickyCard`/`#stickyBody`，169 起也没有 `#stickyToggle`）；
+②`#messages` 的 `offsetTop` 基准（首条记录在 `offsetTop = 8`，正是"停在最上面的提问不被接管"那条
+的判据）；③`insertBefore` 的**移动**语义（pitfall #41 —— 桩漏了它，卡堆重排会被静默打乱）。
+做过 RED 验证，每次失败的都正好是应该失败的那几条：把上夹改回"下一条已渲染的位置" ⇒ 推挤/顶出红；
+`markSources` 改空实现 ⇒ 集合式 source 红；去掉可见过滤 ⇒"顶出后不再渲染"红；
+去掉 `alignToContent()` ⇒"the stack ends where the messages end"红。
 
 ### 5.13–5.15 已拆出：会话目录与重开路径
 
@@ -615,9 +640,119 @@ pending ──用户点按钮──► selected        （回答 optionId）
 | 自拟框 | **[154] 单选：跟着"被选中的那一行"走**（`placeCustomBoxes` 把它 `appendChild` 进那行的容器里），没选时**藏在自己的题块里**（`data-elic-home`）而不是从 DOM 摘掉 —— 摘掉就再也找不回来，写进去的字也会掉出 `collect()`（这条是踩出来的）。多选：仍在列表下方。**任何形态都必须带那行说明**（"填了它就以它作答、取代上面所选"）——adapter 的 `applyAskElicitationResponse` 里 custom **优先于**选择，只写"追加"就是 UI 撒谎 |
 | 收起 | bar 右端的箭头把抽屉收成**一行**（当前题的名字 + 进度 + 箭头）。**Escape 只收起、绝不 cancel**（cancel 会中止工具调用，不能由一次误按键触发）。收起会把这个 promptId 记进 `dismissed`：切走再回来不会自动重弹，内联条的「Open form」是回来的路 |
 | 打开策略 | 自动打开 = 聚焦会话里有 pending 且该 promptId 没被收起过；**主动打开**（内联条 / 收起态）才把焦点给抽屉（显式动作才抢焦点，同 019/125 的态度） |
+| **[161] Submit 的门禁** | 多题时 Submit **只在最后一题那一页可点**（用户要求防误提交：翻页看看后面还有没有时，第一页的提交按钮就在手边，很容易顺手点掉）。**禁用而不是隐藏**，并带一句 `title` 说明为什么——看得见的禁用按钮会说明"还差一步"，藏起来只会让人以为这个表单没有提交按钮。Skip / Cancel 不受影响（它们是逃生门，任何一页都该能用）。判据里还带着 `sending`：否则提交后一次 input/change 触发的 refresh 会把它重新点亮，又变回两条回答路径。`activeTab` 超出新表单的题数时**夹回最后一页**（否则一个 pane 都不显示，而且会骗过上面这条"已在最后一题"的判据） |
+| **附加说明是「追加」（168）** | 用户明确要求（并确认了 adapter 的行为）：选项旁输入的文字**在选项基础上追加**，不是替换。做法在**我们这侧**：`collect()` 把两者合成**一个**答案（`选项 — 说明`，用选项的 label），并且**不再单独发** `question_N_custom` —— adapter 的 `applyAskElicitationResponse` 是「custom 优先并 return」（有它就丢掉所选项），单独发就等于替换。只在**没有勾选任何选项**时，那行文字才作为独立答案发送（自由作答）。那条「replacing the option picked above」的说明行随之删掉（旧语义遗留，用户报「描述不对」），说明只留在输入框的 tooltip 里 |
+| **每个选项行都有自己的补充框（168）** | 多选的每一项都带一个（单选那个由题目级的 extra 框移进所选行）；只在**该行被勾中**时显示（同 154 的「框跟着所选行」）。它不是 schema 字段（`data-elic-note` 而非 `data-field`）⇒ 不会被通用收集循环看到，只被 `collect()` 并进那一项 |
+| **取消选择（168）** | 再点一次**已经选中**的单选行 = 取消（radio 原生做不到）。判据用 `data-elic-picked`（`onPick` 写）：点击时浏览器已把 checked 设成 true，靠它分不出「刚选中」与「再点一次」。未答的题按「未选择」反馈，**不阻塞 Submit**（adapter 的 schema 什么都不 required，空 content 也接受 —— 已实测） |
+| **诊断日志（168）** | 表单构建时 `console.warn('[acpc] form fields: N question(s), M option(s), K with description')`。153 那次「选项说明丢了」两边都证明过客户端是好的（真实 schema 里有、`fieldsOf` 保留、预览渲染得出），留下的下一步就是这行日志 —— 真机再见时，日志直接给答案 |
 | **只看当前会话** | `setSession(sessionId)`（boot 在 `syncElicitations()` 这个唯一入口里同步）+ `pendingForms()` 按 `state.sessionId` 过滤。为什么不用"转录已经是当前会话的"当判据：那是**代理信号**（pitfall #25/#26），一旦某条路径没重建转录，别的会话的表单就会在这边显示出来（用户 2026-10-01 报的正是它）。记录仍记着"谁的表单" —— 切回去它自己会回来。**[154] 另一半在清记录那一侧**：`sessionId` 为空时 `pendingForms()` 直接返回空（草稿页/空态没有会话），而 boot 里所有清记录的地方统一走 `resetTranscript()` 包装（reset + 对账）—— 上一版只调了 `reset`，切到草稿页时抽屉就留在屏幕上了（用户第二张图） |
 | 多个待答表单 | 抽屉同一时刻只呈现一个（记录里第一条未收起的），其余靠各自内联条的「Open form」切过去（`open(promptId)`）——不做叠层 |
 | 委托点击 | 抽屉自己持有一个**容器级** click 监听（tab / 收起 / 清除所选，容器不重建 ⇒ 不怕 pitfall #28 的"重建后 target 脱离"）；`data-elic-action`（提交/跳过/取消）继续走 `links.ts` 的全局委托，根节点查找改为 `.elic` **或** `.elic-drawer`；下拉菜单项的 `data-elic-pick` 与"点外面关菜单"走 document 级监听 |
 | 记录层的 pending 条 | 一行：⏳ + `<gist>`（`state.message` 折成一行）+ `Open form`。结算后仍是那张只读卡（问题 + 曾提供的选项 + 结果说明）——那是历史，不该被这次改动抹掉 |
 | 已答判定 | 从 **DOM** 读（DOM 就是表单状态）：radio/checkbox 看 `checked`，文本框看非空。`onDrawerChange`（容器上的 change/input 委托）负责重算 tab 圆点/进度/未答提示 —— 少了它，勾选框不会让进度动（第一版就漏了） |
 | 桩 DOM 的两个约束 | ①客户端代码里**不要用带值的属性选择器**（`[data-x="v"]`）——`src/test/chat-client.test.ts` 的桩只支持 `[attr]`，用它会让"找不到自己的 input"的 bug 在测试里永远绿；一律 `querySelectorAll('[attr]')` + 过滤（`inputsNamed`/`findByAttr`）。②`loadClient` 刻意不加载 boot，所以抽屉的**请求/应答**接线由 `NS.elicitationView.init()` 自己完成，测试直接调它 |
+
+### 5.34 会话状态通知：等待权限 / 等待表单 / 轮次完成（CUSTOM-20261001-156/157）
+
+**为什么有它**：多会话是常态，而"某个 agent 在后台被挂住"从前只有一条出路 —— 弹到窗口顶部的
+QuickPick（用户截图：他在会话 A 打字，会话 B 的权限请求弹到窗口顶部）。现在：**哪个会话在等你，
+就发一条右下角通知**，点「打开会话」跳过去作答。§5.8 的 `canPresent` 判据是同一次改写的另一半。
+
+| 关注点 | 规则 |
+|---|---|
+| 通道 | `vscode.window.showWarningMessage / showInformationMessage(text, '打开会话')`。**没有更"系统级"的 API**：窗口失焦时会不会变成 Windows 系统 toast 是 **VS Code 宿主自己的行为**，扩展控制不了（验收时看一眼即可，别去写平台特判） |
+| 级别 | 等待类 = **warning**（VS Code 的 info 会自动消失、warning 会一直挂着——agent 被挂住不能错过）；完成 = **info** |
+| 只在"不在屏幕上"时发 | 判据是**宿主**的 `isSessionOnScreen(sessionId)` = 聚焦匹配 **且** 有可见 surface。正在看的会话不发（卡片/抽屉就在眼前）；面板被编辑器盖住、或你看的是别的会话 → 发。**判据刻意不放进 SessionNotifier**：那样它要持有宿主状态，就不可能两行测完 |
+| 三类事件 | 等待权限 / 等待表单 → `ChatPanelHost.show()`（权限与表单共用那一个双形状方法，所以只有一个挂点）；轮次完成 → **`finalizeTurn`**（全仓唯一的轮次结束收敛点，全仓只有一个调用点 —— 不需要第二份"这一轮结束了吗"的状态）。**出错并入完成**（`failed: true` + 同一份文案），不新开一类：同一次失败发两条通知就是噪声 |
+| 取消不发 | `stopReason === 'cancelled'` ⇒ 静默（用户自己按的 Stop，他知道）。文案在导出的纯函数 `stopReasonText()` 里 —— 记录区（`applyStopReason`）与通知**共用同一份**，两处各写一份迟早各说各话（pitfall #19） |
+| 去重 | 键 = `sessionId::kind::token`（等待类 token = promptId；完成类 = 每会话自增轮次号），由 **SessionNotifier 自己拼**（调用方只给 token），`forget(sessionId)` 才是前缀匹配。会话关闭时 forget |
+| 点击 | `focusSession(sessionId, { force: true })`（080/087 的既定用法：否则焦点没变就不发事件）+ 有面则 `reveal(false)`（点通知是**显式用户动作**，可以抢焦点——与 `canPresent` 里那个 `reveal(true)` 的克制正好相反），没有面才 `executeCommand('acpc-chat.focus')`。会话已经关了 ⇒ 记日志、什么都不做（静默会像一个坏掉的按钮，#29） |
+| 模块边界 | `SessionNotifier` **不 import vscode，也不 import Logger**（后者会把它拖进 vscode）：纯逻辑 + 注入的 `NoticeChannel`，所以 `npx mocha --ui tdd out/test/session-notifier.test.js` 直接可跑。真实通道 `vscodeNoticeChannel()` 放在 `ChatPanelHost.ts`（与 `vscodePanelPrefs()` 并排，同一理由） |
+| 通知刷屏 | 同一后台会话连发多个权限请求 = 多条通知（VS Code 自己会堆叠）。接受；要收敛的话再加"同会话 N 秒合并"，但那是另一个决定 |
+
+**"每个请求恰好被答一次"没有被碰**：`PermissionBridge` 一行逻辑都没改（只改了 `canPresent` 的文档）。
+`owner` 的语义从"此刻看得见"变成"归面板拥有"之后，`answer()` 原有的 `owner === 'panel'` 守卫
+自动覆盖了"后台请求等用户跳过来再答"这条新路径。
+
+### 5.35 权限抽屉：与表单抽屉同形，贴在输入框上方（CUSTOM-20261001-158）
+
+用户要求（原话）："询问权限的弹框…需改为跟选项弹框类似，在输入框上面弹出"。
+
+| 关注点 | 规则 |
+|---|---|
+| 两层 | 记录区一行（⏳ + 标题 + `Review`）+ 本体在 `#permDrawer`（body 级浮层）。与表单（152）**逐条同构**——两者都是"agent 被挂住等你点一下"的东西，没有理由长得不一样 |
+| 两个抽屉可以同时存在 | 同一会话先来表单又来权限是真实组合。**各有各的容器与高度变量**（`--acpc-elic-h` / `--acpc-perm-h`），`.perm-drawer` 的 `bottom` = `composer-h + elic-h` ⇒ 权限**贴在表单上面**，不相交、不需要 JS 协调。权限抽屉单独的 `max-height: min(50vh, 320px)`（权限提示天然短；两个 70vh 叠起来会淹没面板） |
+| 为什么另起容器而不是并进 `#elicDrawer` | 后者由 `elicitationView` 端到端拥有（forms / dismissed / tabs / collapsed / ResizeObserver）。塞两种 state 进去要引入"谁拥有 body"的协调器 + 跨类型 tab/收起语义，收益只是一个 CSS 变量 |
+| 显示 = 记录驱动 | `permissionDrawer.sync()` 从转录算 pending（按聚焦会话过滤），由 boot 的**唯一入口 `syncDrawers()`** 在六处（boot/focus/sessionClosed/append/revise/resetTranscript）对账。宿主不知道有抽屉这回事 |
+| 没有"收起" | 与表单刻意不同：权限请求是阻塞的，收起它没有意义；记录行的 `Review` 是唯一的主动打开入口。Escape 不接管 |
+| 回答路径唯一 | 发送与"发送中"守卫都在 `permissionView.answer(host, promptId, optionId)`（`links.ts` 只把按钮解析到宿主：`.perm` **或** `.perm-drawer`，与表单的写法一致）。按钮在两个宿主里都存在，两处各自发送就是两份知识；发送中禁用**全文档**同 promptId 的按钮 |
+| 高度让位 | 消息区 `padding-bottom` 与 `#jumpToLatest` 的 `bottom` 都把两个变量**相加**（`composer-h + elic-h + perm-h`）。观察器 + 显式 poke 两条腿（pitfall #27：ResizeObserver 回调按帧投递，不是每个宿主都送达） |
+| 桩 DOM 注意 | 客户端用 `document.querySelectorAll('[data-perm-option]')` 找按钮——测试桩的 `document` 起初**没有** `querySelectorAll`，那会让"发送中禁用"这条断言永远绿（假阴性）。桩已补上（解析到 body） |
+
+### 5.36 记住用户选过的模式（CUSTOM-20261001-159/160）
+
+用户要求："记住我的模式选择，下次打开新会话时默认使用此模式（比如这个会话我改成了 bypass）"。
+
+| 关注点 | 规则 |
+|---|---|
+| 按 agent 记 | `acpc.lastMode.v1`（globalState，`Record<agentName, {configId, value}>`）。模式是各 agent 自己的词表，按会话记等于没记（新建会话正是要跨会话）；globalState 而不是内存：重载窗口后"又回到默认模式"正是要消灭的现象 |
+| 记什么 | 权威的**那一份**：`configOptions` 里 `category === 'mode'` 的 `currentValue`（128 的教训：`modes.currentModeId` 只是镜像）。`modeOptionOf()` 是唯一的判据出处（三处问它：picker、记、应用） |
+| **在哪记** | 只记**用户动作**：`setConfigOption`（且 configId 就是那个 mode option）、`setMode`、以及草稿页 `applyDraftSelections` 里成功应用的模式项。**agent 自己切的模式不记**（plan mode 自动激活不是偏好），否则"默认值"会悄悄跟着上一个会话的际遇走 |
+| 在哪应用 | `session-created` 的**第三参 `origin`**（`'new' | 'load' | 'resume'`，按"仅追加尾参"的契约加的）。**只对 `'new'` 应用**：打开历史/恢复的会话有自己的模式，那是"重新打开它"的一部分。`origin === undefined`（老调用方、测试直接 emit）按**非新建**处理 —— 宁可不动 |
+| 三道闸门 | 与草稿选择逐条相同：新会话仍提供该 id 且 `category === 'mode'` / 值仍在候选里（`selectValues`）/ 与当前值相同则跳过。**失败只记日志、不写记录区**：默认值不是用户的请求，为它报错是噪声（草稿选择则相反：那是用户显式做的事） |
+| 不播报 | 应用后播种 switch 基线（`choices.set(sessionId, choiceState(...))`），否则 agent 随后的通知会被当成一次用户从未做过的切换播报（073/151 那套机制） |
+| 与草稿页的顺序 | 草稿页的显式选择必须**后**落地：两个都是同一条连接上的 `setConfigOption`，后到的赢。`session-created` 启动的那次应用挂在 `modeApply` 上，`handleCreateDraftAndSend` 先 `await awaitModeApply(sessionId)` 再应用用户选的值 |
+| 草稿页显示它（160） | `handleListDraftOptions` 用 `withRememberedMode()` 把记住的值 overlay 到快照的那一项上——"你不改的话就会建成这样"。**只改这一份拷贝**：`draftOptions` 里那份是 agent 的真实状态，不能被偏好改写 |
+
+### 5.37 轮次之外的 agent 工作：后台子任务（CUSTOM-20261001-162）
+
+**现象（用户报）**：任务还在跑（在等子 agent），发送按钮却已经变回普通状态。
+**根因**：`running` 原本只由"该会话的 `session/prompt` 请求还没返回"（`SessionManager.inFlightTurns`）
+决定，而 **Claude Code 的后台子任务（Task 工具带 `run_in_background`）会在轮次结束后继续干活** ——
+轮次一结束，面板就让它看起来"空闲"了。它的产出此后以**轮次外的通知**继续到达（日志里这类通知还带
+adapter 的私有标记 `_meta."_claude/origin".kind = "task-notification"`），它们的完结则以
+`<task-notification>` 注入块回到会话里（109 早就在处理这类块）。
+
+**状态机**（三条进出条件都要求**有证据**，不猜）：
+
+| 边 | 条件 | 为什么 |
+|---|---|---|
+| 进入 | 某个 tool call 的 `rawInput.run_in_background` 为真 | agent 明说"我起了个后台任务"，也是唯一能**提前**知道的信号；**轮次还在飞时就要记下来**（任务会比轮次活得久） |
+| 保持 | 该会话还有**产出型**通知（助手/思考分片、`tool_call(_update)`）⇒ 看门狗重新武装 | 还在说话/调工具就还在干活。**刻意排除** `session_info_update` / `available_commands_update` / `current_mode_update` / `usage_update` —— 那些是 housekeeping，空闲时也会来，算进去等于给空闲会话钉一个 Stop 按钮 |
+| 退出 ① | 收到 `<task-notification>` 注入块 | 等的就是它；这是**正常结束**，不发通知（与 turn-done 同一态度） |
+| 退出 ② | 新轮次开始 | 轮次自己就报告 running，不必再替后台任务占位 |
+| 退出 ③ | 看门狗超时（默认 **120 s** 无产出）| **必须说出来**：发一条通知（`background-stalled`，info 级，仅当该会话不在屏幕上 —— 与 156 同一条规则）。静默复原正是用户看到的那种"没人告诉我发生了什么" |
+
+**关键取舍**：
+- `running` 现在 = `isTurnInFlight(id) || backgroundTasks.has(id)`（`isSessionRunning`），
+  所以发送按钮、标签圆点的"正在做事"外圈都跟着它走 —— 客户端**零改动**。
+- 超时窗口是**可注入的 ctor 参数**（`backgroundQuietMs`，默认 120 s，比实测看到的最长静默间隔
+  57 s 宽裕一倍）；测试把它调到毫秒级。
+- 一个诚实的边界：**"任务已启动"这个信号来自 adapter 的 `rawInput`**（本仓库已有先例：074 的
+  `_meta.claudeCode.toolName`、153 的 `_askUserQuestionCustomAnswer`）。若某个版本不带这个入参，
+  本机制会安静地不生效（不误报）—— 落盘日志里那行 `keeps running outside the turn (a background
+  task was launched)` 就是判据：**它没出现 ⇒ 信号没来**，而不是状态机坏了。
+
+### 5.38 切会话 / 新建会话时的「按会话状态」收尾（CUSTOM-20261001-165）
+
+用户报：**新建会话时，输入框右侧的上下文表盘还显示着上一个会话的数字**。顺着这条查了一遍
+"客户端按会话存活、却没人负责收尾"的状态，三处问题、一条清单：
+
+| 状态 | 收尾在哪 | 本轮修的是什么 |
+|---|---|---|
+| 上下文表盘（`--acpc-*` 圆环） | `composer.setFocus`（`renderContext(meta.usage)`）**有**；`composer.setDraft` **漏了** | 草稿页没有会话也就没有用量，但没人清 ⇒ 上一条会话的百分比留在那儿（用户截图） |
+| 附件 chip | **没人**（宿主只在"变化时"发 `attachments`，客户端切会话时清空自己的列表） | 切走再切回：chip 不见了，而宿主仍持有它们、**发送时照样带上** —— "看不见却会发出去"比少一个 chip 糟得多。现在 `pushFocus` / `pushBoot` 都会补发当前聚焦会话的那一份（`pushAttachments`） |
+| 图片放大浮层（lightbox） | **没人** | 浮层里是上一个会话的图，切走还盖着新会话的内容。与 154 那次"切走了浮框还在"同一条规矩：**浮层属于它打开时的那个会话** ⇒ 切会话时 `close()` |
+| **置顶条的收缩状态（166）** | 原先是个**模块级布尔** —— 既会串到别的会话，切回来又丢。现在按会话记（`collapsedBySession`），见 §5.25 |
+| **表单抽屉的收缩状态（166）** | 同一形状：收起过的表单让**下一张表单**一冒出来就是收起的。现在"哪张被推开了"只由 `dismissed[promptId]` 记，换一张表单就从展开态开始 |
+
+**改动只有一个理由**：凡是"跟着某个会话才有意义"的东西，切换时必须有明确的收尾点。
+已有的收尾点（改这块之前先看它们，别再加第二个入口）：
+
+- `boot.applyFocus`（focus 消息）：`outline` / `rail` / `stickyUser` / `sessionMenu` /
+  `directoryMenu` / lightbox 按会话重置；
+- `transcriptView.reset()` + `syncDrawers()`（两个抽屉是**记录驱动**的，见 §5.35）；
+- `composer.setFocus` / `setDraft`：草稿文字（按 id 存）、命令/配置项、**上下文表盘**、附件列表。
+
+**没改的**（看过，不是同一类问题）：tab 栏（`setSessions` 按会话）、连接相位（面板级）、
+`imageThumbs`（客户端缓存，重挂载后回退成图标 —— 已在 096 的注释里写明是有意的代价）。

@@ -55,7 +55,14 @@ export interface PermissionState extends PermissionPrompt {
  */
 export interface PermissionPresenter {
   /**
-   * True when this prompt can be answered in a panel the user can actually see.
+   * True when this prompt is OWNED by the panel — i.e. the panel can render it and
+   * the user can answer it there (now or after switching to that session).
+   *
+   * [CUSTOM-20261001-156] This no longer means "visible on screen this instant":
+   * a background session's prompt is owned too (the panel keeps the record, and the
+   * host notifies the user, who jumps over to answer). False is reserved for what
+   * the panel can never do: a non-modern agent, or no surface at all — those must
+   * reach the dialog, or the agent waits forever on a card nobody can see.
    * Implementations may raise the surface, but must not steal focus.
    */
   canPresent(sessionId: string): boolean;

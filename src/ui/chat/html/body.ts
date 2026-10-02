@@ -88,19 +88,13 @@ export function body(surface: SurfaceKey = 'view'): string {
            交叉轴 stretch，高度 = .message-area 的高度。 -->
       <div id="rail" class="rail" hidden><div id="railTrack" class="rail-track"></div></div>
       <!-- [CUSTOM-END] CUSTOM-20260930-132 -->
-      <!-- [CUSTOM-20260928-102] 最近一条用户消息的「悬浮置顶条」（104 改成悬浮卡片 + 收缩按钮）。
+      <!-- [CUSTOM-20260928-102] 悬浮置顶条（104 改成悬浮卡片 + 收缩按钮）。
            它是 .messages-column 的绝对定位子元素，不参与滚动也不占布局。
-           卡片是内层元素：背景/描边/圆角要画在「内容盒」上，px 才能与 .messages 的内容盒对齐。 -->
-      <div id="stickyUser" class="sticky-user" hidden>
-        <!-- 105 起按钮在卡片**外面**（卡片左侧那条引导条通道里）：用户消息铺满整列之后
-             卡片内已没有空档，放在里面就会压住正文。 -->
-        <button id="stickyToggle" class="sticky-toggle" type="button" hidden
-                title="Collapse" aria-label="Collapse or expand the pinned message"
-                aria-expanded="true">&#x25B4;</button>
-        <div id="stickyCard" class="sticky-card">
-          <div id="stickyBody" class="sticky-body"></div>
-        </div>
-      </div>
+           卡片是内层元素：背景/描边/圆角要画在「内容盒」上，px 才能与 .messages 的内容盒对齐。
+           [CUSTOM-20261002-172] 卡堆之后**同时可能有多张卡**（旧卡被顶出上沿、新卡钉住），
+           所以这里只留定位层，卡片由 stickyUser.ts 按条动态建 —— 固定 id 的 #stickyCard /
+           #stickyBody 会撞成重复 id。一张卡 = .sticky-card > .sticky-body > 克隆体。 -->
+      <div id="stickyUser" class="sticky-user" hidden></div>
       <!-- [CUSTOM-20260925-048] role="log" + aria-live: the transcript is the one
            region a screen reader must follow. aria-busy is driven by
            transcriptView (true while any entry is still streaming) so assistive
@@ -219,6 +213,15 @@ export function body(surface: SurfaceKey = 'view'): string {
        放在覆盖层之前：它的 z-index 高于底栏、低于右键菜单与图片浮层。 -->
   <div id="elicDrawer" class="elic-drawer" hidden></div>
   <!-- [CUSTOM-END] CUSTOM-20260930-152 -->
+
+  <!-- [CUSTOM-BEGIN] CUSTOM-20261001-158 - 权限抽屉：与表单抽屉同一形状、同一位置，贴在它的
+       上面（两个同时 pending 时上下堆叠，各自的高度变量相加 —— 见 styles.ts 的 .perm-drawer）。
+       同样是记录驱动（记录区只留一行 ⏳ + Review，见 client/permissionView.ts）。
+       为什么另起一个容器而不是并进 #elicDrawer：后者由 elicitationView 端到端拥有
+       （forms / dismissed / tabs / collapsed / ResizeObserver），把两种 state 塞进一个
+       容器要引入"谁拥有 body"的协调器，收益只是一个 CSS 变量。 -->
+  <div id="permDrawer" class="perm-drawer" hidden></div>
+  <!-- [CUSTOM-END] CUSTOM-20261001-158 -->
 
   <!-- [CUSTOM-20260925-067] 自定义右键菜单；项由 JS 按上下文生成（见 client/contextMenu.ts）。 -->
   <div id="ctxMenu" class="ctx-menu" hidden><div class="ctx-items"></div></div>
