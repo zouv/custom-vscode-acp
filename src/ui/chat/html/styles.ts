@@ -863,23 +863,19 @@ export function styles(): string {
     padding: 2px 8px 0 10px; border-bottom: 1px solid var(--vscode-panel-border);
   }
   .elic-progress { flex: none; font-size: 0.85em; color: var(--vscode-descriptionForeground); }
-  .elic-collapsed-title {
-    display: none; flex: 1; min-width: 0; font-size: 0.92em; font-weight: 600;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
   .elic-toggle {
     flex: none; width: 22px; height: 20px; padding: 0; cursor: pointer;
     background: transparent; border: none; color: inherit; font-family: inherit;
     font-size: 0.8em; line-height: 1;
   }
   .elic-toggle:hover { background: var(--vscode-toolbar-hoverBackground, transparent); border-radius: 3px; }
-  /* 收起态 = 只剩 bar 这一行（用户要的"^ 收成一行"）：正文与操作栏都藏起来，
-     tab 条换成当前题的名字。 */
+  /* 收起态 = 只剩 bar 这一行（用户要的"^ 收成一行"）：正文与操作栏都藏起来。
+     [CUSTOM-20261003-177] **tab 条留在原地**（用户要求）：收起后仍要看得见每一题的标题与
+     圆点状态（已答/未答），而不是只显示当前那一题 —— 否则收起等于"看不见还剩几题没答"。
+     点其中任一 tab 会展开到那一题（见 onDrawerClick）。 */
   .elic-drawer.collapsed .elic-note { display: none; }
   .elic-drawer.collapsed .elic-panes { display: none; }
   .elic-drawer.collapsed .elic-actions { display: none; }
-  .elic-drawer.collapsed .elic-tabs { display: none; }
-  .elic-drawer.collapsed .elic-collapsed-title { display: block; }
   .elic-form { display: flex; flex-direction: column; min-height: 0; }
   /* 操作栏与结果说明固定在抽屉底部（表单区自己滚，按钮不跟着滚走）。 */
   .elic-drawer .elic-actions { padding: 8px 10px; border-top: 1px solid var(--vscode-panel-border); }

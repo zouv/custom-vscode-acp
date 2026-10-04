@@ -132,6 +132,8 @@ export const permissionDrawerClient = `
   function applyDrawerHeight() {
     if (!drawer || !document.body || !document.body.style || !document.body.style.setProperty) { return; }
     document.body.style.setProperty('--acpc-perm-h', drawer.hidden ? '0px' : drawer.offsetHeight + 'px');
+    // [CUSTOM-20261003-176] 同表单抽屉：留白变了要重算视口判定（见 scroll.ts 的 reflow）。
+    if (NS.scroll && NS.scroll.reflowNow) { NS.scroll.reflowNow(); }
   }
 
   function watchHeight() {

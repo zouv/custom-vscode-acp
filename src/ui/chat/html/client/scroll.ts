@@ -41,6 +41,15 @@ export const scrollClient = `
   }
 
   function onScroll() {
+    recompute();
+    // 用户接管了视口：放弃待恢复的位置，不要跟他抢。
+    if (restoreTarget !== null && container && Math.abs(container.scrollTop - expectedTop) > 2) {
+      restoreTarget = null;
+    }
+  }
+
+  /** 重算「是否贴底」与 Jump 按钮。scroll 事件之外的路径也要能调（见 reflow）。 */
+  function recompute() {
     if (!container) { return; }
     // [CUSTOM-20260930-144] distance 用**内容末尾**算（减掉底部那段留白）：留白是给悬浮的输入卡
     // 让位的，它不是内容。这样"内容末尾进入视口"与"判定为到底"就是同一件事 —— 不会出现
@@ -54,9 +63,30 @@ export const scrollClient = `
     var distance = container.scrollHeight - pad - container.scrollTop - container.clientHeight;
     pinned = distance < PIN_THRESHOLD;
     if (pinned) { hideJump(); } else { showJump(); }
-    // 用户接管了视口：放弃待恢复的位置，不要跟他抢。
-    if (restoreTarget !== null && Math.abs(container.scrollTop - expectedTop) > 2) {
-      restoreTarget = null;
+  }
+
+  /**
+   * [CUSTOM-20261003-176] 几何变了之后的**再判定**。
+   *
+   * 为什么需要它：pinned 与 Jump 按钮原先只在 scroll 事件里更新，而**内容高度或底部留白**
+   * （输入卡 / 表单抽屉 / 权限抽屉的高度都进 #messages 的 padding-bottom）变化时，浏览器
+   * **不会**派发 scroll 事件 —— 于是视口停在旧判定上：
+   *   · 本来贴底的人，抽屉/输入卡长高后内容被挤到浮层后面，而他看到的 Jump 状态还是旧的，
+   *     滚动条也已经在头（残留是"没到底"的错觉，实际滚不动）—— 用户 2026-10-03 报的就是这个；
+   *   · 反过来，内容被压缩到不再需要滚动时，Jump 还挂在屏幕上。
+   * 所以三个写高度的模块（composer / elicitationView / permissionDrawer）改完变量就喊一声。
+   *
+   * 贴底时**顺手跟到底**（含刚长出来的那段留白）：这正是「贴着底部」该有的样子，
+   * 也是用户明确要过的语义（"消息区的触底判断保持在输入框上面"）。上翻看历史的人不受影响 ——
+   * keepBottom 取的是变化**之前**的 pinned。
+   */
+  function reflow() {
+    if (!container) { return; }
+    var keepBottom = pinned;
+    recompute();
+    if (keepBottom) {
+      container.scrollTop = container.scrollHeight;
+      recompute();
     }
   }
 
@@ -110,6 +140,8 @@ export const scrollClient = `
 
   /** True while the view sticks to the bottom (diagnostics/tests). */
   function isPinned() { return pinned; }
+
+
 
   // [CUSTOM-20260924-022] 位置记忆：连「是否贴底」一起记。
   // 只记 top 的话，一个本来贴底的会话切回来会停在半空；只记 pinned 又会丢掉阅读位置。
@@ -171,6 +203,8 @@ export const scrollClient = `
     toBottom: toBottom,
     jumpTo: jumpTo,
     isPinned: isPinned,
+    // [CUSTOM-20261003-176] 几何（内容高度 / 底部留白）变化后由写入方调用，见 reflow。
+    reflowNow: reflow,
     remember: remember,
     restore: restore,
     reassert: reassert,

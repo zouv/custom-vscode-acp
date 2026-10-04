@@ -22,11 +22,20 @@ export const bootClient = `
   // DevTools, and every "why does the UI look wrong" investigation so far hit
   // exactly that wall. Capped so a per-entry warning cannot flood the channel.
   (function installLogBridge() {
-    var MAX_FORWARDED = 50;
-    var forwarded = 0;
+    // [CUSTOM-20261002-173] 原来是"每次加载共 50 条"的**终身**上限。实测它被下面那条
+    // 'renderMarkdown asked' 诊断在 200ms 内一次性烧光（真机日志里那 50 条全是它）⇒ 此后任何
+    // 诊断（'form fields' 等）都进不了日志，排查时就会把「日志里没有」读成「没执行」（pitfalls #42）。
+    // 改成**滚动窗口**：每个 WINDOW_MS 最多 MAX_PER_WINDOW 条，窗口一滑配额就回来 ——
+    // 既挡住突发噪声，又不会把长命 webview（用户的窗口开了一整天）永久静音。
+    var WINDOW_MS = 10000;
+    var MAX_PER_WINDOW = 30;
+    var windowStart = Date.now();
+    var forwardedInWindow = 0;
     function forward(level, args) {
-      if (forwarded >= MAX_FORWARDED) { return; }
-      forwarded++;
+      var now = Date.now();
+      if (now - windowStart >= WINDOW_MS) { windowStart = now; forwardedInWindow = 0; }
+      if (forwardedInWindow >= MAX_PER_WINDOW) { return; }
+      forwardedInWindow++;
       try {
         var text = Array.prototype.map.call(args, function (a) {
           if (typeof a === 'string') { return a; }
@@ -36,6 +45,14 @@ export const bootClient = `
         NS.bridge.post({ type: 'clientLog', level: level, message: text });
       } catch (e) { /* logging must never break the UI */ }
     }
+    // [CUSTOM-20261002-173] 本 webview 拿到的文档是哪次构建渲染的 —— 宿主把它写进
+    // '<body data-acpc-build>'（见 utils/BuildInfo.ts 与 html/body.ts）。它必然是本窗口的第 1 条。
+    var build = 'unknown';
+    try {
+      var bodyEl = document.body;
+      if (bodyEl && bodyEl.getAttribute) { build = bodyEl.getAttribute('data-acpc-build') || 'unknown'; }
+    } catch (e) { /* 读不到就报 unknown：日志绝不该让 UI 挂掉 */ }
+    forward('info', ['build ' + build]);
     var nativeWarn = console.warn;
     var nativeError = console.error;
     console.warn = function () { forward('warn', arguments); nativeWarn.apply(console, arguments); };
@@ -179,6 +196,11 @@ export const bootClient = `
    * yet. Round-tripping keeps 'marked' out of the webview bundle (the CSP only
    * allows the nonce'd inline script).
    */
+  // [CUSTOM-20261002-173] 下面那条诊断的调用计数（见文件内 147 与 pitfalls #42）：
+  // 它每次渲染都打一行，实测 200ms 内能打 50 行，把日志桥的转发配额吃光，
+  // 于是后来的诊断（'form fields'）永远进不了日志。改成**只报前几次 + 每 25 次报一次**，
+  // 保留"这条链路确实在跑"的信息量，同时不再淹掉别人。
+  var markdownAsks = 0;
   function requestMarkdown() {
     // [CUSTOM-20260930-147] 这里原来有一条 if (!currentSessionId) { return; }：聚焦会话为空
     // 时整批请求都发不出去。而 transcriptView 的 item **自带 sessionId**（请求方就是它），
@@ -198,8 +220,12 @@ export const bootClient = `
     NS.bridge.post({ type: 'renderMarkdown', items: pending });
     // [CUSTOM-20260930-147] 临时诊断（定位"最后一条不渲染"后可以删）：请求这一侧到底发没发、
     // 带的是哪条记录。与下面 markdownRendered / patch dropped 两条日志合起来能一次定位断点。
-    console.warn('[acpc] renderMarkdown asked: ' + pending.length + ' item(s) ['
-      + pending.map(function (it) { return it.entryId; }).join(',') + ']');
+    // [CUSTOM-20261002-173] 加限流（见上面 markdownAsks）：前 3 次照报，之后每 25 次报一次。
+    markdownAsks++;
+    if (markdownAsks <= 3 || markdownAsks % 25 === 0) {
+      console.warn('[acpc] renderMarkdown asked: ' + pending.length + ' item(s) (call #' + markdownAsks + ') ['
+        + pending.map(function (it) { return it.entryId; }).join(',') + ']');
+    }
   }
 
   // Exposed so transcriptView can ask for rendering when a stream finalizes.

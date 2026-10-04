@@ -97,6 +97,117 @@
   **无头探针**（真 Chromium）：`initial{124} → click{foldDisplay:none, cardH:76} → click{inline, 124}`、`jumped:false`。
 - **基于上游版本**：0.2.0（commit e7371659）
 
+### 2026-10-04 - CUSTOM-20261004-181
+- **改进**：置顶卡堆**留缝** —— 卡底与它顶住的那条（下一条提问/下一张卡）之间留 8px，不再"严丝合缝"
+- **改动文件**：`src/ui/chat/html/client/stickyUser.ts`（`CARD_GAP` + 上夹公式）、`src/test/chat-client.test.ts`（三条断言从"无缝相接"改成"留 8px"）。（文档：`chat-panel.md` §5.25/§5.41、`dev-workflow.md` 验收 195/197/205）
+- **来源**：用户报「置顶对话框，这个间隔太近了，叠到了一起，间隔改大一些」
+- **详细说明**：
+  - 172 的"推挤"是**无缝相接**（`top = min(TOP_GAP, next.natural - h)` ⇒ 卡底正好压在下一条的顶边上，探针里 `contact: true`），当时为的是"看着连续"；真用起来两条紧贴像一条，分不清是两张卡。
+  - 现在上夹里再减一个 `CARD_GAP = 8`：**只改上夹**，`TOP_GAP`（判定线/交接窗，即"什么时候接管"）不动。三种情形一起受益：卡与卡之间、最后一张卡与它顶住的用户消息之间、以及被顶出上沿的过程（早 8px 开始被推）。
+  - 副作用（有意）：旧卡比 172 更早整条出界（不再是"只留最后几个像素"）—— 这正是留缝的应有之义。
+- **验证方式**：`npm test` **311 passing**（三条断言改写：`bottom === 30 - CARD_GAP`、`bottom === 2 - CARD_GAP`、以及"两卡间距绝不小于 CARD_GAP"）。`lint` 0、webpack 成功、`check-registry` 六节全绿；真 Chromium 探针：`#stickystackpushprobe` 旧卡 `bottom 22` / `nextUserTop 30` ⇒ 缝 8px、`contact: false`（改前 30/30、true）；截图 `sticky-stack-push.png` 两条不再相接。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-04 - CUSTOM-20261004-178
+- **修复**：点置顶卡跳转后**显示真实消息**（此前落在交接线上、由克隆体接管 ⇒ 用户看到的仍是悬浮样式）；上方卡堆按既有公式自己滑出上沿
+- **改动文件**：`src/ui/chat/html/client/stickyUser.ts`（`STACK_SEAM` + 落点 + `stackInfo`）、`src/test/chat-client.test.ts`（三条落点断言改写）、`CUSTOMIZATIONS/scripts/preview-records.mjs`（jump 探针加 `stackBottom`/`seam`）。（文档：`chat-panel.md` §5.41、`dev-workflow.md` 验收 202）
+- **来源**：用户报「点击悬浮面板触发定位后，此时已经定位到用户对话卡片位置，但还是显示的悬浮样式」（第 1 条）
+- **详细说明**：
+  - **落点三次演化（都写在代码注释里，免得再绕回去）**：170 用 `host.offsetHeight + TOP_GAP + 2`（host 是覆盖层、高度含**已被顶出屏幕**的卡 ⇒ 上方卡一多就把消息推得很低，用户报"定位偏下"）→ 171 改成 0（消息就地接管悬浮条的位置，代价是那条**仍在活动前缀里** ⇒ 本体隐藏、克隆体站原位 ⇒ 就是本次报的"还是悬浮样式"）→ **178 改成 `TOP_GAP + STACK_SEAM(2)`**。
+  - **为什么只要一个小常量**：`found.follow` 是前缀之后第一个用户消息的 natural，于是 `layout()` 的 `top_i = min(TOP_GAP, natural_{i+1} - h_i)` 会把上方每张卡推到负 y 被 host 的 `overflow:hidden` 裁掉 —— **卡堆自己让开**，不需要额外的抑制态、也不需要量"屏幕外那些卡"的高度。
+  - **新增 `stackInfo()`**：可见卡堆的区间（`top`/`bottom`/`cards`），供探针与"落点有没有被盖住"的判据使用（170 错问的正是 host.offsetHeight）。
+  - **实测**（真 Chromium，`#stickynarrowstickyjumpprobe`）：`nodeNatural 5`、`targetVisibility "visible"`、`overlap false`、`cardTop -5 / cardBottom 60`（卡片底边正好接上消息顶边，`seam 0`）—— 改前是 `hidden / overlap true`。
+- **验证方式**：`npm test` **311 passing**（三条落点断言改成 `TOP_GAP + STACK_SEAM`，其中一条显式断言 `clearance > TOP_GAP`）。`lint` 0、webpack 成功、`check-registry` 六节全绿；真机探针读数见上。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-04 - CUSTOM-20261004-179
+- **修复**：置顶卡与消息记录的**折叠状态双向同步**（点卡片三角 = 消息也折；在消息列表里折 = 卡片也折），并且**重建后仍然记得**（以前记录侧写死 `open = true`，任何重建都弹回展开）
+- **改动文件**：`src/ui/chat/html/client/transcriptView.ts`（共用存储 + `setFoldSession`/`userCollapsed`/`setUserCollapsed` + 建记录时读状态与逐节点 toggle）、`src/ui/chat/html/client/stickyUser.ts`（删掉自己的 `collapsedBySession`，改问记录层；`onFoldChanged`）、`src/test/chat-client.test.ts`。（文档：`chat-panel.md` §5.41、`dev-workflow.md` 验收 203）
+- **来源**：用户报「对话在悬浮状态时点击折叠按钮，消息面板上对应的用户消息卡片还是展开状态（预期保持一致）」（第 2 条）
+- **详细说明**：
+  - **根因是"两边各存一份、谁也不读谁"**（pitfall #19）：记录侧根本没有存储（`details.open` 只在建时写 true，`PATCH_KEYS` 里也没有这一位），卡片侧是 stickyUser 的 `collapsedBySession`、只喂克隆体 ⇒ "点卡片 = 折消息"在数据结构上没有落点。
+  - **唯一真相搬到记录层**（`transcriptView` 是记录的所有者）：`foldBySession[会话][条目]`，粒度沿用 166/172（按会话 + 按条目）；`reset()` **不清**它（切会话回来还要用）。
+  - **两个写入点共用一个入口** `setUserCollapsed()`：写存储 → 应用给**记录本体** → 通知置顶卡（`onFoldChanged`）→ 刷新视口判定（176 的 `reflowNow`）与大纲缓存。**幂等守卫**（写相同的值直接返回）是打断"程序化改 `details.open` → 又触发一次 toggle → 又回写"来回震荡的关键。
+  - **`toggle` 不冒泡** ⇒ 记录侧只能在 `buildUserBubble`（唯一造 user-fold 的地方）逐节点挂监听；漏了它就静默不同步。
+  - **实测**（真 Chromium，`#stickynarrowstickyclickprobe` 的延时采样）：点卡片三角后 `store true / recordOpen false / 卡片 open false` 三者一致。⚠️ 采样必须**延时**：`<details>` 的 toggle 事件是异步派发的，同一同步块里读会得出"没同步"的错觉（本档第一版就是这么误判的）。
+- **验证方式**：`npm test` **311 passing**（新增 4 条：卡片→记录、记录→卡片、hydrate 重建后仍折着、按会话不串）；`lint` 0、webpack 成功、`check-registry` 绿；探针读数见上。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-04 - CUSTOM-20261004-180
+- **修复（性能）**：长会话里点一次折叠就长时间卡顿 —— `rail.measure()` 从"边读边写"改成**读写分离**；置顶条的用户消息列表按内容版本缓存（原先每帧全表走一遍）
+- **改动文件**：`src/ui/chat/html/client/rail.ts`（measure 两段式）、`src/ui/chat/html/client/transcriptView.ts`（内容版本号 `version()`，place/reset 自增）、`src/ui/chat/html/client/stickyUser.ts`（用户列表按版本缓存）、`src/test/chat-client.test.ts`（新增"读写不再交错"的性质测试）、`CUSTOMIZATIONS/scripts/preview-records.mjs`（**自检修好**：见下）。（文档：`pitfalls.md` #44/#45、`dev-workflow.md` 验收 204）
+- **来源**：用户报「消息面板内容很长时，点击卡片进行收缩/展开都会导致界面长时间卡顿（应该是触发了重渲染？），可以做成虚拟列表吗？」（第 3 条）
+- **详细说明**：
+  - **不做虚拟列表**（用户拍板，我也给过理由）：它会同时打破五个不变量 —— rail 的"每条一个圆点、逐个 `getBoundingClientRect`"、大纲锚点、**按会话的绝对 `scrollTop` 记忆**、置顶卡上夹依赖的"下一条记录的自然位置"（pitfall #40）、工具卡分组（`querySelectorAll('.tool[data-tool-id]')`）与 `node(id)`。增量重算能解决同一个问题而风险小得多。
+  - **真凶是读写交错**：旧 `measure()` 在同一循环里读一次 `getBoundingClientRect`、紧接着写一次 `dot.style.top` —— 任何样式写都会让下一次布局读**强制重排** ⇒ n 个标记 = n 次强制重排（几千条记录时就是那几秒）。现在分两遍：① 只读（容器几何 + 每个节点的一行中心）② 只写（hidden / top / 线）；`measure()` 的输出（`points`、圆点 `top`、线）逐字不变。
+  - **置顶条**：`userEntries()` 原先每帧（滚动）与每次折叠都走一遍 `ordered()` 全表 + 逐条 `entry()`；转录内容只在 `place()`（唯一新增点）与 `reset()` 变化，故用 `contentVersion` 版本号把它们绑起来 —— pitfall #27 的正解（让**会改它的那处代码**自己举手，而不是让读的人去列"什么会让它变"）。
+  - **顺带修好一个真 bug（本文件的探针自检）**：`preview-records.mjs` 的 `assertNoBackticksInDriver()` 用 `src.indexOf("function driver()")` 定位模板体 —— 而它命中**自检自己那行代码里的字面量**，于是几十字符的空当成了校验对象，**驱动里写进反引号也照样报 OK**（本次我因此白折腾了三轮：模板提前终止 ⇒ 所有探针一起哑掉，而"守卫"说没事）。已改成按**行首**定义 + `lastIndexOf` 定位，并加 `body.length < 1000` 的哨兵（宁可真报错，也不要静默放行）。
+- **验证方式**：`npm test` **311 passing**（新增性质测试：桩里记录每次几何读取与样式写入的时间线，断言一次全量量测里"写→读"来回只剩常数次 —— 旧版是 O(标记数)；24 个标记、实测 ≤4）。`lint` 0、webpack 成功、`check-registry` 六节全绿、55 张预览图正常。⚠️ **诚实说明**：毫秒无法在无头预览里量（`--virtual-time-budget` 下 `performance.now()` 是虚拟时钟），"数强制重排"又会被 `NS.dom.schedule` 的"已有一帧在排就只入队"挡住（无头下真 rAF 未必送达）—— 所以本条的判据是**结构性质**（单测）而不是耗时数字。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-03 - CUSTOM-20261003-177
+- **改进**：表单抽屉**收起后保留完整 tab 条** —— 每一题的标题与已答/未答圆点都还在（原来只显示当前那一题的名字）
+- **改动文件**：`src/ui/chat/html/styles.ts`、`src/ui/chat/html/client/elicitationView.ts`、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（elicit 探针加 `tabsDisplay` / `panesDisplay` / `tabSummary` 三项读数）。（文档：`docs/arch/chat-panel.md` §5.33、`dev-workflow.md` 验收 201）
+- **来源**：用户报「选项弹出框折叠后，需要完整显示选项 tab（现在只显示了当前的 tab）：包括选项标题、圆点状态」
+- **详细说明**：
+  - **为什么原来只有当前题**：154 的设计是"收起 = 收起成一行，tab 条换成当前题的名字"，理由是省空间。但收起最常见的动机是**边看别处边等**——这时恰恰需要知道"还剩几题、哪几题没答"，只留当前题反而把信息藏掉了。
+  - **改法**：`styles.ts` 里删掉 `.elic-drawer.collapsed .elic-tabs { display: none }` 与 `.elic-collapsed-title` 两条规则（收起只藏 `.elic-panes` 与 `.elic-actions`）；`elicitationView.ts` 去掉 `firstTitle` 与那个 span（含 `refreshChrome` 里的同步），**收起态点 tab 顺手展开**——正文是藏着的，不展开的话点了只有圆点变化，用户会以为坏了。
+  - **实测**（真 Chromium，`#elicshrunkprobe`）：收起态 `tabsDisplay=flex` / `panesDisplay=none`、抽屉高 **33px**（一行）、两个 tab 各带圆点与标题。
+- **验证方式**：`npm test` **306 passing**（新增 1 条：收起后每一题仍在且带圆点/标题；收起态点第二个 tab 会展开并停在那一题）。`npm run lint` 0、webpack 成功、`check-registry` 六节全绿；预览读数与截图 `elic-shrunk.png` 见上。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-03 - CUSTOM-20261003-176
+- **修复**：底部浮层（输入卡 / 表单抽屉 / 权限抽屉）长高或收起后，**视口判定不再滞后** —— 贴底者的视口跟着留白走，最后一条记录不再被浮层盖住却滚不动；Jump 按钮也不再挂在屏幕上不消失
+- **改动文件**：`src/ui/chat/html/client/scroll.ts`（拆 `recompute()` + 新增 `reflowNow()`）、`composer.ts`、`elicitationView.ts`（写高度后喊一声 + `refresh()` 里显式重写高度）、`permissionDrawer.ts`、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（新增四档几何复现/读数）。（文档：`docs/arch/chat-panel.md` §5.40、`docs/pitfalls.md` #27 第三次复发、`dev-workflow.md` 验收 200）
+- **来源**：用户报「有时候消息面板还没拉到最底部（Jump 还在），但滚动条已经触底了，没法通过鼠标滚动界面。请排查下」
+- **详细说明**：
+  - **先量后改（pitfall #31）**：给预览驱动加了 `#elicbottomstuck*` 四档，把"内容 + 抽屉 + 输入卡"的几何与滚动状态一起读出来（`atMax` / `padBottom` / `drawerH` / `coveredByDrawer` / `pinned` / `jumpHidden`）。**静态几何本来就是自洽的**（贴底时留白 = 24 + 输入卡 + 抽屉，内容既不被卡片也不被抽屉压住）；不自洽的是**迁移**：切题让抽屉变矮后 `--acpc-elic-h` 仍停在旧值 315px（真实 287px）。
+  - **根因**：`pinned` 与 Jump 的显隐原先**只在 `scroll` 事件里**更新，而"底部留白变化 / 内容被 markdown 撑高 / 抽屉换题"**都不派发 scroll 事件** —— 视口判定停在旧值。表现就是用户看到的：内容被浮层挤到后面、滚动条却已经在头（判定还以为没到底，反过来 Jump 又挂在屏幕上），于是"滚不动"。这与 pitfalls #27（023 的引导条圆点）**同族第三次复发**。
+  - **修法三条**：① `scroll.ts` 拆出 `recompute()`，新增 `reflowNow()` —— 记下变化前的 pinned，重算，**原来贴底就带到底部**（含刚长出来的留白）；② 三个写留白高度的模块写完 CSS 变量各喊一声；③ 抽屉切题/展开/收起**显式**再写一次高度（不能只靠 ResizeObserver —— 它的回调按帧投递，152 已踩过）。
+  - **验证（改前/改后对照，读数是几何数字不是肉眼）**：`#elicbottomstuckgrowdrawerprobe` 改后 `padBottom 423→395`、`scrollTop` 跟着 `max` 走（贴底保持）、`coveredByDrawer=false`；`#elicbottomstucktallgrowprobe`（抽屉长高）`padBottom 395→423`、`scrollTop 2384→2412`、`pinned/jumpHidden` 保持正确；`#elicbottomstuckpullupgrowdrawerprobe`（上翻看历史中）视口**一动不动的**、Jump 正常显示。
+- **验证方式**：`npm test` **305 passing**（新增 3 条：留白进"内容末尾"的语义、贴底时 reflow 跟着走、没贴底时绝不抢视口且 Jump 会自己消失）。`npm run lint` 0、webpack 成功、`check-registry` 六节全绿、`normalize-eol` 无修正；四档预览读数见上（改前 `coveredByDrawer=true` 的那档改后为 `false`）。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-03 - CUSTOM-20261003-175
+- **修复（根治）**：`@agentclientprotocol/sdk` **0.21.1 → 1.7.0** —— 表单的「选项说明」丢失由 SDK 的 zod 解析造成（`zEnumOption` 丢未声明键），1.3.0 起已修
+- **改动文件**：`package.json` / `package-lock.json`（依赖）、`src/core/SessionManager.ts`、`src/core/ConnectionManager.ts`、`src/core/AcpClientImpl.ts`、`src/ui/chat/protocol.ts`、`CUSTOMIZATIONS/scripts/probe-elicitation.mjs`。（文档：`docs/pitfalls.md` #43、`registry.md`）
+- **来源**：用户选定「直接升 SDK 根治」（174 已查明根因，本条落地修法）
+- **详细说明**：
+  - **① 依赖**：`npm install @agentclientprotocol/sdk@1.7.0`（**npm**，见 AGENTS 硬约束）。选 1.7.0 而不是最低可修的 1.3.0：同为 1.x（迁移面一样），取最新避免再踩同线的已知问题。
+  - **② 迁移点（只有三处，都是 1.x 的硬改名）**：
+    · `AcpClientImpl`：`unstable_createElicitation` → **`createElicitation`**（SDK 把 elicitation 正式化；方法名必须与 `Client` 接口逐字一致，否则连接**永不派发** —— 探针那个自建 client 也得跟着改，否则它会静默地一次表单都收不到）。
+    · `ConnectionManager`：`Stream` 改从主入口导入 —— 1.x 的 `exports` 映射挡住了 `@agentclientprotocol/sdk/dist/stream.js` 深导入。
+    · **models API 整个消失**（`SessionModelState` / `unstable_setSessionModel`）：模型在 1.x 由 Config Options（`category: 'model'`）表达。本仓库 `SessionManager.setModel()` 早已优先走 Config Options，只有"agent 没给 model 类配置项"时才回落到旧 API —— 那条回落现在**先判断方法存在**（不存在就记日志返回），否则就是静默的 TypeError。旧形状保留为本地类型 `LegacySessionModelState`（只服务老 agent 的 `models` 字段与 legacy 面板的 modelsUpdate）。
+  - **③ 真机端到端验证（这次走的是**整条链**）**：`node CUSTOMIZATIONS/scripts/probe-elicitation.mjs --answer 0` —— 真 agent（claude-agent-acp v0.85.1）+ 真 `ClientSideConnection`（**入站请求因此真的过了 SDK 的 zod 解析**这一跳，这正是前三轮假绿漏掉的那一跳）。结果：`raw schema` 里选项带 `description`，`our fields` 显示 `A 方案 [desc 8字] / B 方案 [desc 8字]`（**以前这里是「无 desc」**），回答按 ACP 形状回传、agent 正常收下 ✓。探针的打印也顺手加了「每个选项有没有说明」这一眼。
+  - **④ 顺带修复**：`_meta` 同样曾被削 ⇒ 选项的 `preview`（adapter 放在 `_meta._claude/askUserQuestionOption`）现在也读得到了（`optionOf` 一直有这段代码，只是以前拿不到数据）。
+- **验证方式**：`npm test` **302 passing**、`npm run lint` 0、webpack 成功、`check-registry` 六节全绿、`normalize-eol` 无修正；真机探针见上（表单带说明 + 回答闭环 ✓）。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-03 - CUSTOM-20261003-174
+- **修复**：单选回归**原生 radio 交互**（再点已选中行**不再**取消选择）；并**查明**「选项说明丢失」的真根因（不在我们这侧 —— ACP SDK 的 zod 解析削掉了 `description`）
+- **改动文件**：`src/ui/chat/html/client/elicitationView.ts`、`src/test/chat-client.test.ts`。（文档：`docs/arch/chat-panel.md` §5.33 两行、`docs/pitfalls.md` #43）
+- **来源**：用户复验 173 的两条 —— ①「最新的板板，选项还是没有显示 description 内容，你再检查日志看看」②「选项界面里已经有了 clear answer，单选按钮点击后取消选中的逻辑可以去掉了（保持原单选按钮的交互）」
+- **详细说明**：
+  - **① 单选回到原生交互**：删掉 168 那条 `radio.addEventListener('click', …)` 与它依赖的 `data-elic-picked` 记账（`clearPick`/`onPick` 两处写入一并删）。清除选择只走底部 `Clear answer`。**显式互斥保留**（桩 DOM 没有原生 radio 组行为，靠浏览器才成立的假设不能用在这里）。
+  - **② 说明丢失的根因（173 的指纹当场破案）**：日志里宿主与客户端指纹一致（`…921e20a191ef`）⇒ **窗口跑的就是当前构建**，于是"旧窗口"这条假设被排除；紧接着新诊断给出 `[acpc] form fields: 1 question(s), 4 option(s), **0 with description**` —— 数据**到客户端时就已经没有说明**。顺着往上游查：ACP SDK 用 zod 校验入站请求（`acp.js: validate.zCreateElicitationRequest.parse(params)`），而 0.21.1 的 `zEnumOption = z.object({ const, title })` **没有 `description` 也没有 `_meta`**，zod 的 object 默认**丢弃未声明键** ⇒ adapter 发来的 `description` 在进入 `fieldsOf` 之前就被削掉了。**实证**：把真机报文先过一遍 `zCreateElicitationRequest.parse`，4/4 带说明变成 **0/4**。
+  - **为什么 153/168/173 三轮都判"客户端是好的"**：三次验证都是把日志里的**原始报文**直接喂 `fieldsOf`（原始 JSON-RPC 流量日志当然带着 `description`）—— **绕过了 SDK 这一层**。教训：验证"数据到得了某处"时，必须走**它真实经过的那条链**，而不是把两端各自证明一遍（已回写 pitfalls #43）。
+  - **顺带**：`_meta` 同样被削 ⇒ 选项的 `preview`（adapter 放在 `_meta._claude/askUserQuestionOption`）我们一直读不到，属同一根因、一并随修法解决。
+  - **修法两条路（待定）**：A. 本地回填（从同一 `toolCallId` 的 AskUserQuestion 工具调用 `rawInput.questions[].options[].description` 补回 —— 该字段在 zod 里是 `z.unknown()`，**没有被削**）；B. 升 SDK 到 **≥1.3**（1.3.0 起 `zEnumOption` 补上 `description`/`_meta`，根治；代价：1.x 有 `exports` 映射挡着我们那句 `@agentclientprotocol/sdk/dist/stream.js` 深导入，且 `unstable_createElicitation` → `createElicitation` 改名，需真机回归）。**本条只落地 ①，② 的修法另开一轮。**
+- **验证方式**：`npm test` **302 passing**（改 1 条拆 2 条：再点已选中行**保持选中**且提交带着该选项；未答不再需要"点了再取消"那条路，直接不点即为未答、Submit 照常发出空 content）。`npm run lint` 0、webpack 成功、`check-registry` 六节全绿。根因实证脚本见上（真报文 → `zCreateElicitationRequest.parse` → 说明 4→0）。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-02 - CUSTOM-20261002-173
+- **功能**：**构建指纹**（版本 + git 短 sha + 打包时间 + 产物哈希）落进日志与 webview；客户端日志桥由"每次加载 50 条"的终身上限改为**滚动窗口**，并给 markdown 诊断限流
+- **改动文件**：`src/utils/BuildInfo.ts`（新增）、`webpack.config.js`（DefinePlugin 注入）、`src/extension.ts`、`src/ui/chat/html/body.ts`、`src/ui/chat/html/client/boot.ts`、`src/test/chat-client.test.ts`。（文档：`docs/arch/chat-panel.md` §5.39、`docs/pitfalls.md` #42、`architecture.md` §0.5/§1、`docs/dev-workflow.md`；账本三行见 `registry.md`）
+- **来源**：用户反问「你能确定那个跑的是旧客户端吗，如果不能确定，看是不是要给日志加一个插件版本号及编译版本号」——上一轮我只能给出**间接**推理（宿主 04:08 后没重启、客户端代码 12:05 才编译），无法判定"那份 dist 里有没有这段渲染"
+- **详细说明**：
+  - **① 指纹本身**：`buildStamp()` = `v<版本>·<git短sha[-dirty]>·<打包时间>·<sha256前12位>(<字节数>)`。版本号从 `__dirname` 往上找 `package.json`（`dist/` 与 `out/` 两种布局都成立），git 与时间由 `webpack.config.js` 的 `DefinePlugin` 在打包时注入（**`.vsix` 里没有 `.git`**，运行时拿不到），哈希是运行时对 `__filename` 取的 —— **它是唯一真正识别代码的一项**（同版本编两次只有它变）。**刻意不 import `vscode`**：无头预览会直接 require `out/ui/chat/html/body.js`，单测也在裸 node 下跑；全程 try/catch，任何一步失败只退化成 `unknown`，绝不抛。
+  - **② 三处上报，互为对照**：宿主 activate 首行带指纹（"宿主进程载入的是哪份代码"）；`html/body.ts` 把它写进 `<body data-acpc-build>`（"这份文档是哪次构建渲染的"）；客户端 boot **第一条**日志（`forward('info', 'build …')`）把它报出来（"webview 实际拿到的文档是哪个"）。判读：三者一致 = 当前构建；客户端是旧值 = 窗口旧；**两行都没有 = 窗口根本没重载**。
+  - **③ 真凶：日志桥的配额**。客户端 `console.warn/error` 经 `clientLog` 进日志文件，原先上限是**每次加载共 50 条**。实测这 50 条被 `[acpc] renderMarkdown asked` **在 193 毫秒内**（04:10:02.551–.744）一次性烧光 ⇒ 此后任何诊断都进不了日志，于是"日志里没有"被读成"诊断没执行"（上一轮加的 `form fields` 诊断就是这么失效的，已写进 pitfalls #42）。改为**滚动窗口**（10s / 30 条）后长命 webview 不再被永久静音；噪声源本身也限流（前 3 次 + 每 25 次一次）。
+  - **④ 测试里的一条真教训**：第一版测试用 `console.warn` 驱动转发，在扩展宿主里**一条都抓不到**（客户端打的补丁未必安在测试用的那个 console 对象上），改成走客户端自己注册的 `error` 监听通道 —— 依赖"某个全局对象就是同一个对象"的测试是假信号。
+- **验证方式**：`npm test` **301 passing**（新增 3 条：指纹形状/稳定性/字符集；`<body data-acpc-build>` 与 `buildStamp()` 一致；客户端 boot 首条日志带指纹、配额在一个窗口内 ≤30 条、**窗口滑过后恢复上报**、属性缺失时报 `unknown` 而不抛）。`npm run lint` 0 warning、webpack 成功（`dist` 里确认注入的是 `"2819d85-dirty"` 与打包时间）、无头预览 `elic-real-pick.png` 与改动前**逐像素一致**（新增属性不影响渲染）。`node CUSTOMIZATIONS/scripts/check-registry.mjs` 六节全绿（exit 0），`normalize-eol.mjs` 已把新文件归一为 CRLF。
+- **基于上游版本**：0.2.0（commit e7371659）
+
 ### 2026-10-02 - CUSTOM-20261002-168
 - **修复/功能**：表单（AskUserQuestion）四条：附加说明改**追加**语义、说明行移进 tooltip、单选可取消选择、多选每项带自己的补充框
 - **改动文件**：`src/ui/chat/html/client/elicitationView.ts`、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（multi 档勾一项让补充框显形）。（文档：`chat-panel.md` §5.33、`dev-workflow.md` 验收 193）

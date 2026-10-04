@@ -102,7 +102,10 @@ const client = {
    * 这一条就是探针要验的东西：agent 送来的 form 长什么样，我们的 fieldsOf 认得多少，
    * 以及我们按 ACP 形状回过去的答案 agent 收不收。
    */
-  async unstable_createElicitation(params) {
+  // [CUSTOM-20261003-175] 方法名必须跟着 SDK 走：1.x 起叫 `createElicitation`
+  //（旧的 `unstable_createElicitation` 已不存在，用旧名字 SDK 不会派发到它 —— 探针会静默地
+  // 一次表单都收不到）。
+  async createElicitation(params) {
     elicitationSeen++;
     console.log('\n  ===== ELICITATION =====');
     console.log('  mode      :', params.mode);
@@ -114,7 +117,9 @@ const client = {
     const fields = fieldsOf(params.requestedSchema);
     console.log('  our fields:', JSON.stringify(fields.map(f => ({
       name: f.name, kind: f.kind, title: f.title, customFor: f.customFor,
-      options: (f.options ?? []).map(o => o.value),
+      // [CUSTOM-20261003-175] 打印每个选项**有没有说明**（2026-10-03 的案子：SDK 的 zod
+      // schema 曾把 option.description 削掉，真机就是靠这一眼看出来的）。
+      options: (f.options ?? []).map(o => o.value + (o.description ? ' [desc ' + o.description.length + '字]' : ' [无 desc]')),
     }))));
 
     if (noAnswer) {

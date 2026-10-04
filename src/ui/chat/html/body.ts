@@ -5,10 +5,20 @@
 // 编辑区面板与编辑器标签同处一列，用侧边栏底色会显得像外部面板；侧边栏视图则必须
 // 保持侧边栏底色。差异全部交给 CSS（`.surface-editor`），标记里只写类名。
 // [CUSTOM-END] CUSTOM-20260925-050
+// [CUSTOM-BEGIN] CUSTOM-20261002-173 - body 带上构建指纹，客户端 boot 会把它报进日志。
+//
+// 为什么放在 HTML 里而不是让客户端自己算：webview 里跑的是**嵌在这个文档里的**那份脚本，
+// 它自己算出来的哈希和宿主一模一样、证明不了任何事。真正要回答的是"这份文档是哪次构建渲染的"
+// —— 也就是**生成它的那个宿主进程**是谁，而这个值正是那个时候由宿主写进去的。
+// 于是日志上「宿主 activate 的指纹」与「客户端 boot 报出的指纹」一对照，
+// 就能区分三种情况：一致=当前构建；客户端是旧值=窗口/webview 是旧的；两者都没有这行=根本没重载。
+// （取值见 utils/BuildInfo.ts；只含 [A-Za-z0-9._+:-]，可直接进属性。）
+// [CUSTOM-END] CUSTOM-20261002-173
 import type { SurfaceKey } from '../ChatSurface';
+import { buildStamp } from '../../../utils/BuildInfo';
 
 export function body(surface: SurfaceKey = 'view'): string {
-  return `<body class="surface-${surface}">
+  return `<body class="surface-${surface}" data-acpc-build="${buildStamp()}">
   <div id="agentBar" class="agent-bar" hidden>
     <select id="agentSelect" class="agent-select" aria-label="Focused agent"></select>
   </div>

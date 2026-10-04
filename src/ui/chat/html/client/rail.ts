@@ -214,6 +214,14 @@ export const railClient = `
 
   /** Position every dot. The only place that reads layout. */
   function measure() {
+    // [CUSTOM-BEGIN] CUSTOM-20261004-180 - 读写分离（长会话里点一次折叠就卡住的真凶）。
+    //
+    // 旧版在**同一个循环里**边读边写：firstLineCentre() 读一次 getBoundingClientRect，
+    // 紧接着写 dot.style.top —— 而任何一次样式写都会让下一次读**强制重排**。于是 n 个标记
+    // = n 次强制布局，几千条的会话里一次折叠要卡好几秒（用户 2026-10-04 报的"长时间卡顿"）。
+    // 现在分两遍：① 只读（容器几何 + 每个节点的一行中心）② 只写（hidden / top / 线）。
+    // 两遍之间没有写 ⇒ 第二遍的写不会让第一遍的读互相失效，全表只付一次重排。
+    // [CUSTOM-END] CUSTOM-20261004-180
     var box = messagesEl.getBoundingClientRect();
     // [CUSTOM-20260926-070] A hidden panel (background editor group, or a webview
     // that has not been revealed) reports height 0 for everything. Measuring here
@@ -222,20 +230,29 @@ export const railClient = `
     // panel really has a size again (that is also how a zero-height hydrate is
     // rescued). Not an rAF loop: nothing schedules a tick while nothing moves.
     if (box.height === 0) { needMeasure = true; return; }
-    points = [];
     // Content coordinates: what the track's translateY(-scrollTop) is relative to.
     var origin = box.top - messagesEl.scrollTop;
+    var containerTop = messagesEl.offsetTop;
+    // ① 读阶段：只读布局，一个样式都不写。
+    var measured = [];
+    var toHide = [];
     for (var i = 0; i < marks.length; i++) {
       var node = NS.transcriptView.node(marks[i].id);
       var dot = marks[i].node;
-      if (!node || !dot) { if (dot) { dot.hidden = true; } continue; }
-      dot.hidden = false;
+      if (!node || !dot) { if (dot) { toHide.push(dot); } continue; }
       var centre = firstLineCentre(node, origin);
-      // The dot element carries the -half-size margin, so 'top' IS its centre.
-      dot.style.top = centre + 'px';
       // 'y' stays the entry's own TOP: syncActive() asks "which entry is the
       // viewport top inside", which is a question about the entry, not its line.
-      points.push({ i: i, y: node.offsetTop - messagesEl.offsetTop, centre: centre });
+      measured.push({ i: i, dot: dot, y: node.offsetTop - containerTop, centre: centre });
+    }
+    // ② 写阶段：批量写回（同一个布局里连着写，不会互相触发重排）。
+    for (var h = 0; h < toHide.length; h++) { toHide[h].hidden = true; }
+    points = [];
+    for (var k = 0; k < measured.length; k++) {
+      measured[k].dot.hidden = false;
+      // The dot element carries the -half-size margin, so 'top' IS its centre.
+      measured[k].dot.style.top = measured[k].centre + 'px';
+      points.push({ i: measured[k].i, y: measured[k].y, centre: measured[k].centre });
     }
     if (points.length === 0) {
       lineEl.hidden = true;

@@ -1,6 +1,8 @@
 import { ClientSideConnection, ndJsonStream, PROTOCOL_VERSION } from '@agentclientprotocol/sdk';
 import type { Agent, InitializeResponse } from '@agentclientprotocol/sdk';
-import type { Stream } from '@agentclientprotocol/sdk/dist/stream.js';
+// [CUSTOM-20261003-175] SDK 1.x 把 `Stream` 收进主入口；原来那句深导入
+// （`@agentclientprotocol/sdk/dist/stream.js`）会被 1.x 的 `exports` 映射挡在门外。
+import type { Stream } from '@agentclientprotocol/sdk';
 import { ChildProcess } from 'node:child_process';
 import { Readable, Writable } from 'node:stream';
 

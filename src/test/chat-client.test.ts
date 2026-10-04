@@ -34,6 +34,14 @@ import { stickyUserClient } from '../ui/chat/html/client/stickyUser';
 import { stateCardClient } from '../ui/chat/html/client/stateCard';
 // [CUSTOM-20260930-132] 面板静态标记：版心的承重结构断言（下面那个 suite）。
 import { body as chatPanelMarkup } from '../ui/chat/html/body';
+// [CUSTOM-20261002-173] 客户端 boot 的日志桥（构建指纹 + 转发配额）。
+import { bootClient } from '../ui/chat/html/client/boot';
+// [CUSTOM-20261003-176] 视口判定的再计算（scroll.reflowNow）。
+import { scrollClient } from '../ui/chat/html/client/scroll';
+// [CUSTOM-20261004-180] 圆点量测的读写分离。
+import { railClient } from '../ui/chat/html/client/rail';
+// [CUSTOM-20261002-173] 宿主侧构建指纹。
+import { buildStamp } from '../utils/BuildInfo';
 
 // --- 最小桩 DOM -------------------------------------------------------------
 // Only what the exercised paths touch. Deliberately NOT a general DOM: a fuller
@@ -1819,6 +1827,10 @@ suite('chat client logic: image chip and pinned question (stub DOM)', () => {
   const TOP_GAP = 3;
   /** 卡片的 2px 描边（border-box）：卡片比它复制的那条记录高这么多。 */
   const CARD_BORDER = 4;
+  /** [CUSTOM-20261004-178] 跳转落点越过判定线的缝（见 stickyUser.ts 的同名常量）。 */
+  const STACK_SEAM = 2;
+  /** [CUSTOM-20261004-181] 卡堆的缝：卡底与它顶住的那条之间留这么多（172 是无缝相接）。 */
+  const CARD_GAP = 8;
 
   function cardsOf(host: StubNode): StubNode[] {
     return host.childNodes.filter((c: StubNode) => c.nodeType === 1);
@@ -2032,7 +2044,8 @@ suite('chat client logic: image chip and pinned question (stub DOM)', () => {
     const pushed = flowOf(host, nodes);
     assert.strictEqual(pushed.length, 1, 'u2 needs no copy yet — it is still the record itself');
     assert.strictEqual(pushed[0].id, 'u1');
-    assert.strictEqual(Math.round(pushed[0].bottom), 30, 'the bottom edge sits exactly on u2\'s top');
+    assert.strictEqual(Math.round(pushed[0].bottom), 30 - CARD_GAP,
+      'the bottom edge stops CARD_GAP above the next question top (181; 172 was flush)');
     assert.strictEqual(cardOf(host, 'u2'), null);
 
     // 继续滚到 u2 越线：两张卡同时在，u2 停在判定线上，u1 只剩一条边。
@@ -2042,8 +2055,12 @@ suite('chat client logic: image chip and pinned question (stub DOM)', () => {
     assert.strictEqual(both[0].id, 'u1', 'the older one is on top');
     assert.strictEqual(both[1].id, 'u2');
     assert.strictEqual(Math.round(both[1].top), TOP_GAP, 'the newest rests on the line');
-    assert.ok(both[0].bottom > 0 && both[0].bottom <= TOP_GAP,
-      'and the older one is down to the last few pixels, never below them');
+    // [CUSTOM-20261004-181] 留缝之后旧卡比 172 更早整条出界（不再是"只留最后几个像素"）——
+    // 这正是"留缝"的应有之义：两条永不相接。
+    assert.strictEqual(Math.round(both[0].bottom), 2 - CARD_GAP,
+      'the older card keeps CARD_GAP away from the newest question (181)');
+    assert.ok(both[0].bottom <= both[1].top - CARD_GAP,
+      'and it never comes closer to the newest card than that gap');
 
     // 再往下滚：u1 整条出界，就此**不再渲染**（它参与过的上夹已经用完）。
     scrollTo(1100);
@@ -2062,7 +2079,8 @@ suite('chat client logic: image chip and pinned question (stub DOM)', () => {
     const pulled = flowOf(host, nodes);
     assert.strictEqual(pulled.length, 1);
     assert.strictEqual(pulled[0].id, 'u1', 'u2 is handed back to the transcript');
-    assert.strictEqual(Math.round(pulled[0].bottom), 30, 'u1\'s bottom == u2\'s top, same as scrolling down');
+    assert.strictEqual(Math.round(pulled[0].bottom), 30 - CARD_GAP,
+      'same gap as scrolling down (181) — pulling back up lands on the same geometry');
 
     scrollTo(900);   // u2 的自然位置 100：旧卡完整回到位
     const settled = flowOf(host, nodes);
@@ -2125,10 +2143,13 @@ suite('chat client logic: image chip and pinned question (stub DOM)', () => {
 
     assert.strictEqual(jumps.length, 1, 'the click jumps back to the original');
     assert.strictEqual(jumps[0].node, NS.transcriptView.node('u1'));
-    // [CUSTOM-20261002-171] 落点是 0：顶边一碰到交接线就交棒，消息**就地接管悬浮条的位置**
-    //（本体让位），既不重叠也不会被挤到下面去。170 那次"让开悬浮条高度"是解反了。
-    assert.strictEqual(jumps[0].clearance, 0,
-      'the jump lands ON the handoff line, so the original takes over that spot');
+    // [CUSTOM-20261004-178] 落点**越过**交接线一点点（TOP_GAP + STACK_SEAM）：被点的这条因此
+    // 落在活动前缀**之外** ⇒ 本体不再让位、真实消息显示在最顶；上方的卡堆按 layout() 的
+    // 上夹公式自己滑出上沿。171 那版落 0（正好压在线上）会让它仍在前缀里 ⇒ 用户看到的
+    // 是克隆体（"定位过去了但显示的还是悬浮样式"，2026-10-04 报的）。
+    assert.strictEqual(jumps[0].clearance, TOP_GAP + STACK_SEAM,
+      'the jump lands just PAST the handoff line, so the real message keeps the floor');
+    assert.ok(jumps[0].clearance! > TOP_GAP, 'that is the whole point: outside the handoff window');
   });
 
   test('the cards mirror the list rendering toggles without losing their entry animation', () => {
@@ -2179,15 +2200,17 @@ suite('chat client logic: image chip and pinned question (stub DOM)', () => {
       'a one-line message has nothing to shrink — and no dead control to offer');
   });
 
-  // [CUSTOM-20261002-170/171] 用户先后报了两件事："两条气泡重叠"与"定位偏下"。两者是同一个数的两面 ——
-  // 落点必须**在交接窗口之内**（0 < TOP_GAP）：消息就地接管悬浮条的位置、本体让位 ⇒ 不重叠也不偏下。
-  test('the jump lands the message on the handoff line, never below or under (170/171)', () => {
-    // 高一点的提问（卡高 = 44 + 4）：170 让悬浮条高度参与过落点计算，171 撤销 —— 不该再影响。
+  // [CUSTOM-20261002-170/171 → 20261004-178] 三次报的都是同一个数的三面：
+  //   170 "两条气泡重叠" ⇒ 落点得让开卡堆；171 "定位偏下" ⇒ 别把**屏幕外**的卡也算进让位量；
+  //   178 "定位过去了但还是悬浮样式" ⇒ 落点要越过交接线，那条才不会被克隆体接管。
+  test('the jump lands just past the handoff line (170/171/178)', () => {
+    // 高一点的提问（卡高 = 60 + 4）：卡高**不该**参与落点（170 的错），也不该让本条被接管。
     const { NS, host, scrollTo, jumps, docListeners } = stickySetup([{ id: 'u1', top: 8, height: 60 }]);
     scrollTo(100);
     dispatchClick(cardOf(host, 'u1') as StubNode, docListeners);
     assert.strictEqual(jumps.length, 1);
-    assert.strictEqual(jumps[0].clearance, 0, 'inside the handoff window, so the original gives way');
+    assert.strictEqual(jumps[0].clearance, TOP_GAP + STACK_SEAM,
+      'past the line ⇒ the original keeps the floor (178); a constant ⇒ no card height involved (171)');
     assert.strictEqual(jumps[0].node, NS.transcriptView.node('u1'));
   });
 
@@ -2198,7 +2221,7 @@ suite('chat client logic: image chip and pinned question (stub DOM)', () => {
     dispatchClick(cardOf(host, 'u1') as StubNode, docListeners);
     assert.strictEqual(jumps.length, 1);
     assert.strictEqual(jumps[0].node, NS.transcriptView.node('u1'), 'the older card, not the newest');
-    assert.strictEqual(jumps[0].clearance, 0);
+    assert.strictEqual(jumps[0].clearance, TOP_GAP + STACK_SEAM);
 
     // 空定位层本身不该吃掉点击（真面板靠 pointer-events: none，这里靠"找不到卡就不跳"）。
     dispatchClick(host, docListeners);
@@ -2241,6 +2264,61 @@ suite('chat client logic: image chip and pinned question (stub DOM)', () => {
     scrollTo(998);
     assert.strictEqual(detailsOpen(host, 'u1'), false, 'coming back to s-1 restores the collapsed card');
     assert.strictEqual(detailsOpen(host, 'u2'), true, 'and its neighbour is still open');
+  });
+
+  // [CUSTOM-20261004-179] 折叠状态只有**一份**（transcriptView 的共用存储）：点卡片 = 记录跟着折，
+  // 点记录 = 卡片跟着折。166/172 定的粒度不变（按会话 + 按条目），只是不再各存一份（pitfall #19）。
+  test('collapsing the CARD folds the message record too (179)', () => {
+    const { host, nodes, scrollTo } = twoFoldedQuestions();
+    scrollTo(998);
+    collapseCard(host, 'u1');
+    const record = nodes['u1'].querySelector('details') as unknown as { open: boolean };
+    assert.strictEqual(record.open, false, '消息面板里那一条跟着折起来（2026-10-04 报的就是这个不一致）');
+    const neighbour = nodes['u2'].querySelector('details') as unknown as { open: boolean };
+    assert.strictEqual(neighbour.open, true, '旁边那条不受牵连');
+  });
+
+  test('folding the RECORD folds its card too (179)', () => {
+    const { host, nodes, scrollTo } = twoFoldedQuestions();
+    scrollTo(998);
+    const record = nodes['u1'].querySelector('details') as unknown as { open: boolean; dispatch: (t: string) => void };
+    record.open = false;
+    record.dispatch('toggle');
+    assert.strictEqual(detailsOpen(host, 'u1'), false, '卡片跟着折（toggle 不冒泡，监听是逐节点挂的）');
+  });
+
+  test('a rebuilt record comes back collapsed — the state survives hydration (179)', () => {
+    const { NS, host, scrollTo } = twoFoldedQuestions();
+    scrollTo(998);
+    collapseCard(host, 'u1');
+    // 重建走的就是这条路径（切会话回来 / 重开面板都是 hydrate）。
+    NS.transcriptView.hydrate({
+      sessionId: 's-1',
+      entries: [
+        { id: 'u1', kind: 'user', at: 1, text: 'q '.repeat(120) },
+        { id: 'u2', kind: 'user', at: 2, text: 'q '.repeat(120) },
+      ],
+    });
+    const rebuilt = NS.transcriptView.node('u1').querySelector('details') as unknown as { open: boolean };
+    assert.strictEqual(rebuilt.open, false, '重建后仍然折着（以前是写死的 open=true，会弹回展开）');
+  });
+
+  test('the fold state is per session: it does not leak across sessions (179)', () => {
+    const { NS, host, scrollTo } = twoFoldedQuestions();
+    scrollTo(998);
+    collapseCard(host, 'u1');
+    assert.strictEqual(detailsOpen(host, 'u1'), false);
+
+    // 换会话（boot 的做法：setSession → 重建）。
+    NS.stickyUser.setSession('s-2');
+    NS.transcriptView.hydrate({ sessionId: 's-2', entries: [{ id: 'u1', kind: 'user', at: 1, text: 'q '.repeat(120) }] });
+    const other = NS.transcriptView.node('u1').querySelector('details') as unknown as { open: boolean };
+    assert.strictEqual(other.open, true, 's-2 里的 u1 是展开的 —— 状态没有串会话');
+
+    NS.stickyUser.setSession('s-1');
+    NS.transcriptView.hydrate({ sessionId: 's-1', entries: [{ id: 'u1', kind: 'user', at: 1, text: 'q '.repeat(120) }] });
+    const back = NS.transcriptView.node('u1').querySelector('details') as unknown as { open: boolean };
+    assert.strictEqual(back.open, false, '切回 s-1 仍然是折的');
   });
 
   // 没排布的帧（面板隐藏）什么都不做：否则会把一屏 0 高的卡"量"进缓存，之后所有位置都是错的。
@@ -2504,6 +2582,28 @@ suite('chat client logic: form record + drawer (stub DOM, CUSTOM-20260929-119/20
     assert.deepStrictEqual(posted, [], 'Escape must never send cancel — that aborts the tool call');
   });
 
+  // [CUSTOM-20261003-177] 收起态保留**完整 tab 条**（用户要求：收起后仍要看得到每一题的标题
+  // 与圆点状态，而不是只显示当前那一题）。收起只藏正文与操作栏；点任一 tab 会展开到那一题。
+  // （"tab 条真的可见"是 CSS 的事，桩 DOM 量不到 —— 那半由预览探针的 tabsDisplay/panesDisplay 钉住。）
+  test('a collapsed drawer keeps every tab, and clicking one expands to it (177)', () => {
+    const { NS, drawer, docListeners } = mount([TWO, SINGLE]);
+    NS.elicitationView.setCollapsed(true);
+    assert.ok(drawer.className.includes('collapsed'), '先确实收起了');
+
+    const tabs = drawer.querySelectorAll('.elic-tab');
+    assert.ok(tabs.length > 1, '这个夹具不止一题');
+    for (const tab of tabs) {
+      assert.ok(tab.querySelector('.elic-tab-dot'), '每一题都带圆点（已答/未答的状态）');
+      assert.ok(String(tab.querySelector('.elic-tab-text')!.textContent || '').length > 0,
+        '以及标题 —— 收起后要能看出还有哪几题');
+    }
+
+    dispatchClick(tabs[1], docListeners);
+    assert.ok(!drawer.className.includes('collapsed'), '收起态点 tab 应当展开（否则点了像没反应）');
+    const panes = drawer.querySelectorAll('.elic-field');
+    assert.strictEqual(panes[1].hidden, false, '并且停在点的那一题');
+  });
+
   test('a settled form is history: no controls, and a click cannot answer it again', () => {
     const { NS, drawer, messages, posted } = mount();
     // The host settles a form by revising the entry — the very path boot handles.
@@ -2596,17 +2696,32 @@ suite('chat client logic: form record + drawer (stub DOM, CUSTOM-20260929-119/20
       'only the option that was annotated is merged');
   });
 
-  test('clicking the picked row again clears it, and Submit still works (168)', () => {
+  // [CUSTOM-20261003-174] 单选回归**原生 radio 交互**：再点一次已选中的行**不取消**。
+  // 168 曾加过"再点一次取消"（当时那是唯一的清除入口）；174 起清除只走底部的 `Clear answer` ——
+  // 一个按钮做这件事比"再点同一行"可预期得多，也不再让"手抖点两下"静默丢掉选择。
+  test('a second click on the picked row keeps it picked (native radio, 174)', () => {
     const { drawer, posted, docListeners } = mount();
     const radio = inputsNamed(drawer, 'question_0')[0];
     pickRow(drawer.querySelectorAll('.elic-option-row')[0]);
     assert.strictEqual((radio as unknown as { checked: boolean }).checked, true, 'picked');
 
     // A second click on the same row: the browser sets checked first, then dispatches click.
+    // 这正是 168 那条判据依赖的时序 —— 现在它必须**什么都不做**。
     dispatchBubbling(radio, 'click');
-    assert.strictEqual((radio as unknown as { checked: boolean }).checked, false, 'the pick is cleared');
-    assert.match(drawer.querySelector('.elic-progress')!.textContent!, /Answered 0\/1/);
+    assert.strictEqual((radio as unknown as { checked: boolean }).checked, true,
+      '再点一次必须保持选中（原生 radio 行为）');
+    assert.match(drawer.querySelector('.elic-progress')!.textContent!, /Answered 1\/1/);
 
+    dispatchClick(drawer.querySelector('.elic-submit')!, docListeners);
+    assert.strictEqual(posted.length, 1);
+    assert.deepStrictEqual((posted[0] as { content?: unknown }).content,
+      { question_0: 'Astro 官方模板' }, '提交的是那个仍然选中的选项');
+  });
+
+  // 未答不阻塞提交（adapter 的 schema 什么都不 required，空 content 也接受 —— 已实测）：
+  // 174 之后"未答"就是**根本不点**，不再需要"先点再取消"那条路。
+  test('an unanswered question does not block Submit (174)', () => {
+    const { drawer, posted, docListeners } = mount();
     dispatchClick(drawer.querySelector('.elic-submit')!, docListeners);
     assert.strictEqual(posted.length, 1, 'an unanswered question does not block Submit');
     assert.deepStrictEqual((posted[0] as { content?: unknown }).content, {});
@@ -3145,5 +3260,275 @@ suite('chat panel markup: 底部栏与消息列的承重结构 (stub markup, CUS
 
     assert.ok(!markup.includes('class="input-row"'),
       '.input-row 这层已删：它唯一的子节点就是 textarea，留下的 flex:1 在新父级里含义完全不同');
+  });
+});
+
+// [CUSTOM-20261002-173] 构建指纹：**让日志自己说清"这个窗口跑的是哪份代码"**。
+//
+// 为什么需要这三条断言：2026-10-02 排查「表单的选项说明丢了」时，两边都证明过代码是对的
+// （报文里带 description、当前客户端确实画灰字第二行），可用户窗口里就是没有；而日志里
+// **没有任何**能区分"这份代码有没有这段渲染"的信息 —— 宿主只报了一个版本号字符串，
+// 客户端一个字节都没报。结论只能是"要么窗口跑的是旧的，要么我漏了什么"，无法收敛。
+// 现在宿主 activate 报一次指纹、文档带一次、客户端 boot 再报一次，三者对照即可判定。
+suite('build fingerprint: 宿主 / 标记 / 客户端三处自报身份 (CUSTOM-20261002-173)', () => {
+  /** 一屏日志里应当一眼看出这是构建指纹：v 版本 · … · 哈希(字节数)。 */
+  const looksLikeStamp = (text: string): boolean =>
+    /^v\S+·.*[0-9a-f]{12}\(\d+B\)$/.test(text);
+
+  test('buildStamp() 稳定、非空、只含属性安全字符', () => {
+    const first = buildStamp();
+    assert.strictEqual(first, buildStamp(), '同一次运行里必须稳定（算一次缓存）');
+    assert.ok(looksLikeStamp(first), `指纹形状应为 "v版本·…·哈希(字节)"，实际 ${first}`);
+    assert.ok(/^[A-Za-z0-9._+:()·-]+$/.test(first),
+      `指纹要能直接进 HTML 属性与日志，不该含引号/空格，实际 ${first}`);
+  });
+
+  test('<body> 带 data-acpc-build，值与 buildStamp() 一致', () => {
+    const markup = chatPanelMarkup('view');
+    const found = /<body[^>]*data-acpc-build="([^"]*)"/.exec(markup);
+    assert.ok(found, 'body 标记里必须有 data-acpc-build —— 客户端那条自报身份的日志全靠它');
+    // 「哪个面」那个 class 还在（别在加属性时把 surface 挤掉）。
+    assert.ok(/<body class="surface-view"[^>]*data-acpc-build=/.test(markup));
+    assert.strictEqual(found[1], buildStamp());
+  });
+
+  test('客户端 boot 第一条日志报出该指纹；转发配额是滚动窗口而非终身上限', () => {
+    const posted: Array<Record<string, any>> = [];
+    const g = globalThis as Record<string, any>;
+    const hadAcquire = Object.prototype.hasOwnProperty.call(g, 'acquireVsCodeApi');
+    const realNow = Date.now;
+    let clock = 1_000_000;
+    g.acquireVsCodeApi = () => ({ postMessage: (m: Record<string, any>) => { posted.push(m); } });
+    (Date as any).now = () => clock;
+    try {
+      // 驱动 `forward` 走**客户端自己注册的 error 监听**，而不是去调全局 console.warn：
+      // 后者要求"客户端打的那个补丁正好安在测试用的这个 console 对象上"，而扩展宿主的
+      // console 与裸 node 未必是同一个对象 —— 实测在宿主里就一条都抓不到（白掉一次）。
+      const listeners: Record<string, (e: any) => void> = {};
+      const bodyEl = new StubNode('body');
+      bodyEl.setAttribute('data-acpc-build', 'v9.9.9·abc1234·2020-01-01T00:00:00.000Z·deadbeefcafe(1B)');
+      const doc: Record<string, unknown> = {
+        // 'loading' ⇒ boot 的 init() 不跑：本套件只测日志桥这一条链路。
+        readyState: 'loading',
+        body: bodyEl,
+        addEventListener: () => {}, removeEventListener: () => {},
+        getElementById: () => null,
+      };
+      const win: Record<string, any> = {
+        __acpc: {},
+        addEventListener: (type: string, fn: (e: any) => void) => { listeners[type] = fn; },
+        setTimeout: () => 0,
+      };
+      new Function('window', 'document', bootClient)(win, doc);
+
+      assert.strictEqual(posted.length, 1, 'boot 只该先报这一条');
+      assert.strictEqual(posted[0].type, 'clientLog');
+      assert.strictEqual(posted[0].level, 'info');
+      assert.ok(String(posted[0].message).includes('abc1234'),
+        `客户端必须把自己拿到的构建指纹报出来，实际 ${posted[0].message}`);
+
+      const boom = (text: string) => listeners.error({ message: text, lineno: 1 });
+
+      // 突发噪声：一个窗口内超出配额的部分被丢掉（挡洪水）。
+      for (let i = 0; i < 100; i++) { boom('flood ' + i); }
+      const floods = posted.filter(m => String(m.message).includes('flood')).length;
+      assert.ok(floods > 0 && floods <= 30, `一个窗口内最多 30 条，实际 ${floods}`);
+
+      // 窗口滑过之后必须能继续上报 —— 这条正是"终身 50 条"与"滚动窗口"的分水岭：
+      // 旧实现里那个长命 webview（用户的窗口开了一整天）会被永久静音，诊断再也不落盘。
+      clock += 11_000;
+      boom('after window');
+      assert.ok(posted.some(m => String(m.message).includes('after window')),
+        '窗口滑过之后必须恢复上报，否则诊断会被"用满一次就永久哑掉"的老毛病挡住');
+
+      // 读不到数据属性时只报 unknown，绝不抛（日志桥不能把 UI 拖下水）。
+      const posted2: Array<Record<string, any>> = [];
+      g.acquireVsCodeApi = () => ({ postMessage: (m: Record<string, any>) => { posted2.push(m); } });
+      const win2: Record<string, any> = { __acpc: {}, addEventListener: () => {}, setTimeout: () => 0 };
+      new Function('window', 'document', bootClient)(win2, { ...doc, body: new StubNode('body') });
+      assert.ok(String(posted2[0].message).includes('unknown'), '没有属性时报 unknown 而不是宕掉');
+    } finally {
+      (Date as any).now = realNow;
+      if (hadAcquire) { g.acquireVsCodeApi = () => ({ postMessage: () => {} }); }
+      else { delete g.acquireVsCodeApi; }
+    }
+  });
+});
+
+// [CUSTOM-20261003-176] 视口判定只在 scroll 事件里更新 —— 而**内容高度或底部留白**
+// （输入卡 / 表单抽屉 / 权限抽屉都进 #messages 的 padding-bottom）变化时浏览器**不会**派发
+// scroll 事件。用户 2026-10-03 报的"消息面板没到底（Jump 还在）、滚动条却已触底、鼠标滚不动"
+// 就是这一族：贴底的人被长高的浮层挤到后面，视口判定却停在旧值。修法是写入方喊一声 reflowNow()。
+suite('scroll: 几何（内容 / 留白）变化后视口判定要重算 (CUSTOM-20261003-176)', () => {
+  function mountScroll(paddingBottom = '0px'): { NS: any; el: any; jump: any } {
+    const NS: Record<string, any> = {};
+    const listeners: Record<string, Array<() => void>> = {};
+    const el: Record<string, any> = {
+      scrollTop: 0,
+      scrollHeight: 1000,
+      clientHeight: 400,
+      addEventListener: (type: string, fn: () => void) => {
+        (listeners[type] = listeners[type] ?? []).push(fn);
+      },
+      fire: (type: string) => { for (const fn of listeners[type] ?? []) { fn(); } },
+    };
+    const jump: Record<string, any> = { hidden: true, addEventListener: () => {} };
+    const win: Record<string, any> = {
+      __acpc: NS,
+      getComputedStyle: () => ({ paddingBottom }),
+      setTimeout: () => 0,
+      addEventListener: () => {},
+    };
+    new Function('window', 'document', scrollClient)(win, {});
+    NS.scroll.init(el, jump);
+    return { NS, el, jump };
+  }
+
+  test('padding 算进"内容末尾"：贴着留白区仍然算贴底，但翻出去就不算', () => {
+    const { NS, el, jump } = mountScroll('300px');
+    el.scrollTop = 600;                       // max = 1000 - 400
+    el.fire('scroll');
+    assert.strictEqual(NS.scroll.isPinned(), true, '到底 = 内容末尾进入视口');
+    el.scrollTop = 500;                       // distance = 1000-300-500-400 = -200，仍在留白区内
+    el.fire('scroll');
+    assert.strictEqual(NS.scroll.isPinned(), true, '留白不是内容，它不该把"到底"判成"没到底"');
+    el.scrollTop = 100;                       // distance = 100 ≥ 阈值 ⇒ 真的在看历史
+    el.fire('scroll');
+    assert.strictEqual(NS.scroll.isPinned(), false);
+    assert.strictEqual(jump.hidden, false, '这时才该出现 Jump');
+  });
+
+  test('贴底时 reflowNow() 跟着长高的（留白/内容）走 —— 这正是"内容被浮层盖住"的消失条件', () => {
+    const { NS, el, jump } = mountScroll();
+    el.scrollTop = 600;
+    el.fire('scroll');
+    assert.strictEqual(NS.scroll.isPinned(), true, '先贴底');
+
+    el.scrollHeight = 1400;                   // 抽屉/输入卡长高 400px：浏览器**不会**派发 scroll
+    NS.scroll.reflowNow();
+    assert.strictEqual(el.scrollTop, 1400, '贴底的人应当被带到底部，而不是停在半空');
+    assert.strictEqual(NS.scroll.isPinned(), true);
+    assert.strictEqual(jump.hidden, true);
+  });
+
+  test('没贴底时 reflowNow() 绝不抢视口，只把 Jump 状态刷新', () => {
+    const { NS, el, jump } = mountScroll();
+    el.scrollTop = 0;
+    el.fire('scroll');
+    assert.strictEqual(NS.scroll.isPinned(), false, '在顶端看历史');
+    assert.strictEqual(jump.hidden, false);
+
+    el.scrollHeight = 1400;
+    NS.scroll.reflowNow();
+    assert.strictEqual(el.scrollTop, 0, '上翻看历史的人不该被拽走');
+    assert.strictEqual(jump.hidden, false, '而且 Jump 仍然在');
+
+    el.scrollHeight = 350;                    // 内容缩到装得下：连滚动都不需要了
+    NS.scroll.reflowNow();
+    assert.strictEqual(NS.scroll.isPinned(), true, '不再需要滚动 ⇒ 判定为贴底');
+    assert.strictEqual(jump.hidden, true, '这时 Jump 必须自己消失（旧实现会一直挂着）');
+  });
+});
+
+// [CUSTOM-20261004-180] rail.measure() 的**读写分离**。
+//
+// 旧版在同一个循环里读一次 getBoundingClientRect、紧接着写一次 dot.style.top —— 每一次样式写都
+// 会让下一次布局读**强制重排**，于是 n 个标记 = n 次强制布局（长会话里点一次折叠就卡好几秒，
+// 用户 2026-10-04 报的）。修法是分两遍：① 只读 ② 只写。
+//
+// 桩里量不了"重排"本身，但**量得了读写的时间线**：把每个节点的几何读取与每次样式写入都记进一条
+// ops 时间线，然后数 "读→写→读" 的来回次数。旧版那是 O(标记数)，新版必须是常数级。
+suite('rail: 量测读写分离 (CUSTOM-20261004-180)', () => {
+  function mountRail(markCount: number): { NS: Record<string, any>; ops: string[] } {
+    const ops: string[] = [];
+    const read = (what: string): void => { ops.push('r:' + what); };
+    const write = (what: string): void => { ops.push('w:' + what); };
+
+    function styleStub(): Record<string, unknown> {
+      const st: Record<string, unknown> = {};
+      for (const prop of ['top', 'left', 'height', 'transform']) {
+        Object.defineProperty(st, prop, {
+          configurable: true,
+          get: () => '',
+          set: () => { write('style'); },
+        });
+      }
+      return st;
+    }
+
+    function geoNode(className: string): Record<string, any> {
+      const attrs: Record<string, string> = {};
+      const node: Record<string, any> = {
+        nodeType: 1, className, style: styleStub(), childNodes: [] as unknown[],
+        textContent: '', tabIndex: -1, title: '',
+        addEventListener: () => {}, removeEventListener: () => {},
+        appendChild: (c: unknown) => { node.childNodes.push(c); return c; },
+        // rebuild 在圆点上写 data-rail-index / title —— 少了 setAttribute 就会在**第一个**圆点上
+        // 抛错（被 dom.schedule 的 try/catch 吞掉），表现成"探针里一个读都没有"。
+        setAttribute: (k: string, v: string) => { attrs[k] = String(v); },
+        getAttribute: (k: string) => (k in attrs ? attrs[k] : null),
+        removeAttribute: (k: string) => { delete attrs[k]; },
+        querySelector: () => null, querySelectorAll: () => [] as unknown[],
+        getBoundingClientRect: () => { read('rect'); return { top: 0, bottom: 0, height: 20 }; },
+      };
+      Object.defineProperty(node, 'offsetTop', { configurable: true, get: () => { read('top'); return 100; } });
+      Object.defineProperty(node, 'offsetHeight', { configurable: true, get: () => { read('height'); return 30; } });
+      Object.defineProperty(node, 'hidden', { configurable: true, get: () => false, set: () => { write('hidden'); } });
+      Object.defineProperty(node, 'classList', {
+        configurable: true,
+        get: () => ({ add: () => { write('class'); }, remove: () => { write('class'); }, toggle: () => { write('class'); }, contains: () => false }),
+      });
+      return node;
+    }
+
+    const ids: string[] = [];
+    const entries: Record<string, any> = {};
+    const nodes: Record<string, any> = {};
+    for (let i = 0; i < markCount; i++) {
+      const id = 'e' + i;
+      ids.push(id);
+      entries[id] = { id, kind: i % 2 === 0 ? 'user' : 'assistant', text: 'line ' + i, at: i };
+      nodes[id] = geoNode('entry');
+    }
+    const messages = geoNode('messages');
+    messages.scrollTop = 0;
+    const rail = geoNode('rail');
+    const track = geoNode('rail-track');
+
+    const NS: Record<string, any> = { dom: {}, transcriptView: {} };
+    const win: Record<string, any> = {
+      __acpc: NS,
+      requestAnimationFrame: (fn: () => void) => { fn(); return 0; },
+      setTimeout: () => 0, addEventListener: () => {}, getComputedStyle: () => ({ paddingBottom: '0px' }),
+    };
+    const doc: Record<string, any> = { createElement: () => geoNode('x'), addEventListener: () => {} };
+    new Function('window', 'document', domClient)(win, doc);
+    new Function('window', 'document', railClient)(win, doc);
+    NS.transcriptView = {
+      ordered: () => ids,
+      entry: (id: string) => entries[id],
+      node: (id: string) => nodes[id],
+      resolvePendingFolds: () => {},
+    };
+    NS.rail.init(messages, rail, track);
+    return { NS, ops };
+  }
+
+  test('一次全量量测里，"写之后再读"只出现常数次（旧版是 O(标记数)）', () => {
+    const { NS, ops } = mountRail(24);
+    ops.length = 0;
+    NS.rail.invalidate();      // rebuild + measure（桩的 rAF 是同步的）
+    // 数 "写→读" 的来回：旧版每个标记都要付一次。
+    let flips = 0;
+    let sawWrite = false;
+    for (const op of ops) {
+      if (op.startsWith('w:')) { sawWrite = true; continue; }
+      if (sawWrite && op.startsWith('r:')) { flips += 1; sawWrite = false; }
+    }
+    assert.ok(ops.filter(o => o.startsWith('r:')).length > 0, '这一轮确实读了几何');
+    assert.ok(ops.filter(o => o.startsWith('w:')).length > 0, '也确实写了圆点位置');
+    assert.ok(flips <= 4,
+      `一次量测里"写后再读"应当只剩常数次（收尾的 applyScroll/syncActive 那几下），实际 ${flips} 次 —— ` +
+      '退回边读边写时它会随标记数增长（24 个标记 ≈ 24 次强制重排）');
   });
 });
