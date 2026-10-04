@@ -98,6 +98,37 @@ export const stickyUserClient = `
   // 「记录高 + 4」估高 —— 误差只落在屏幕外，见 heightOf。
   var CARD_BORDER = 4;
 
+  // [CUSTOM-BEGIN] CUSTOM-20261004-178 - 点卡片跳转的落点缝。
+  //
+  // 用户 2026-10-04 报："点悬浮面板定位后，已经定位到那条消息了，但显示的还是悬浮样式"。
+  // 根因：落点用 clearance 0（171 按"消息就地接管悬浮条的位置"定的），于是被点的那条
+  // natural ≈ 0 < TOP_GAP —— 它**仍在活动前缀里**，于是本体被隐藏（.sticky-source）、
+  // 由克隆体站在原位 ⇒ 看到的就是悬浮样式。
+  //
+  // 修法只需把落点推过判定线一点点：让被点的那条成为**前缀之后的第一个**（found.follow）。
+  // 好处是上方卡堆会**按既有公式自己让开** —— layout() 里
+  //     top_i = min(TOP_GAP, natural_{i+1} - h_i)
+  // 而 natural_{i+1} 现在就是这条的 natural（很小）⇒ 上面每张卡都被推到负 y、被 host 的
+  // overflow:hidden 裁掉 ⇒ "卡堆让开、真实消息显示在顶上"。**不需要额外的抑制态**。
+  // 那 2px 是缝：卡片高由 offsetHeight 量、natural 由 offsetTop 算，两者在亚像素上可能差一点，
+  // 加上卡片 2px 描边的沉降。宁可多 2px，也不要让落点擦着判定线（擦线就会翻回"克隆体接管"）。
+  var STACK_SEAM = 2;
+  // [CUSTOM-END] CUSTOM-20261004-178
+
+  // [CUSTOM-BEGIN] CUSTOM-20261004-181 - 卡堆的缝。
+  //
+  // 用户 2026-10-04 报："置顶对话框这个间隔太近了、叠到了一起，间隔改大一些"。
+  // 172 定的是**严丝合缝**（上夹公式 top = next.natural - h ⇒ 卡的底边正好压在下一条的顶边上，
+  // 探针里那个 contact:true 就是这个语义）。当时是为了"推挤"看着连续，但真用起来两条紧贴
+  // 在一起像一条，分不清是两张卡。
+  // 现在在**上夹里再减一个缝**：卡底与"它顶住的那条"之间留 CARD_GAP 像素。三种情形一起受益 ——
+  //   · 卡与卡之间（前一张的底 vs 后一张的顶）
+  //   · 最后一张卡的底 vs 它顶住的那条用户消息的顶
+  //   · 被顶出上沿的过程中同样是"离 GAP 更早就开始被推"
+  // 它只改**上夹**这一处：TOP_GAP（判定线/交接窗）不动 —— 那是另一件事（什么时候接管）。
+  var CARD_GAP = 8;
+  // [CUSTOM-END] CUSTOM-20261004-181
+
   // [CUSTOM-20261002-172] 被顶出上沿的卡再多留这么多像素才卸载。它纯粹是**避免抖动**：用户
   // 停在交界线上微抖时，卸载/重建会让每帧都克隆一次 markdown 气泡（这面板最贵的事）。
   // 它不改变画面：留着的那张整条都在 y<0，照样被 overflow:hidden 裁着。
@@ -108,17 +139,24 @@ export const stickyUserClient = `
   // [CUSTOM-20261002-172] 每张卡：entryId -> { id, el, bodyEl, sig, h, measured }
   // 元素**缓存**：滚动每帧只改 marginTop；只有内容真的变了（sig）才重建克隆体。
   var cards = {};
+  // [CUSTOM-20261004-178] sync() 最近一次排布出来的**可见**卡（stackInfo 读数用）。
+  var lastPlaced = [];
   var marked = [];         // 当前带 .sticky-source 的本体节点（集合式 diff，每帧幂等重贴）
   var lastRight = -1;      // [CUSTOM-20260928-105] last value written to host.style.right
   var sessionId = null;
-  // [CUSTOM-20261002-172] 收缩状态：sessionId -> { entryId: true }。166 起它按会话记
-  // （原先模块级布尔会串会话）；卡堆之后还要再按**卡**分（用户拍板：点哪张收哪张）——
-  // 判据就是坑点 #38 的那句"用户说每个 X 自己保持，代码里就该出现 byX"。
-  var collapsedBySession = {};
   var syncQueued = false;
 
-  /** User entries in transcript order (the same accessor the outline uses). */
+  /**
+   * User entries in transcript order (the same accessor the outline uses).
+   *
+   * [CUSTOM-20261004-180] **按内容版本缓存**：这里每一帧（滚动）与每次折叠都会被调一次，
+   * 而它原来每次都走一遍 ordered() 全表 + 逐条 entry()。转录内容只在 place()/reset() 变化，
+   * 那两个地方会自增 transcriptView 的 version()（见那边的注释）。
+   */
+  var userListCache = { version: -1, list: [] };
   function userEntries() {
+    var v = (NS.transcriptView.version && NS.transcriptView.version()) || 0;
+    if (userListCache.version === v) { return userListCache.list; }
     var out = [];
     if (!NS.transcriptView.ordered) { return out; }
     var ids = NS.transcriptView.ordered();
@@ -126,6 +164,7 @@ export const stickyUserClient = `
       var entry = NS.transcriptView.entry(ids[i]);
       if (entry && entry.kind === 'user') { out.push(entry); }
     }
+    userListCache = { version: v, list: out };
     return out;
   }
 
@@ -176,7 +215,9 @@ export const stickyUserClient = `
       var next = (i + 1 < items.length) ? items[i + 1].natural : found.follow;
       var top = TOP_GAP;
       if (next !== null) {
-        var upper = next - h;
+        // [CUSTOM-20261004-181] 上夹再让出 CARD_GAP：卡底与它顶住的"下一条"之间留一条缝
+        //（172 是无缝相接，用户用下来觉得"叠到了一起"）。
+        var upper = next - h - CARD_GAP;
         if (upper < top) { top = upper; }
       }
       placed.push({ id: items[i].id, node: items[i].node, h: h, top: top });
@@ -252,9 +293,16 @@ export const stickyUserClient = `
     return (node && node.querySelector && node.querySelector('.fold-body')) ? 'fold' : 'plain';
   }
 
+  /**
+   * [CUSTOM-20261004-179] 折叠状态**不再自己存** —— 它搬到了记录层（transcriptView 的
+   * 共用存储），因为用户要的是"卡片与消息保持一致"，而两份副本必然会漂（pitfall #19）。
+   * 这里只问那一个真相。
+   */
   function collapsedFor(entryId) {
-    var bySession = sessionId ? collapsedBySession[sessionId] : null;
-    return !!(bySession && bySession[entryId]);
+    if (NS.transcriptView && NS.transcriptView.userCollapsed) {
+      return NS.transcriptView.userCollapsed(entryId);
+    }
+    return false;
   }
 
   /** [CUSTOM-20261002-171] 折叠状态同步到**这张卡自己的** <details> 与三角的 tip。 */
@@ -267,11 +315,13 @@ export const stickyUserClient = `
     if (det && det.open === collapsed) { det.open = !collapsed; }
   }
 
-  function setCollapsed(card, on) {
-    if (sessionId) {
-      var bySession = collapsedBySession[sessionId] || (collapsedBySession[sessionId] = {});
-      bySession[card.id] = !!on;
-    }
+  /**
+   * [CUSTOM-20261004-179] 折叠状态变了（可能来自本卡，也可能是记录那边改的）：把这张卡的开合
+   * 与高度缓存对齐。写状态的活由 transcriptView 的共用存储干 —— 这里只负责**跟上**。
+   */
+  function onFoldChanged(entryId) {
+    var card = cards[entryId];
+    if (!card) { return; }
     // 这张卡的高度变了（收成一行）：作废缓存的高度，下一帧重量、重排。
     card.measured = false;
     card.h = 0;
@@ -292,7 +342,17 @@ export const stickyUserClient = `
     var record = { id: item.id, el: card, bodyEl: bodyEl, sig: signatureOf(item.node), h: 0, measured: false };
     if (copyDetails) {
       copyDetails.open = !collapsedFor(item.id);
-      copyDetails.addEventListener('toggle', function () { setCollapsed(record, !copyDetails.open); });
+      // [CUSTOM-20261004-179] 点卡片三角 = 写共用存储 ⇒ 记录那边也会跟着折（用户要的双向一致）。
+      copyDetails.addEventListener('toggle', function () {
+        record.measured = false;
+        record.h = 0;
+        if (NS.transcriptView && NS.transcriptView.setUserCollapsed) {
+          NS.transcriptView.setUserCollapsed(record.id, !copyDetails.open);
+        } else {
+          applyToggle(record);
+          scheduleSync();
+        }
+      });
     }
     bodyEl.appendChild(copy);
     card.setAttribute('data-sticky-id', item.id);
@@ -424,6 +484,7 @@ export const stickyUserClient = `
       placed = visible(layout(found));
       mount(placed);
     }
+    lastPlaced = placed;
     place(placed);
     markSources(placed);
     if (host.hidden !== (placed.length === 0)) { host.hidden = placed.length === 0; }
@@ -466,6 +527,28 @@ export const stickyUserClient = `
    */
   function setSession(id) {
     sessionId = id || null;
+    // [CUSTOM-20261004-179] 折叠状态存在记录层、按会话分桶；焦点变化是这个面板唯一的咽喉点
+    // （boot.applyFocus 调这里），所以顺手把会话同步过去 —— 少一个会漂的调用点（pitfall #19）。
+    if (NS.transcriptView && NS.transcriptView.setFoldSession) {
+      NS.transcriptView.setFoldSession(sessionId);
+    }
+  }
+
+  /**
+   * [CUSTOM-20261004-178] 可见卡堆此刻占的**区间**（视口坐标，top/bottom）。给探针读数用，
+   * 也是"落点有没有被卡堆盖住"这件事唯一该问的量 —— 170 当年问的是 host.offsetHeight，
+   * 那个含屏幕外的卡，问错了对象。
+   */
+  function stackInfo() {
+    var top = null;
+    var bottom = null;
+    for (var i = 0; i < lastPlaced.length; i++) {
+      var t = lastPlaced[i].top;
+      var b = t + lastPlaced[i].h;
+      if (top === null || t < top) { top = t; }
+      if (bottom === null || b > bottom) { bottom = b; }
+    }
+    return { top: top, bottom: bottom, cards: lastPlaced.length };
   }
 
   function detach(el) {
@@ -507,21 +590,26 @@ export const stickyUserClient = `
       var card = event.target && event.target.closest ? event.target.closest('.sticky-card') : null;
       var id = card ? card.getAttribute('data-sticky-id') : null;
       var node = id ? NS.transcriptView.node(id) : null;
-      // [CUSTOM-20261002-170] 落点要让开**悬浮条自己的高度**（+ 一点缝）：
-      // 原先是 TOP_GAP+1（4px），而悬浮条高 124px 上下 ⇒ 跳过去的消息正好被它盖住，
-      // 用户看到的就是"界面里的和悬浮的两条对话重叠"（真浏览器探针量到 overlap:true）。
-      // 让位量**量出来的**，不是猜的：隐藏时 offsetHeight 为 0，退化成一个小缝，同样成立。
-      // [CUSTOM-20261002-171] 落点回到**交接窗口之内**（0 < TOP_GAP）：顶边一碰到那条线就交棒，
-      // 消息**就地接管悬浮条的位置**（用户预期："定位在悬浮框的位置"），本体同时让位
-      // （visibility:hidden）⇒ 既不重叠、也不会像 170 那样被挤到下面去。
-      // 170 的"让开悬浮条自身高度"把问题解反了：那让开的是**别的东西占着的位置**。
-      if (node) { NS.scroll.jumpTo(node, 0); }
+      // 落点演化（三次都记下来，免得再绕回去）：
+      // [170] clearance = 悬浮条自身高度 + TOP_GAP + 2 ⇒ 消息落在条**下面**、不重叠；但它量的
+      //   是 host.offsetHeight —— host 是 absolute 覆盖层、高度含**已被顶出屏幕**的那些卡
+      //   ⇒ 上方卡一多就把消息推到很下面（用户报"定位偏下"）。
+      // [171] clearance = 0 ⇒ 消息就地接管悬浮条的位置；代价是那条**仍在活动前缀里** ⇒
+      //   本体隐藏、克隆体站原位 ⇒ 用户看到的仍是悬浮样式（2026-10-04 报的这条）。
+      // [178] clearance = TOP_GAP + STACK_SEAM ⇒ 推过判定线一点点：这条成为 found.follow，
+      //   本体**不再被接管**（真实消息显示在最顶），而上方的卡堆按 layout() 的
+      //   top = min(TOP_GAP, next.natural - h) 自己滑出上沿（= 用户要的"让开"）。
+      if (node) { NS.scroll.jumpTo(node, TOP_GAP + STACK_SEAM); }
     });
   }
 
   NS.stickyUser = {
     init: init, sync: sync, schedule: scheduleSync, reset: reset, refresh: refresh,
     setSession: setSession,
+    // [CUSTOM-20261004-178] 可见卡堆的区间（探针与"落点有没有被盖住"的判据）。
+    stackInfo: stackInfo,
+    // [CUSTOM-20261004-179] 折叠状态由记录层统一管；它变了就叫这里一声（见 onFoldChanged）。
+    onFoldChanged: onFoldChanged,
   };
 })(window.__acpc = window.__acpc || {});
 `;

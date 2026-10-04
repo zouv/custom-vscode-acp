@@ -23,13 +23,22 @@ import type {
   InitializeResponse,
   ContentBlock,
   SessionModeState,
-  SessionModelState,
   AvailableCommand,
   SessionConfigOption,
   SessionInfo as ProtocolSessionInfo,
   AgentCapabilities,
 } from '@agentclientprotocol/sdk';
 import { RequestError } from '@agentclientprotocol/sdk';
+
+// [CUSTOM-20261003-175] ACP SDK 1.x **删掉了整个 session models API**（`SessionModelState` /
+// `unstable_setSessionModel`）：模型改由 Session Config Options（`category: 'model'`）表达 ——
+// 本仓库的 `setModel()` 早就优先走那条路，只有"agent 没给 model 类配置项"时才回落到旧 API。
+// 这里保留旧形状的本地类型，只为兼容**老 agent**（0.21 时代）送来的 `models` 字段与 legacy 面板的
+// modelsUpdate 消息；新 agent 上它恒为 null。
+export interface LegacySessionModelState {
+  currentModelId: string;
+  availableModels: Array<{ modelId: string; name: string; description?: string | null }>;
+}
 
 import { AgentManager } from './AgentManager';
 import { ConnectionManager, ConnectionInfo } from './ConnectionManager';
@@ -52,7 +61,7 @@ export interface SessionInfo {
   createdAt: string;
   initResponse: InitializeResponse;
   modes: SessionModeState | null;
-  models: SessionModelState | null;
+  models: LegacySessionModelState | null;
   /**
    * Generic session config options (ACP "Session Config Options" — supersedes
    * `modes` / `models`). `null` means the agent did not provide this field.
@@ -928,10 +937,21 @@ export class SessionManager extends EventEmitter {
       }
     }
 
+
+    // [CUSTOM-20261003-175] 回落路径：老 agent 没有 model 类配置项，只能走 0.21 时代的
+    // `unstable_setSessionModel`。SDK 1.x **删除了该方法** ⇒ 它现在可能根本不存在，直接调用会抛
+    // TypeError（且是静默失败：用户只看到模型没切过去）。显式判断 + 说清楚。
     const connInfo = this.connectionManager.getConnection(session.agentId);
     if (!connInfo) { return; }
-
-    await (connInfo.connection as any).unstable_setSessionModel({ sessionId, modelId });
+    const legacySetModel = (connInfo.connection as unknown as {
+      unstable_setSessionModel?: (p: { sessionId: string; modelId: string }) => Promise<unknown>;
+    }).unstable_setSessionModel;
+    if (typeof legacySetModel !== 'function') {
+      log(`SessionManager: agent "${session.agentId}" has no model config option and the legacy `
+        + `setSessionModel API is gone (ACP SDK 1.x) — cannot switch model to ${modelId}`);
+      return;
+    }
+    await legacySetModel.call(connInfo.connection, { sessionId, modelId });
 
     // Update local state
     if (session.models) {

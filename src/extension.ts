@@ -23,9 +23,15 @@ import { getAgentNames } from './config/AgentConfig';
 import { fetchRegistry } from './config/RegistryClient';
 import { log, logError, disposeChannels, getOutputChannel, getTrafficChannel } from './utils/Logger';
 import { initTelemetry, sendEvent } from './utils/TelemetryManager';
+// [CUSTOM-BEGIN] CUSTOM-20261002-173 - 激活日志上报构建指纹（排查"当前窗口跑的是哪份代码"）。
+import { buildStamp } from './utils/BuildInfo';
+// [CUSTOM-END] CUSTOM-20261002-173
 
 export function activate(context: vscode.ExtensionContext): void {
-  log('ACP Client extension activating...');
+  // [CUSTOM-BEGIN] CUSTOM-20261002-173 - 这一行的指纹是对照基准：webview 客户端会在 boot 时
+  // 报出它拿到的 `<body data-acpc-build>`，两者一致才说明"窗口跑的就是当前构建"。
+  log(`ACP Client extension activating... [build ${buildStamp()}]`);
+  // [CUSTOM-END] CUSTOM-20261002-173
 
   // --- Telemetry ---
   const telemetryReporter = initTelemetry();

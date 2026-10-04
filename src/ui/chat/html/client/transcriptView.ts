@@ -50,6 +50,68 @@ export const transcriptViewClient = `
   // every streamed chunk.
   var streamingCount = 0;
   var lastBusy = null;
+  // [CUSTOM-BEGIN] CUSTOM-20261004-180 - 转录内容版本号。
+  // 置顶条每一帧都要一份"用户消息列表"，而它此前每次都走一遍 ordered() 全表 + 逐条 entry()
+  //（滚动每一帧、每次折叠都付一次）。内容只在 place()（唯一新增点）与 reset() 变化，所以用版本号
+  // 把它们绑起来：置顶条只在版本变了时重建那份列表 —— pitfall #27 的正解是让**会改它的那处代码**
+  // 自己举手，而不是让读的人去列"什么会让它变"。
+  var contentVersion = 0;
+  // [CUSTOM-END] CUSTOM-20261004-180
+
+  // [CUSTOM-BEGIN] CUSTOM-20261004-179 - 用户消息折叠状态：**唯一的真相**（记录与置顶卡共用）。
+  //
+  // 用户 2026-10-04 报："对话在悬浮状态时点了折叠按钮，消息面板里对应的那条还是展开的（预期一致）"。
+  // 根因是两边各存一份、谁也不读谁：
+  //   · 记录这边根本没有存储 —— details.open 只在建的时候写成 true，重建（patch/hydrate/切会话）
+  //     就回到展开，用户手动折过的状态**本来就保不住**；
+  //   · 卡片那边是 stickyUser 的 collapsedBySession，只喂克隆体。
+  // 于是"点卡片 = 折消息"这件事在数据结构上就没有落点。现在把这一位收在这里（记录层的所有者），
+  // 两边都**读它**、任何一侧的 toggle 都**写它**：
+  //   · 键 = 会话 + 条目（沿用 166/172 定下的粒度："每张卡各记各的"、"切走再切回各自记得"）；
+  //   · reset() **不清**它（切会话回来还要用）；换会话只换 foldSessionId；
+  //   · 幂等：写相同的值直接返回 —— 这是打断"程序化改写 details.open → 又触发一次 toggle →
+  //     又回写"这条来回震荡的关键（写 DOM 只在值真的不同时才做，同样是为它）。
+  var foldBySession = {};
+  var foldSessionId = null;
+
+  /** [CUSTOM-20261004-179] 当前转录属于哪个会话（折叠状态按它分桶；boot 在焦点咽喉点同步）。 */
+  function setFoldSession(id) {
+    foldSessionId = id || null;
+  }
+
+  /** [CUSTOM-20261004-179] 这条用户消息被用户折起来了吗（记录与卡片共用这一个答案）。 */
+  function userCollapsed(entryId) {
+    var bySession = foldSessionId ? foldBySession[foldSessionId] : null;
+    return !!(bySession && bySession[entryId]);
+  }
+
+  /**
+   * [CUSTOM-20261004-179] 写折叠状态，并把**另一边**同步过去。
+   *
+   * 调用来自两处：记录自己的 details 的 toggle，以及置顶卡克隆体的 toggle。两边都写同一个
+   * 函数 ⇒ 无论用户点的是哪一个，两边都跟着变（用户要的"保持一致"）。写相同的值直接返回：
+   * 程序化地改 details.open 也会触发一次 toggle，没有这条守卫就会来回震荡。
+   */
+  function setUserCollapsed(entryId, collapsed) {
+    var on = collapsed === true;
+    if (foldSessionId) {
+      var bySession = foldBySession[foldSessionId] || (foldBySession[foldSessionId] = {});
+      if (!!bySession[entryId] === on) { return; }
+      bySession[entryId] = on;
+    }
+    // ① 记录本体（用户可能是在卡片上点的）。
+    var node = nodeOf(entryId);
+    var det = node && node.querySelector ? node.querySelector('details.user-fold') : null;
+    if (det && det.open === on) { det.open = !on; }
+    // ② 置顶卡（用户可能是在记录上点的）。卡片没有这一条时它自己会无视。
+    if (NS.stickyUser && NS.stickyUser.onFoldChanged) { NS.stickyUser.onFoldChanged(entryId); }
+    // ③ 折叠改了内容高度，两处缓存会因此过期（都是"几何变了但没有任何事件"那一族，pitfall #27）：
+    //    视口的贴底判定（176 的入口）与大纲的锚点表。rail 的圆点**不在这里刷新** —— 它观察着
+    //    这条记录节点，ResizeObserver 会带着"变了哪一个"来找我们（见 180 的增量重排）。
+    if (NS.scroll && NS.scroll.reflowNow) { NS.scroll.reflowNow(); }
+    if (NS.outline && NS.outline.invalidate) { NS.outline.invalidate(); }
+  }
+  // [CUSTOM-END] CUSTOM-20261004-179
 
   // Only these keys may be copied onto a stored entry. Narrowing the write
   // prevents a future message shape from silently corrupting entry objects.
@@ -115,6 +177,8 @@ export const transcriptViewClient = `
     userCount = 0;
     messageCount = 0;
     streamingCount = 0;
+    // [CUSTOM-20261004-180] 记录整批换掉：也让置顶条的缓存失效。
+    contentVersion++;
     // Must be cleared too: a stale id would tag the next markdown batch with
     // the previous session, and the extension would render it for a session
     // the webview then filters out.
@@ -284,7 +348,11 @@ export const transcriptViewClient = `
   function buildUserBubble(entry) {
     var details = document.createElement('details');
     details.className = 'user-fold';
-    details.open = true;
+    // [CUSTOM-20261004-179] 折叠状态来自共用存储（不再是写死的 true）：重建/切回会话时才记得住。
+    details.open = !userCollapsed(entry.id);
+    // [CUSTOM-20261004-179] toggle **不冒泡**，所以只能逐节点挂；这里是唯一造 user-fold 的地方
+    //（settleUserFold 复用同一个节点、不重建），漏掉它就等于两边静默不同步。
+    details.addEventListener('toggle', function () { setUserCollapsed(entry.id, !details.open); });
     var summary = NS.dom.el('summary', 'bubble');
     // Caret before the label, so the prepended icon lands leftmost (see foldCaret).
     summary.appendChild(foldCaret());
@@ -821,6 +889,8 @@ export const transcriptViewClient = `
     objects[entry.id] = entry;
     nodes[entry.id] = node;
     order.push(entry.id);
+    // [CUSTOM-20261004-180] 内容变了：置顶条的缓存该重建了（见 contentVersion 的注释）。
+    contentVersion++;
     // [CUSTOM-20260925-045] The one place entries are added, so the one place
     // the outline's anchor count can change.
     if (entry.kind === 'user') { userCount++; }
@@ -853,6 +923,8 @@ export const transcriptViewClient = `
     reset();
     if (!snapshot) { return; }
     sessionId = snapshot.sessionId;
+    // [CUSTOM-20261004-179] 折叠状态按会话分桶 —— 快照路径自己就知道是哪个会话。
+    setFoldSession(snapshot.sessionId);
     var entries = snapshot.entries || [];
     // [CUSTOM-20260926-071] User-message folds are decided by MEASUREMENT, so they
     // are settled once the whole snapshot is in the DOM - settling inside the loop
@@ -1061,13 +1133,19 @@ export const transcriptViewClient = `
     pendingMarkdown: pendingMarkdown,
     // [CUSTOM-20260930-149] boot 用每条带记录的消息自带的 sessionId 校正它（reset 之后会是 null）。
     setSessionId: setSessionId,
+    // [CUSTOM-20261004-179] 折叠状态的唯一真相（置顶卡与记录共用；boot 在焦点咽喉点同步会话）。
+    setFoldSession: setFoldSession,
+    userCollapsed: userCollapsed,
+    setUserCollapsed: setUserCollapsed,
     // [CUSTOM-20260926-071] Called by the rail when a record gains a real size.
     resolvePendingFolds: resolvePendingFolds,
     ordered: ordered,
     entry: entryOf,
     node: nodeOf,
     userAnchorCount: userAnchorCount,
-    messageAnchorCount: messageAnchorCount
+    messageAnchorCount: messageAnchorCount,
+    // [CUSTOM-20261004-180] 内容版本（place/reset 里自增）：置顶条据此缓存用户消息列表。
+    version: function () { return contentVersion; }
   };
 })(window.__acpc = window.__acpc || {});
 `;

@@ -54,10 +54,19 @@ const CLIENT_DIR = join(HTML_DIR, 'client');
 // 于是这类错误要到运行时才炸，而且报错位置指向别处。这个文件已经踩过十次，直接自检。
 (function assertNoBackticksInDriver() {
   const src = readFileSync(fileURLToPath(import.meta.url), "utf8");
-  const start = src.indexOf("function driver()");
+  // [CUSTOM-20261004-179] ⚠️ 这里曾经是 src.indexOf("function driver()") —— 而它命中的是**本自检
+  // 自己那行代码里的字面量**（就在上面几行），于是 bt/end 落在几十字符的空当里，自检一直在
+  // 校验一段几乎空的区域：我在驱动里写进两个反引号（模板提前终止、整个脚本语法错误、浏览器里
+  // 所有探针一起哑掉），它照样报 OK。定位真身的判据必须是**行首**那个定义，且取**最后一个**
+  // 匹配（本文件里只有一处真定义）。守卫自己坏掉的方式就是静默放行 —— 见 pitfalls #19/#27。
+  const start = src.lastIndexOf(String.fromCharCode(10) + "function driver()");
   const bt = src.indexOf("`", start);
   const end = src.indexOf("`;", bt + 1);
   const body = src.slice(bt + 1, end);
+  if (bt < 0 || end < bt || body.length < 1000) {
+    console.error("  [FATAL] 找不到真正的 driver 模板体（自检自身可能又跑偏了）—— 别信这次 OK");
+    process.exit(1);
+  }
   if (body.indexOf("`") >= 0) {
     console.error("  [FATAL] driver() 的模板体里有反引号（pitfalls #11）—— 它会被当成字符串结束符");
     process.exit(1);
@@ -887,13 +896,22 @@ function driver() {
         scrollTop: Math.round(document.getElementById('messages').scrollTop),
         targetTop: an ? Math.round(an.top) : null, targetBottom: an ? Math.round(an.bottom) : null,
         cardTop: ac ? Math.round(ac.top) : null, cardBottom: ac ? Math.round(ac.bottom) : null,
-        // [CUSTOM-20261002-171] 判据是**落点在交接窗口之内**（0 <= natural < 3）且本体让位：
-        // 消息就地接管卡片的位置 ⇒ 画面上只有一张。overlap 会报 true，那是**预期的** ——
-        // 本体的矩形确实在卡片下面，只是它 visibility:hidden（170 的"两条重叠"是本体**可见**）。
+        // [CUSTOM-20261004-178] 判据翻面了：落点**越过**交接线（natural >= TOP_GAP+缝）⇒ 本体
+        // **不再让位**（visibility 仍可见）、上方卡堆按上夹公式自己滑出上沿 ⇒ 两者不相交。
+        // 171 那版（落 0）读数是反的：targetVisibility='hidden'、overlap=true（克隆体接管）。
         nodeNatural: node ? Math.round(node.offsetTop - document.getElementById('messages').scrollTop) : null,
         overlap: (ac && an) ? (an.top < ac.bottom && an.bottom > ac.top) : null,
         targetVisibility: node ? getComputedStyle(node).visibility : null,
-        stickyVisible: sjHost ? !sjHost.hidden : null
+        stickyVisible: sjHost ? !sjHost.hidden : null,
+        // [CUSTOM-20261004-178] 可见卡堆的区间（NS.stickyUser.stackInfo）：170 当年错用了
+        // host.offsetHeight（含屏幕外的卡）来算让位量 —— 这个读数就是"该问的那个量"。
+        stackBottom: NS.stickyUser.stackInfo ? NS.stickyUser.stackInfo().bottom : null,
+        stackCards: NS.stickyUser.stackInfo ? NS.stickyUser.stackInfo().cards : null,
+        seam: (function () {
+          var info = NS.stickyUser.stackInfo ? NS.stickyUser.stackInfo() : null;
+          var nat = node ? node.offsetTop - document.getElementById('messages').scrollTop : null;
+          return (info && info.bottom !== null && nat !== null) ? Math.round(nat - info.bottom) : null;
+        })()
       }));
     } catch (e) { out.push(JSON.stringify({ kind: 'sticky-jump-error', message: String((e && e.message) || e) })); } }
     var stickyHostEl2 = document.getElementById('stickyUser');
@@ -908,8 +926,17 @@ function driver() {
       function snap() {
         var det = clickCard ? clickCard.querySelector('details') : null;
         var fb0 = clickCard ? clickCard.querySelector('.fold-body') : null;
+        // [CUSTOM-20261004-179] 同时读**记录本体**的 details.open：点卡片三角时它必须跟着折
+        // （用户 2026-10-04 报的"消息面板里还是展开的"）。两份状态必须永远相等。
+        var recId = clickCard ? clickCard.getAttribute('data-sticky-id') : null;
+        var recNode = recId ? NS.transcriptView.node(recId) : null;
+        var recDet = recNode && recNode.querySelector ? recNode.querySelector('details') : null;
         return {
           open: det ? det.open : null,
+          recordOpen: recDet ? recDet.open : null,
+          // 共用存储读到的那一位（定位断点：没写进去 / 写了但没应用 / 应用了但节点不对）。
+          storeCollapsed: (recId && NS.transcriptView.userCollapsed) ? NS.transcriptView.userCollapsed(recId) : null,
+          recFound: !!recNode,
           foldDisplay: fb0 ? getComputedStyle(fb0).display : null,
           cardH: clickCard ? Math.round(clickCard.getBoundingClientRect().height) : null
         };
@@ -920,13 +947,70 @@ function driver() {
       if (caret2 && caret2.click) { caret2.click(); }
       var s2 = snap();
       NS.scroll.jumpTo = origJump;
+      // [CUSTOM-20261004-179] 诊断：**直接**调一次共用存储的写入口（绕过 toggle 监听）。
+      // 这一步能把"函数坏了"与"监听没挂上"分开 —— 两侧症状一模一样。
+      var directOk = false;
+      var directErr = null;
+      try {
+        var rid = clickCard ? clickCard.getAttribute('data-sticky-id') : null;
+        if (rid && NS.transcriptView.setUserCollapsed) {
+          NS.transcriptView.setUserCollapsed(rid, true);
+          directOk = NS.transcriptView.userCollapsed(rid) === true;
+        }
+      } catch (e) { directErr = String((e && e.message) || e); }
+      var s3 = snap();
+      // ⚠️ details 的 toggle 事件是**异步派发**的（浏览器把它排成独立 task）——上面那三个
+      // 同步快照读到的都是"监听还没跑"的状态，会得出"没同步"的错觉（本档第一版就是这么误判的）。
+      // 所以真正的判据在下面的延时采样里（同 #bootround 的先例）。
+      window.setTimeout(function () {
+        try {
+          var preLate = document.getElementById('probe');
+          if (!preLate) { return; }
+          var lateStore = null;
+          var lateRecord = null;
+          var rid2 = clickCard ? clickCard.getAttribute('data-sticky-id') : null;
+          if (rid2 && NS.transcriptView.userCollapsed) { lateStore = NS.transcriptView.userCollapsed(rid2); }
+          var rn2 = rid2 ? NS.transcriptView.node(rid2) : null;
+          var rd2 = rn2 && rn2.querySelector ? rn2.querySelector('details') : null;
+          if (rd2) { lateRecord = rd2.open; }
+          preLate.textContent = preLate.textContent + String.fromCharCode(10) + JSON.stringify({
+            kind: 'sticky-click-late', id: rid2, store: lateStore, recordOpen: lateRecord, snapshot: snap()
+          });
+        } catch (e) { /* 采样失败不该影响别的档 */ }
+      }, 80);
       out.push(JSON.stringify({
         kind: 'sticky-click', caretFound: !!caret2, caretTitle: caret2 ? String(caret2.title || '') : null,
+        directCall: directOk, directError: directErr, afterDirectCall: s3,
         cardId: clickCard ? clickCard.getAttribute('data-sticky-id') : null,
         jumped: jumped,
         initial: s0, afterFirstClick: s1, afterSecondClick: s2
       }));
     } catch (e) { out.push(JSON.stringify({ kind: 'sticky-click-error', message: String((e && e.message) || e) })); } }
+    // [CUSTOM-20261004-179] 反向：点**记录本体**的三角，卡片要跟着折（toggle 不冒泡，
+    // 客户端是逐节点挂的监听 —— 这一档就是为了证明那条监听真的挂上了）。
+    if (stickyHostEl2 && location.hash.indexOf('stickyrecordclick') >= 0) { try {
+      var recIds = NS.transcriptView.ordered();
+      var recUser = null;
+      for (var ri = 0; ri < recIds.length; ri++) {
+        var re = NS.transcriptView.entry(recIds[ri]);
+        if (re && re.kind === 'user' && NS.transcriptView.node(re.id).querySelector('.fold-caret')) { recUser = re; break; }
+      }
+      var recN = recUser ? NS.transcriptView.node(recUser.id) : null;
+      var recCaret = recN ? recN.querySelector('.fold-caret') : null;
+      var recBefore = recN && recN.querySelector('details') ? recN.querySelector('details').open : null;
+      if (recCaret && recCaret.click) { recCaret.click(); }
+      var recAfter = recN && recN.querySelector('details') ? recN.querySelector('details').open : null;
+      var cardNow = recUser ? document.getElementById('stickyUser').querySelector('[data-sticky-id="' + recUser.id + '"]') : null;
+      var cardDet = cardNow ? cardNow.querySelector('details') : null;
+      out.push(JSON.stringify({
+        kind: 'sticky-record-click',
+        recordId: recUser ? recUser.id : null,
+        caretFound: !!recCaret,
+        recordBefore: recBefore, recordAfter: recAfter,
+        cardFound: !!cardNow,
+        cardOpen: cardDet ? cardDet.open : null
+      }));
+    } catch (e) { out.push(JSON.stringify({ kind: 'sticky-record-click-error', message: String((e && e.message) || e) })); } }
     var stickyHost = document.getElementById('stickyUser');
     if (stickyHost) {
       // [CUSTOM-20261002-172] 卡堆：**逐张**量几何（子节点顺序 = 从旧到新）。判定靠这些数字，不靠
@@ -1121,6 +1205,30 @@ function driver() {
         })(),
         // 让位：消息区的底部留白必须把抽屉的高度也加进去（--acpc-elic-h），否则最后一条记录
         // 会被抽屉压住 —— 同 144 对输入卡做的那件事。
+        // [CUSTOM-20261003-177] 收起态必须**保留完整 tab 条**（用户要求）：每一题的标题与圆点
+        // 状态都要在，藏起来的只有正文与操作栏。这两项是 CSS 的 display，桩 DOM 量不到 —— 只能在这量。
+        tabsDisplay: (function () {
+          var t = document.querySelector('.elic-tabs');
+          return t ? getComputedStyle(t).display : null;
+        })(),
+        panesDisplay: (function () {
+          var p = document.querySelector('.elic-panes');
+          return p ? getComputedStyle(p).display : null;
+        })(),
+        tabSummary: (function () {
+          var out = [];
+          var tabs = document.querySelectorAll('.elic-tab');
+          for (var ti = 0; ti < tabs.length; ti++) {
+            var dot = tabs[ti].querySelector('.elic-tab-dot');
+            var text = tabs[ti].querySelector('.elic-tab-text');
+            out.push({
+              title: text ? text.textContent : null,
+              hasDot: !!dot,
+              answered: tabs[ti].className.indexOf('answered') >= 0
+            });
+          }
+          return out;
+        })(),
         elicVar: document.body ? document.body.style.getPropertyValue('--acpc-elic-h') : null,
         messagesPadBottom: document.getElementById('messages')
           ? getComputedStyle(document.getElementById('messages')).paddingBottom : null,
@@ -1283,6 +1391,90 @@ function driver() {
           - drawerEl3.getBoundingClientRect().bottom),
       }));
     }
+    // [CUSTOM-20261003-176] 复现用户 2026-10-03 报的"消息面板没到底（Jump 还在），可滚动条已经触底、
+    // 鼠标再也滚不动"。**只能量不能推**（pitfall #31）：把滚动状态与"内容 / 表单抽屉 / 输入卡"三者的
+    // 几何一起读出来。elic 档只 hydrate 了表单本身（滚不动），这里把标准夹具一并具上，才有得滚。
+    if (location.hash.indexOf('bottomstuck') >= 0) { try {
+      // 标准夹具重复几遍：本档要复现的是"长会话里滚到底"的状态，而 FIXTURES 只有一屏多一点
+      // （内容只比视口短 ~96px）——那种状态下"上翻"根本翻不动，量出来的东西没有代表性。
+      var longStuck = [];
+      for (var repStuck = 0; repStuck < 4; repStuck++) {
+        for (var fi = 0; fi < fixtures.length; fi++) {
+          var cloned = {};
+          for (var fk in fixtures[fi]) { if (Object.prototype.hasOwnProperty.call(fixtures[fi], fk)) { cloned[fk] = fixtures[fi][fk]; } }
+          cloned.id = fixtures[fi].id + '-r' + repStuck;
+          longStuck.push(cloned);
+        }
+      }
+      NS.transcriptView.hydrate({
+        sessionId: SESSION,
+        entries: longStuck.concat([{ id: 'preview-elic', kind: 'elicitation', at: Date.now(), elicitation: elicState }])
+      });
+      NS.elicitationView.setSession(SESSION);
+      NS.elicitationView.sync();
+      // 真滚到底（值变了 ⇒ 浏览器异步派发 scroll），再手动派发一次让 onScroll 在同一同步块里跑完。
+      messages.scrollTop = messages.scrollHeight;
+      messages.dispatchEvent(new Event('scroll'));
+      function measureStuck(tag) {
+        var padStuck = parseFloat(getComputedStyle(messages).paddingBottom) || 0;
+      var maxStuck = messages.scrollHeight - messages.clientHeight;
+      var jumpStuck = document.getElementById('jumpToLatest');
+      var drawerStuck = document.getElementById('elicDrawer');
+      var dRectStuck = (drawerStuck && !drawerStuck.hidden) ? drawerStuck.getBoundingClientRect() : null;
+      var compStuck = document.getElementById('composer');
+      var cRectStuck = compStuck ? compStuck.getBoundingClientRect() : null;
+      var orderStuck = NS.transcriptView.ordered() || [];
+      var lastStuck = orderStuck.length ? NS.transcriptView.node(orderStuck[orderStuck.length - 1]) : null;
+      var lRectStuck = lastStuck ? lastStuck.getBoundingClientRect() : null;
+      out.push(JSON.stringify({
+        kind: 'bottom-stuck-' + tag,
+        scrollTop: Math.round(messages.scrollTop), max: Math.round(maxStuck),
+        atMax: Math.abs(messages.scrollTop - maxStuck) < 1,
+        padBottom: Math.round(padStuck),
+        distance: Math.round(messages.scrollHeight - padStuck - messages.scrollTop - messages.clientHeight),
+        pinned: NS.scroll.isPinned(),
+        jumpHidden: jumpStuck ? jumpStuck.hidden : null,
+        composerH: cRectStuck ? Math.round(cRectStuck.height) : -1,
+        composerTop: cRectStuck ? Math.round(cRectStuck.top) : null,
+        drawerH: dRectStuck ? Math.round(dRectStuck.height) : 0,
+        drawerOffsetH: drawerStuck ? drawerStuck.offsetHeight : -1,
+        drawerTop: dRectStuck ? Math.round(dRectStuck.top) : null,
+        lastRecordBottom: lRectStuck ? Math.round(lRectStuck.bottom) : null,
+        coveredByComposer: (lRectStuck && cRectStuck) ? lRectStuck.bottom > cRectStuck.top : null,
+        coveredByDrawer: (lRectStuck && dRectStuck) ? lRectStuck.bottom > dRectStuck.top : null,
+        elicVar: (document.body.style.getPropertyValue('--acpc-elic-h') || '').trim(),
+        composerVar: (document.body.style.getPropertyValue('--acpc-composer-h') || '').trim(),
+      }));
+      }
+      // ⚠️ 预览驱动**默认不接** scroll.ts（见本文件里 'onScroll 没绑上' 那条注释）——那会让
+      // pinned / jumpHidden 两列恒为初值，读出来是假数据。本档要验的正是"几何变了之后视口判定
+      // 有没有重算"，所以这里显式接上真监听。
+      NS.scroll.init(messages, document.getElementById('jumpToLatest'));
+      // 变高方向：基线先切到**较矮**的那一题，迁移时切回较高的一题 ⇒ 抽屉长高。
+      if (location.hash.indexOf('tallgrow') >= 0) { NS.elicitationView.selectTab(1); }
+      var padStuck0 = parseFloat(getComputedStyle(messages).paddingBottom) || 0;
+      measureStuck('base');
+      // 迁移：先上翻一点（Jump 出现、pinned=false），再让抽屉长高（换到更高的那一题）。
+      // 这两步在真机上都不会产生 scroll 事件 —— 正是"Jump 还在、内容却被盖住"的嫌疑路径。
+      // pullup：上翻到**留白之外**（真的 un-pin，Jump 出现）——"在看历史的人"那种状态。
+      if (location.hash.indexOf('pullup') >= 0) {
+        messages.scrollTop = Math.max(0, messages.scrollTop - (padStuck0 + 120));
+        messages.dispatchEvent(new Event('scroll'));
+      }
+      if (location.hash.indexOf('growdrawer') >= 0) {
+        NS.elicitationView.selectTab(1);
+      }
+      if (location.hash.indexOf('tallgrow') >= 0) {
+        NS.elicitationView.selectTab(0);
+      }
+      measureStuck('after');
+    } catch (e) { out.push(JSON.stringify({ kind: 'bottom-stuck-error', message: String((e && e.message) || e) })); } }
+    // [CUSTOM-20261004-180] 长会话里"点一次折叠"的代价。
+    // 量的是**布局读取次数**（确定性，不受 --virtual-time 影响）与两帧内的毫秒数：
+    // 改前 rail.measure 边读边写（读一次 rect → 写一次 dot.top），每次写都让下一次读强制重排
+    // ⇒ O(n) 次强制布局；改后只读一遍再只写一遍 ⇒ O(n) 次读、一次重排。
+    // 计数口是三个（rect / offsetTop / offsetHeight），页面里别的模块也会读 —— 所以看的是
+    // **同一个操作在改前/改后两次运行里的差**，不是绝对值。
     var pre = document.createElement('pre');
     pre.id = 'probe';
     pre.textContent = out.join('\\n');
@@ -1471,6 +1663,8 @@ const SHOTS = [
   ['#elicmulti', 'elic-multi', '1440,900'],
   ['#elicshrunk', 'elic-shrunk'],
   // [CUSTOM-20260930-153] 真机形状（照抄日志里那次请求）：选项带长描述、自拟框那题没有 _meta 标记。
+  // [CUSTOM-20261003-176] 「贴底却看不全」的复现档（读的是几何与滚动状态，不是肉眼）。
+  ['#elicbottomstuckprobe', 'bottom-stuck', '1440,1000'],
   ['#elicreal', 'elic-real', '1440,1000'],
   ['#elicrealpick', 'elic-real-pick', '1440,1000'],
   // 钉住大纲栏：抽屉与输入卡必须同一条中线（asideW/2 = 120px 的偏移就是用户看到的"没居中"）。

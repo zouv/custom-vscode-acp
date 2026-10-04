@@ -72,7 +72,7 @@ webpack + ts-loader（不是 esbuild）；ESLint flat config；`@vscode/test-cli
 | 任务类型 | 该读（仅限） | 可忽略 | 入口 |
 |---|---|---|---|
 | 连接/拉起 agent 失败（ENOENT、退出码、stderr） | `AgentManager.ts` + `AgentConfig.ts` | UI、webview | §2.1 |
-| ACP 握手 / 协议 traffic 日志 | `ConnectionManager.ts` + `StreamAdapter.ts` + `AcpClientImpl.ts` + `Logger.ts(logTraffic)` | tree、webview | §2.2 |
+| ACP 握手 / 协议 traffic 日志 / **日志里的构建指纹** | `ConnectionManager.ts` + `StreamAdapter.ts` + `AcpClientImpl.ts` + `Logger.ts(logTraffic)` + `utils/BuildInfo.ts` | tree、webview | §2.2 |
 | 会话生命周期（新建/加载/恢复/切换、认证 -32000） | `SessionManager.ts` + `SessionHistoryStore.ts` | handlers | §2.3 |
 | 发消息 / 取消 / 流式更新 | `SessionManager.ts(sendPrompt/cancelTurn)` + `SessionUpdateHandler.ts` + `ChatWebviewProvider.ts(handleMessage)` | tree | §2.4 |
 | 聊天 UI（新面板 / 路由 / 标签页 / 工具调用渲染） | `src/ui/chat/`（入口 `index.ts`；先看 [`docs/arch/chat-panel.md`](./docs/arch/chat-panel.md) §5.1 的文件表再定位） | 旧面板、core | arch/chat-panel.md §5.1 |
@@ -113,6 +113,7 @@ webpack + ts-loader（不是 esbuild）；ESLint flat config；`@vscode/test-cli
 | `src/config/RegistryClient.ts` | 拉 `cdn.agentclientprotocol.com` 的 agent registry，5 分钟 TTL，失败回退缓存 | 换 registry 源 / 缓存策略 |
 | `src/utils/Logger.ts` | 双输出通道（`ACP Client (Custom)` / `ACP Traffic (Custom)`）；`logTraffic` 按 JSON-RPC 分类 REQUEST/NOTIFICATION/RESPONSE，受 `acpc.logTraffic` 开关控制 | 日志格式 / 新增通道 |
 | `src/utils/StreamAdapter.ts` | `childProcessToWebStreams`：ChildProcess → `AcpStream{readable,writable}` | 流适配 |
+| `src/utils/BuildInfo.ts` | 构建指纹（版本 + git 短 sha + 打包时间 + bundle 哈希）：`buildStamp()`。宿主 activate 写一行、`html/body.ts` 写进 `<body data-acpc-build>`、客户端 boot 第一条日志报出来 —— 用于判定"这个窗口跑的是哪份代码" | 改日志身份标识 / 排查"改动没生效"（先确认跑的是哪份代码） |
 | `src/utils/TelemetryManager.ts` | **本仓库已改为 no-op**（见 registry `CUSTOM-20260923-002`），保留同名 API | 重新启用遥测 |
 | `src/test/extension.test.ts` | 扩展存在 / 能激活 / 命令已注册（断言 `acpc.` 前缀） | 改扩展 id 或命令前缀时必须同步 |
 | `src/test/nesting.test.ts` | 嵌套推断的 11 条单元测试（护栏行为钉死；全项目最"猜"的一块） | 改 `src/ui/chat/nesting/` 时必须同步 |

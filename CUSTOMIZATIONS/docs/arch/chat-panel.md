@@ -429,7 +429,7 @@ pending ──用户点按钮──► selected        （回答 optionId）
 走到第一条没进窗口的就收工（它之后只会更低），而它的 `natural` 同时是前缀末条的**上夹**（顺手多读一次 offsetTop，与 104 的开销相同）。**103 的两条旧规则都已作废**：
 "完全离开视口"（102）与"视口里有更晚的提问就不置顶"（103）—— 后者被用户推翻，理由是
 反例很常见：视口中间摆着一条提问、更早那条已经滚上去，那时什么都不钉，读者就找不到"我上面那条问的是什么" |
-| 落位（172） | `top = min(TOP_GAP, 上夹 - 本卡高)`；上夹 = **下一条用户消息的 natural**（前缀内取下一候选；前缀末条取那条 follow；没有下一条就没有上夹）。这就是原生 `position: sticky` 分区头的等价式，**逐条独立，不是链式递推** |
+| 落位（172） | `top = min(TOP_GAP, 上夹 - 本卡高)`；上夹 = **下一条用户消息的 natural**（前缀内取下一候选；前缀末条取那条 follow；没有下一条就没有上夹）。这就是原生 `position: sticky` 分区头的等价式，**逐条独立，不是链式递推** | **[181] 上夹再减 `CARD_GAP(8)`**：卡底与它顶住的那条之间留一条缝（172 是无缝相接，用户 2026-10-04 报"间隔太近、叠到了一起"） |
 | **为什么上夹锚"自然位置"** | 锚"下一条**已渲染**的位置"会让旧卡底边永远停在钉住那条的顶上 ⇒ 旧卡**永久残留一条边**、永远"看不到全部消失"，与用户"直到卡片 A 看不到"直接冲突（把这条记进 pitfalls #40）。锚自然位置（布局量，随滚动线性减小）才会一路滑成负值、被 `overflow: hidden` 裁掉 |
 | "两张一起悬浮"是怎么来的 | 过渡帧里旧卡被顶着往上走，而新卡**还在自己的自然位置上**（它没进前缀 ⇒ **不需要副本**，本体就在那儿）—— 看上去就是"两张卡相接"，其实只有一张是克隆体。新卡越线后才接管（≤TOP_GAP 的窗口，与 104 的交接窗同一个常量）。用户要的"旧卡底边 == 判定线"在公式里**逐字成立**：`top + 卡高 == 下一条的 natural` |
 | 卡片不再唯一（172） | 每张卡 = `.sticky-card > .sticky-body > 克隆体`，由 `stickyUser.ts` 按条动态建 —— `body.ts` 只留空的 `#stickyUser`（固定 id 的 `#stickyCard`/`#stickyBody` 会撞成重复 id）。折叠仍走克隆体自己的原生 `<details>`（171） |
@@ -634,17 +634,18 @@ pending ──用户点按钮──► selected        （回答 optionId）
 |---|---|
 | 层级 | `position: fixed`。**不要**用 `transform` 居中：我们要的规则是"与输入卡**同一个包含块**"（见下），transform 给不了这个。居中规则**必须与输入卡同源**：`left: 0; right: var(--acpc-aside-w, 0px); margin: 0 auto; width: min(100% - 16px, --acpc-composer-max)`。输入卡的中心不是面板中心——`.composer-main` 是"面板宽 − 预留功能区"，钉住大纲栏时两者差 `asideW/2`（240px 的栏 ⇒ 120px 偏移，用户 2026-10-01 报的"没居中"就是这个）。`bottom: var(--acpc-composer-h)` 直接叠在底栏上（实测抽屉下沿 = 输入卡上沿）。`z-index: 9`（高于底栏 8、低于右键菜单 60 与图片浮层 90） |
 | 高度让位 | 新增 `--acpc-elic-h`：`#messages` 的 `padding-bottom` 与 `#jumpToLatest` 的 `bottom` 各加一段（实测展开 405px = 24 + 底栏 84 + 抽屉 297；收起 145px）。写变量的是 `applyDrawerHeight()`，**观察器 + 显式调用两条腿**：ResizeObserver 的回调按帧投递，不是每个宿主都送达（无头预览里就没送达，第一版只靠它 ⇒ 留白停在旧值，抽屉会压住最后一条记录）。这是 pitfall #27 的同一件事：量，并且别赌回调时机 |
-| 题目分页 | 一个 tab 一道题（标题取 `field.title`，即 AskUserQuestion 的 `header`）；`customFor === X` 的字段并进 `X` 那道题（**按名字配对**，不按位置）。tab 上的圆点 = 已答/未答。**[154] bar（用户要求）：没有标题行** —— tab 条、`Answered n/N` 与收起箭头合成一条，进度与箭头**靠右**；收起时 tab 条换成当前题的名字 |
+| 题目分页 | 一个 tab 一道题（标题取 `field.title`，即 AskUserQuestion 的 `header`）；`customFor === X` 的字段并进 `X` 那道题（**按名字配对**，不按位置）。tab 上的圆点 = 已答/未答。**[154] bar（用户要求）：没有标题行** —— tab 条、`Answered n/N` 与收起箭头合成一条，进度与箭头**靠右** |
 | 单选 | **[154] 平铺的 radio 列表**（用户第二次改规则：不要下拉）——每行 = **主标题 + 副标题（选项说明）**，末尾一行 `Other`（自由作答也是一"选"）。底层就是一组普通 radio，`collect()` 的判据一个字节没动；点击时**显式**取消同级 checked（桩 DOM 没有原生 radio 组行为，显式让两边一致）。没有下拉菜单 = 没有"菜单被裁/开错方向"那一类问题（153 为此改过两版规则） |
 | 多选 | **经典复选框列表**（用户规则 2），行 = 选项名 + 选项介绍（用户规则 3） |
 | 自拟框 | **[154] 单选：跟着"被选中的那一行"走**（`placeCustomBoxes` 把它 `appendChild` 进那行的容器里），没选时**藏在自己的题块里**（`data-elic-home`）而不是从 DOM 摘掉 —— 摘掉就再也找不回来，写进去的字也会掉出 `collect()`（这条是踩出来的）。多选：仍在列表下方。**任何形态都必须带那行说明**（"填了它就以它作答、取代上面所选"）——adapter 的 `applyAskElicitationResponse` 里 custom **优先于**选择，只写"追加"就是 UI 撒谎 |
-| 收起 | bar 右端的箭头把抽屉收成**一行**（当前题的名字 + 进度 + 箭头）。**Escape 只收起、绝不 cancel**（cancel 会中止工具调用，不能由一次误按键触发）。收起会把这个 promptId 记进 `dismissed`：切走再回来不会自动重弹，内联条的「Open form」是回来的路 |
+| 收起 | bar 右端的箭头把抽屉收成**一行**。**[177] 收起时保留完整 tab 条**（用户要求：收起后仍要看得到每一题的标题与圆点状态，而不是只显示当前那一题 —— 否则收起等于"看不见还剩几题没答"）；藏起来的只有正文（`.elic-panes`）与操作栏。**收起态点任一 tab 会展开到那一题**（否则点了像没反应）。实测收起态高度 **33px**（一行 · 1440×1000 预览档 `#elicshrunkprobe`）**Escape 只收起、绝不 cancel**（cancel 会中止工具调用，不能由一次误按键触发）。收起会把这个 promptId 记进 `dismissed`：切走再回来不会自动重弹，内联条的「Open form」是回来的路 |
 | 打开策略 | 自动打开 = 聚焦会话里有 pending 且该 promptId 没被收起过；**主动打开**（内联条 / 收起态）才把焦点给抽屉（显式动作才抢焦点，同 019/125 的态度） |
 | **[161] Submit 的门禁** | 多题时 Submit **只在最后一题那一页可点**（用户要求防误提交：翻页看看后面还有没有时，第一页的提交按钮就在手边，很容易顺手点掉）。**禁用而不是隐藏**，并带一句 `title` 说明为什么——看得见的禁用按钮会说明"还差一步"，藏起来只会让人以为这个表单没有提交按钮。Skip / Cancel 不受影响（它们是逃生门，任何一页都该能用）。判据里还带着 `sending`：否则提交后一次 input/change 触发的 refresh 会把它重新点亮，又变回两条回答路径。`activeTab` 超出新表单的题数时**夹回最后一页**（否则一个 pane 都不显示，而且会骗过上面这条"已在最后一题"的判据） |
 | **附加说明是「追加」（168）** | 用户明确要求（并确认了 adapter 的行为）：选项旁输入的文字**在选项基础上追加**，不是替换。做法在**我们这侧**：`collect()` 把两者合成**一个**答案（`选项 — 说明`，用选项的 label），并且**不再单独发** `question_N_custom` —— adapter 的 `applyAskElicitationResponse` 是「custom 优先并 return」（有它就丢掉所选项），单独发就等于替换。只在**没有勾选任何选项**时，那行文字才作为独立答案发送（自由作答）。那条「replacing the option picked above」的说明行随之删掉（旧语义遗留，用户报「描述不对」），说明只留在输入框的 tooltip 里 |
 | **每个选项行都有自己的补充框（168）** | 多选的每一项都带一个（单选那个由题目级的 extra 框移进所选行）；只在**该行被勾中**时显示（同 154 的「框跟着所选行」）。它不是 schema 字段（`data-elic-note` 而非 `data-field`）⇒ 不会被通用收集循环看到，只被 `collect()` 并进那一项 |
-| **取消选择（168）** | 再点一次**已经选中**的单选行 = 取消（radio 原生做不到）。判据用 `data-elic-picked`（`onPick` 写）：点击时浏览器已把 checked 设成 true，靠它分不出「刚选中」与「再点一次」。未答的题按「未选择」反馈，**不阻塞 Submit**（adapter 的 schema 什么都不 required，空 content 也接受 —— 已实测） |
-| **诊断日志（168）** | 表单构建时 `console.warn('[acpc] form fields: N question(s), M option(s), K with description')`。153 那次「选项说明丢了」两边都证明过客户端是好的（真实 schema 里有、`fieldsOf` 保留、预览渲染得出），留下的下一步就是这行日志 —— 真机再见时，日志直接给答案 |
+| **取消选择：只剩 Clear answer（174）** | 168 曾让「再点一次已选中的单选行」也取消选择（当时那是唯一入口）。**174 起删掉**：抽屉底部已有 `Clear answer`，一个按钮做这件事比"再点同一行"可预期得多，也免得手抖点两下静默丢掉选择。现在单选就是**原生 radio**（再点保持选中），`data-elic-picked` 那套记账一并删除；显式互斥仍然保留（桩 DOM 没有原生 radio 组行为）。未答的题按「未选择」反馈，**不阻塞 Submit**（adapter 的 schema 什么都不 required，空 content 也接受 —— 已实测） |
+| ⚠️ **选项说明为什么会丢（2026-10-03 定的案）** | 真机日志 `[acpc] form fields: 1 question(s), 4 option(s), **0 with description**`。根因**不在我们这侧**：ACP SDK 用 zod 解析入站请求（`acp.js` 里 `validate.zCreateElicitationRequest.parse(params)`），而 0.21.1 的 `zEnumOption` 只声明了 `const` 与 `title` —— zod 的 object **丢弃未声明的键**，于是 adapter 发来的 `description`（以及 `_meta`）在进到 `fieldsOf` 之前就没了。**为什么此前三轮都"验证通过"**：153/168/173 的验证都是把日志里的**原始报文**直接喂 `fieldsOf`，绕过了 SDK 那一层（原始 JSON-RPC 流量日志当然还在）。修法见 `pitfalls.md` #43 与 registry（两条路：本地回填 / 升 SDK ≥1.3） |
+| **诊断日志（168）** | 表单构建时 `console.warn('[acpc] form fields: N question(s), M option(s), K with description')`。**这行最终真的抓到了案子**（2026-10-03：`0 with description`），但它第一次写下来时**根本进不了日志** —— 被日志桥那 50 条终身配额挤掉（见 §5.39 / pitfalls #42，173 已修）。诊断通道要先能落盘，诊断才有意义 |
 | **只看当前会话** | `setSession(sessionId)`（boot 在 `syncElicitations()` 这个唯一入口里同步）+ `pendingForms()` 按 `state.sessionId` 过滤。为什么不用"转录已经是当前会话的"当判据：那是**代理信号**（pitfall #25/#26），一旦某条路径没重建转录，别的会话的表单就会在这边显示出来（用户 2026-10-01 报的正是它）。记录仍记着"谁的表单" —— 切回去它自己会回来。**[154] 另一半在清记录那一侧**：`sessionId` 为空时 `pendingForms()` 直接返回空（草稿页/空态没有会话），而 boot 里所有清记录的地方统一走 `resetTranscript()` 包装（reset + 对账）—— 上一版只调了 `reset`，切到草稿页时抽屉就留在屏幕上了（用户第二张图） |
 | 多个待答表单 | 抽屉同一时刻只呈现一个（记录里第一条未收起的），其余靠各自内联条的「Open form」切过去（`open(promptId)`）——不做叠层 |
 | 委托点击 | 抽屉自己持有一个**容器级** click 监听（tab / 收起 / 清除所选，容器不重建 ⇒ 不怕 pitfall #28 的"重建后 target 脱离"）；`data-elic-action`（提交/跳过/取消）继续走 `links.ts` 的全局委托，根节点查找改为 `.elic` **或** `.elic-drawer`；下拉菜单项的 `data-elic-pick` 与"点外面关菜单"走 document 级监听 |
@@ -756,3 +757,100 @@ adapter 的私有标记 `_meta."_claude/origin".kind = "task-notification"`）�
 
 **没改的**（看过，不是同一类问题）：tab 栏（`setSessions` 按会话）、连接相位（面板级）、
 `imageThumbs`（客户端缓存，重挂载后回退成图标 —— 已在 096 的注释里写明是有意的代价）。
+
+### 5.39 构建指纹与日志桥的滚动窗口（CUSTOM-20261002-173）
+
+**它解决的是"排查时无法判定窗口跑的是哪份代码"**。2026-10-02 排查「表单的选项说明丢了」时，
+两边都能证明代码是对的（报文里选项带 `description`；当前客户端确实把它画成灰字第二行），可用户窗口里就是没有。
+当时手里只有**间接**证据（宿主 04:08 之后没重启过、客户端代码 12:05 才重新编译），
+而"那份 dist 里到底有没有这段渲染"**无从查证** —— 未提交的中间态已经不存在了。
+所以这一轮不是去改渲染，而是**让运行时自己报身份**。
+
+**三个上报点（互为对照，缺一不可）**：
+
+| 位置 | 谁写的 | 回答什么 |
+|---|---|---|
+| `ACP Client extension activating... [build …]` | 宿主 activate（`src/extension.ts`） | **宿主进程**载入的是哪份代码 |
+| `<body data-acpc-build="…">` | 宿主渲染文档时（`html/body.ts`） | 这份 webview 文档是哪次构建生成的 |
+| `chat-panel: client(info): build …` | 客户端 boot 第一条日志（`html/client/boot.ts`） | 这个 webview **实际拿到**的文档带的是哪个指纹 |
+
+指纹形如 `v0.2.0-custom.6·2819d85-dirty·2026-10-02T13:45:07.598Z·9f3e1a2b4c5d(2110432B)`：
+版本号（`package.json`）+ git 短 sha（打包时由 `webpack.config.js` 的 DefinePlugin 注入，工作区不干净会带 `-dirty`）
++ 打包时间 + **打包产物 sha256 前 12 位与字节数**。最后一项是唯一真正识别代码的：同一版本编两次只有它不同。
+算法与兜底都在 [`src/utils/BuildInfo.ts`](../../../src/utils/BuildInfo.ts)（**刻意不 import vscode**，
+因为无头预览与单测会在裸 node 下 require 它；任何一步失败只退化成 `unknown`，绝不抛）。
+
+**判读规则**：客户端那行与宿主那行一致 ⇒ 跑的是当前构建；客户端是**旧值** ⇒ 窗口是旧的；
+**压根没有这两行** ⇒ 这个窗口根本没重载过（改了代码只 `Ctrl+R` 之前先 `npm run compile`，见 `dev-workflow.md`）。
+
+**顺带修掉的真凶：日志桥的配额**。客户端 `console.warn/error` 经 `clientLog` 转发进日志文件，
+原先的上限是**每次加载共 50 条**（终身）。实测这 50 条被 `[acpc] renderMarkdown asked` 那条诊断
+**在 200ms 内一次性烧光**（真机日志里那 50 条全是它），此后任何诊断都进不了日志 ——
+于是"日志里没有"被误读成"诊断没执行"，白掉一轮排查。现在：
+
+- 转发配额改成**滚动窗口**（`WINDOW_MS = 10000` / `MAX_PER_WINDOW = 30`）：窗口一滑配额就回来，
+  突发噪声挡得住，而长命 webview（用户窗口开一整天）不会被永久静音。
+- 噪声源本身限流：那条 markdown 诊断只报**前 3 次 + 每 25 次**一次。
+
+⚠️ 改这两处时注意：客户端代码在模板字符串里（反引号/反斜杠，pitfalls #11），
+且**配额是每条 webview 独立的**（计数器在闭包里）——重挂载会重置，这是有意的。
+
+### 5.40 几何变了要重算视口判定（CUSTOM-20261003-176）
+
+**问题**：`pinned`（是否贴底）与 `#jumpToLatest` 的显隐原先**只在 `scroll` 事件里**更新
+（`scroll.ts` 的 `onScroll`）。可是让"内容末尾相对视口的位置"改变的原因里，有一大半**不会派发
+scroll 事件**：底部留白（输入卡 / 表单抽屉 / 权限抽屉的高度都进 `#messages` 的 padding-bottom）
+变化、内容被 markdown 回填撑高、抽屉换题…… 于是视口判定停在旧值：
+
+- 本来贴底的人，抽屉长高后内容被挤到浮层后面 —— 他看到的 Jump 状态却是旧的，滚动条也已经在头，
+  表现成"**面板没到底、却滚不动、还盖着内容**"（用户 2026-10-03 报的正是这个）；
+- 反向：内容缩到不再需要滚动时，Jump 还挂在屏幕上（明明没得滚了还在提示"回到底部"）。
+
+**修法**（三条，缺一不可）：
+1. `scroll.ts` 把 `onScroll` 的判定拆成 `recompute()`，并新增 **`reflowNow()`**：先记下变化前的
+   `pinned`，重算，然后**若原来贴底就把视口带到新的底部**（含刚长出来的留白）。这正是"贴着底部"
+   该有的语义，也是用户明确要过的（"消息区的触底判断保持在输入框上面"）；上翻看历史的人不受影响。
+2. **三个写留白高度的模块**（`composer.ts` / `elicitationView.applyDrawerHeight` /
+   `permissionDrawer.ts`）写完 CSS 变量后各喊一声 `NS.scroll.reflowNow()`。
+3. **不能只靠 ResizeObserver**（152 的既有教训）：抽屉切题 / 展开 / 收起会改变高度，而它的回调按帧
+   投递，所以 `elicitationView.refresh()` 里**显式**再写一次高度（同一条腿走两遍，代价是一次
+   `offsetHeight` 读取）。
+
+**怎么验（量，别推 —— pitfall #31）**：`preview-records.mjs` 的
+`#elicbottomstuckprobe` / `#elicbottomstuckgrowdrawerprobe` / `#elicbottomstuckpullupgrowdrawerprobe` /
+`#elicbottomstucktallgrowprobe` 四档，把"内容 + 表单抽屉 + 输入卡"的几何与滚动状态一起读出来
+（`atMax` / `padBottom` / `drawerH` / `coveredByDrawer` / `pinned` / `jumpHidden`）。
+⚠️ 预览驱动**默认不接** `scroll.ts`（不调 `NS.scroll.init`），所以档位里显式接了一次 —— 否则
+`pinned` / `jumpHidden` 两列恒为初值，读出来是假数据。
+
+**逻辑侧**由 `src/test/chat-client.test.ts` 的三条用例钉住（留白进"内容末尾"的语义、
+贴底时 reflow 跟着走、没贴底时绝不抢视口）。
+
+### 5.41 置顶卡四改：跳转落点 / 折叠同步 / 长会话量测 / 卡堆的缝（CUSTOM-20261004-178..181）
+
+**① 点卡片跳转的落点（178）**。三次演化，都写在 `stickyUser.ts` 的注释里：
+
+| 版本 | clearance | 结果 |
+|---|---|---|
+| 170 | `host.offsetHeight + TOP_GAP + 2` | 消息落在条**下面**、不重叠；但 host 是 absolute 覆盖层、高度含**已被顶出屏幕**的卡 ⇒ 上方卡一多就把消息推得很低（"定位偏下"） |
+| 171 | `0` | 消息就地接管悬浮条的位置；代价是那条**仍在活动前缀里** ⇒ 本体隐藏、克隆体站原位 ⇒ 用户看到的仍是悬浮样式 |
+| **178** | `TOP_GAP + STACK_SEAM(2)` | 推过判定线一点点：这条成为 `found.follow` ⇒ 本体**不再被接管**（真实消息显示在最顶），上方卡堆按 `layout()` 的 `top = min(TOP_GAP, next.natural - h)` **自己滑出上沿** |
+
+关键认识：**不需要额外的抑制态，也不需要量"屏幕外那些卡"的高度** —— 落点一过线，既有公式就把整堆卡推到负 y、被 host 的 `overflow:hidden` 裁掉。另新增 `NS.stickyUser.stackInfo()`（可见卡堆的 `top`/`bottom`/`cards`）：这才是"落点有没有被盖住"该问的量（170 问错了对象）。
+实测（真 Chromium）：`nodeNatural 5 / targetVisibility visible / overlap false / 卡堆 -5..60`（底边正好接上消息顶边）。
+
+**② 折叠状态只有一份（179）**。用户要"卡片与消息保持一致"，而两边原先各存一份（记录侧**根本没存**，卡片侧有自己的 `collapsedBySession`）⇒ 必然漂（pitfall #19）。现在：
+
+- 真相在**记录层**：`transcriptView` 的 `foldBySession[会话][条目]`，粒度沿用 166/172；`reset()` **不清**它（切会话回来还要用）；会话由 boot 的焦点咽喉点（`stickyUser.setSession` → `setFoldSession`）同步。
+- 唯一写入入口 `setUserCollapsed(entryId, collapsed)`：写存储 → 应用给**记录本体** → 通知置顶卡（`onFoldChanged`）→ 刷 `scroll.reflowNow()`（176）与 `outline.invalidate()`。**幂等守卫**（写同值直接返回）打断"程序化改 `details.open` → 再触发一次 toggle → 又回写"的来回震荡。
+- **`toggle` 不冒泡** ⇒ 记录侧只能在 `buildUserBubble`（唯一造 user-fold 的地方）逐节点挂监听；`stickyUser` 那侧同理（克隆体在 `buildCard` 里挂）。
+- ⚠️ **验证时注意**：`<details>` 的 toggle 事件是**异步派发**的，探针在同一同步块里读会得出"没同步"的错觉 —— 采样必须延时（`#stickynarrowstickyclickprobe` 的延时行）。
+
+**③ 长会话里的量测（180）**。
+
+- **rail.measure() 读写分离**：旧版边读边写（读一次 `getBoundingClientRect` → 写一次 `dot.style.top`），任何样式写都让下一次布局读**强制重排** ⇒ n 个标记 = n 次强制重排。现在 ① 只读（容器几何 + 每个节点的一行中心）② 只写（hidden / top / 线），输出逐字不变。**性质由桩单测钉住**（记一条读写时间线，断言"写→读"来回只剩常数次）。
+- **置顶条用户列表按内容版本缓存**：`userEntries()` 原先每帧 + 每次折叠都走一遍 `ordered()` 全表；`transcriptView.version()` 在 `place()`/`reset()` 自增，缓存据此失效 —— pitfall #27 的正解（让**会改它的代码**举手）。
+- **不做虚拟列表**（用户拍板）：它会同时打破 rail 的逐条圆点、大纲锚点、按会话的**绝对** `scrollTop` 记忆、置顶卡依赖"下一条记录的自然位置"的上夹（pitfall #40）、工具卡分组与 `node(id)` 五处不变量。
+- ⚠️ **测量教训**：无头预览跑在 `--virtual-time-budget` 下，`performance.now()` 是虚拟时钟（量出 3010ms 是假的）；"数强制重排"又会被 `NS.dom.schedule` 的"已有一帧在排就只入队"挡住（无头下真 rAF 未必送达 ⇒ 那一帧永远挂着）。**结论：涉及帧机制的代价，用桩单测钉结构性质，别在无头里追毫秒**。
+
+**④ 卡堆的缝（181）**。172 的"推挤"是**严丝合缝**（`top = next.natural - h` ⇒ 卡底正好压在下一条的顶边上，探针里 `contact: true`），为的是看着连续；但用户用下来报"间隔太近、叠到了一起"。现在在上夹里再减一个 `CARD_GAP = 8`：卡底与它顶住的那条之间留 8px，三种情形一起受益（卡与卡、最后一张卡与它顶住的用户消息、以及被顶出上沿的过程）。**只改上夹** —— `TOP_GAP`（判定线/交接窗）不动，那是"什么时候接管"，是另一件事。实测（`#stickystackpushprobe`）：旧卡 `bottom 22` / `nextUserTop 30` ⇒ 缝 8px、`contact: false`。

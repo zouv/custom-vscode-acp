@@ -71,8 +71,11 @@ export class AcpClientImpl implements Client {
    * fallback consent prompt) arrive here once `clientCapabilities.elicitation.form`
    * is declared. The method name must match the SDK's `Client` interface exactly or
    * the connection never dispatches to it.
+   *
+   * [CUSTOM-20261003-175] SDK 1.x 把它从 `unstable_createElicitation` 正式化为
+   * `createElicitation`（旧名字在 1.x 里已不存在）。
    */
-  async unstable_createElicitation(
+  async createElicitation(
     params: CreateElicitationRequest,
   ): Promise<CreateElicitationResponse> {
     if (!this.elicitationHandler) {

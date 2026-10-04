@@ -269,6 +269,8 @@ export const composerClient = `
     if (!composerEl || !document.body || !document.body.style || !document.body.style.setProperty) { return; }
     function apply() {
       document.body.style.setProperty('--acpc-composer-h', composerEl.offsetHeight + 'px');
+      // [CUSTOM-20261003-176] 留白变了 ⇒ 视口判定要跟着重算（scroll 事件不会来，见 scroll.ts 的 reflow）。
+      if (NS.scroll && NS.scroll.reflowNow) { NS.scroll.reflowNow(); }
     }
     apply();
     if (typeof window.ResizeObserver === 'function') {

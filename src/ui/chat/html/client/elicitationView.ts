@@ -194,12 +194,10 @@ export const elicitationViewClient = `
     radio.setAttribute('data-field', field.name);
     radio.setAttribute('data-kind', 'select');
     radio.addEventListener('change', function () { onPick(field.name, value); });
-    // [CUSTOM-20261002-168] 再点一次**已经选中**的那一行 = 取消选择（radio 原生做不到）。
-    // 判据用 data-elic-picked（由 onPick 写）：点击时浏览器已经把它设成 checked 了，
-    // 靠 checked 自己分不出"刚选中"与"再点一次"。
-    radio.addEventListener('click', function () {
-      if (radio.checked && radio.getAttribute('data-elic-picked') === '1') { clearPick(field.name); }
-    });
+    // [CUSTOM-20261003-174] 这里曾有一条"再点一次已选中的行 = 取消选择"（168 加的，当时是唯一的
+    // 清除入口）。用户要求去掉：抽屉底部已经有 'Clear answer'，一个按钮做这件事比"再点同一行"
+    // **可预期得多** —— 后者让"手抖点两下"静默丢掉选择，而且和别的单选控件行为不一致。
+    // 现在这一行就是**原生 radio**：再点一次保持选中。（配套删掉了 data-elic-picked 记账。）
     label.appendChild(radio);
     var text = el('span', 'elic-option-text');
     text.appendChild(el('span', 'elic-option-label', title));
@@ -246,7 +244,6 @@ export const elicitationViewClient = `
     var inputs = inputsNamed(form, fieldName);
     for (var i = 0; i < inputs.length; i++) {
       inputs[i].checked = false;
-      inputs[i].setAttribute('data-elic-picked', '0');
     }
     refresh(form, state);
   }
@@ -305,9 +302,9 @@ export const elicitationViewClient = `
     if (!form || !state) { return; }
     var inputs = inputsNamed(form, fieldName);
     for (var i = 0; i < inputs.length; i++) {
+      // [CUSTOM-20261003-174] 显式互斥仍然是**必须**的（桩 DOM 没有原生 radio 组行为），
+      // 但不再记 data-elic-picked：那个属性只服务于已删除的"再点一次取消"。
       inputs[i].checked = inputs[i].value === value;
-      // [168] 记住"这一格是当前选中项"，供"再点一次取消"判定。
-      inputs[i].setAttribute('data-elic-picked', inputs[i].checked ? '1' : '0');
     }
     refresh(form, state);
   }
@@ -458,14 +455,13 @@ export const elicitationViewClient = `
     console.warn('[acpc] form fields: ' + groups.length + ' question(s), ' + optTotal +
       ' option(s), ' + optWithDesc + ' with description');
     // [CUSTOM-20261001-154] 标题行没了（用户要求）：tab 栏、进度与收起按钮合成一条 bar，
-    // 进度与箭头**靠右**对齐。收起来时 tab 条隐藏、只留当前题的名字 + 进度 + 箭头。
+    // 进度与箭头**靠右**对齐。[CUSTOM-20261003-177] 收起时**同样**保留这条 tab 条
+    // （用户要求：收起后仍要看得到每一题的标题与圆点状态）—— 收起只藏正文与操作栏。
     var bar = el('div', 'elic-bar');
     var tabs = el('div', 'elic-tabs');
     var panes = el('div', 'elic-panes');
-    var firstTitle = '';
     for (var i = 0; i < groups.length; i++) {
       var title = groups[i].field.title || ('Question ' + (i + 1));
-      if (i === 0) { firstTitle = title; }
       var tab = el('button', 'elic-tab');
       tab.type = 'button';
       tab.setAttribute('data-elic-tab', String(i));
@@ -474,7 +470,6 @@ export const elicitationViewClient = `
       tabs.appendChild(tab);
       panes.appendChild(buildGroup(groups[i], i));
     }
-    bar.appendChild(el('span', 'elic-collapsed-title', firstTitle));
     bar.appendChild(tabs);
     bar.appendChild(el('span', 'elic-progress', ''));
     var toggle = el('button', 'elic-toggle');
@@ -519,10 +514,6 @@ export const elicitationViewClient = `
     var total = groups.length;
     var progress = form.querySelector('.elic-progress');
     if (progress) { progress.textContent = 'Answered ' + answered + '/' + total; }
-    var collapsedTitle = form.querySelector('.elic-collapsed-title');
-    if (collapsedTitle && groups[activeTab]) {
-      collapsedTitle.textContent = groups[activeTab].field.title || ('Question ' + (activeTab + 1));
-    }
     // The "Clear answer" link belongs to a select that HAS a pick.
     var clears = form.querySelectorAll('.elic-clear');
     for (var c = 0; c < clears.length; c++) {
@@ -550,6 +541,10 @@ export const elicitationViewClient = `
 
   function refresh(form, state) {
     refreshChrome(form, state);
+    // [CUSTOM-20261003-176] 切题 / 展开 / 收起都会改变抽屉高度，也就是消息区的底部留白。
+    // ResizeObserver 的回调按帧投递（152 的既有教训：它不能是唯一一条腿），这里显式重写一次 ——
+    // applyDrawerHeight 内部同时会喊 scroll.reflowNow()，让视口判定跟着重算。
+    applyDrawerHeight();
   }
 
   // --- The drawer ----------------------------------------------------------
@@ -933,7 +928,13 @@ export const elicitationViewClient = `
   function onDrawerClick(event) {
     var target = event.target;
     var tab = closestAttr(target, 'data-elic-tab');
-    if (tab) { selectTab(Number(tab.getAttribute('data-elic-tab'))); return; }
+    if (tab) {
+      selectTab(Number(tab.getAttribute('data-elic-tab')));
+      // [CUSTOM-20261003-177] 收起态下点 tab = "我要看那一题" ⇒ 顺手展开，否则点了像没反应
+      // （正文是藏着的，只有圆点/标题那一点点变化，用户会以为坏了）。
+      if (collapsed) { setCollapsed(false); }
+      return;
+    }
     var toggle = closestAttr(target, 'data-elic-toggle');
     if (toggle) { setCollapsed(!collapsed); return; }
     var clear = closestAttr(target, 'data-elic-clear');
@@ -975,6 +976,8 @@ export const elicitationViewClient = `
   function applyDrawerHeight() {
     if (!drawer || !document.body || !document.body.style || !document.body.style.setProperty) { return; }
     document.body.style.setProperty('--acpc-elic-h', drawer.hidden ? '0px' : drawer.offsetHeight + 'px');
+    // [CUSTOM-20261003-176] 抽屉高度就是消息区的底部留白 ⇒ 写完要重算视口判定（见 scroll.ts 的 reflow）。
+    if (NS.scroll && NS.scroll.reflowNow) { NS.scroll.reflowNow(); }
   }
 
   function watchHeight() {

@@ -2,7 +2,9 @@
 // postMessage 协议：**从第一天起就是 session 作用域的**——每一条会话相关的消息都同时携带
 // agentName 与 sessionId，接收端校验二者匹配后才生效，绝不静默落到「当前聚焦会话」上。
 // [CUSTOM-END] CUSTOM-20260923-011
-import type { SessionConfigOption, SessionModeState, SessionModelState } from '@agentclientprotocol/sdk';
+import type { SessionConfigOption, SessionModeState } from '@agentclientprotocol/sdk';
+// [CUSTOM-20261003-175] ACP SDK 1.x 删掉了 models API（说明见 core/SessionManager.ts 的同名注释）。
+import type { LegacySessionModelState } from '../../core/SessionManager';
 
 import type { EntryPatch, TranscriptEntry, TranscriptSnapshot } from './transcript/types';
 import type { ToolCallView } from './content/toolCalls';
@@ -41,7 +43,7 @@ export interface SessionSummary {
 export interface SessionMeta {
   sessionId: string;
   modes: SessionModeState | null;
-  models: SessionModelState | null;
+  models: LegacySessionModelState | null;
   configOptions: SessionConfigOption[] | null;
   availableCommands: Array<{ name: string; description: string; inputHint?: string | null }>;
   usage: { used: number; size: number; costAmount?: number; costCurrency?: string } | null;
