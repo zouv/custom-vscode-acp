@@ -115,6 +115,12 @@
   - **⑤输出例（真 Chromium 造的样本）**：`scroll#1 user-scroll st=2412/2412 atmax=1 pad=423 dist=-423 pin=1 jump=0 …` → `scroll#2 geom:composer 84px->197px st=2112/2686 atmax=0 pad=536 dist=38 pin=0 jump=1 … sup=3` —— 一条日志就能看出"输入卡长高 → 留白 423→536 → 视口落到底部之外、Jump 亮起"。
 - **验证方式**：`npm test` **344 passing**（诊断在既有滚动测试里被真实触发；第一次跑还因为桩 DOM 的 `document.body` 没有 `style` 而红了三条，已加 `bodyVar()` 判空）。**真 Chromium 端到端**：`preview-records.mjs` 新增 `#scrolllogprobe` 档（造几何变化 + 滚动，把 console 捕下来看），跑出来 `geom:elic/perm/composer` 三条与 `user-scroll` 一条，字段齐全；`scroll.ts` 里三个写入方（输入卡/表单抽屉/权限抽屉）各加一行 `noteGeometry`。`lint` 0；`check-registry.mjs` 六节全绿。
 - **下次复现时怎么用**：`grep "acpc] scroll#" ~/.claude/acp-client-custom.log` —— 按序号读一遍就能定案，不需要用户复述现象。
+- **第一次复现（2026-10-05，custom.8 装上后）与据此的加强**：真机日志 209 条诊断读下来，**排除了三条嫌疑**：
+  ⓐ 80 次程序写**全部**是"贴底跟到底"（`scroll-after-program` 的 st 单调递增 6→…→5940），**没有任何一次写到 43** ⇒ 不是"我们把他拽回去"；
+  ⓑ `clamped-short` **0 次** ⇒ 跟到底每次都落到了 max；
+  ⓒ `atmax=1 且 pin=0`（不可能组合）**0 次**。
+  而现场是：面板停在 `st=43`（近顶部）而 `max=5940+`，`user-scroll` 整场只有 8 次 —— 也就是说**用户拖的那个滚动条没有作用到 #messages 上**（拖拽会连续产生 scroll 事件，一次都没有）。
+  据此加了两样东西：**`sf=view|editor`**（两个面各有自己的 #messages，先排除"看的是另一个文档"）与 **`scrollbar-press`**（按下点落在滚动条那条带子上时记一笔，`offsetX > clientWidth`；之后有没有跟着的 scroll 事件，就能判定"拖了到底动没动"）。**不记区内的普通按下** —— 点工具卡/选文字都会触发，那点噪声会把这套诊断自己的配额吃光。
 - **基于上游版本**：0.2.0（commit e7371659）
 
 ### 2026-10-05 - CUSTOM-20261005-191
