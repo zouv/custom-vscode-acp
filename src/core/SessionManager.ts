@@ -861,6 +861,59 @@ export class SessionManager extends EventEmitter {
     }
   }
 
+  // [CUSTOM-BEGIN] CUSTOM-20261004-187 - 轮次进行中的补充消息（steering）。
+  /**
+   * Whether the agent behind this session advertised **steering**
+   * (`_session/steering`) — the only supported way to hand the agent another message
+   * while its turn is still running.
+   */
+  supportsSteering(sessionId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session) { return false; }
+    return this.connectionManager.getConnection(session.agentId)?.supportsSteering === true;
+  }
+
+  /** Whether a prompt turn is in flight for this session (a Stop button is showing). */
+  hasRunningTurn(sessionId: string): boolean {
+    return this.inFlightTurns.has(sessionId);
+  }
+
+  /**
+   * [CUSTOM-20261004-187] Inject a message into the turn that is already running.
+   *
+   * `_session/steering` is an agreed-but-unpublished ACP extension method, so a
+   * `session/prompt` sent now would be a **different** turn (or be rejected) — this is
+   * the only way to add to the one in flight. It is a REQUEST, not a notification: the
+   * agent answers whether it took the message.
+   *
+   * Returns `'idle'` when the agent says no turn was running (`idleBehavior:
+   * 'promptRequired'`): our own `inFlightTurns` flag can be stale (background work, a
+   * turn started elsewhere), and the caller must then fall back to a normal prompt
+   * rather than silently swallowing the message.
+   */
+  async steerPrompt(sessionId: string, prompt: string | ContentBlock[]): Promise<'steered' | 'idle'> {
+    const session = this.sessions.get(sessionId);
+    if (!session) { throw new Error(`Session not found: ${sessionId}`); }
+    const connInfo = this.connectionManager.getConnection(session.agentId);
+    if (!connInfo) { throw new Error(`No connection for agent: ${session.agentId}`); }
+    if (!connInfo.supportsSteering) { throw new Error('This agent does not support steering.'); }
+
+    const blocks: ContentBlock[] = typeof prompt === 'string'
+      ? [{ type: 'text', text: prompt }]
+      : prompt;
+
+    log(`steerPrompt: session=${sessionId}, blocks=${blocks.length}`);
+    const result = await connInfo.connection.extMethod('_session/steering', {
+      sessionId,
+      prompt: blocks,
+      _meta: { steering: { idleBehavior: 'promptRequired' } },
+    });
+    const outcome = (result as { outcome?: unknown } | null | undefined)?.outcome;
+    log(`steerPrompt: outcome=${String(outcome ?? 'steered')}`);
+    return outcome === 'promptRequired' ? 'idle' : 'steered';
+  }
+  // [CUSTOM-END] CUSTOM-20261004-187
+
   /**
    * Cancel an active prompt turn.
    */

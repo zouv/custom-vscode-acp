@@ -53,6 +53,17 @@ export interface SessionMeta {
    * cleared client-side while the extension still holds them.
    */
   attachments: Attachment[];
+  /**
+   * [CUSTOM-20261004-187] The session's agent takes messages **mid-turn**
+   * (`_session/steering`, advertised at handshake). The composer reads it to decide what
+   * Enter does while a turn is running: send, or (unsupported) stay put and say so —
+   * a silent no-op is what the user reported as "the input can't be sent any more".
+   *
+   * Optional, and **absent means unsupported**: the field is a capability the host may
+   * not know yet (no connection, an older extension host), and guessing "supported"
+   * would send a message into a hole.
+   */
+  steering?: boolean;
 }
 
 /** Incremental patch for an existing transcript entry (streaming text, status). */

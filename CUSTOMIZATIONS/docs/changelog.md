@@ -97,6 +97,147 @@
   **无头探针**（真 Chromium）：`initial{124} → click{foldDisplay:none, cardH:76} → click{inline, 124}`、`jumped:false`。
 - **基于上游版本**：0.2.0（commit e7371659）
 
+### 2026-10-05 - CUSTOM-20261005-192
+- **功能**：给"滚动条到底了、面板却不在底部"加**自检日志**（不猜，等它自己开口）
+- **改动文件**：`src/ui/chat/html/client/scroll.ts`（新增 `logScrollState()`；`recompute` 在 **pinned 翻转**时调用；`reflow` 在**跟到底之后仍判没到底**时调用 `follow-fell-short`）
+- **来源**：用户「又出现了，消息面板还没移到底部，滚动条就已经触底了」（截图：一列 RUN/READ 工具卡，底部那条被图的下边缘切掉，屏幕中部浮着 `Jump to latest`）
+- **详细说明**：
+  - **①先排除了已知的那条**：176 修过同类（"贴底却看不全"），它的链在预览档里是**自洽**的 —— 跑 `#elicbottomstuckprobe`：`atMax:true / pinned:true / distance:-423 / jumpHidden:true / coveredByComposer:false`（pad 423 = 24 + 输入卡 84 + 抽屉 315，账对得上）。所以这次是**另一条路**，不能再按"留白没跟上"去修。
+  - **②为什么不直接改**：`distance = scrollHeight − padBottom − scrollTop − clientHeight`、`pinned = distance < 32` —— 这五个量是一张必须自洽的账（例如 atMax 时 distance 必然是 −padBottom < 0、必然 pinned）。没有数字就动手，只会在**两张账之间来回换**。所以先把账打成一行日志。
+  - **③打在哪（用户要求"多留日志"，所以覆盖了这条链的每个交接点）**：
+    ⓐ **`pinned` 翻转**（一次"视口归属"交接）；
+    ⓑ **`user-scroll` / `scroll-after-program`** —— 程序写 `scrollTop` 也会派发 scroll，不分开就会被读成"用户自己滚到底了"（新加 `writeTop()` 统一记账：写完回读真实落点，顺带能抓到"被夹住"）；
+    ⓒ **`grew-unpinned` / `skip-unpinned`** —— 内容长了而我们在"不跟"的状态（"面板没到底"的正当来源，也是本 bug 的嫌疑交界点）；
+    ⓓ **`clamped-short`** —— 跟到底、写完立刻读回却发现没落到 max（最可疑的机械成因）；
+    ⓔ **`geom:composer|elic|perm 旧->新`** —— 三个进 padding-bottom 的高度变量**变化时**通知（176 的第一嫌疑链），由写入方经 `NS.scroll.noteGeometry()` 打；
+    ⓕ **`toBottom` / `restore:<top>` / `jumpTo`** —— 视口所有权的显式交接。
+  - **④格式与配额（这一步不能省）**：`[acpc] scroll#<序号> <原因> st=<scrollTop>/<max> atmax= pad= dist= pin= jump= sh= ch= cv= ev= pv= last=<最后一条的 bottom> comp=<输入卡 top> kind= sup=<被压掉的条数>`。**序号**让"日志里少一条"与"这事没发生"区分开；字段名压短是因为日志桥把每条截到 **400 字符**（原来那条 360+ 的长字段写法，尾巴上的 `last/comp` 正好是"谁盖住了谁"的关键量，会被截掉）；**节流 700ms/原因 + 自带 12 条/10s 的上限**，因为日志桥本身只有 10s/30 条全客户端共享（173/pitfalls #42）—— 诊断不能把配额烧光，否则"日志里没有"又会被读成"没发生"。
+  - **⑤输出例（真 Chromium 造的样本）**：`scroll#1 user-scroll st=2412/2412 atmax=1 pad=423 dist=-423 pin=1 jump=0 …` → `scroll#2 geom:composer 84px->197px st=2112/2686 atmax=0 pad=536 dist=38 pin=0 jump=1 … sup=3` —— 一条日志就能看出"输入卡长高 → 留白 423→536 → 视口落到底部之外、Jump 亮起"。
+- **验证方式**：`npm test` **344 passing**（诊断在既有滚动测试里被真实触发；第一次跑还因为桩 DOM 的 `document.body` 没有 `style` 而红了三条，已加 `bodyVar()` 判空）。**真 Chromium 端到端**：`preview-records.mjs` 新增 `#scrolllogprobe` 档（造几何变化 + 滚动，把 console 捕下来看），跑出来 `geom:elic/perm/composer` 三条与 `user-scroll` 一条，字段齐全；`scroll.ts` 里三个写入方（输入卡/表单抽屉/权限抽屉）各加一行 `noteGeometry`。`lint` 0；`check-registry.mjs` 六节全绿。
+- **下次复现时怎么用**：`grep "acpc] scroll#" ~/.claude/acp-client-custom.log` —— 按序号读一遍就能定案，不需要用户复述现象。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-05 - CUSTOM-20261005-191
+- **功能**：强化右侧大纲栏里**用户消息**的区分度（用户行 = 骨架，助手行 = 补充，两级拉开）
+- **改动文件**：`src/ui/chat/html/client/outline.ts`（kind 类从图标挪/扩到**整行**）、`src/ui/chat/html/styles.ts`（`.outline-item.kind-user/-assistant` 一组规则）、`src/test/chat-client.test.ts`（在既有大纲测试里加 2 条断言）。文档：`CUSTOMIZATIONS/docs/arch/chat-panel.md` §5.9 表新增一行
+- **来源**：用户「右侧边栏用户消息区分度不是很明显，看看怎么设计强化下」（附截图：一列 👤/💬 小图标 + 文字 + 时间，两类行看着一样）
+- **详细说明**：
+  - **①现状（先渲染出来看的，没靠推）**：`preview-records.mjs` 的 `#composeroutline` 档截图确认 —— 两类行**只有一小格图标**在区分（👤 蓝 / 💬 灰，`opacity: .7`），文字颜色、字重、字号、缩进完全一致。用户说得对。
+  - **②做法**：把 `kind` 类挂到**行**上（原来只在图标上），然后按"用户是骨架、助手是补充"拉开两级 ——
+    用户行：`--vscode-foreground` + `font-weight: 600` + 图标 `opacity: 1`；
+    助手行：`--vscode-descriptionForeground` + `font-size: .95em` + 图标 `opacity: .45` + `padding-left: 16px`（缩进一格，读起来"挂在上面那条下面"而不是并列的另一条）。
+  - **③两条刻意**：ⓐ**不用左竖条/背景色**做这个区分 —— 那两条通道已经被"当前项"占着（`.active` 的 border-left 与背景），一个颜色两种意思正是 047 的教训；ⓑ**kind 决定字重/字号/缩进/图标浓淡，只有"颜色"让位给选中态**。第一版把整条规则写成 `:not(.active)`，结果选中一个用户行时它的字重从 600 掉回 400（截图里看得出来）—— 选中一个东西不该**改变它是什么**。
+- **验证方式**：**真 Chromium 前后截图**（`#composeroutline` 档，1440×1000）：改前两类行同色同重、只有图标不同；改后用户行加粗提亮、助手行变暗缩小，选中行保持与其它用户行同样的字重。`npm test` **344 passing**（在既有的"大纲行结构"测试里加了 2 条：行上必须带 `kind-user` / `kind-assistant` —— 这是 JS↔CSS 的契约，去掉类不会报错、只会**静默**退回"全都一样"）。`lint` 0；`check-registry.mjs` 六节全绿。
+- **同日收敛（用户看过效果后）**：**撤掉缩进那一档**，其余三档（文字颜色 / 字重 / 字号 + 图标浓淡）保留。理由：助手行 `padding-left: 16px` 读起来确实像子项，但侧栏默认只有 240px，缩进直接吃掉可读宽度 —— 同一行少显示一个字（截图对比可见 `啊唯，三条都收…` → `啊唯，三条都收到…`），而三档已经足以分辨。**这条决定写进了 CSS 注释与 §5.9**，免得以后有人顺手加回来。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-04 - CUSTOM-20261004-190
+- **功能**：修"任务进行中时上下文圆环外围的闪烁失效"（只剩下面多了一段不动的圆环）
+- **改动文件**：`src/ui/chat/html/client/composer.ts`（`renderContext` 记 `drawnGauge`，数字没变就不重建 DOM）、`CUSTOMIZATIONS/scripts/preview-records.mjs`（新增 `#gauge-rebuild` 档）、`src/test/chat-client.test.ts`（新增 1 条）。文档：`CUSTOMIZATIONS/docs/pitfalls.md` #51、`CUSTOMIZATIONS/docs/arch/chat-panel.md` §5.29 表新增一行
+- **来源**：用户「任务进行中时，上下文圆环外围的闪烁效果失效了（现在只能看到下面多了一段圆环），看看是闪烁效果没支持，还是出BUG了」
+- **详细说明**：
+  - **①结论：CSS 没问题，是 BUG 在"谁把它拆了重装"**。量出来 `.gauge-spin` 的 `animationName` 就是 `gauge-spin`、`.context-meter.running` 也在 —— 外圈那条动画挂得好好的。真正的原因：`renderContext` **每次都 `NS.dom.clear` + 重建 svg**，而重建 `<svg>` 让 CSS 动画**从 0 重新开始**；`setRunning` 会走到 `renderContext`，它又由 `sessionsChanged` 驱动，宿主**每个 `agent_message_chunk` 都 `refreshSessions()`** ⇒ 流式期间每秒重建几十次 ⇒ 那条弧永远停在起点角度，看起来就是"多了一段不动的圆环"。
+  - **②修法**：`renderContext` 记住上次画在 DOM 里的那组数字（`drawnGauge = {used,size}`），**数字没变就只更新 class / title**（便宜、不碰结构），变了才重画。于是 `setRunning` 退化成"翻一个 `running` 类名"，动画活下来。选在**渲染器**里修而不是在 `setRunning` 里修：这样 `setMeta` / `setFocus` 等所有调用方都受益（同一类知识只留一处）。
+  - **③为什么"看起来像是闪烁没支持"**：这类缺陷没有任何报错，两端日志都干净 —— 只有"动没动"这一件事出了问题，而它**在截图里看不出来**（一帧而已）。
+- **验证方式**：**真 Chromium，判据是节点身份**（`preview-records.mjs` 的 `#gauge-rebuild`，连调三次 `setRunning(true)` 模拟流式的三次 `sessionsChanged`）：
+  修前 `sameSvgNode:false, secondCallKept:false, thirdCallKept:false`；修后 `sameSvgNode:true, secondCallKept:true, thirdCallKept:true`。
+  `npm test` **344 passing**（新增 1 条：running 翻转不许重建表盘、但数字真的变了必须重画）；**该条确认会咬**：`composer.ts` 单独 `git stash` 回旧代码后失败，`pop` 后转绿。`lint` 0；`check-registry.mjs` 六节全绿。
+  **过程中踩到的三个测量陷阱已记进 pitfalls #51**：无头里 `prefers-reduced-motion` 恒为 reduce（动画量不到，且 `!important` 连 inline 都压）、元素不在渲染树里就没有 Animation 对象（`#gauge` 档的 composer 本来就是 `display:none`）、`--virtual-time` 下动画时钟不推进；**外加一个自伤**：改完源码忘了 `npm run compile-tests`，harness 读旧 `out/` 量了一次"修了却仍 false"。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-04 - CUSTOM-20261004-189
+- **功能**：修表单抽屉"每输入一个字符就失去焦点"（附加内容框 / Other 自拟框）
+- **改动文件**：`src/ui/chat/html/client/elicitationView.ts`（`placeCustomBoxes` 两处 `appendChild` 改成"只在真的换行时才搬"）、`CUSTOMIZATIONS/scripts/preview-records.mjs`（新增 `#elicfocusprobe`：真 Chromium 量焦点）、`src/test/chat-client.test.ts`（新增 1 条：桩里钉"打字不许搬动"）。文档：`CUSTOMIZATIONS/docs/pitfalls.md` #50、`CUSTOMIZATIONS/docs/arch/chat-panel.md` §5.33 的「自拟框」行
+- **来源**：用户「发现选项的弹出面板，在附加内容输入框输入内容时（以及 Other 里的自定义输入框），每输入一个字符就会失去焦点」
+- **详细说明**：
+  - **①根因**：`placeCustomBoxes` 把题目级的自拟框 `appendChild` 进"被选中的那一行"，而它在**每次 refresh** 里都跑，refresh 又由 `onDrawerChange` 在**每个 `input` 事件**上触发 ⇒ 每敲一个键就搬一次框。`appendChild` 的 DOM 语义是**先摘下来再插回去**，"摘"这一步会触发浏览器的失焦步骤（焦点回 `body`）。
+  - **②"同一个父级不算搬动"是错的**（这是我原本的假设，被实测推翻）：`if (box.parentNode !== host)` 这个修法的前提正是"同父级也失焦"。真 Chromium 探针直接量那条原语：把已聚焦节点的祖先 appendChild 到**同一个**父级 ⇒ `focusAfterSameParentMove: false`。
+  - **③为什么以前没发现**：那个框的值确实不丢（代码注释写着 "appendChild MOVES the element: its typed value survives"）—— 保住的是**值**，丢的是**焦点**。同一个动作有两份状态，只验了一份（#19/#34 同族）。
+  - **④修法**：判据从"搬到哪儿"改成"**要不要搬**"（`if (box.parentNode !== host)`；回 `data-elic-home` 那条同理）。
+- **验证方式**：**真 Chromium 前后对比**（`preview-records.mjs` 的 `#elicfocusprobe`，聚焦自拟框后连打三个字符再读 `document.activeElement`）：修前 `other.focusedAfter:false, activeNow:"BODY.surface-view"`，修后 `focusedAfter:true, activeNow:"INPUT.elic-input"`；同一探针里 `focusAfterSameParentMove` 始终为 `false`（证明修法是"不去搬"，不是碰巧）。`npm test` **343 passing**（新增 1 条 —— 桩 DOM 建不了焦点，但能建**搬动**（pitfall #41），所以钉的是"搬没搬"）；**该条确认会咬**：`elicitationView.ts` 单独 `git stash` 回旧代码后失败，`pop` 后转绿。`lint` 0；`check-registry.mjs` 六节全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-04 - CUSTOM-20261004-188
+- **功能**：修表单抽屉"有时候一冒出来就停在**最后一个** tab 上" —— 页号改成**按表单**记（`activeTabs[promptId]`），新表单从第一页开始
+- **改动文件**：`src/ui/chat/html/client/elicitationView.ts`（`activeTab` → `activeTabs` + `tabIndexOf`；`refreshChrome` 的夹回写回自己那一格；`selectTab` 只改本表单）、`src/test/chat-client.test.ts`（新增 2 条 + `FOUR` 夹具/`activeTabOf`）。文档：`CUSTOMIZATIONS/docs/arch/chat-panel.md` §5.33 的 161 行、`CUSTOMIZATIONS/docs/pitfalls.md` #38 复发记录
+- **来源**：用户「弹出选项面板，有时候会默认聚焦到最后一个选项 tab，请检查下是不是默认 tab 给错了」
+- **详细说明**：用户的怀疑（"默认 tab 给错了"）**基本正确**，但机制比"给错默认值"更绕一层 —— 是**模块级状态 + 夹回**相乘：
+  - 页号是模块级的一个数字 `var activeTab = 0`，**从不按表单复位**；
+  - 161 为了让"题数变少的表单"不指向不存在的页，写了 `if (activeTab >= groups.length) activeTab = groups.length - 1`，而那个夹回是相对**当前表单**的题数做的 ⇒ 上一张停在第 4 题（`activeTab = 3`）、新的一张只有 2 题时，夹回把**新**表单主动放到最后一页。**"有时候" = 新表单比旧表单短的时候**（第一版还抱怨"**聚焦**" —— 是 `.active`/aria-selected 落在最后一枚 tab 上，不是键盘焦点）。
+  - 166 修过**同一个文件**里**同一个错误**的上一个字段（`collapsed`，见 pitfalls #38），当时 `activeTab` 就在同几行里没被扫到。
+- **验证方式**：`npm test` **342 passing**（新增 2 条：新表单从第一页开始 / 每张表单各自记住自己的页，来回切不串）。**两条都确认会咬**：把 `elicitationView.ts` 单独 `git stash` 回旧代码后跑，2 条**全部失败**，`stash pop` 后转绿。`lint` 0；`check-registry.mjs` 六节全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-04 - CUSTOM-20261004-187
+- **功能**：轮次进行中也能把输入框里的消息发出去 —— 走协议里现成的 **steering**（注入正在跑的那一轮），而不是当第二个 `session/prompt`。不支持的 agent 保持不发，但**在输入卡上方写明原因**（以前是静默无反应）
+- **改动文件**：`src/core/ConnectionManager.ts`（读 `_meta.steering.supported` → `ConnectionInfo.supportsSteering`）、`src/core/SessionManager.ts`（`supportsSteering` / `hasRunningTurn` / `steerPrompt`）、`src/ui/chat/ChatPanelHost.ts`（`handleSendPrompt` 的 steering 分支）、`src/ui/chat/protocol.ts`（`SessionMeta.steering`）、`src/ui/chat/html/body.ts`（`#steerHint`）、`src/ui/chat/html/styles.ts`（`.steer-hint`）、`src/ui/chat/html/client/composer.ts`（`send()` 判据 + 提示显隐 + 能力随 `setFocus`/`setMeta` 更新）、`src/test/chat-panel.test.ts`（新增 suite 3 条）、`src/test/chat-client.test.ts`（新增 3 条 + `composerBar` 暴露 `sent`/`steerHint`）。文档：`CUSTOMIZATIONS/architecture.md` §1/§2.4、`CUSTOMIZATIONS/docs/arch/chat-panel.md` §5.44
+- **来源**：用户「发现现在如果任务在进行中，输入框的内容没法 Enter 发送了，需要支持增量发送」
+- **详细说明**：
+  - **①为什么以前发不出去**：182 刚把回车改成"只调 `send()`"（免得第二次回车把整轮停掉），而 `send()` 守着 `if (state.running) return` —— 于是跑着按回车 = **静默空操作**。要支持补发，就得有一条"不产生第二个轮次"的出口。
+  - **②协议（读实跑适配器源码确认，非猜）**：`claude-agent-acp` 注册了自定义方法 **`_session/steering`**，参数 `{sessionId, prompt: ContentBlock[], _meta?: {steering: {idleBehavior}}}`,把消息**注入正在跑的那一轮**；能力在 `InitializeResponse._meta.steering.supported` 里声明；`idleBehavior: 'promptRequired'` 表示"没有轮次在跑时请改用普通 prompt"（应答 `{outcome:'promptRequired'}`）。SDK 侧 `ClientSideConnection.extMethod(method, params)` 就是普通 JSON-RPC request（不过滤方法名）。
+  - **③三条不变量**：ⓐ steering **不产生第二个 `PromptResponse`** ⇒ 宿主在 steer 成功后**一个轮次状态都不动**（不 `endBackgroundTask`、不 `finalizeTurn`、不 `refreshSessions`），否则 Stop 按钮永不熄灭、永不发"轮次完成"、标题永不冻结；ⓑ 能力是**每个 agent 一份**、跟着连接走，客户端**换会话先重置为 false**（宁可提示也不把消息发给不认它的 agent；`meta` 缺这个字段一律当不支持）；ⓒ `steerPrompt` 返回 `'idle'` 时必须落回普通路径 —— 我们这边的 `inFlightTurns` 可能陈旧，读错就静默吞掉用户消息。
+  - **④界面**：支持的 agent 不提任何多余的话（回车直接发，与 Claude Code CLI 一致）；不支持的显示 `#steerHint`，判据是 **running && !steering && 输入框里确实有东西**（少了最后一条会在每次长轮次里无缘无故常驻）。它放在 `.composer-inner` 里（与 `#stopConfirm` 同位置家族，理由同 183：`.composer-main` 是 flex 行，挂外面会被压成 0 高）。
+- **验证方式**：`npm test` **340 passing**（新增 6 条 —— 宿主：注入 / 不产生第二个轮次（`prompted` 为空 + 无 turn-done 通知）/ idle 回落 / 不支持的 agent 不走这条路；客户端：回车发得出 / 不支持的保持不发并给提示 / 能力不跨会话泄漏）。**新测试确认会咬**：把 `ChatPanelHost.ts` + `composer.ts` 一起 `git stash` 回旧代码后跑，187 的 6 条**全部失败**，`stash pop` 后转绿。`lint` 0；`check-registry.mjs` 六节全绿。**⚠️ 真机未跑**：要拉起 agent 且让某一轮真的跑着才能验（会把消息注入那一轮）；协议形状已按适配器自己的 `parseSteerRequest` 逐字比对过。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-04 - CUSTOM-20261004-186
+- **功能**：修"消息显示不全"——长回复只显示开头几个字（且 `**` 是字面量），后面收到的内容一个字都不显示
+- **改动文件**：`src/ui/chat/ChatPanelHost.ts`（`handleRenderMarkdown` 拒绝过期回填）、`src/ui/chat/html/client/transcriptView.ts`（`asked[entryId]` + `patch`/`trackMarkdown` 两条作废规则）、`src/test/chat-panel.test.ts`（新增 suite 2 条）、`src/test/chat-client.test.ts`（新增 2 条 + 桩 `appendData`）。文档：`CUSTOMIZATIONS/docs/arch/chat-panel.md`（双面不变量表 `renderMarkdown` 往返一行）、`CUSTOMIZATIONS/docs/pitfalls.md` #49
+- **来源**：用户报"有时候会出现，消息显示不全的情况"并给出截图（`D:\Git\zgame\zgame_ai_coding\ai-vibe-creator` 会话，最后一条助手回复只显示 `后端**没事`）
+- **详细说明**：
+  - **①取证**：该会话的扩展侧日志已被 5MB 截断（`Logger` 在激活时 truncate），但 agent 自己的会话记录还在（`~/.claude/projects/D--Git-zgame-.../56642cf5….jsonl`）—— 里面那条回复是**完整**的（`后端**没事**——被终止的只是那层包装 shell…`），而面板只显示了开头 8 个字，且 `**` 未渲染。**8 个字 + 字面量 `**` 正是"渲染的是不完整原文"的指纹**（markdown 里不成对的行内标记保持字面量）。
+  - **②根因**：`renderMarkdown` 的 item 带的是**请求发出那一刻**的文本快照；适配器 `includePartialMessages: true`（读实跑源码确认）⇒ 一条消息拆成很多 `agent_message_chunk`，正文一直在长；128 又让记录"一落地就自己发起渲染请求" ⇒ 第一片到达时就把请求发出去了，回来的 html 是**那一片**的渲染。而"这份 html 已经作废"的信号**过不了线**：宿主 store 合并时把 `last.html` 置 undefined，`JSON.stringify` 丢掉 undefined 键 ⇒ 客户端 `entry.html` 永不清理，`applyAssistant` 见 `hasHtml` 就把正文重设成旧渲染。工具卡那条路 084 早踩过同一个坑（用文本指纹 key 治好了），助手/思考这条一直没治。
+  - **③为什么"有时候"**：只有"回填比后续分片先到"（记录后续还会流一会儿）才会冻住；收尾那一刻才回填的短消息永远正常 —— 所以只在**长回复**上见。
+  - **④修法**：两边都要求"一份 html 只对它照之渲染的那段文本有效"。宿主：`item.text` 与当前 `entry.text` 不符 ⇒ 不落盘、不回填（并记一行 `stale markdown reply dropped`）。客户端：新增 `asked[entryId]`（这次问的是哪段文本），旧回填**丢弃**；文本变了而这一 patch 没带新 html ⇒ **丢掉手里的 html**（补上宿主那条过不来的规则）；`trackMarkdown` 的自愈路径改成"已收尾且没有可用的新 html ⇒ 把当前文本重新要一次"，不再被旧回填的到达顺序左右。
+  - **⑤顺带**：桩 DOM 的文本节点补了 `appendData` —— 流式增量路径（`setStreamingText`）此前在桩里会直接抛，也就是说那条路径**从来没被测试覆盖过**（pitfall #41 同族）。
+- **验证方式**：`npm test` **334 passing**（新增 4 条：客户端"早渲染过的记录不冻住"、"迟到的旧回填不覆盖正文"；宿主"过期回填不落盘"、"文本相符的回填照常落盘"）。**四条都确认会咬**：把 `ChatPanelHost.ts` / `transcriptView.ts` 分别 `git stash` 回旧代码后跑，4 条**全部失败**，`stash pop` 后转绿。`lint` 0；`check-registry.mjs` 六节全绿。**真 Chromium 冒烟**（`preview-records.mjs` 的 `#bootroundprobe`）：`{"hasMdClass":true,"text":"v2",...}` —— 顺带抓到本修法**第一版的自伤**（旧回填不清 `pending`，反而把"收尾后重新要一次"的路堵死，探针当时报 `hasMdClass:false`；只看单测发现不了）。证据链：agent 会话 JSONL 的完整原文 + 适配器源码（`includePartialMessages: true`、`sessionUsage` 的累加）+ 用户截图。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-04 - CUSTOM-20261004-185
+- **功能**：修上下文圆环"超过上限"（截图 `100% · 1841k / 1000k tokens`）+ tooltip 里的金额只保留两位小数
+- **改动文件**：`src/ui/chat/ChatPanelHost.ts`（删除 `applyResponseUsage` 及其调用点）、`src/ui/chat/html/client/composer.ts`（`renderContext` 金额 `toFixed(2)`）、`src/test/chat-panel.test.ts`（新增 suite 1 条：响应里的累计 token 不许动圆环）、`src/test/chat-client.test.ts`（新增 1 条：金额两位小数 + 无金额不印 NaN）。文档：`CUSTOMIZATIONS/docs/arch/chat-panel.md` §5.29 圆环数据来源、`CUSTOMIZATIONS/docs/pitfalls.md` #48
+- **来源**：用户四条提问（前两条问机制，后两条是改动要求："计费会出现很多小数点，优化下，只保留2位小数即可"、"上下文进度会出现超过上限的情况，请排查下"）
+- **详细说明**：
+  - **①机制（回答提问）**：圆环数据只有一份 `ChatPanelHost.usage`（`sessionId → {used,size,cost}`）。`used/size` 来自 agent 的 `usage_update`；**金额我们从不计算、只透传** `usage_update.cost{amount,currency}`（协议定义即"cumulative session cost"）。客户端 `pct = clamp(used/size, 0, 1)`（环被夹住）+ `percent = round(pct*100)`（≤100），而 tooltip 文字用的是**未夹的原始数字** —— 这正是"环满格、数字超限"的来源。
+  - **②越界根因（实锤）**：宿主曾在每轮结束时把 `PromptResponse.usage.totalTokens` 折进 `used`（`size` 沿用旧值）。ACP 协议里该字段是 *Sum of all token types **across session***；直接读了实跑适配器 `@agentclientprotocol/claude-agent-acp`（npx 缓存 `dist/acp-agent.js:7311 sessionUsage` → `tallyTotal` → `:4046 accumulatedUsage.inputTokens += …`）确认它是**每轮累加**、且 cache read 每轮重算 ⇒ 只增不减。窗口 1M 而累计 1.84M，于是"超过上限"。
+  - **③为什么这个 fallback 从来没起作用**：它只在 `size` 已知时才展示，而 `size` 只可能由 `usage_update` 提供 —— 没有 `usage_update` 就没有 `size`，客户端会直接隐藏表盘。即它唯一能做到的事就是把已经正确的读数改坏。修法：删掉这个写入者，圆环**只认 `usage_update`**；要展示"会话累计 token / 花费"请另开字段（已写进代码注释与 pitfalls #48）。
+  - **④小数**：金额是 agent 给的裸浮点（日志实测 `2.6394680000000004`），原样拼进 tooltip 就是"4.676045 USD"。展示前 `toFixed(2)`，且非数字（undefined/null/NaN）整段不显示。
+- **验证方式**：`npm test` **330 passing**（新增 2 条）；`npm run lint` 0；`check-registry.mjs` 六节全绿。**新测试确认会咬**：把 `ChatPanelHost.ts` 单独 `git stash` 回旧代码后跑，该条**失败**（`a session-cumulative token total must never be rendered as context-window occupancy`），`stash pop` 后转绿 —— 不是一条永远为真的断言。证据来源：`~/.claude/acp-client-custom.log`（真实 `usage_update`：`used: 55642, size: 1000000, cost.amount: 2.6394680000000004`）+ 适配器源码。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-04 - CUSTOM-20261004-184
+- **功能**：让助手正文里的**本地文件链接**能点开 —— `[GOAL.md:74](GOAL.md:74)` 这类 agent 常写的文档跳转，此前渲染成一行带删除线的灰字（悬停浮出 `Blocked link scheme`），点了没有任何反应；现在接上宿主**早就有**的 `openFile` 通道：按会话 cwd 解析相对路径、按 `:12` / `#L12` 跳行
+- **改动文件**：`src/ui/chat/markdown.ts`（`link()` 增本地路径分支 + `fileLinkTarget()`）、`src/ui/chat/content/contentBlocks.ts`（`localPathOf` 改为 export，供两处复用）、`src/test/chat-panel.test.ts`（新增宿主侧 suite 10 条）、`src/test/chat-client.test.ts`（新增桩 DOM suite 3 条：点击真的发 openFile，而不是 openLink）、`CUSTOMIZATIONS/scripts/preview-records.mjs`（新增 `#linkclickprobe` 档）。文档：`CUSTOMIZATIONS/docs/arch/chat-panel.md` §5.5 与 §5.7 规则二、`CUSTOMIZATIONS/docs/pitfalls.md` #47、`CUSTOMIZATIONS/docs/dev-workflow.md` 的"自动化能覆盖到哪"（补上"点击可以在预览里量"）
+- **来源**：用户报「消息界面里渲染出来的 md 内容，有的提供了文档跳转链接，但是点击后没反应」并给出截图（表格单元里 `GOAL.md:74` / `AGENTS.md:596`，悬停显示 `Blocked link scheme`）
+- **详细说明**：
+  - **①根因是"同一类资源有两条渲染路径，只有一条接上了点击通道"**：`resource_link` 内容块走 `contentBlocks.localPathOf` → `data-path` → 客户端委托 → `openFile`（039 建的，完整可用）；而 **markdown 正文链接**走的是 `markdown.ts` 的 `link()`，那里的判定是「`http`/`https`/`mailto` 放行，其余一律降级成静态 `link-blocked` span」。于是同一个文件，以 chip 出现能点开，以 markdown 链接出现就是个死字。
+  - **②修法 = 复用而不是复制判定**：`localPathOf` 导出，`link()` 在 scheme 判定失败后调**同一个**函数；命中就写 `data-path`（+ 行号时 `data-line`）。**不新增客户端代码**——`links.ts` 的委托早就在读这两个属性。
+  - **③剥行号必须早于路径判定**：`GOAL.md:74` 里 `GOAL.md` 本身就是合法 URI scheme 语法（`.` 与 `-` 都是 scheme 允许字符），不先剥就会被判成"scheme 为 `goal.md` 的外链"而落进 blocked 分支。支持 `path:12` / `path:12:5` / `path#L12` / `path#L12-L30`。
+  - **④保守边界**：解析不出的 fragment（`#section`）与未知协议（`javascript:` / `command:` / `data:`）**仍保持 inert**，且不得退化成"打开某个文件第 1 行"——那比不动更糟。
+- **验证方式**：`npm test` **328 passing**（宿主侧新增 10 条：相对路径带行号 / `#L12` / 区间 / 绝对路径 / `file:` URI / 无行号 / 属性转义 / http 仍走外链 / 未知协议仍 inert / 孤立 fragment 不成文件链接；客户端侧新增 3 条：`data-path` 点击发 `openFile`（带行号 / 不带行号）、`data-href` 仍发 `openLink`）；`npm run lint` 0；`check-registry.mjs` 六节全绿。**真 Chromium 端到端**（`preview-records.mjs` 的 `#linkclickprobe`，宿主 SafeMarkdown 真实产物 → 真 sanitize → 真点击）：`{"kind":"link-click","anchorFound":true,"dataPath":"GOAL.md","dataLine":"74","inertSpans":0,"sent":[{"type":"openFile","path":"GOAL.md","line":74}]}` —— 中间那一跳（真 DOMParser 白名单**保留了** data-path/data-line）由此第一次被覆盖。另用 `node -e` 对编译产物喂真实形状量过一遍，量出两件想当然会错的事：`#L12` 与 `C:/x:12` 的剥法、以及**反斜杠路径在 markdown 层就被吃掉**（`\r` 被当成转义，`C:\repo\a.ts` 根本到不了宿主）
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-04 - CUSTOM-20261004-183
+- **改进**：**停止要二次确认** —— Escape（输入框内）与 Stop 按钮都不再直接中止轮次，先在输入卡上方问一句
+- **改动文件**：`src/ui/chat/html/body.ts`（`#stopConfirm` 标记）、`src/ui/chat/html/styles.ts`（观感）、`src/ui/chat/html/client/composer.ts`（显隐与两条触发路径）、`src/test/chat-client.test.ts`（3 条）、`CUSTOMIZATIONS/scripts/preview-records.mjs`（截图档 + 探针读数）。（文档：`chat-panel.md` §5.43、`pitfalls.md` #46 续、`dev-workflow.md` 验收 207）
+- **来源**：用户「Escape 不管触发停止还是关弹窗类界面，都是不可逆的，需要先弹二次确认框」
+- **详细说明**：
+  - **先把事实核清楚**：Escape 在本面板里只有**停止**是不可逆的（工具调用被掐断）；关菜单/图片浮层/历史列表都能重开；表单抽屉的 Escape 只是**收起**、打过的字全在（152 起就绝不 cancel）⇒ 只给停止加这一步，其余保持一键（多一步只是添堵）。
+  - **形态是面板内一条**（不是宿主模态框）：`#stopConfirm` 与输入卡同宽同中线、`role="alertdialog"`（不抢焦点、不模态）；`[Stop]` 才真的 `cancelTurn`，`[Keep going]`（或**再按一次 Escape**）收起；轮次结束 / 换会话自动收起。
+  - **两个实现要点**：① 它必须在 `.composer-inner` **里** —— `.composer-main` 是 flex 行（`justify-content:center`），挂在它下面会被压成 **0 高**（第一版读数 `stopConfirmH: 0`）；② 它长在 `#composer` 里 ⇒ 高度自动进 `--acpc-composer-h`，消息区让位与 176 的视口重算都跟着（实测 `stopConfirmH 41 / composerH 84→131 / padBottom 155px`）。
+- **验证方式**：`npm test` **315 passing**（新增 3 条：Escape 只问不停、再按一次收起、点 `Stop` 才发 `cancelTurn`；`Keep going` 什么都不停；Stop 按钮同样先问、且轮次自己结束后那一问自动收起）。`lint` 0、webpack 成功、`check-registry` 六节全绿；截图 `stop-confirm-connected.png` 见观感，`#stopconfirmprobe` 见读数。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-04 - CUSTOM-20261004-182
+- **修复**：**回车只发送、绝不停止** —— 发完消息后再按一次 Enter 不再把整轮掐掉
+- **改动文件**：`src/ui/chat/html/client/composer.ts`（`onKeyDown` 的回车分支）、`src/test/chat-client.test.ts`。（文档：`chat-panel.md` §5.42、`pitfalls.md` #46、`dev-workflow.md` 验收 206）
+- **来源**：用户报「输入框消息发出之后，再按一次 Enter 会触发停止」
+- **详细说明**：
+  - **根因**：回车与 Send/Stop 按钮**共用一条路由**（`state.running ? cancel() : send()`）。按钮翻成 `Stop`（title/aria）时用户看得见，回车没有这个提示；而发完消息光标还在输入框里、手也还在键盘上 ⇒ 第二次回车中止整轮（不可逆：工具调用被掐断）。
+  - **修法**：回车只调 `send()` —— 它本来就守着"跑着不发""空内容且无附件不发"，于是跑着按回车成了**安全空操作**；停止保持显式（Send/Stop 按钮或 Escape）。
+- **验证方式**：`npm test` **312 passing**（新增一条：跑着 + 空输入按回车 ⇒ 一条消息都不发（旧版发的是 `cancelTurn`）；跑着 + 有草稿 ⇒ 同样不发；不跑 + 有文字 ⇒ 正常 `sendPrompt`）。`lint` 0、webpack 成功、`check-registry` 六节全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
 ### 2026-10-04 - CUSTOM-20261004-181
 - **改进**：置顶卡堆**留缝** —— 卡底与它顶住的那条（下一条提问/下一张卡）之间留 8px，不再"严丝合缝"
 - **改动文件**：`src/ui/chat/html/client/stickyUser.ts`（`CARD_GAP` + 上夹公式）、`src/test/chat-client.test.ts`（三条断言从"无缝相接"改成"留 8px"）。（文档：`chat-panel.md` §5.25/§5.41、`dev-workflow.md` 验收 195/197/205）

@@ -27,6 +27,16 @@ export interface ConnectionInfo {
   initResponse: InitializeResponse;
   /** Terminal handler for this connection — lets the chat panel read terminal output. */
   terminals: TerminalHandler;
+  // [CUSTOM-BEGIN] CUSTOM-20261004-187 - 轮次进行中的补充消息（steering）能力。
+  /**
+   * The agent advertised ACP **steering** (`InitializeResponse._meta.steering.supported`):
+   * a message can be injected into the turn that is already running
+   * (`_session/steering`) instead of being queued as another `session/prompt`.
+   * Claude Code's adapter registers it; others do not. Read once at handshake — it is a
+   * protocol-level capability, not session state.
+   */
+  supportsSteering: boolean;
+  // [CUSTOM-END] CUSTOM-20261004-187
 }
 
 /**
@@ -122,7 +132,15 @@ export class ConnectionManager {
 
     log(`ConnectionManager: initialized. Agent: ${initResponse.agentInfo?.name || 'unknown'} v${initResponse.agentInfo?.version || '?'}`);
 
-    const info: ConnectionInfo = { connection, client, initResponse, terminals: terminalHandler };
+    // [CUSTOM-BEGIN] CUSTOM-20261004-187 - steering 能力（见 ConnectionInfo.supportsSteering）。
+    // `_meta` 的类型是 unknown —— 这是**schema 之外**约定好的扩展方法，所以按形状防御性读取，
+    // 不硬断言。
+    const meta = initResponse._meta as { steering?: { supported?: unknown } } | null | undefined;
+    const supportsSteering = meta?.steering?.supported === true;
+    log(`ConnectionManager: steering ${supportsSteering ? 'supported' : 'not supported'} by ${agentId}`);
+
+    const info: ConnectionInfo = { connection, client, initResponse, terminals: terminalHandler, supportsSteering };
+    // [CUSTOM-END] CUSTOM-20261004-187
     this.connections.set(agentId, info);
 
     return info;

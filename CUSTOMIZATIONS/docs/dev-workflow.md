@@ -126,7 +126,8 @@ node CUSTOMIZATIONS/scripts/preview-records.mjs --print    # 只生成 HTML 不�
 | 嵌套推断的护栏行为 | ✅ | `src/test/nesting.test.ts`（11 条） |
 | **ACP 表单请求（elicitation / AskUserQuestion）** | ⚠️ 桥可单测，协议面须探针 | 桥的逻辑（FIFO/三态/降级）由 `src/test/elicitation-bridge.test.ts` 覆盖；客户端表单由桩 DOM 覆盖；**"adapter 到底发不发、发的形状对不对"只能实跑**：`node CUSTOMIZATIONS/scripts/probe-elicitation.mjs`（真 agent、一轮额度、会在会话历史留一条）。它支持 `--no-answer` / `--reopen <id>` 复现"会话停在提问上"，**实测重开不会重抛提问**（pitfalls #32） |
 | **宿主发给 webview 的协议流**（记录有没有建出来、有没有永远 streaming、快照与增量是否一致） | ✅ | `src/test/chat-panel.test.ts`（`CUSTOM-20260925-054`），由**真实抓包的 replay 夹具**驱动 |
-| **布局与观感**（空白条、条目被压扁、diff 被折叠、按钮化后外观错位、焦点环、滚动跟随） | ⚠️ **记录区可自动截图；其余仍须人工** | `preview-records.mjs`（`CUSTOM-20260929-116`）把 webview **真正用的** CSS/标记/客户端模块拼成一个独立 HTML，交给本机 Chrome/Edge **无头截图**（`#expanded` / `#collapsed` 各一张）⇒ 记录区的折/展形状、占几行、有没有重复的首行，**在 F5 之前就能看到**（这一条是 `114/115/116` 连续两次翻车换来的，见 `docs/pitfalls.md` #31）。它**测不了**：真实主题色与字体度量、VS Code 自己的布局（气泡宽度、侧边栏宽度是脚本自己选的）、以及一切**交互**（键盘、滚动跟随、悬停）——那些仍然必须人工。**jsdom 不是 Chromium**，用它测布局只会给出假信心 |
+| **布局与观感**（空白条、条目被压扁、diff 被折叠、按钮化后外观错位、焦点环、滚动跟随） | ⚠️ **记录区可自动截图；其余仍须人工** | `preview-records.mjs`（`CUSTOM-20260929-116`）把 webview **真正用的** CSS/标记/客户端模块拼成一个独立 HTML，交给本机 Chrome/Edge **无头截图**（`#expanded` / `#collapsed` 各一张）⇒ 记录区的折/展形状、占几行、有没有重复的首行，**在 F5 之前就能看到**（这一条是 `114/115/116` 连续两次翻车换来的，见 `docs/pitfalls.md` #31）。它**测不了**：真实主题色与字体度量、VS Code 自己的布局（气泡宽度、侧边栏宽度是脚本自己选的）、以及**交互本身**。**jsdom 不是 Chromium**，用它测布局只会给出假信心。
+**但"点击"是可以在这里量的**（`#stickynarrowstickyclickprobe`、`#linkclickprobe`）：驱动脚本在真页面上派发一次真 `MouseEvent`，把**桥的出口**（`NS.bridge.post`）拦下来记一笔就得到"这次点击到底发了什么消息"——不需要人去看 Output。前提是那条链**同步**走完（CLICK → 委托 → post）；要等异步回填的（如 `window.postMessage` 那类）就得按 `#bootround` 的姿势挂定时器晚采样。键盘 / 悬停 / 读屏仍然只能人工 |
 | **键盘与读屏**（Tab 顺序、`aria-busy` 的播报时机、焦点落点） | ❌ **必须人工** | 需要真交互与辅助技术 |
 | **需要真实 agent 的行为**（replay 内容、权限弹窗、工具卡内容） | ⚠️ 夹具化后✅ | 协议形状变了要**重抓**夹具（见下）；抓包本身要花额度 |
 
@@ -552,6 +553,8 @@ node CUSTOMIZATIONS/scripts/check-webview-client.mjs --fix
 | 203 | 点置顶卡的**折叠三角**，再回到消息列表看那一条；反向：在消息列表里折一条有卡片钉着的提问 | 两边**永远一致**（一个折，另一个也折）；切走会话再切回来、或重开面板后仍然保持 | 消息列表还是展开的（状态没共用）；或切回来弹回展开（重建没读状态）；或切会话串了状态 |
 | 204 | 很长的会话（几百条记录）里折叠/展开一条消息 | 圆点、引导线跟着重排且**不卡**（旧版这里会僵住好几秒） | 明显卡顿（rail 又变成边读边写，见 pitfalls #44）；或圆点位置错位（读写分离改动破坏了 points/线的输出） |
 | 205 | 长会话里让两张提问卡**同时悬浮**（或让它们与下面那条提问贴住） | 卡与卡之间、卡与下面的提问之间都有**约 8px 的缝**，不会像一条 | 两条严丝合缝粘成一条（CARD_GAP 被改回 0 或没进上夹公式，见 181） |
+| 206 | 发一条消息，**趁它还在跑**再按一次 Enter（输入框里空着或有新草稿都试一次） | 什么都不发生（不发送、也不停止）；要停下就点 Send/Stop 按钮（提示已变成 `Stop`）或按 Escape | 第二次回车把整轮停掉（182 的回退：回车又和按钮共用路由了） |
+| 207 | 轮次跑着时在输入框里按 **Escape**；再按一次；然后点 **Stop 按钮** | 第一次 Escape 在输入卡上方冒出一条「Stop this turn? …」+ `Stop` / `Keep going`（**没有**停止）；再按一次 Escape 或点 `Keep going` 收起它；点 `Stop` 才真的停 | 一按 Escape 就停了（183 的回退）；或那条东西看不见/点不到（被 flex 行压成 0 高、或没进 --acpc-composer-h ⇒ 盖住最后一条）；或轮次自己结束后那条还挂着 |
 
 > **这一块有一层自动测试**（`src/test/chat-client.test.ts`，桩 DOM）：它测**逻辑**——
 > 折叠触发（含"只折行"与"一行放得下"两个方向）、summary/body 的切分、三角与图标的顺序（INV-J）、

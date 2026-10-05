@@ -14,6 +14,8 @@
 //      marked 新增了没人覆盖的钩子也能兜住。
 // [CUSTOM-END] CUSTOM-20260923-011
 import { Marked, type RendererObject, type Tokens } from 'marked';
+// [CUSTOM-20261004-184] The one place that decides "is this href a local file".
+import { localPathOf } from './content/contentBlocks';
 
 const HTML_ESCAPES: Record<string, string> = {
   '&': '&amp;',
@@ -33,6 +35,56 @@ const SAFE_LINK_SCHEME = /^(https?:|mailto:)/i;
 
 /** Keep code-block language classes to a boring character set. */
 const UNSAFE_LANG_CHARS = /[^a-z0-9_+#.-]/gi;
+
+// [CUSTOM-BEGIN] CUSTOM-20261004-184 - 让「本地文件链接」能点开。
+//
+// 现象：agent 写的 `[GOAL.md:74](GOAL.md:74)` / `[a.ts](./src/a.ts#L12)` 这类**本地路径链接**
+// 一律落进下面的"协议白名单之外"分支，被渲染成一行带删除线的灰字（hover 显示
+// "Blocked link scheme"）——用户点它没有任何反应，而它看上去像是能点的。
+//
+// 根因：`link()` 只认 http/https/mailto，把「没有 scheme 的相对路径」当成了「不认识的协议」
+// （`file:` 同样被挡）。而宿主**早就有**这条通道：内容块 chip 用 `data-path` → links.ts 的
+// 点击委托 → `openFile`（按会话 cwd 解析相对路径 + 跳行号，见 ChatPanelHost.handleOpenFile）。
+// 这里只是把 markdown 链接接到**同一条**路上，判定复用 contentBlocks 的 localPathOf。
+//
+// 行号语法按 agent 实际写法剥掉：`path:12` / `path:12:5` / `path#L12` / `path#L12-L20`。
+// 剥离必须**先于** localPathOf——`GOAL.md:74` 里 `GOAL.md` 本身符合 URI scheme 的语法
+// （`.` 是合法 scheme 字符），不剥就会被当成 scheme `goal.md` 而判成"非本地路径"。
+// [CUSTOM-END] CUSTOM-20261004-184
+const LINE_SUFFIX = /^(.*?):(\d+)(?::\d+)?$/;
+const FRAGMENT_LINE = /^L?(\d+)(?:-L?\d+)?$/i;
+
+/**
+ * [CUSTOM-20261004-184] Split `path[:line]` / `path#Lline` into a local path plus
+ * an optional line, or undefined when the href is not a local file reference.
+ */
+export function fileLinkTarget(href: string): { path: string; line?: number } | undefined {
+  const value = String(href ?? '').trim();
+  if (!value) { return undefined; }
+
+  let rest = value;
+  let line: number | undefined;
+
+  const hash = rest.indexOf('#');
+  if (hash >= 0) {
+    const fragment = FRAGMENT_LINE.exec(rest.slice(hash + 1));
+    // A fragment we do not understand (`#section`) is not a file target: opening
+    // the file at line 1 would be worse than leaving the link inert.
+    if (!fragment) { return undefined; }
+    line = Number(fragment[1]);
+    rest = rest.slice(0, hash);
+  }
+
+  const trailing = LINE_SUFFIX.exec(rest);
+  if (trailing) {
+    rest = trailing[1];
+    if (line === undefined) { line = Number(trailing[2]); }
+  }
+
+  const path = localPathOf(rest);
+  if (!path) { return undefined; }
+  return { path, line };
+}
 
 const renderer: RendererObject = {
   // Raw HTML is rendered as literal text: lossless (the reader still sees what
@@ -71,16 +123,26 @@ const renderer: RendererObject = {
   link(this: { parser: { parseInline(tokens: unknown): string } }, { href, title, tokens }: Tokens.Link) {
     const label = this.parser.parseInline(tokens);
     const raw = String(href ?? '');
-    if (!SAFE_LINK_SCHEME.test(raw)) {
-      // Downgrade to plain text rather than emitting a dangerous href.
-      // `command:` in particular would turn agent output into IDE command
-      // execution, and `javascript:`/`data:` are outright script vectors.
-      return `<span class="link-blocked" title="Blocked link scheme">${label}</span>`;
+    if (SAFE_LINK_SCHEME.test(raw)) {
+      const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
+      // No real href: navigation is handled by a delegated click handler that
+      // round-trips through the extension for allowlisting + openExternal.
+      return `<a href="#" data-href="${escapeHtml(raw)}"${titleAttr}>${label}</a>`;
     }
-    const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
-    // No real href: navigation is handled by a delegated click handler that
-    // round-trips through the extension for allowlisting + openExternal.
-    return `<a href="#" data-href="${escapeHtml(raw)}"${titleAttr}>${label}</a>`;
+    // [CUSTOM-20261004-184] A local file reference: same round-trip, but down the
+    // `openFile` channel (session cwd resolves relative paths, `data-line` jumps).
+    // The client's delegated handler already reads exactly these two attributes —
+    // this branch only had to start emitting them.
+    const file = fileLinkTarget(raw);
+    if (file) {
+      const lineAttr = file.line && file.line > 0 ? ` data-line="${file.line}"` : '';
+      const titleAttr = ` title="${escapeHtml(title || file.path)}"`;
+      return `<a href="#" data-path="${escapeHtml(file.path)}"${lineAttr}${titleAttr}>${label}</a>`;
+    }
+    // Downgrade to plain text rather than emitting a dangerous href.
+    // `command:` in particular would turn agent output into IDE command
+    // execution, and `javascript:`/`data:` are outright script vectors.
+    return `<span class="link-blocked" title="Blocked link scheme">${label}</span>`;
   },
 
   image({ href, text }: Tokens.Image) {

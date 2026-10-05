@@ -107,6 +107,11 @@ function loadCompiled() {
     styles: require(join(dir, 'styles')).styles,
     body: require(join(dir, 'body')).body,
     clientSource: require(join(dir, 'client', 'index')).clientSource,
+    // [CUSTOM-20261004-184] 宿主侧 SafeMarkdown 的**真实输出**，不做手写近似 ——
+    // #linkclick 档要验的正是"宿主写出来的 HTML 经过真 sanitize / 真点击之后还剩什么"，
+    // 于是它的**输入**必须是真产物（同 #bootround 用真 clientSource 的道理）。
+    fileLinkHtml: new (require(join(dir, '..', 'markdown')).SafeMarkdown)()
+      .render('[GOAL.md:74](GOAL.md:74)'),
   };
 }
 
@@ -713,6 +718,13 @@ function driver() {
   }
   // [CUSTOM-20260930-140/144] 真悬浮的验收档：滚到最底，看最后一条记录有没有被输入卡压住
   // （贴底时 #messages 会拿到 .pin-bottom，把输入卡的高度让出来）。
+  // [CUSTOM-20261004-183] 停止确认条：摆出来看观感（在输入卡上方、同宽同中线），
+  // 并读一下它的高度有没有被算进底部留白（它长在 #composer 里 ⇒ 观察器应当自己认出来）。
+  if (location.hash.indexOf('stopconfirm') >= 0) {
+    var scEl = document.getElementById('stopConfirm');
+    if (scEl) { scEl.hidden = false; }
+    NS.composer.init();
+  }
   if (location.hash.indexOf('composerbottom') >= 0) {
     messages.scrollTop = messages.scrollHeight;
     // scroll 事件是**异步派发**的，而探针在同一个同步块里读数 —— 手动派发一次，让 scroll.ts
@@ -1246,6 +1258,28 @@ function driver() {
       var colRect = colEl.getBoundingClientRect();
       var cardRect = cardEl.getBoundingClientRect();
       out.push(JSON.stringify({
+        // [CUSTOM-20261004-183] 停止确认条：它的高度必须进 --acpc-composer-h（消息让位）。
+        bodyPhase: (document.body && document.body.getAttribute) ? document.body.getAttribute('data-phase') : null,
+        composerDisplay: (function () {
+          var el = document.getElementById('composer');
+          return el ? getComputedStyle(el).display : null;
+        })(),
+        composerTop: (function () {
+          var el = document.getElementById('composer');
+          return el ? Math.round(el.getBoundingClientRect().top) : null;
+        })(),
+        composerBottom: (function () {
+          var el = document.getElementById('composer');
+          return el ? Math.round(el.getBoundingClientRect().bottom) : null;
+        })(),
+        stopConfirmHidden: (function () {
+          var el = document.getElementById('stopConfirm');
+          return el ? el.hidden : null;
+        })(),
+        stopConfirmH: (function () {
+          var el = document.getElementById('stopConfirm');
+          return el && !el.hidden ? Math.round(el.getBoundingClientRect().height) : 0;
+        })(),
         kind: 'composer',
         innerW: window.innerWidth,
         colW: Math.round(colRect.width), colLeft: Math.round(colRect.left),
@@ -1475,6 +1509,180 @@ function driver() {
     // ⇒ O(n) 次强制布局；改后只读一遍再只写一遍 ⇒ O(n) 次读、一次重排。
     // 计数口是三个（rect / offsetTop / offsetHeight），页面里别的模块也会读 —— 所以看的是
     // **同一个操作在改前/改后两次运行里的差**，不是绝对值。
+    // [CUSTOM-20261004-184] 正文里的本地文件链接：**整条链**走一遍。
+    //
+    // 为什么要真浏览器：宿主侧（markdown.ts 写出 data-path）与客户端（点击委托发 openFile）
+    // 各自都有单元测试，中间那一跳**只在真 webview 里存在** —— 宿主 HTML 要经过客户端的
+    // sanitize()（真 DOMParser + 属性白名单）才会变成 DOM，而白名单正是"没列进去的属性
+    // 静默消失"的地方。两端各证一遍 != 整条链通了（pitfalls #43）。
+    // 输入用的是宿主 SafeMarkdown 的真实产物（buildHtml 现算的），不是手写近似。
+    // ⚠️ 本模板体里**不能出现反引号**（pitfalls #11）：注释里也别写，用 sanitize() 这种写法。
+    if (location.hash.indexOf('linkclick') >= 0) { try {
+      var sent = [];
+      var realPost = NS.bridge.post;
+      // 只在桥的出口拦一道。这里**看不到 sessionId**：本页没有走过 boot 消息，boot 的
+      // currentSessionId 是 null（postForSession 只在有聚焦会话时才补写）—— 这一档量的是
+      // "点击有没有落到 openFile 这条通道上"，补写那一步由 boot 自己的路径负责。
+      NS.bridge.post = function (m) { sent.push(m); return realPost(m); };
+      NS.transcriptView.hydrate({ sessionId: SESSION, entries: [
+        { id: 'link1', kind: 'assistant', at: Date.now(), streaming: false,
+          text: '[GOAL.md:74](GOAL.md:74)', html: window.__acpcLinkHtml }
+      ]});
+      var anchor = messages.querySelector('a[data-path]');
+      var inert = messages.querySelector('.link-blocked');
+      // boot 的 init 挂在 DOMContentLoaded 上，而驱动脚本在**解析期**就跑（文件末尾的
+      // <script>）—— 那一刻委托还没装上。rail / composer 两个档也是这么各自补一次的。
+      if (anchor) { NS.links.installDelegatedHandlers(document.body); }
+      if (anchor) {
+        // 真点击（冒泡 + 可取消），走的是 boot 装在 document.body 上的那条委托。
+        anchor.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      }
+      out.push(JSON.stringify({
+        kind: 'link-click',
+        anchorFound: !!anchor,
+        dataPath: anchor ? anchor.getAttribute('data-path') : null,
+        dataLine: anchor ? anchor.getAttribute('data-line') : null,
+        inertSpans: inert ? 1 : 0,
+        sent: sent,
+      }));
+    } catch (e) { out.push(JSON.stringify({ kind: 'link-click-error', message: String((e && e.message) || e) })); } }
+    // [CUSTOM-20261004-189] 表单里打字时**焦点会不会掉**。
+    //
+    // 用户报："在附加内容输入框（以及 Other 里的自定义输入框）输入内容时，每输入一个字符就
+    // 失去焦点"。这是一个**浏览器行为**的断言（移动一个已聚焦的节点会不会让它失焦），按本仓库
+    // 的规矩只能量不能推（pitfall #31）。做法完全照用户的操作：选中一行 → 点进那个框 → 派发
+    // 一次真的 'input' 事件（打字就是它）→ 看 document.activeElement 还是不是那个框。
+    if (location.hash.indexOf('elicfocus') >= 0) { try {
+      // 计一次"这个宿主被 appendChild 了几次"：只有计数 > 0 才谈得上"是不是搬动弄丢了焦点"。
+      function spyAppend(node) {
+        var host = node && node.parentNode;
+        if (!host) { return { moves: 0 }; }
+        if (!host.__acpcAppendCount) {
+          var original = host.appendChild.bind(host);
+          host.__acpcAppendCount = 0;
+          host.appendChild = function (child) { host.__acpcAppendCount += 1; return original(child); };
+        }
+        return host;
+      }
+      function probeFocus(label, find, pick) {
+        var result = { label: label, found: false, moves: 0, focusedBefore: null, focusedAfter: null, note: null };
+        if (pick) { pick(); }
+        var input = find();
+        if (!input) { result.note = 'no input'; return result; }
+        result.found = true;
+        input.focus();
+        result.focusedBefore = document.activeElement === input;
+        var host = spyAppend(input);
+        var chainBefore = [];
+        for (var n = input; n; n = n.parentNode) { chainBefore.push(n); }
+        // [CUSTOM-20261004-189] 先直接量**那条浏览器原语**：把已聚焦节点的祖先重新
+        // appendChild 到**同一个**父级，焦点还在吗？appendChild 的语义是"先摘下来再插回去"，
+        // 而"摘下来"正是会触发失焦的那一步 —— 这一格是"是不是搬动造成的"的判据本身，
+        // 不靠推理（pitfall #31）。
+        var box = input.closest ? input.closest('[data-elic-custom], .elic-note-box') : null;
+        if (box && box.parentNode) {
+          var keeper = box.parentNode;
+          keeper.appendChild(box);          // 同一个父级，纯搬动
+          result.focusAfterSameParentMove = document.activeElement === input;
+          input.focus();
+        }
+        // 连打三个字符（每次 input 事件都是用户敲一下键）。
+        for (var k = 0; k < 3; k++) {
+          input.value += String(k);
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        result.moves = host && host.__acpcAppendCount ? host.__acpcAppendCount : 0;
+        result.focusedAfter = document.activeElement === input;
+        result.sameChain = (function () {
+          var now = []; for (var m = input; m; m = m.parentNode) { now.push(m); }
+          return now.length === chainBefore.length;
+        })();
+        result.activeNow = document.activeElement
+          ? String(document.activeElement.tagName + '.' + (document.activeElement.className || '')) : 'none';
+        return result;
+      }
+      var otherResults = probeFocus('other', function () {
+        var box = document.querySelector('[data-elic-custom]');
+        return box ? box.querySelector('input') : null;
+      }, function () {
+        var radio = document.querySelector('.elic-field input[type="radio"]');
+        if (radio) { radio.checked = true; radio.dispatchEvent(new Event('change', { bubbles: true })); }
+      });
+      // 多选那一题在第二页：先切过去，它的每行补充框才可能拿到焦点。
+      var noteResults = probeFocus('note', function () {
+        var box = document.querySelector('.elic-note-box');
+        return box ? box.querySelector('input') : null;
+      }, function () {
+        if (NS.elicitationView.selectTab) { NS.elicitationView.selectTab(1); }
+        var noteRow = document.querySelector('.elic-note-box');
+        var cb = noteRow && noteRow.parentNode ? noteRow.parentNode.querySelector('input[type="checkbox"]') : null;
+        if (cb) { cb.checked = true; cb.dispatchEvent(new Event('change', { bubbles: true })); }
+      });
+      out.push(JSON.stringify({ kind: 'elic-focus', other: otherResults, note: noteResults }));
+    } catch (e) { out.push(JSON.stringify({ kind: 'elic-focus-error', message: String((e && e.message) || e) })); } }
+    // [CUSTOM-20261004-190] 圆环外圈那条动画有没有被重建打断。
+    //
+    // 截图看不出动没动（一帧而已），而无头 Edge 里 prefers-reduced-motion 恒为 true（实测），
+    // 那条全局 animation:none!important 会把一切动画摁死 —— 所以本档**量不了动效**，
+    // 也不装作量了。能确定量的是它的**成因**：动画会被节点被重建重置。
+    // 判据 = 节点身份：调一次 setRunning（流式期间每个 chunk 都会来一次）后，那颗 svg 还是不是同一颗。
+    // 修前 sameSvgNode:false（外圈永远停在起点 = 用户报的只剩下面多了一段圆环），修后 true。
+    if (location.hash.indexOf('gauge') >= 0) { try {
+      var meterEl = document.getElementById('contextMeter');
+      var spinBefore = meterEl ? meterEl.querySelector('.gauge-spin') : null;
+      var svgBefore = meterEl ? meterEl.querySelector('svg') : null;
+      if (NS.composer && NS.composer.setRunning) { NS.composer.setRunning(true); }
+      var svgAfter1 = meterEl ? meterEl.querySelector('svg') : null;
+      if (NS.composer && NS.composer.setRunning) { NS.composer.setRunning(true); }
+      var svgAfter2 = meterEl ? meterEl.querySelector('svg') : null;
+      if (NS.composer && NS.composer.setRunning) { NS.composer.setRunning(true); }
+      var svgAfter3 = meterEl ? meterEl.querySelector('svg') : null;
+      out.push(JSON.stringify({
+        kind: 'gauge-rebuild',
+        className: meterEl ? String(meterEl.className) : null,
+        hasSpin: !!spinBefore,
+        sameSpinNode: !!spinBefore && spinBefore === (meterEl ? meterEl.querySelector('.gauge-spin') : null),
+        sameSvgNode: !!svgBefore && svgBefore === svgAfter1,
+        secondCallKept: !!svgAfter1 && svgAfter1 === svgAfter2,
+        thirdCallKept: !!svgAfter2 && svgAfter2 === svgAfter3,
+        hiddenBefore: !meterEl || meterEl.hidden,
+        reducedMotion: window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)').matches : null,
+        meterBox: (meterEl && meterEl.getBoundingClientRect)
+          ? Math.round(meterEl.getBoundingClientRect().width) + 'x' + Math.round(meterEl.getBoundingClientRect().height)
+          : null,
+      }));
+    } catch (e) { out.push(JSON.stringify({ kind: 'gauge-rebuild-error', message: String((e && e.message) || e) })); } }
+    // [CUSTOM-20261005-192] 滚动诊断到底会不会打 —— 造两次几何变化（输入卡长高、抽屉/权限变量）
+    // 与一次「到底再上翻」，把 console 捕下来看。
+    if (location.hash.indexOf('scrolllog') >= 0) { try {
+      var logLines = [];
+      var nativeWarn3 = console.warn;
+      console.warn = function () {
+        logLines.push(Array.prototype.slice.call(arguments).join(' '));
+        nativeWarn3.apply(console, arguments);
+      };
+      // ① 输入卡长高（多行 → autoGrow → --acpc-composer-h 变化 → noteGeometry）
+      var inputEl = document.getElementById('promptInput');
+      if (inputEl) {
+        inputEl.value = 'a\\nb\\nc\\nd\\ne\\nf';
+        inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      // ② 滚到底，再上翻一点（user-scroll 两条 + pinned 翻转）
+      var msgsEl = document.getElementById('messages');
+      if (msgsEl) {
+        msgsEl.scrollTop = msgsEl.scrollHeight;
+        msgsEl.dispatchEvent(new Event('scroll'));
+        if (NS.scroll && NS.scroll.reflowNow) { NS.scroll.reflowNow(); }
+        msgsEl.scrollTop = Math.max(0, msgsEl.scrollTop - 300);
+        msgsEl.dispatchEvent(new Event('scroll'));
+      }
+      window.setTimeout(function () {
+        var preEl = document.getElementById('probe');
+        if (preEl) {
+          preEl.textContent += '\\n' + JSON.stringify({ kind: 'scroll-log', count: logLines.length, lines: logLines.slice(0, 10) });
+        }
+      }, 400);
+    } catch (e) { out.push(JSON.stringify({ kind: 'scroll-log-error', message: String((e && e.message) || e) })); } }
     var pre = document.createElement('pre');
     pre.id = 'probe';
     pre.textContent = out.join('\\n');
@@ -1506,8 +1714,12 @@ function buildHtml() {
   const earlyErrors = '<script>window.__acpcErrors = [];'
     + ' window.addEventListener("error", function (e) {'
     + ' window.__acpcErrors.push(String(e.message || e) + " @" + (e.lineno || 0)); });</script>';
+  // [CUSTOM-20261004-184] #linkclick 档的输入：宿主 SafeMarkdown 对
+  // `[GOAL.md:74](GOAL.md:74)` 的真实产物。`<` 转义掉，免得序列化后提前结束脚本标签。
+  const linkHtmlScript = '<script>window.__acpcLinkHtml = '
+    + JSON.stringify(compiled.fileLinkHtml).replace(/</g, '\\u003c') + ';</script>';
   return [title, `<style>${THEME}</style>`, `<style>${style}</style>`, markup,
-    vscodeStub, earlyErrors,
+    vscodeStub, earlyErrors, linkHtmlScript,
     `<script>${script}</script>`, `<script>${driver()}</script>`].join('\n');
 }
 
@@ -1612,6 +1824,13 @@ const SHOTS = [
   // ⚠️ hash 必须是 `#composerbottom`：`#composerwidebottom` 里**不含** 'composerbottom' 这个
   // 子串（'wide' 夹在中间），driver 的 indexOf 判断会静默不匹配 —— 这个坑在本文件里出现过
   // 第二次了（`#gaugebusybig` 不含 'gaugebig'），凡是"给现有档加后缀"都要先念一遍。
+  // [CUSTOM-20261004-183] 停止确认条（在输入卡上方）。
+  // ⚠️ 截图档**不能**带 'probe'：探针会把几十行 <pre> 追加到 body 末尾，正好盖住底部的
+  // composer（它是绝对定位）。数字用另一个 hash（#stopconfirmprobe）读。
+  ['#stopconfirm', 'stop-confirm', '1440,1000'],
+  // 已连接相位下再出一张（draft 页走 setConnected(true)）：composer 在纯 composer 档里
+  // 一直截不到（既有现象，与 183 无关），借这个相位才能看到确认条的观感。
+  ['#composerdraftstopconfirm', 'stop-confirm-connected', '1440,1000'],
   ['#composerbottom', 'composer-wide-bottom', '1440,1000'],
   // [CUSTOM-20260930-144] 中途（不在底部）：不该有那段让位留白，消息应当铺到面板底。
   ['#composermid', 'composer-mid', '1440,900'],
@@ -1668,7 +1887,15 @@ const SHOTS = [
   ['#elicreal', 'elic-real', '1440,1000'],
   ['#elicrealpick', 'elic-real-pick', '1440,1000'],
   // 钉住大纲栏：抽屉与输入卡必须同一条中线（asideW/2 = 120px 的偏移就是用户看到的"没居中"）。
+  // [CUSTOM-20261004-189] 表单里打字掉不掉焦点（真 Chromium 量，不推）。
+  ['#elicfocusprobe', 'elic-focus', '1440,900'],
   ['#elicrealsidebar', 'elic-real-sidebar', '1440,1000'],
+  // [CUSTOM-20261004-184] 正文里的本地文件链接：宿主 SafeMarkdown 的真实 HTML → 真 sanitize →
+  // 真点击 → 桥的出口。探针读 anchorFound / dataPath / dataLine / inertSpans / sent ——
+  // 五项一起看才算"整条链通了"；截图看它长成了能点的样子（而不是带删除线的灰字）。
+  // ⚠️ 档位必须带 'probe'：探针块整体在 `indexOf('probe')` 那道门后面（879 行），
+  // 不带的话 hydrate 与点击都不会发生，截出来是普通夹具图（差点当成"渲染没生效"）。
+  ['#linkclickprobe', 'file-link', '1440,900'],
 ];
 for (const [hash, name, size] of SHOTS) {
   const out = join(OUT_DIR, `${name}.png`);

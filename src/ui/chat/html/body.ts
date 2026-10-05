@@ -183,7 +183,23 @@ export function body(surface: SurfaceKey = 'view'): string {
          （后者会在宽屏下横跨整屏）。 -->
     <div class="composer-main">
       <div class="composer-inner">
+        <!-- [CUSTOM-20261004-183] 停止确认条：Escape 与 Stop 按钮都不再**直接**中止轮次
+             （中止不可逆：工具调用被掐断）。先在这里问一句，默认隐藏，显隐由 composer.ts 管。
+             role=alertdialog 而不是 dialog：它不抢焦点、不模态 —— 只是横在输入卡上方的一条。
+             ⚠️ 必须放在 .composer-inner **里面**：.composer-main 是 flex 行（justify-content:center），
+             直接放它下面会被当行内项压成 0 高（第一版就是这么错的）。 -->
+        <div id="stopConfirm" class="stop-confirm" hidden role="alertdialog" aria-label="Stop this turn?">
+          <span class="stop-confirm-text">Stop this turn? The agent will abort what it is doing.</span>
+          <button type="button" class="stop-confirm-btn" data-stop-confirm="stop">Stop</button>
+          <button type="button" class="stop-confirm-btn" data-stop-confirm="keep">Keep going</button>
+        </div>
         <div id="slashPopup" class="slash-popup" hidden></div>
+        <!-- [CUSTOM-20261004-187] 轮次进行中、而当前 agent **不支持** steering 时的一条说明。
+             以前这种情况按回车是**静默无反应**（182 把回车改成只调 send()，而 send() 守着
+             "跑着不发"），用户报的就是"跑着的时候发不出去了"。现在支持的 agent 会真的把消息注入
+             正在跑的那一轮；不支持的就把原因写出来，别让人以为是自己没按对。
+             同样必须在 .composer-inner 里面（理由见上面 #stopConfirm）。 -->
+        <div id="steerHint" class="steer-hint" hidden>This agent can't take messages mid-turn — send it when this turn finishes.</div>
         <div id="attachments" class="attachments" hidden></div>
         <!-- [CUSTOM-BEGIN] CUSTOM-20260930-133 - 一体式输入卡：textarea 与按钮栏合进同一个描边
              容器（原来是"带边框的 textarea + 卡外一行按钮"，中间隔一条缝，看着像两个孤立的
