@@ -34,21 +34,27 @@ export const scrollClient = `
       logScrollState(fromProgram ? 'scroll-after-program' : 'user-scroll');
       onScroll();
     });
-    // [CUSTOM-20261005-192] 「我拖了滚动条，但它没动」——2026-10-05 那次真机日志里，
-    // 面板停在 st=43 而 max=5940+，**没有任何一次程序写接近过 43**（80 次程序写全在贴底跟到底，
-    // st 单调递增），所以问题不在"我们把他拽回去"，而在**手势没作用到 #messages 上**。
-    // 这一条就是为它加的：按下时若落在滚动条那条带子上（offsetX 超出 clientWidth），记一笔 ——
-    // 之后有没有跟着的 scroll 事件，就能判定"拖了到底动没动"。
-    container.addEventListener('pointerdown', function (event) {
-      // 只记**落在滚动条那条带子上**的按下（offsetX 超出 clientWidth）。不记"区内的普通按下"——
-      // 点工具卡、选文字都会触发，那点噪声会把这套诊断自己的配额吃光。
-      var onScrollbar = typeof event.offsetX === 'number' && event.offsetX > container.clientWidth;
-      if (onScrollbar) { logScrollState('scrollbar-press', true); }
-    }, true);
+    // [CUSTOM-20261005-192] 「我拖了滚动条，但它没动」——2026-10-05 那次真机日志里，面板停在
+    // st=43 而 max=19604，**没有任何一次程序写接近过 43**（80 次程序写全在贴底跟到底），
+    // 所以问题不在"我们把他拽回去"，而在**手势没作用到 #messages 上**。
+    // 这一条就为它而加：**文档级**记下每次按下落在哪一类控件上（粗粒度标签），节流后不会刷屏。
+    // 有了它，"他拖的到底是哪个条"就不必再猜 —— 而#messages 与右侧大纲栏两个滚动条只隔一条边。
+    // 桩 DOM 的 document 只有滚动那套测试需要的那几个方法（没有 addEventListener）⇒ 判空跳过。
+    if (document.addEventListener) { document.addEventListener('pointerdown', function (event) {
+      var label = pressLabel(event);
+      // 只记**有意义**的那几类：点滚动条（拖了没动就是它）、点大纲栏（会触发 jumpTo）、
+      // 以及落在面板外。点记录/点输入框（打字）太频繁，记了只会把这套诊断自己的配额吃光。
+      if (label === 'messages-bar' || label === 'outline' || label === 'outside') {
+        logScrollState('press@' + label, false);
+      }
+    }, true); }
     jumpBtn.addEventListener('click', function () {
       pinned = true;
       hideJump();
       restoreTarget = null;
+      // [CUSTOM-20261005-192] 这里原来是直写 scrollTop（绕过 writeTop）⇒ 它引发的 scroll 事件
+      // 会被**误标**成 user-scroll（"用户自己滚的"）。读日志时那会把"我们把人送到人工位置"看成
+      // 他的操作，这一格必须走同一个出口。
       writeTop(container.scrollHeight);
     });
     // [CUSTOM-20260924-022] 位置记忆跨面板开关存活（每个文档各存各的：
@@ -91,6 +97,33 @@ export const scrollClient = `
     if (cls.indexOf('surface-editor') >= 0) { return 'editor'; }
     if (cls.indexOf('surface-view') >= 0) { return 'view'; }
     return cls || 'unknown';
+  }
+
+  /**
+   * [CUSTOM-20261005-192] 一次按下落在哪一类控件上（粗粒度，够定位就行）。
+   *
+   * -bar 后缀 = 落在**滚动条那条带子上**（offsetX 超出该元素的 clientWidth；Chromium 上
+   * 点滚动条的事件确实以元素本身为 target）。这一格就是"他拖的是不是这个条"的判据。
+   */
+  function pressLabel(event) {
+    var target = event && event.target;
+    if (!target || !target.closest || !container) { return 'other'; }
+    if (target.closest('.outline-sidebar')) { return 'outline'; }
+    if (target.closest('#composer')) { return 'composer'; }
+    if (container.contains(target)) {
+      // 「落在滚动条那条带子上」两种判据并用：offsetX > clientWidth 是 Chromium 上点自身滚动条
+      // 的特征；再用 clientX 与容器的右边界比一次 —— 合成事件（预览探针）没有 offsetX，但能给
+      // clientX，于是这一格**在探针里也验得了**（不能验的判据等于没写）。
+      var byOffset = typeof target.offsetX === 'number' && target.clientWidth
+        && target.offsetX > target.clientWidth;
+      var byClient = false;
+      if (!byOffset && typeof event.clientX === 'number' && target.getBoundingClientRect) {
+        var rect = target.getBoundingClientRect();
+        byClient = rect.width > 0 && event.clientX > rect.left + target.clientWidth;
+      }
+      return (byOffset || byClient) ? 'messages-bar' : 'messages';
+    }
+    return 'outside';
   }
 
   /** 读 body 上的 CSS 变量。桩 DOM 的 body 没有 style（滚动那套测试就是这么搭的），判空返回 '-'。 */

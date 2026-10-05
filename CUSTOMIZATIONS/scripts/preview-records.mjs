@@ -1676,12 +1676,23 @@ function driver() {
         msgsEl.scrollTop = Math.max(0, msgsEl.scrollTop - 300);
         msgsEl.dispatchEvent(new Event('scroll'));
       }
+      // ③ 手势落点：在"记录区"与"大纲栏"各按一下（看 press@ 标签对不对）。
+      // 隔 800ms 再按：诊断自带 700ms 节流，紧跟在前三条 geom 后面会被合理地压掉。
+      window.setTimeout(function () {
+        var msgsEl2 = document.getElementById('messages');
+        if (msgsEl2) {
+          var rect2 = msgsEl2.getBoundingClientRect();
+          msgsEl2.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientX: rect2.left + msgsEl2.clientWidth + 5 }));
+        }
+        var outlineEl = document.querySelector('.outline-sidebar') || document.getElementById('outline');
+        if (outlineEl) { outlineEl.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true })); }
+      }, 800);
       window.setTimeout(function () {
         var preEl = document.getElementById('probe');
         if (preEl) {
           preEl.textContent += '\\n' + JSON.stringify({ kind: 'scroll-log', count: logLines.length, lines: logLines.slice(0, 10) });
         }
-      }, 400);
+      }, 1200);
     } catch (e) { out.push(JSON.stringify({ kind: 'scroll-log-error', message: String((e && e.message) || e) })); } }
     var pre = document.createElement('pre');
     pre.id = 'probe';
