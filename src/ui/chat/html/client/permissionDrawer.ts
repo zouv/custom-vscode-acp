@@ -131,7 +131,10 @@ export const permissionDrawerClient = `
    */
   function applyDrawerHeight() {
     if (!drawer || !document.body || !document.body.style || !document.body.style.setProperty) { return; }
-    document.body.style.setProperty('--acpc-perm-h', drawer.hidden ? '0px' : drawer.offsetHeight + 'px');
+    var height = drawer.hidden ? 0 : drawer.offsetHeight;
+    document.body.style.setProperty('--acpc-perm-h', height + 'px');
+    // [CUSTOM-20261005-192] 高度变了就进滚动诊断（与表单抽屉、输入卡同一条链）。
+    if (NS.scroll && NS.scroll.noteGeometry) { NS.scroll.noteGeometry('perm', height); }
     // [CUSTOM-20261003-176] 同表单抽屉：留白变了要重算视口判定（见 scroll.ts 的 reflow）。
     if (NS.scroll && NS.scroll.reflowNow) { NS.scroll.reflowNow(); }
   }

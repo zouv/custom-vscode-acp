@@ -24,8 +24,12 @@ export type ContentBlockView =
 const WINDOWS_ABS = /^[a-zA-Z]:[\\/]/;
 const URI_SCHEME = /^([a-zA-Z][a-zA-Z0-9+.-]*):/;
 
+// [CUSTOM-20261004-184] Exported so markdown.ts can route a **link** to the same
+// channel a content-block chip takes. The judgement "is this a local path, and
+// which form" belongs here once — a second copy in markdown.ts is exactly the
+// host/client drift pitfalls #19 describes.
 /** Local filesystem path for a file-ish URI, or undefined for anything else. */
-function localPathOf(uri: string | null | undefined): string | undefined {
+export function localPathOf(uri: string | null | undefined): string | undefined {
   const value = (uri ?? '').trim();
   if (!value) { return undefined; }
   if (WINDOWS_ABS.test(value) || value.startsWith('/') || value.startsWith('\\\\')) {

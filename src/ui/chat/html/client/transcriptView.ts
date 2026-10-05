@@ -13,6 +13,17 @@ export const transcriptViewClient = `
   var nodes = {};
   var objects = {};
   var pending = {};
+  // [CUSTOM-20261004-186] entryId -> 这次渲染请求**是针对哪段文本**发出的。
+  //
+  // 回填报文里只有 entryId（没有文本指纹），所以"这份 html 是哪一版的渲染结果"只能靠这里记。
+  // 记录文本一变，旧的那份 html 就作废了 —— 而作废这件事**传不过来**：宿主 store 合并时确实把
+  // last.html 置成 undefined（见 TranscriptStore.appendAssistantChunk），但 JSON.stringify
+  // 会丢掉 undefined 键，客户端那份副本于是永远以为"我手里这版 html 还是最新的"。
+  // 后果就是记录冻在**第一段的渲染结果**上，后面收到的内容一个字都不显示（用户报的"消息
+  // 显示不全"）。工具卡那条路 084 已经用"key 里带文本指纹"治过，助手/思考这条一直没治。
+  // 详见 pitfalls #49。
+  // ⚠️ 本文件是嵌在模板字符串里的客户端代码，注释里也**不能出现反引号**（pitfalls #11）。
+  var asked = {};
   var sessionId = null;
   var messagesEl = null;
   // [CUSTOM-20260924-021] Explicit append order. Object key order is NOT usable
@@ -170,6 +181,9 @@ export const transcriptViewClient = `
     nodes = {};
     objects = {};
     pending = {};
+    // [CUSTOM-20261004-186] 渲染请求与记录一起作废：留着旧 entryId 的"问过哪段文本"，
+    // 只会让新会话里同名 id 的第一次回填被误判成旧文本的。
+    asked = {};
     order = [];
     tails = {};
     requestedViews = {};
@@ -204,14 +218,14 @@ export const transcriptViewClient = `
     var text = entry.text;
     if (!text) { return; }
     if (entry.html !== undefined && entry.html !== null && entry.html !== '') { return; }
-    if (entry.kind === 'assistant') { pending[entry.id] = text; scheduleMarkdown(); return; }
+    if (entry.kind === 'assistant') { asked[entry.id] = text; pending[entry.id] = text; scheduleMarkdown(); return; }
     // [CUSTOM-20260926-072] A thought renders markdown through the same round-trip,
     // but only once it has SETTLED: html for a block that is still streaming would
     // freeze a prefix of the text while the stream keeps appending. A settled
     // thought collapses immediately anyway, so the reader sees the rendered form
     // rather than a flicker. markPending runs for every placed record, so this also
     // covers records hydrated from a snapshot (replay / session switch).
-    if (entry.kind === 'thought' && entry.streaming === false) { pending[entry.id] = text; scheduleMarkdown(); }
+    if (entry.kind === 'thought' && entry.streaming === false) { asked[entry.id] = text; pending[entry.id] = text; scheduleMarkdown(); }
   }
 
   function flushPending() {
@@ -306,11 +320,21 @@ export const transcriptViewClient = `
    *     ask for a thought's markdown at all.
    */
   function trackMarkdown(entryId, entry, changes) {
-    if (changes.html !== undefined && changes.html !== null) {
+    // [CUSTOM-20261004-186] 只有"渲染的就是当前这段文本"的回填才算数（asked 没记录时按
+    // 老规矩照收：那说明 html 不是这条请求要回来的）。旧文本的回填既不该落到正文上，
+    // 也不该把我们新排的请求顶掉。
+    var hasHtml = changes.html !== undefined && changes.html !== null;
+    var fresh = hasHtml && (asked[entryId] === undefined || asked[entryId] === entry.text);
+    if (fresh) {
       delete pending[entryId];
+      delete asked[entryId];
       return;
     }
+    // 过期回填（或压根没有回填）：把那次请求**清掉**。留着它（它问的是一段已经不存在的
+    // 文本）会让下面那条自愈判据永远不成立 —— 记录停在原文，谁也不再来要一次。
+    delete pending[entryId];
     if (entry.streaming === false && entry.text) {
+      asked[entryId] = entry.text;
       pending[entryId] = entry.text;
       flushPending();
     }
@@ -1005,6 +1029,20 @@ export const transcriptViewClient = `
     for (var i = 0; i < PATCH_KEYS.length; i++) {
       var key = PATCH_KEYS[i];
       if (Object.prototype.hasOwnProperty.call(changes, key)) { entry[key] = changes[key]; }
+    }
+    // [CUSTOM-20261004-186] 两条作废规则，都是宿主 store 已有的语义在客户端这侧的补课
+    // （宿主那边合并时把 html 置回 undefined，但 undefined 过不了 JSON，客户端收不到这个信号）。
+    //   ① 回填只认领"针对当前文本"的那一份 —— 否则正文会被一份旧渲染覆盖回去；
+    //   ② 文本变了而这一版没带新 html ⇒ 手里的 html 已经作废，丢掉它，让正文跟着**文本**走
+    //      （流式期间显示原文，收尾时 trackMarkdown 会把完整文本要来重渲染）。
+    // ① 回填只认领"针对当前文本"的那一份。只在**确知**它过时（问过、且问的不是这段文本）
+    //    时丢弃 —— asked 没记录的情况（例如 html 来自快照）一律照收，别把正常的回填误伤。
+    if (changes.html !== undefined && changes.html !== null
+      && asked[entryId] !== undefined && asked[entryId] !== entry.text) {
+      entry.html = undefined;
+    }
+    if (changes.text !== undefined && changes.html === undefined && entry.html !== undefined) {
+      entry.html = undefined;
     }
     if (wasStreaming !== !!entry.streaming) {
       streamingCount += entry.streaming ? 1 : -1;

@@ -116,8 +116,10 @@
 ### 5.5 fork 侧的安全约定
 
 - CSP：`script-src` **只有 nonce**（无 `'unsafe-inline'`），`img-src` 额外允许 `data:`（非文本内容的 base64 图片）。
-- 链接：markdown 渲染出的 `<a>` **不带真实 href**（只写 `data-href`），点击回传扩展侧做协议白名单
-  （仅 `http`/`https`/`mailto`）再 `openExternal`。**`command:` 必须拒绝**——那等于把 IDE 变成远程命令执行。
+- 链接：markdown 渲染出的 `<a>` **不带真实 href**。点击分两条通道：可放行协议（仅 `http`/`https`/`mailto`）
+  写 `data-href`，回传扩展侧复验后 `openExternal`；**本地文件路径**（相对/绝对/`file:`，含 `:12` / `#L12` 行号后缀）
+  写 `data-path` + `data-line`，走 `openFile`（按会话 cwd 解析、跳到行）。两者都不是 → `link-blocked` 静态 span。
+  **`command:` 必须拒绝**——那等于把 IDE 变成远程命令执行。
 - markdown：扩展侧 `SafeMarkdown` 渲染 + 客户端 `DOMParser` 白名单双重兜底。
 
 ### 5.6 子 agent 分组：全部是推断（CUSTOM-20260923-013）
@@ -162,7 +164,7 @@
 | 下行消息 | `post(msg)` **广播**（客户端本来就按 `currentSessionId` 过滤，广播即同步） |
 | `boot` | **定向**（`pushBoot(from)`）。广播会让另一个文档被迫 `hydrate` → reset + 重建 + 滚到底 |
 | `focus` / `meta` / `sessionsChanged` / `append` / `revise` | 广播 |
-| `renderMarkdown` 往返 | 请求照旧；`markdownRendered` 广播（两个文档都需要 html，`TranscriptStore.patch` 幂等） |
+| `renderMarkdown` 往返 | 请求照旧；`markdownRendered` 广播（两个文档都需要 html，`TranscriptStore.patch` 幂等）。**186 加了一条铁律：一份 html 只对"它照之渲染的那段文本"有效**。请求带的是发起那一刻的文本，而正文还在流（适配器 `includePartialMessages: true`，一条消息拆成很多 chunk），所以回填往往对不上当前文本。两边都要判：宿主 `handleRenderMarkdown` 比对 `item.text` 与 store 当前 `entry.text`，不符就**不落盘、不回填**；客户端 `patch` 则用 `asked[entryId]`（这次问的是哪段文本）判定，不符就丢掉手里的 html。**不判的后果**：正文冻在"第一段"上，后面收到的内容一个字都不显示（用户报的"消息显示不全"），而且换会话/重开都还是那一版 |
 | 关掉再打开 | `onDidDispose` → `detachSurface('editor')`；store 不动；重开 → 新文档 → `ready` → 定向 boot → 全量快照 |
 | 窗口重载后恢复 | **非目标**（需 `registerWebviewPanelSerializer`） |
 
@@ -246,6 +248,7 @@ pending ──用户点按钮──► selected        （回答 optionId）
 | 跳转 | `scroll.jumpTo(node)` 先置 `pinned = false` 再写 `scrollTop`，随后 scroll 事件按真实距离重算 |
 | Escape | **捕获阶段**监听 + `stopPropagation`：composer 在 textarea 上监听 Escape 取消轮次，不拦会误取消 |
 | 上限 | 200 条锚点，多出的折叠成一行「… N earlier hidden」 |
+| **两类行的区分度（191）** | 锚点既有 `user` 也有 `assistant`，而在此之前两者**只有一小格图标**不同（076/077 只给图标带了 kind 类），文字颜色/字重/缩进完全一样 —— 整排读起来是同质列表（用户报"用户消息区分度不明显"）。现在 **kind 类挂在行上**（`outline.ts` 的 `row.className = 'outline-item kind-' + entry.kind`），按两级拉开：**用户行 = 骨架**（正常前景色 + `font-weight: 600` + 图标 `opacity: 1`）、**助手行 = 补充**（`descriptionForeground` + `font-size: .95em` + 图标 `.45`）。**刻意不用左竖条/背景色**做这个区分 —— 那两条通道已被"当前项"占用（`.outline-item.active` 的 border-left 与背景），一个颜色两种意思是 047 的教训。另一条分工：**kind 决定字重/字号/图标浓淡，只有"颜色"让位给选中态**（写成整条 `:not(.active)` 会让选中一个用户行时字重从 600 掉回 400 —— 选中一个东西不该改变它是什么）。**缩进那一档试过又撤了**：助手行 `padding-left` 读起来像子项，但侧栏默认只有 240px，缩进直接吃掉可读宽度、长标题更早被省略号截断（实测同一行少显示一个字）；三档（颜色/字重/字号）已经够分辨 —— 别再顺手加回来 |
 | **有没有东西可导航（081）** | **这条判据管所有形态**：没有锚点（无会话 / 新会话 / 全是工具记录）时，☰ 按钮、下拉浮层、**钉住的右侧栏****一律不显示**。045 当年只把它加在 ☰ 按钮上——那时下拉是唯一形态，"没有按钮就没有大纲"成立；076 让它可钉住之后，钉住的那一栏**没走这条判据**，于是空态旁边会摊着一列 "OUTLINE / No messages yet"，把空态挤出面板正中（用户截图）。判据只有一处（`outline.ts` 的 `anchorsPresent`，由 `syncButton()` 唯一写入、`renderVisibility()` 读取），**mode 只是偏好、不决定可不可见**：钉住状态留着，第一条消息一到那栏自己回来。副作用：空对话时没法点 ✕ 取消钉住（等第一条消息即可）——因为此时它本来也没有内容可导航 |
 
 **`invalidate()` 的调用点**在 `boot.ts` 的 `append` / `revise` / `focus` / `boot` / `sessionClosed` / `error`
@@ -343,6 +346,10 @@ pending ──用户点按钮──► selected        （回答 optionId）
    → 客户端写 `data-path`（走 `openFile`，相对路径按会话 cwd 解析）；http/https/mailto → `data-href`；
    **两者都不是 → 静态 chip**（不得长成可点的样子，否则点一次吃一个 `Blocked link` 警告）。
    注意 Windows 盘符（`C:\x`）符合 URI scheme 语法，**必须先于 scheme 判定**。
+   **同一个判定用于 markdown 正文链接**（184）：`markdown.ts` 的 `link()` 先剥行号后缀（`path:12` / `path#L12`）
+   再调**同一个** `localPathOf`，命中就写 `data-path` + `data-line`。此前它只放行 http/https/mailto，
+   agent 写的 `[GOAL.md:74](GOAL.md:74)` 全被渲染成带删除线的 `link-blocked` 灰字 —— 看着能点、点了没反应。
+   **剥行号必须早于 scheme 判定**：`GOAL.md:74` 里 `GOAL.md` 本身就是合法 scheme 语法。
 3. **工具卡的 body 只有一个构建入口 `fillToolBody(body, tool)`**，`render()` 与 `update()` 共用。
    两条路径各写一遍是「locations 时有时无」与「展开的 diff 被下一次更新合上」的共同根因
    （pitfall #15 的第二次复发）。重建前 `captureExpansion` / 重建后 `applyExpansion`，按
@@ -538,6 +545,8 @@ pending ──用户点按钮──► selected        （回答 optionId）
 | 时刻挂在**标题行**里 | `.rec-time` 绝对定位浮在记录右上角，但**DOM 上必须位于标题行之内**（工具卡是 `.tool-head` 的一项，其余进 `summary`）——折叠的 `details` 会隐藏 summary 之外的一切，挂在记录节点上的话折叠态就看不到时刻了。`.messages > *` 因此要有 `position: relative`。工具卡用 `appendChild`（跟在耗时之后 ⇒ `2.2s 11:57`），其余用 `insertBefore(…, summary.firstChild)`（绝对定位下 DOM 顺序无关，这样能保住"正文是 summary 最后一个子节点"这条既有约束） |
 | 顶部进度条已删除 | `#usageBar` / `tabs.renderUsage` / `.usage-bar` `.usage-track` `.usage-fill` 全部删掉；**成本**信息移进底部圆环的 tooltip。上下文用量现在只有一处呈现 |
 | 底部圆环 | 24px 的两圈 SVG。内圈 = 进度（`stroke-dashoffset` 由 JS 按百分比算好，`rotate(-90deg)` 把起点挪到 12 点方向），圆心 = 百分比数字（不带 `%`），配色沿用 0.7 / 0.9 两档。**外圈 = "有轮次在跑"**：一段 1/4 弧缓慢旋转，用 `currentColor`（**不是**进度的蓝色——同色会被读成两根进度条），半径比内圈大 2.5（只差 1.5 时两环贴在一起，读不出是"外圈"）。数据仍是 `meta.usage`；`setRunning` 是外圈的唯一开关，而那条路径拿不到 `meta`，所以 composer 自己留了一份 `lastUsage` |
+| 圆环的数字从哪来（185） | **唯一写入者是 `usage_update`**（`used` = 当前上下文 token 数，`size` = 窗口大小）。185 之前这里还有第二个写入者：`PromptResponse.usage.totalTokens` 被折进 `used` —— 那是**单位张冠李戴**，协议里该字段是 *Sum of all token types across session*（claude-agent-acp 每轮 `+= input/output/cache_read/cache_write`），只增不减，于是长会话出现 `1841k / 1000k` 这种"超过上限"的读数。**要展示会话累计量就另开字段，别复用 `used`**（pitfall #48）。另外 tooltip 里的金额是 agent 给的裸浮点，展示前 `toFixed(2)` |
+| **外圈动画不能被"重建"（190）** | 外圈那条 CSS 动画**靠节点活着**：重建 `<svg>` 等于让动画从 0 重新开始。而 `renderContext` 原来每次都重建，`setRunning` 又由 `sessionsChanged` 驱动、宿主**每个 `agent_message_chunk` 都 `refreshSessions()`** ⇒ 流式期间每秒重建几十次 ⇒ 外圈永远停在起点角度（用户报的"任务进行中时闪烁失效，只剩下面多了一段圆环"）。修法：**数字没变就不重建**（`drawnGauge` 记住上次画的 used/size），只改 class/title —— 于是 `setRunning` 只翻 `running` 类。验收档 `#gauge-rebuild`（判据是**节点身份**，见 pitfalls #51：无头里量不了动效本身） |
 | 视觉验收 | `preview-records.mjs` 的 `#times` / `#timescollapsed` / `#gauge`（外加 `#gaugewarn` / `#gaugehot` / `#gaugebusy` / `#gaugebig`）。**圆环的配色与外圈半径都是看图才改对的**——布局与观感不靠推（pitfall #31） |
 
 ### 5.30 标签状态点：颜色说状态，外圈说"正在做事"（CUSTOM-20260930-130）
@@ -637,10 +646,10 @@ pending ──用户点按钮──► selected        （回答 optionId）
 | 题目分页 | 一个 tab 一道题（标题取 `field.title`，即 AskUserQuestion 的 `header`）；`customFor === X` 的字段并进 `X` 那道题（**按名字配对**，不按位置）。tab 上的圆点 = 已答/未答。**[154] bar（用户要求）：没有标题行** —— tab 条、`Answered n/N` 与收起箭头合成一条，进度与箭头**靠右** |
 | 单选 | **[154] 平铺的 radio 列表**（用户第二次改规则：不要下拉）——每行 = **主标题 + 副标题（选项说明）**，末尾一行 `Other`（自由作答也是一"选"）。底层就是一组普通 radio，`collect()` 的判据一个字节没动；点击时**显式**取消同级 checked（桩 DOM 没有原生 radio 组行为，显式让两边一致）。没有下拉菜单 = 没有"菜单被裁/开错方向"那一类问题（153 为此改过两版规则） |
 | 多选 | **经典复选框列表**（用户规则 2），行 = 选项名 + 选项介绍（用户规则 3） |
-| 自拟框 | **[154] 单选：跟着"被选中的那一行"走**（`placeCustomBoxes` 把它 `appendChild` 进那行的容器里），没选时**藏在自己的题块里**（`data-elic-home`）而不是从 DOM 摘掉 —— 摘掉就再也找不回来，写进去的字也会掉出 `collect()`（这条是踩出来的）。多选：仍在列表下方。**任何形态都必须带那行说明**（"填了它就以它作答、取代上面所选"）——adapter 的 `applyAskElicitationResponse` 里 custom **优先于**选择，只写"追加"就是 UI 撒谎 |
+| 自拟框 | **[154] 单选：跟着"被选中的那一行"走**（`placeCustomBoxes` 把它 `appendChild` 进那行的容器里），没选时**藏在自己的题块里**（`data-elic-home`）而不是从 DOM 摘掉 —— 摘掉就再也找不回来，写进去的字也会掉出 `collect()`（这条是踩出来的）。多选：仍在列表下方。**任何形态都必须带那行说明**（"填了它就以它作答、取代上面所选"）——adapter 的 `applyAskElicitationResponse` 里 custom **优先于**选择，只写"追加"就是 UI 撒谎。**[189] 只在真的换行时才搬**（`if (box.parentNode !== host)`）：`placeCustomBoxes` 每个 `input` 事件都会跑一次，而无条件的 `appendChild` 会把里面的输入框**摘下来再插回去** ⇒ **每敲一个键就失焦**（用户报的"输入一个字符就失去焦点"；实测同一个父级也照样失焦，见 pitfalls #50 / `#elicfocusprobe`） |
 | 收起 | bar 右端的箭头把抽屉收成**一行**。**[177] 收起时保留完整 tab 条**（用户要求：收起后仍要看得到每一题的标题与圆点状态，而不是只显示当前那一题 —— 否则收起等于"看不见还剩几题没答"）；藏起来的只有正文（`.elic-panes`）与操作栏。**收起态点任一 tab 会展开到那一题**（否则点了像没反应）。实测收起态高度 **33px**（一行 · 1440×1000 预览档 `#elicshrunkprobe`）**Escape 只收起、绝不 cancel**（cancel 会中止工具调用，不能由一次误按键触发）。收起会把这个 promptId 记进 `dismissed`：切走再回来不会自动重弹，内联条的「Open form」是回来的路 |
 | 打开策略 | 自动打开 = 聚焦会话里有 pending 且该 promptId 没被收起过；**主动打开**（内联条 / 收起态）才把焦点给抽屉（显式动作才抢焦点，同 019/125 的态度） |
-| **[161] Submit 的门禁** | 多题时 Submit **只在最后一题那一页可点**（用户要求防误提交：翻页看看后面还有没有时，第一页的提交按钮就在手边，很容易顺手点掉）。**禁用而不是隐藏**，并带一句 `title` 说明为什么——看得见的禁用按钮会说明"还差一步"，藏起来只会让人以为这个表单没有提交按钮。Skip / Cancel 不受影响（它们是逃生门，任何一页都该能用）。判据里还带着 `sending`：否则提交后一次 input/change 触发的 refresh 会把它重新点亮，又变回两条回答路径。`activeTab` 超出新表单的题数时**夹回最后一页**（否则一个 pane 都不显示，而且会骗过上面这条"已在最后一题"的判据） |
+| **[161] Submit 的门禁** | 多题时 Submit **只在最后一题那一页可点**（用户要求防误提交：翻页看看后面还有没有时，第一页的提交按钮就在手边，很容易顺手点掉）。**禁用而不是隐藏**，并带一句 `title` 说明为什么——看得见的禁用按钮会说明"还差一步"，藏起来只会让人以为这个表单没有提交按钮。Skip / Cancel 不受影响（它们是逃生门，任何一页都该能用）。判据里还带着 `sending`：否则提交后一次 input/change 触发的 refresh 会把它重新点亮，又变回两条回答路径。页号超出**当前表单**的题数时**夹回最后一页**（否则一个 pane 都不显示，而且会骗过上面这条"已在最后一题"的判据）。**[188] 这个页号是每张表单自己的**：`activeTabs[promptId]`（缺省 0），不再是模块级的一个数字 —— 原来是全局数字时，夹回会拿**上一张**表单的页号去夹**新**表单，于是"新表单一冒出来就停在最后一个 tab"（用户报的现象；166 已经为 `collapsed` 踩过同一个坑，见 pitfalls #38 的复发记录） |
 | **附加说明是「追加」（168）** | 用户明确要求（并确认了 adapter 的行为）：选项旁输入的文字**在选项基础上追加**，不是替换。做法在**我们这侧**：`collect()` 把两者合成**一个**答案（`选项 — 说明`，用选项的 label），并且**不再单独发** `question_N_custom` —— adapter 的 `applyAskElicitationResponse` 是「custom 优先并 return」（有它就丢掉所选项），单独发就等于替换。只在**没有勾选任何选项**时，那行文字才作为独立答案发送（自由作答）。那条「replacing the option picked above」的说明行随之删掉（旧语义遗留，用户报「描述不对」），说明只留在输入框的 tooltip 里 |
 | **每个选项行都有自己的补充框（168）** | 多选的每一项都带一个（单选那个由题目级的 extra 框移进所选行）；只在**该行被勾中**时显示（同 154 的「框跟着所选行」）。它不是 schema 字段（`data-elic-note` 而非 `data-field`）⇒ 不会被通用收集循环看到，只被 `collect()` 并进那一项 |
 | **取消选择：只剩 Clear answer（174）** | 168 曾让「再点一次已选中的单选行」也取消选择（当时那是唯一入口）。**174 起删掉**：抽屉底部已有 `Clear answer`，一个按钮做这件事比"再点同一行"可预期得多，也免得手抖点两下静默丢掉选择。现在单选就是**原生 radio**（再点保持选中），`data-elic-picked` 那套记账一并删除；显式互斥仍然保留（桩 DOM 没有原生 radio 组行为）。未答的题按「未选择」反馈，**不阻塞 Submit**（adapter 的 schema 什么都不 required，空 content 也接受 —— 已实测） |
@@ -854,3 +863,80 @@ scroll 事件**：底部留白（输入卡 / 表单抽屉 / 权限抽屉的高�
 - ⚠️ **测量教训**：无头预览跑在 `--virtual-time-budget` 下，`performance.now()` 是虚拟时钟（量出 3010ms 是假的）；"数强制重排"又会被 `NS.dom.schedule` 的"已有一帧在排就只入队"挡住（无头下真 rAF 未必送达 ⇒ 那一帧永远挂着）。**结论：涉及帧机制的代价，用桩单测钉结构性质，别在无头里追毫秒**。
 
 **④ 卡堆的缝（181）**。172 的"推挤"是**严丝合缝**（`top = next.natural - h` ⇒ 卡底正好压在下一条的顶边上，探针里 `contact: true`），为的是看着连续；但用户用下来报"间隔太近、叠到了一起"。现在在上夹里再减一个 `CARD_GAP = 8`：卡底与它顶住的那条之间留 8px，三种情形一起受益（卡与卡、最后一张卡与它顶住的用户消息、以及被顶出上沿的过程）。**只改上夹** —— `TOP_GAP`（判定线/交接窗）不动，那是"什么时候接管"，是另一件事。实测（`#stickystackpushprobe`）：旧卡 `bottom 22` / `nextUserTop 30` ⇒ 缝 8px、`contact: false`。
+
+### 5.42 回车只发送、绝不停止（CUSTOM-20261004-182）
+
+**现象**：用户报「输入框消息发出之后，再按一次 Enter 会触发停止」。
+**根因**：回车与 Send/Stop 按钮**共用一条路由** —— `state.running ? cancel() : send()`。按钮那样做没问题（它的 title/aria 会变成 `Stop`，用户看得见自己在按什么），但**回车没有这个提示**；而发完消息后光标还在输入框里、手也还在键盘上，第二次回车就把整轮停掉了（代价是不可逆的：工具调用被中止）。
+**修法**：回车只调 `send()`。`send()` 本来就守着"跑着不发"和"空内容且无附件不发"，于是"跑着按回车"变成一个**安全的空操作**。停止保持为**显式动作**：Send/Stop 按钮（含 `Stop` 提示）或 Escape。
+**教训**：**一个输入不该在两种状态下做相反的事**，除非当下就有可见的提示。"发消息"与"中止整轮"是量级完全不同的两个动作（后者不可逆），把它们接到同一个键上，误触成本由用户承担。
+
+> 187 补了这条的另一半：跑着时回车**不该是空操作**。见 §5.44（steering：把消息注入正在跑的那一轮；
+> 不支持的 agent 则在输入卡上方写明原因 —— 182 那种"静默空操作"正是用户随后报的"发不出去了"）。
+
+### 5.43 停止要二次确认（CUSTOM-20261004-183）
+
+**来源**：用户「Escape 不管触发停止还是关弹窗类界面，都是不可逆的，需要先弹二次确认框」。
+**先把事实核清楚**（决定这条改动该盖到哪）：Escape 在本面板里干的活分两类 ——
+
+| 动作 | 可逆吗 | 处理 |
+|---|---|---|
+| **停止本轮**（输入框有焦点、轮次在跑） | **不可逆**（工具调用被掐断、agent 正在做的事丢了） | **加二次确认**（本条） |
+| 关菜单 / 图片浮层 / 历史列表 | 可逆（都能重开、不丢内容） | 保持一键 |
+| 表单抽屉收起 | 可逆（**只收起**，打过的字全在；152 起就绝不 cancel） | 保持一键 |
+
+**做法**：`#stopConfirm`（`body.ts`）是输入卡上方的一条（同宽同中线，观感沿用抽屉那一套），默认隐藏。
+两条触发路径都走它：**Escape**（输入框内）与 **Stop 按钮**。条上两个按钮（`data-stop-confirm="stop" | "keep"`）：
+点了 `Stop` 才真的发 `cancelTurn`；`Keep going`（或**再按一次 Escape**）只是收起这一问。
+轮次自己结束（`setRunning(false)`）或换会话（`setFocus` 且 changed）时这一问自动收起。
+
+⚠️ 两个实现要点（都踩过）：
+- **它必须放在 `.composer-inner` 里**：`.composer-main` 是 flex **行**（`justify-content:center`），
+  直接挂在它下面会被当成行内项**压成 0 高**（第一版读数 `stopConfirmH: 0`，截图里也看不到）。
+- 它长在 `#composer` 里 ⇒ 高度自动进 `--acpc-composer-h`（composer 的观察器），消息区照常让位、
+  176 的视口重算也在。实测：`stopConfirmH 41`、`composerH 84 → 131`、`messagesPadBottom 155px`。
+- `role="alertdialog"` 而不是 `dialog`：**不抢焦点、不模态** —— 它只是横在输入卡上方的一条，
+  别遮住你要停的那个会话。
+
+**验收档**：`#composerdraftstopconfirm`（截图，借"已连接"相位才看得到 composer）、
+`#stopconfirmprobe`（读数）。⚠️ 纯 `#stopconfirm` 那张截图里 composer 不可见 —— 那是**既有**现象
+（`#composer*` 档一直如此，与 183 无关），要出图得借一个 `setConnected(true)` 的相位。
+
+### 5.44 轮次进行中的补充消息（steering，CUSTOM-20261004-187）
+
+**来源**：用户「任务在进行中，输入框的内容没法 Enter 发送了，需要支持增量发送」。182 刚把回车改成
+"只调 send()"，而 `send()` 守着"跑着不发" ⇒ **跑着按回车 = 静默空操作**（那正是 182 想要的
+"误触不会停轮次"，但没有第二条路把消息送出去）。
+
+**协议**（读实跑的 `claude-agent-acp` 源码确认，非猜）：适配器注册了自定义方法
+**`_session/steering`**，参数 `{sessionId, prompt: ContentBlock[], _meta?: {steering: {idleBehavior}}}`
+—— 它把消息**注入正在跑的那一轮**，而不是排成第二个 `session/prompt`；能力在
+`InitializeResponse._meta.steering.supported` 里声明。`idleBehavior: 'promptRequired'` 表示
+"如果当前没有轮次在跑，请改用普通 prompt"（应答 `{outcome: 'promptRequired'}`）。
+SDK 侧走 `ClientSideConnection.extMethod(method, params)`（就是普通 JSON-RPC request，不过滤方法名）。
+
+**链路**：`initialize` 读能力 → `ConnectionInfo.supportsSteering` → `SessionManager`
+（`supportsSteering` / `hasRunningTurn` / `steerPrompt`）→ `ChatPanelHost.handleSendPrompt`
+在落完用户气泡后判 `hasRunningTurn && supportsSteering` → `steerPrompt`；**成功就原样返回**。
+→ 能力随 `SessionMeta.steering` 下发 → composer 决定 running 时回车是"发出去"还是"原地提示"。
+
+**三条不变量（破了不会有自动检查报错）**：
+1. **steering 不产生第二个 `PromptResponse`**。走正常路径会 await 一个永远不来的响应：Stop 按钮
+   永不熄灭、`finalizeTurn` 永不执行（不会 touchHistory / 不会发"轮次完成"通知）。所以宿主在
+   steer 成功后**一个轮次状态都不动**（不 `endBackgroundTask`、不 `finalizeTurn`、不 `refreshSessions`）。
+2. **能力是**每个 agent 一份**，跟着连接走**（`ConnectionInfo`），并随 `SessionMeta` 下发；客户端在
+   **换会话时先重置为 false**（宁可提示，也不把消息发给不认它的 agent）。`meta` 里没这个字段时
+   一律当"不支持"。
+3. **`steerPrompt` 的 `'idle'` 必须落回普通路径**：我们这边的 `inFlightTurns` 可能陈旧（后台任务、
+   别处发起的轮次），agent 说"我没在跑"时**不能把消息吞掉**。
+
+**界面**：支持的 agent 什么都不用多说（回车就发出去了，与 Claude Code CLI 一致）；不支持的
+显示 `#steerHint`（输入卡上方一条，与 `#stopConfirm` 同位置家族）—— 判据是
+**running && !steering && 输入框里确实有东西**（少了最后一条就会在每次长轮次里无缘无故常驻）。
+它同样必须放在 `.composer-inner` 里（理由见 5.43）。
+
+**验收**：`npm test` 的 `chat panel: a message sent mid-turn steers the running turn`（宿主：注入 /
+不产生第二个轮次 / idle 回落 / 不支持的 agent 不走这条路）与
+`chat client logic: composer input bar` 里的 187 三条（回车发得出 / 不支持的保持不发并给提示 /
+能力不跨会话泄漏）。**真机未跑**：要拉起 agent 且让一轮真的跑着才能验，见"自动化能覆盖到哪"那张表。
+

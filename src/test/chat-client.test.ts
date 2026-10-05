@@ -240,6 +240,13 @@ class StubText {
   parentNode: StubNode | null = null;
   constructor(public data: string) {}
   get textContent(): string { return this.data; }
+  /**
+   * [CUSTOM-20261004-186] Real CharacterData API. `setStreamingText` extends the tail
+   * in place with it (the O(delta) path) — without it the stub throws on the SECOND
+   * chunk of a streaming record, i.e. on the very thing that path exists for
+   * (pitfall #41: a stub that does not model the API it stands in for).
+   */
+  appendData(more: string): void { this.data += more; }
 }
 
 function makeText(data: string): StubText { return new StubText(data); }
@@ -629,6 +636,52 @@ suite('chat client logic: assistant message fold (stub DOM)', () => {
     assert.strictEqual(body!.textContent, '啊唯，三条都收到。', 'the text lives in the body');
   });
 
+  // [CUSTOM-20261004-186] 先渲染过一版的流式记录，文本继续增长时**不能停在那一版上**。
+  //
+  // 宿主 store 里有一条对应的规则（`appendAssistantChunk` 合并时把 `last.html` 置 undefined），
+  // 但 **undefined 过不了 JSON**（`JSON.stringify` 丢掉 undefined 键），客户端那份副本因此
+  // 永远不知道"这版 html 已经作废" —— 正文就冻在**第一段的渲染结果**上，后面收到的内容一个字
+  // 都不显示。用户看到的正是这个形状：一条长回复只显示开头几个字，且 `**` 是字面量
+  // （= 渲染的是不完整原文，markdown 里不成对的行内标记保持字面量）。
+  test('a record that rendered early does not freeze when its text grows (186)', () => {
+    const { NS } = loadClient();
+    NS.dom.setSanitizedHtml = (node: any, html: string) => { node.textContent = html; };
+    const { body } = assistantFoldOf(NS, { id: 'a4', kind: 'assistant', at: 1, text: '后端', streaming: true });
+
+    // 第一段刚到就回了 html（128 起，记录落地就会自己发起渲染请求）。
+    NS.transcriptView.patch('a4', { html: '<p>后端</p>' });
+    assert.strictEqual(body!.textContent, '<p>后端</p>');
+
+    // 消息还在流：后续分片到达。
+    NS.transcriptView.append({
+      id: 'a4', kind: 'assistant', at: 1, streaming: true,
+      text: '后端**没事**——被终止的只是那层包装 shell，uvicorn 进程本身还在跑',
+    });
+    assert.strictEqual(body!.textContent, '后端**没事**——被终止的只是那层包装 shell，uvicorn 进程本身还在跑',
+      'the body must follow the record text, not the chunk it once rendered');
+
+    // 收尾：它必须把**完整**文本再要一次渲染（这才是自愈路径）。
+    NS.transcriptView.patch('a4', { streaming: false });
+    const items = NS.transcriptView.pendingMarkdown();
+    assert.strictEqual(items.length, 1, `the settled record must ask for its markdown, got ${items.length}`);
+    assert.strictEqual(items[0].text, '后端**没事**——被终止的只是那层包装 shell，uvicorn 进程本身还在跑',
+      'and it must ask for the CURRENT text, not the prefix it already rendered');
+  });
+
+  // [CUSTOM-20261004-186] 回填是**异步**的：它可能落在文本已经往前走之后。
+  // 这种"迟到的旧渲染"既不能盖回正文，也不能把记录重新按旧文本渲染一遍。
+  test('a reply that arrives after the text moved on is not applied (186)', () => {
+    const { NS } = loadClient();
+    NS.dom.setSanitizedHtml = (node: any, html: string) => { node.textContent = html; };
+    const { body } = assistantFoldOf(NS, { id: 'a5', kind: 'assistant', at: 1, text: '后端', streaming: true });
+    // 记录落地时就问过渲染（asked = '后端'），随后文本继续增长。
+    NS.transcriptView.append({ id: 'a5', kind: 'assistant', at: 1, streaming: true, text: '后端**没事**——uvicorn 还在跑' });
+    // 现在"那一份"回填才到。
+    NS.transcriptView.patch('a5', { html: '<p>后端</p>' });
+    assert.strictEqual(body!.textContent, '后端**没事**——uvicorn 还在跑',
+      'a late reply for an older text must not overwrite the body');
+  });
+
   test('the markdown rewrite lands in the body and leaves the header row intact', () => {
     const { NS } = loadClient();
     const calls: Array<{ node: any; html: string }> = [];
@@ -766,6 +819,11 @@ suite('chat client logic: conversation outline (stub DOM)', () => {
     assert.strictEqual(rows[1].getAttribute('data-jump-id'), 'a1');
     assert.ok(rows[0].querySelector('.outline-kind-user'), 'user row icon is typed (colour)');
     assert.ok(rows[1].querySelector('.outline-kind-assistant'), 'assistant row icon is typed (colour)');
+    // [CUSTOM-20261005-191] 而且**行本身**也带 kind 类：整行的字重/颜色/缩进都靠它
+    // （用户报"用户消息区分度不明显"—— 之前只有图标那一小格带 kind，整排读起来一模一样）。
+    // 这条是 JS 与 CSS 之间的契约，去掉类不会有任何报错，只会静默退化成"全都一样"。
+    assert.ok(rows[0].className.includes('kind-user'), 'the row carries its kind for whole-line styling');
+    assert.ok(rows[1].className.includes('kind-assistant'), 'both kinds, or the list goes flat again');
     assert.ok(rows[0].querySelector('.outline-time'), 'row has a time');
     // [CUSTOM-20260926-077] HH:MM:SS — two colons.
     assert.strictEqual((rows[0].querySelector('.outline-time')!.textContent.match(/:/g) || []).length, 2, 'time shows seconds');
@@ -912,11 +970,23 @@ suite('chat client logic: composer text ownership (stub DOM)', () => {
   // `stashDraft` did nothing while a draft was focused. Leaving a draft discarded what
   // you had typed; entering another draft showed the previous one's text.
 
-  function composerWithInput(): { NS: Record<string, any>; input: StubNode } {
+  function composerWithInput(): { NS: Record<string, any>; input: StubNode; stopConfirm: StubNode; sendBtn: StubNode } {
     const input = new StubNode('textarea');
+    const sendBtn = new StubNode('button');
+    // [CUSTOM-20261004-183] 停止确认条（真面板里由 body.ts 提供，初始 hidden）。
+    // 桩要连**两个按钮**一起建：客户端是靠 data-stop-confirm 认它们的。
+    const stopConfirm = new StubNode('div');
+    stopConfirm.hidden = true;
+    const stopYes = new StubNode('button');
+    stopYes.setAttribute('data-stop-confirm', 'stop');
+    const stopNo = new StubNode('button');
+    stopNo.setAttribute('data-stop-confirm', 'keep');
+    stopConfirm.appendChild(stopYes);
+    stopConfirm.appendChild(stopNo);
     const { NS } = loadClient({
       promptInput: input,
-      sendStopBtn: new StubNode('button'),
+      sendStopBtn: sendBtn,
+      stopConfirm: stopConfirm,
       slashPopup: new StubNode('div'),
       attachments: new StubNode('div'),
       configPickers: new StubNode('div'),
@@ -924,12 +994,101 @@ suite('chat client logic: composer text ownership (stub DOM)', () => {
       contextMeter: new StubNode('div'),
     });
     NS.composer.init();
-    return { NS, input };
+    return { NS, input, stopConfirm, sendBtn };
   }
 
   const session = (id: string) => ({
     sessionId: id, agentName: 'Claude Code', title: null, cwd: '/tmp',
     createdAt: '', loading: false, running: false, unread: false,
+  });
+
+  // [CUSTOM-20261004-183] 停止是**不可逆**的（工具调用会被掐断）⇒ 多一步确认。
+  // 用户 2026-10-04 报：「Escape 不管触发停止还是关弹窗，都是不可逆的，需要先弹二次确认框」。
+  // 核过事实：只有"停止"不可逆（关菜单/浮层都能重开，表单抽屉的 Escape 只收起且保留已打的字），
+  // 所以只给停止加这一步。形态是面板内一条（不抢焦点、不遮住会话），不是宿主模态框。
+  test('Escape asks before stopping, and only "Stop" actually cancels (183)', () => {
+    const { NS, input, stopConfirm } = composerWithInput();
+    const posted: Array<Record<string, any>> = [];
+    NS.bridge.post = (m: Record<string, any>) => { posted.push(m); };
+    const pressEscape = (): void => {
+      (input as unknown as { dispatch: (t: string, e: any) => void })
+        .dispatch('keydown', { key: 'Escape', preventDefault: () => {} });
+    };
+    const buttons = (): StubNode[] => stopConfirm.querySelectorAll('[data-stop-confirm]');
+
+    NS.composer.setFocus({ ...session('s1'), running: true }, null);
+    pressEscape();
+    assert.deepStrictEqual(posted, [], 'Escape 不再直接停止（这正是要修的那条）');
+    assert.strictEqual(stopConfirm.hidden, false, '而是把那一问摆出来');
+
+    pressEscape();   // 再按一次 Escape = 收起这一问
+    assert.strictEqual(stopConfirm.hidden, true, '再按一次 Escape 只是收起它');
+    assert.deepStrictEqual(posted, [], '收起也不停止');
+
+    pressEscape();
+    assert.strictEqual(buttons().length, 2, '条上就两个按钮：Stop / Keep going');
+    dispatchClick(buttons()[0], {});
+    assert.strictEqual(posted.length, 1, '点了 Stop 才真的停');
+
+    assert.strictEqual((posted[0] as Record<string, any>).type, 'cancelTurn');
+    assert.strictEqual(stopConfirm.hidden, true, '停止之后这一问自己收起来');
+  });
+
+  test('"Keep going" dismisses the question without stopping (183)', () => {
+    const { NS, input, stopConfirm } = composerWithInput();
+    const posted: Array<Record<string, any>> = [];
+    NS.bridge.post = (m: Record<string, any>) => { posted.push(m); };
+    NS.composer.setFocus({ ...session('s1'), running: true }, null);
+    (input as unknown as { dispatch: (t: string, e: any) => void })
+      .dispatch('keydown', { key: 'Escape', preventDefault: () => {} });
+    assert.strictEqual(stopConfirm.hidden, false);
+
+    dispatchClick(stopConfirm.querySelectorAll('[data-stop-confirm]')[1], {});
+    assert.deepStrictEqual(posted, [], 'Keep going 什么都不停');
+    assert.strictEqual(stopConfirm.hidden, true);
+  });
+
+  test('the Stop button asks too, and the turn ending on its own clears the question (183)', () => {
+    const { NS, sendBtn, stopConfirm } = composerWithInput();
+    const posted: Array<Record<string, any>> = [];
+    NS.bridge.post = (m: Record<string, any>) => { posted.push(m); };
+    NS.composer.setFocus({ ...session('s1'), running: true }, null);
+
+    dispatchClick(sendBtn, {});
+    assert.strictEqual(stopConfirm.hidden, false, '点 Stop 按钮同样先问一句');
+    assert.deepStrictEqual(posted, [], '问的时候还没有停');
+
+    NS.composer.setRunning(false);   // 轮次自己结束了
+    assert.strictEqual(stopConfirm.hidden, true, '这一问不该留着');
+  });
+
+  // [CUSTOM-20261004-182] 回车**只发送、绝不停止**。
+  // 用户报："输入框消息发出之后，再按一次 Enter 会触发停止" —— 旧版回车与 Send/Stop 按钮共用
+  // 一条路由（running 时 cancel()），而发完消息后光标还在输入框里、手也还在键盘上。
+  test('Enter never stops a running turn (182)', () => {
+    const { NS, input } = composerWithInput();
+    const posted: Array<Record<string, any>> = [];
+    NS.bridge.post = (m: Record<string, any>) => { posted.push(m); };
+    const pressEnter = (): void => {
+      (input as unknown as { dispatch: (t: string, e: any) => void })
+        .dispatch('keydown', { key: 'Enter', shiftKey: false, preventDefault: () => {} });
+    };
+
+    NS.composer.setFocus({ ...session('s1'), running: true }, null);
+    (input as unknown as { value: string }).value = '';
+    pressEnter();
+    assert.deepStrictEqual(posted, [], '跑着的时候按回车什么都不做 —— 绝不能是 cancelTurn');
+
+    // 跑着 + 有文字：同样不发（send() 自己守着"跑着不发"），停下来的方式只有按钮/Escape。
+    (input as unknown as { value: string }).value = '第二条';
+    pressEnter();
+    assert.deepStrictEqual(posted, [], '跑着时不发送，也不停止');
+
+    // 不在跑 + 有文字：正常发送。
+    NS.composer.setFocus(session('s1'), null);
+    pressEnter();
+    assert.strictEqual(posted.length, 1, '不跑的时候回车照常发送');
+    assert.strictEqual((posted[0] as Record<string, any>).type, 'sendPrompt');
   });
 
   test('a draft keeps its own text, and gives it back when you return', () => {
@@ -1407,12 +1566,16 @@ suite('chat client logic: history picker filter (stub DOM)', () => {
 // Jump to latest 居中）属真浏览器的事，见文件头「桩 DOM 只测逻辑」的边界。
 suite('chat client logic: composer input bar (stub DOM)', () => {
   function composerBar(): {
-    NS: Record<string, any>; input: StubNode; sendBtn: StubNode; contextMeter: StubNode; attachments: StubNode;
+    NS: Record<string, any>; input: StubNode; sendBtn: StubNode; contextMeter: StubNode;
+    attachments: StubNode; steerHint: StubNode; sent: Array<Record<string, unknown>>;
   } {
     const input = new StubNode('textarea');
     const sendBtn = new StubNode('button');
     const contextMeter = new StubNode('div');
     const attachments = new StubNode('div');
+    // [CUSTOM-20261004-187] 轮次中发不出去时那条说明（#steerHint），以及发出去的消息。
+    const steerHint = new StubNode('div');
+    const sent: Array<Record<string, unknown>> = [];
     const { NS } = loadClient({
       promptInput: input,
       sendStopBtn: sendBtn,
@@ -1420,14 +1583,66 @@ suite('chat client logic: composer input bar (stub DOM)', () => {
       attachments,
       configPickers: new StubNode('div'),
       contextMeter,
+      steerHint,
     });
+    NS.bridge.post = (msg: Record<string, unknown>) => { sent.push(msg); };
+    NS.bridge.postForSession = (msg: Record<string, unknown>) => { sent.push(msg); };
     NS.composer.init();
-    return { NS, input, sendBtn, contextMeter, attachments };
+    return { NS, input, sendBtn, contextMeter, attachments, steerHint, sent };
   }
 
   const session = (id: string) => ({
     sessionId: id, agentName: 'Claude Code', title: null, cwd: '/tmp',
     createdAt: '', loading: false, running: false, unread: false,
+  });
+
+  // [CUSTOM-20261004-187] 轮次进行中的补充消息（steering）。
+  //
+  // 用户报：任务进行中输入框里打了字、按回车**没有任何反应**（182 把回车改成只调 send()，
+  // 而 send() 守着"跑着不发"）。现在支持的 agent 会真的把消息注入正在跑的那一轮；不支持的
+  // 保持不发，但必须在界面上说明白（"打了字按回车没反应"最像程序坏了）。
+  function enter(input: StubNode): void {
+    (input as unknown as { dispatch: (t: string, e: any) => void })
+      .dispatch('keydown', { key: 'Enter', shiftKey: false, preventDefault: () => {} });
+  }
+
+  test('Enter sends mid-turn when the agent takes mid-turn messages (187)', () => {
+    const { NS, input, sent, steerHint } = composerBar();
+    NS.composer.setFocus(session('s-1'), { availableCommands: [], configOptions: [], usage: null, steering: true });
+    NS.composer.setRunning(true);
+    input.value = '补充一句';
+    assert.strictEqual(steerHint.hidden, true, 'this agent takes mid-turn messages — nothing to warn about');
+
+    enter(input);
+    assert.deepStrictEqual(sent, [{ type: 'sendPrompt', sessionId: 's-1', text: '补充一句' }],
+      'the host decides how to deliver it (steering vs a new turn) — the composer just sends');
+    assert.strictEqual(input.value, '', 'and the box is cleared like any other send');
+  });
+
+  test('an agent without steering keeps Enter a no-op — and says why (187)', () => {
+    const { NS, input, sent, steerHint } = composerBar();
+    NS.composer.setFocus(session('s-1'), { availableCommands: [], configOptions: [], usage: null, steering: false });
+    NS.composer.setRunning(true);
+    assert.strictEqual(steerHint.hidden, true, 'nothing typed yet — no hint');
+
+    input.value = '补充一句';
+    (input as unknown as { dispatch: (t: string, e: any) => void }).dispatch('input', {});
+    assert.strictEqual(steerHint.hidden, false, 'there is something to send and nowhere to send it');
+
+    enter(input);
+    assert.deepStrictEqual(sent, [], 'nothing may be sent to an agent that cannot take it');
+    assert.strictEqual(input.value, '补充一句', 'and the text stays put');
+  });
+
+  test('the capability does not leak into the next session (187)', () => {
+    const { NS, input, sent } = composerBar();
+    NS.composer.setFocus(session('s-1'), { availableCommands: [], configOptions: [], usage: null, steering: true });
+    // Switching sessions must not carry the previous agent's capability over.
+    NS.composer.setFocus(session('s-2'), { availableCommands: [], configOptions: [], usage: null });
+    NS.composer.setRunning(true);
+    input.value = '补充一句';
+    enter(input);
+    assert.deepStrictEqual(sent, [], 'an unknown capability means unsupported, not "send and hope"');
   });
 
   // [CUSTOM-20261001-165] 新建会话（草稿页）不该显示上一个会话的上下文数字。
@@ -1472,6 +1687,64 @@ suite('chat client logic: composer input bar (stub DOM)', () => {
     assert.strictEqual(contextMeter.classList.contains('running'), true);
     NS.composer.setRunning(false);
     assert.strictEqual(contextMeter.classList.contains('running'), false);
+  });
+
+  // [CUSTOM-20261004-190] 外圈那条 CSS 动画靠"节点不被重建"活着。
+  //
+  // 用户报"任务进行中时外圈的闪烁失效，只剩下面多了一段圆环"。根因：`setRunning` 会重画整个
+  // 表盘，而它由 `sessionsChanged` 驱动、宿主**每个 agent_message_chunk 都 refreshSessions**
+  // ⇒ 流式期间每秒重建几十次 ⇒ 动画每次都从 0 重新开始 ⇒ 永远停在起点角度。
+  // 实测（真 Chromium，preview-records.mjs 的 `#gauge-rebuild` 档）：修前 `sameSvgNode:false`。
+  // 桩 DOM 建不了动画，但能建**节点身份** —— 那正是会重启动画的那件事。
+  test('a running flip must not rebuild the gauge (that restarts its animation) (190)', () => {
+    const { NS, contextMeter } = composerBar();
+    NS.composer.setMeta({ availableCommands: [], configOptions: [], usage: { used: 450000, size: 1000000 } });
+    const svg = contextMeter.querySelector('svg');
+    assert.ok(svg, 'the meter drew a gauge');
+    const spin = contextMeter.querySelector('.gauge-spin');
+    assert.ok(spin, 'and the outer arc is part of it');
+
+    // 流式期间每来一个 chunk 就会走一次这条路（值没变）。
+    NS.composer.setRunning(true);
+    NS.composer.setRunning(true);
+    assert.strictEqual(contextMeter.querySelector('svg'), svg,
+      'the gauge node must survive a running flip — rebuilding it restarts the spin from 0');
+    assert.strictEqual(contextMeter.querySelector('.gauge-spin'), spin);
+    assert.strictEqual(contextMeter.classList.contains('running'), true, 'but the class still flips');
+
+    // 数字**真的**变了就必须重画（否则读数会停在上一次）。
+    NS.composer.setMeta({ availableCommands: [], configOptions: [], usage: { used: 900000, size: 1000000 } });
+    assert.notStrictEqual(contextMeter.querySelector('svg'), svg, 'new numbers get a new gauge');
+    assert.strictEqual(contextMeter.querySelector('.gauge-text')!.textContent, '90');
+  });
+
+  // [CUSTOM-20261004-185] 金额保留两位小数。
+  // agent 给的是一枚裸浮点（日志实测 `2.6394680000000004` —— 累计值反复相加的浮点噪声），
+  // 直接拼进 tooltip 就是"4.676045 USD"那种一长串。
+  test('the cost in the tooltip is rounded to two decimals (185)', () => {
+    const { NS, contextMeter } = composerBar();
+
+    NS.composer.setMeta({
+      availableCommands: [], configOptions: [],
+      usage: { used: 55642, size: 1000000, costAmount: 2.6394680000000004, costCurrency: 'USD' },
+    });
+    assert.match(contextMeter.title, /2\.64 USD/, `got: ${contextMeter.title}`);
+    assert.ok(!contextMeter.title.includes('2.6394'), 'the float noise must not reach the tooltip');
+
+    // 0.5 这类"看起来已经够短"的值也统一成两位（金额的惯例写法）。
+    NS.composer.setMeta({
+      availableCommands: [], configOptions: [],
+      usage: { used: 1, size: 1000000, costAmount: 4.676045, costCurrency: 'USD' },
+    });
+    assert.match(contextMeter.title, /4\.68 USD/, `got: ${contextMeter.title}`);
+
+    // 没有金额（或不是数字）就不显示这一段 —— 不能印出 "NaN USD"。
+    NS.composer.setMeta({
+      availableCommands: [], configOptions: [],
+      usage: { used: 1, size: 1000000, costCurrency: 'USD' },
+    });
+    assert.ok(!contextMeter.title.includes('USD'), `got: ${contextMeter.title}`);
+    assert.ok(!contextMeter.title.includes('NaN'), `got: ${contextMeter.title}`);
   });
 
   test('empty text sends only when an attachment is present', () => {
@@ -2767,6 +3040,85 @@ suite('chat client logic: form record + drawer (stub DOM, CUSTOM-20260929-119/20
     assert.strictEqual(byAction(drawer, 'skip')!.disabled, false);
     assert.strictEqual(byAction(drawer, 'cancel')!.disabled, false);
   });
+
+  // [CUSTOM-20261004-188] 当前页是**每张表单自己的**，不是全局的一个数字。
+  //
+  // 用户报"弹出选项面板，有时候会默认聚焦到最后一个选项 tab"。根因：页号是模块级的一个数字，
+  // 而 161 的"夹回最后一页"是相对**当前表单**的题数做的 —— 上一张停在第 4 题（3）、新的一张只有
+  // 2 题，夹回就把它落成最后一页。166 已经为 `collapsed` 踩过同一个坑（见 pitfalls #38）。
+  const FOUR = {
+    promptId: 's1:9',
+    sessionId: 's1',
+    message: '四道题',
+    status: 'pending',
+    fields: [0, 1, 2, 3].map(i => ({
+      name: 'q' + i, kind: 'select', title: 'Q' + i,
+      options: [{ value: 'v' + i, title: 'V' + i }],
+    })),
+  };
+
+  /** Which page the drawer is showing (the tab carrying `.active`). */
+  function activeTabOf(drawer: StubNode): number {
+    return drawer.querySelectorAll('.elic-tab')
+      .findIndex(t => String(t.className).split(/\s+/).includes('active'));
+  }
+
+  test('a form opens on its FIRST page, whatever page the previous one was left on (188)', () => {
+    const { NS, drawer } = mount([FOUR, TWO]);
+    assert.strictEqual(activeTabOf(drawer), 0, 'the first form starts at its first question');
+
+    NS.elicitationView.selectTab(3);
+    assert.strictEqual(activeTabOf(drawer), 3, 'the user paged to the last question');
+
+    NS.elicitationView.open(TWO.promptId);
+    assert.strictEqual(activeTabOf(drawer), 0,
+      'the next form must start at ITS first question, not inherit the previous one\'s page');
+    assert.strictEqual(drawer.querySelectorAll('.elic-field')[0].hidden, false,
+      'and the first pane is the one on screen');
+  });
+
+  test('each form keeps its own page when you go back to it (188)', () => {
+    const { NS, drawer } = mount([FOUR, TWO]);
+    NS.elicitationView.selectTab(3);
+    NS.elicitationView.open(TWO.promptId);
+    assert.strictEqual(activeTabOf(drawer), 0);
+
+    NS.elicitationView.open(FOUR.promptId);
+    assert.strictEqual(activeTabOf(drawer), 3, 'per form, not one number for the whole panel');
+  });
+
+  // [CUSTOM-20261004-189] 打字时**不许搬动**那个框。
+  //
+  // 用户报："在附加内容输入框（以及 Other 里的自定义输入框）输入内容时，每输入一个字符就会
+  // 失去焦点"。根因：`placeCustomBoxes` 每次 refresh 都 `host.appendChild(box)` ——
+  // appendChild 的语义是**先摘下来再插回去**，而"摘"会让里面的输入框失焦。实测（真 Chromium，
+  // preview-records.mjs 的 #elicfocusprobe）：把已聚焦节点的祖先 appendChild 到**同一个**父级，
+  // 焦点照样掉（`focusAfterSameParentMove: false`）。而 refresh 每个 'input' 事件都来一次。
+  //
+  // 桩 DOM 建不了"焦点"，但能建"搬动"（appendChild 在这里就是移动语义，pitfall #41）——
+  // 所以钉住的判据是**搬没搬**，那正是浏览器里会失焦的那件事。
+  test('typing in the custom box does not re-append it (the move is what blurs it) (189)', () => {
+    const { drawer } = mount([SINGLE]);
+    // 选中一行 ⇒ 题目级的 Other 框被移进那一行：这是**唯一一次**合法的搬动。
+    const row = drawer.querySelectorAll('.elic-option-row')[0];
+    pickRow(row);
+    const box = byAttr(drawer, 'data-elic-custom', 'question_0_custom')!;
+    assert.strictEqual(box.parentNode, row, 'the box lives in the picked row');
+
+    // 之后每一次 refresh（每个字符都会触发一次）都不许再搬它。
+    const moves: StubNode[] = [];
+    const realAppend = row.appendChild.bind(row) as (child: StubNode) => StubNode;
+    (row as unknown as { appendChild: (child: StubNode) => StubNode }).appendChild =
+      (child: StubNode) => { moves.push(child); return realAppend(child); };
+
+    const input = box.querySelector('input')!;
+    input.value = '写点东西';
+    dispatchBubbling(input, 'input');
+    dispatchBubbling(input, 'input');
+    assert.deepStrictEqual(moves, [],
+      're-appending an already-placed box is exactly what drops the focus in a real browser');
+    assert.strictEqual(box.parentNode, row, 'and it stays where the user is typing');
+  });
 });
 
 
@@ -3530,5 +3882,47 @@ suite('rail: 量测读写分离 (CUSTOM-20261004-180)', () => {
     assert.ok(flips <= 4,
       `一次量测里"写后再读"应当只剩常数次（收尾的 applyScroll/syncActive 那几下），实际 ${flips} 次 —— ` +
       '退回边读边写时它会随标记数增长（24 个标记 ≈ 24 次强制重排）');
+  });
+});
+
+// [CUSTOM-20261004-184] 正文里的本地文件链接：点击要落到 `openFile`，不是 `openLink`。
+//
+// **这一条补的是半边链**。宿主侧（`markdown.ts` 写出 data-path）在同一天的 `chat-panel.test.ts`
+// 里已经钉住了，但"点了之后客户端发什么"此前**从来没有测过**——`data-path` 这条委托从 039
+// 起只服务工具卡 chip，而 chip 与正文链接是**两条渲染路径**（pitfalls #47）。两端各证一遍
+// 不等于整条链通了（pitfalls #43），所以这里把点击真跑一次，断言发出去的消息形状。
+suite('chat client logic: file links in prose (stub DOM)', () => {
+  function clickOnAttr(attr: string, value: string, extra?: [string, string]) {
+    const harness = loadClient();
+    const root = new StubNode('div');
+    const target = new StubNode('a');
+    target.setAttribute(attr, value);
+    if (extra) { target.setAttribute(extra[0], extra[1]); }
+    root.appendChild(target);
+    harness.NS.links.installDelegatedHandlers(root);
+
+    const sent: Array<Record<string, unknown>> = [];
+    harness.NS.bridge.post = (msg: Record<string, unknown>) => { sent.push(msg); };
+    harness.NS.bridge.postForSession = (msg: Record<string, unknown>) => { sent.push(msg); };
+    dispatchClick(target, harness.docListeners);
+    return sent;
+  }
+
+  test('a data-path link asks to open the file at its line', () => {
+    assert.deepStrictEqual(clickOnAttr('data-path', 'GOAL.md', ['data-line', '74']), [
+      { type: 'openFile', path: 'GOAL.md', line: 74 },
+    ]);
+  });
+
+  test('without a line the request carries no line at all', () => {
+    assert.deepStrictEqual(clickOnAttr('data-path', 'docs/notes.md'), [
+      { type: 'openFile', path: 'docs/notes.md', line: undefined },
+    ]);
+  });
+
+  test('a data-href link still takes the external channel', () => {
+    assert.deepStrictEqual(clickOnAttr('data-href', 'https://example.com'), [
+      { type: 'openLink', href: 'https://example.com' },
+    ]);
   });
 });

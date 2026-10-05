@@ -295,6 +295,30 @@ export function styles(): string {
   }
   .outline-item.active .outline-time { color: inherit; opacity: 0.85; }
   .outline-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* [CUSTOM-20261005-191] 「这一行是谁说的」要一眼看得出来。用户报"右侧边栏用户消息区分度不明显" ——
+     在此之前两类行只有**一小格图标**在区分（076/077），文字颜色/字重/缩进完全一样，整排读起来是
+     一片同质的列表。做法是把两个方向拉开：
+
+       · **用户行 = 骨架**：正常前景色 + 中等字重 + 图标满不透明 —— 它是"我在问什么"的地图。
+       · **助手行 = 补充**：描述色（更暗）+ 字号略小 + 图标半隐 + **缩进一格**（padding-left），
+         读起来"挂在上面那条下面"，而不是并列的另一条。
+
+     刻意**不用**左竖条/背景色做这个区分：那两条通道已经被"当前项"占着（.outline-item.active
+     的 border-left 与背景）—— 一个颜色两种意思正是 047 踩过的坑（rail 的焦点环 vs 位置）。
+
+     还有一条**分工**要写清楚：kind 决定"字重 / 字号 / 图标浓淡"，**只有颜色让位给选中态**
+     （选中行有它自己的 foreground）。第一版把整条规则都写成 :not(.active)，结果选中一个用户行
+     时它的字重从 600 掉回 400 —— 选中一个东西不该**改变它是什么**。
+
+     **缩进那一档试过又撤了**（用户看过效果后定的）：padding-left 让助手行读起来像"子项"，
+     但侧栏本来就窄（默认 240px），缩进直接吃掉可读宽度、长标题更早被省略号截断 ——
+     而"是谁说的"靠颜色/字重/字号已经够了。**别再顺手加回来**：那是拿宽度换层级。 */
+  .outline-item.kind-user .outline-text { font-weight: 600; }
+  .outline-item.kind-assistant .outline-text { font-size: 0.95em; }
+  .outline-item.kind-user .outline-kind { opacity: 1; }
+  .outline-item.kind-assistant .outline-kind { opacity: 0.45; }
+  .outline-item:not(.active).kind-user .outline-text { color: var(--vscode-foreground); }
+  .outline-item:not(.active).kind-assistant .outline-text { color: var(--vscode-descriptionForeground); }
   /* [CUSTOM-20260925-057] 历史会话行右侧的目录提示（只显示最后一段，全路径在 tooltip 里）。
      没有它的话，245 条跨目录会话只能靠 hover 才知道各自属于哪个项目。 */
   .outline-cwd {
@@ -833,6 +857,40 @@ export function styles(): string {
      **不要**用 transform 居中 —— 抽屉里的下拉菜单是 position: fixed，transform 会让它变成
      "相对该元素"定位。bottom 跟着 --acpc-composer-h：浮层叠在底栏之上，两者一起由消息区的
      留白让位。 */
+  /* [CUSTOM-20261004-183] 停止确认条：与输入卡同宽同中线、贴在它上方；观感沿用抽屉那一套。
+     不抢焦点、不模态（role=alertdialog），所以它不需要 z-index 之争 —— 它就在流里。 */
+  .stop-confirm {
+    display: flex; align-items: center; gap: 8px;
+    width: 100%; margin: 0 0 6px; padding: 6px 10px;
+    background: var(--vscode-editor-background);
+    border: 1px solid var(--vscode-inputValidation-warningBorder, var(--vscode-panel-border));
+    border-radius: 6px; font-size: 0.9em;
+  }
+  .stop-confirm-text { flex: 1; min-width: 0; }
+  .stop-confirm-btn {
+    flex: none; padding: 2px 10px; cursor: pointer; font-family: inherit; font-size: inherit;
+    color: var(--vscode-button-secondaryForeground, inherit);
+    background: var(--vscode-button-secondaryBackground, transparent);
+    border: 1px solid var(--vscode-panel-border); border-radius: 4px;
+  }
+  .stop-confirm-btn:hover { background: var(--vscode-button-secondaryHoverBackground, var(--vscode-toolbar-hoverBackground, transparent)); }
+  .stop-confirm-btn[data-stop-confirm="stop"] {
+    color: var(--vscode-button-foreground, #fff);
+    background: var(--vscode-inputValidation-errorBorder, var(--vscode-button-background, #0e639c));
+    border-color: transparent;
+  }
+
+  /* [CUSTOM-20261004-187] 「这个 agent 吃不了轮次中的补充消息」那条说明。
+     与 #stopConfirm 同一个位置家族（.composer-inner 里、输入卡上方），但它是**陈述**不是提问：
+     没有按钮、不抢焦点，用最轻的描边与描述色，避免在长轮次里喧宾夺主。 */
+  .steer-hint {
+    width: 100%; margin: 0 0 6px; padding: 5px 10px;
+    color: var(--vscode-descriptionForeground);
+    background: transparent;
+    border: 1px dashed var(--vscode-panel-border);
+    border-radius: 6px; font-size: 0.88em;
+  }
+
   .elic-drawer, .perm-drawer {
     position: fixed; left: 0; right: var(--acpc-aside-w, 0px); margin: 0 auto;
     bottom: var(--acpc-composer-h, 0px);

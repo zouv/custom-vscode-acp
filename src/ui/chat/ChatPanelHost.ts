@@ -155,7 +155,18 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
   // 字节只留宿主内存、不进 meta（否则每次 boot/focus 都重发整张图）；发送时据此拼
   // ACP `image` ContentBlock。
   private readonly imageData: Map<string, Map<string, { data: string; mimeType: string }>> = new Map();
-  /** sessionId → latest usage numbers, rendered as a token bar. */
+  /**
+   * [CUSTOM-20261004-185] sessionId → 上下文占用，渲染成输入卡右下角那颗圆环。
+   *
+   * **只有一个写入者：`usage_update`**（`used` = 当前上下文 token 数，`size` = 窗口大小）。
+   * 曾经还有一个 `applyResponseUsage` 把 `PromptResponse.usage.totalTokens` 折进 `used` ——
+   * 那是**单位张冠李戴**：协议里 `Usage.totalTokens` 是 *Sum of all token types across session*
+   * （claude-agent-acp 实现为每轮 `+= input/output/cache_read/cache_write`，cache read 每轮都重算），
+   * 是个只增不减的累计量，而 `size` 是窗口大小 ⇒ 长会话必然出现 `1841k / 1000k`。
+   * 它当初的理由是"没发 usage_update 的 agent 也能有读数"，但那**不成立**：没有 usage_update
+   * 就没有 `size`，`renderContext` 在 `!size` 时直接隐藏 —— 那个分支唯一能做到的事就是把
+   * 已经正确的读数改坏。要再引入"会话累计 token"，请**另开字段**，别复用 `used`。
+   */
   private readonly usage: Map<string, SessionMeta['usage']> = new Map();
   /** `${sessionId}::${toolCallId}` → transcript entry id. */
   private readonly toolEntryIds: Map<string, string> = new Map();
@@ -916,6 +927,26 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       }
     }
 
+    // [CUSTOM-BEGIN] CUSTOM-20261004-187 - 轮次进行中：把这条消息**注入**正在跑的那一轮
+    // （Claude Code 的 steering），而不是当第二个 `session/prompt` 发出去。
+    //
+    // 为什么要单独一条路：steering 是在**同一个**轮次里追加内容，它**不会**产生第二个
+    // PromptResponse。走下面的正常路径要么被 SessionManager 的"已有轮次在跑"守卫拒掉
+    // （那正是用户报的"任务进行中按回车没反应"），要么 await 一个永远不来的响应
+    // （Stop 按钮永不熄灭、finalizeTurn 永不执行）。所以这里把用户气泡落账后**原样返回**：
+    // 轮次状态一个都不动，让原来那一轮自己收尾。
+    if (this.sessionManager.hasRunningTurn(sessionId) && this.sessionManager.supportsSteering(sessionId)) {
+      try {
+        const how = await this.sessionManager.steerPrompt(sessionId, blocks);
+        if (how === 'steered') { return; }
+        // 'idle'：agent 说它没在跑（我们这边的标记陈旧了，例如后台任务）⇒ 落回普通路径。
+      } catch (e: any) {
+        this.reportError(sessionId, e);
+        return;
+      }
+    }
+    // [CUSTOM-END] CUSTOM-20261004-187
+
     // [CUSTOM-20261001-157] How this turn ended, for the turn-done notification
     // (filled in below; `finalizeTurn` runs in the finally, so it has to be declared
     // out here).
@@ -934,7 +965,8 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
 
       const response = await pending;
       this.applyStopReason(sessionId, response.stopReason);
-      this.applyResponseUsage(sessionId, (response as { usage?: unknown }).usage);
+      // [CUSTOM-20261004-185] 这里原来还有一次 `applyResponseUsage`（把 PromptResponse 的
+      // totalTokens 折进圆环）—— 那是单位张冠李戴，已删除；圆环只认 usage_update。
       // [CUSTOM-20261001-157] 这一轮怎么结束的，决定要不要（以及怎么）通知。
       outcome = turnOutcome(response.stopReason);
     } catch (e: any) {
@@ -957,28 +989,6 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
     if (!message) { return; }
     const entry = this.transcripts.appendNotice(sessionId, 'warn', message);
     if (entry) { this.post({ type: 'append', sessionId, entries: [entry] }); }
-  }
-
-  /**
-   * Fold `PromptResponse.usage` into the token bar. Not every agent emits
-   * `usage_update`, so without this the bar stays hidden for them.
-   * The two shapes differ: the response reports absolute token counts, the
-   * notification reports `used`/`size` of the context window.
-   */
-  private applyResponseUsage(sessionId: string, usage: unknown): void {
-    if (!usage || typeof usage !== 'object') { return; }
-    const u = usage as { totalTokens?: number; inputTokens?: number; outputTokens?: number };
-    const used = typeof u.totalTokens === 'number' ? u.totalTokens : undefined;
-    if (used === undefined) { return; }
-    const previous = this.usage.get(sessionId);
-    this.usage.set(sessionId, {
-      used,
-      // The response carries no context-window size; keep the last known one.
-      size: previous?.size ?? 0,
-      costAmount: previous?.costAmount,
-      costCurrency: previous?.costCurrency,
-    });
-    this.pushMeta(sessionId);
   }
 
   // --- Switch notices (CUSTOM-20260926-073) --------------------------------
@@ -1431,11 +1441,29 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
         continue;
       }
       const html = this.markdown.render(item.text);
+      // [CUSTOM-20261004-186] A render only applies to the text it was made from.
+      //
+      // `item.text` is a snapshot of the record as it looked when the client asked;
+      // the record can have grown since (prose streams, and the ask goes out the
+      // moment the record lands — 128). Storing that html anyway leaves the STORE
+      // holding a rendering of a prefix, which the next snapshot (session switch,
+      // reopen, tab focus) hands to the client as if it were current — the record
+      // then shows its first few lines and nothing else. Dropping it is not a loss:
+      // the record still has no html, so the client's settle-time request renders
+      // the text it actually has.
       // [CUSTOM-20260925-066] A KEYED item is a sub-block of a tool card, not a
       // transcript record: there is nothing in the store to patch, the HTML goes
       // back to the element that asked for it. Skipping the patch also avoids a
       // pointless lookup for an id that can never be found.
-      if (!item.key) { this.transcripts.patch(sessionId, item.entryId, { html }); }
+      if (!item.key) {
+        const current = this.transcripts.getEntry(sessionId, item.entryId);
+        const renderedFrom = (current as { text?: string } | undefined)?.text;
+        if (current && renderedFrom !== undefined && renderedFrom !== item.text) {
+          log(`${LOG_PREFIX}: stale markdown reply dropped for ${item.entryId} (asked ${item.text.length} chars, now ${renderedFrom.length})`);
+          continue;
+        }
+        this.transcripts.patch(sessionId, item.entryId, { html });
+      }
       rendered.push({ entryId: item.entryId, sessionId, html, key: item.key });
     }
     if (rendered.length > 0) {
@@ -2663,6 +2691,8 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       configOptions: session?.configOptions ?? null,
       availableCommands: wireCommands(session),
       usage: this.usage.get(sessionId) ?? null,
+      // [CUSTOM-20261004-187] Whether Enter may send while a turn is running.
+      steering: this.sessionManager.supportsSteering(sessionId),
       // Attachments live here so they survive a focus/boot round-trip; the
       // standalone `attachments` message is only for immediate feedback.
       attachments: this.attachments.get(sessionId) ?? [],

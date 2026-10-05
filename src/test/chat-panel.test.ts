@@ -22,6 +22,8 @@ import * as assert from 'assert';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+// [CUSTOM-20261004-184] Builds a valid file: URI for whatever platform runs the tests.
+import { pathToFileURL } from 'node:url';
 import * as vscode from 'vscode';
 
 import type { SessionNotification } from '@agentclientprotocol/sdk';
@@ -39,6 +41,8 @@ import { SessionUpdateHandler } from '../handlers/SessionUpdateHandler';
 import { PermissionBridge } from '../handlers/PermissionBridge';
 import { ElicitationBridge } from '../handlers/ElicitationBridge';
 import { isBlankText } from '../ui/chat/content/contentBlocks';
+// [CUSTOM-20261004-184] The markdown link router under test.
+import { SafeMarkdown } from '../ui/chat/markdown';
 import { choiceChanges, choiceSnapshotFromState, choiceSnapshotPatched } from '../ui/chat/sessionChoices';
 import { directoryKey, directoryOptions } from '../ui/chat/historyDirs';
 import { panelIdForAgent } from '../ui/chat/panelContract';
@@ -3242,5 +3246,263 @@ suite('chat panel: background work keeps the session running (CUSTOM-20261001-16
     await settle();
     assert.strictEqual(runningOf(harness, 's-1'), false,
       'the turn is over and the background wait was already cleared — nothing keeps it "running"');
+  });
+});
+
+// [CUSTOM-20261004-184] Markdown links to local files.
+//
+// The bug: `[GOAL.md:74](GOAL.md:74)` rendered as a struck-through grey span
+// (title="Blocked link scheme") — it LOOKED clickable and did nothing, because
+// `link()` only allowlisted http/https/mailto and dumped every other href into
+// the "blocked scheme" branch. Fixing that is invisible to every existing check
+// (a wrong href shape still renders *something*), so the routing is pinned here.
+suite('chat panel: markdown links to local files', () => {
+  const md = new SafeMarkdown();
+  const render = (link: string) => md.render(link);
+
+  test('a relative path with a line number becomes an openFile link', () => {
+    const html = render('[GOAL.md:74](GOAL.md:74)');
+    assert.ok(html.includes('data-path="GOAL.md"'), `expected a file link, got ${html}`);
+    assert.ok(html.includes('data-line="74"'), `expected the line to travel, got ${html}`);
+    assert.ok(!html.includes('link-blocked'), 'it must not be inert any more');
+    assert.ok(html.includes('>GOAL.md:74</a>'), `label must be preserved, got ${html}`);
+  });
+
+  test('a GitHub-style fragment carries the line too', () => {
+    const html = render('[a.ts](./src/a.ts#L12)');
+    assert.ok(html.includes('data-path="./src/a.ts"'), `got ${html}`);
+    assert.ok(html.includes('data-line="12"'), `got ${html}`);
+  });
+
+  test('a fragment range jumps to its first line', () => {
+    const html = render('[a.ts](src/a.ts#L12-L30)');
+    assert.ok(html.includes('data-line="12"'), `got ${html}`);
+  });
+
+  test('an absolute path survives the line split', () => {
+    // Forward slashes: CommonMark reads `\r` in a link destination as an escape,
+    // so a backslash path never reaches us as a link at all (measured, not
+    // assumed) — and fileUri() accepts `C:/…` just as well as `C:\…`.
+    const html = render('[a.ts](C:/repo/src/a.ts:12)');
+    assert.ok(html.includes('data-path="C:/repo/src/a.ts"'), `got ${html}`);
+    assert.ok(html.includes('data-line="12"'), `got ${html}`);
+  });
+
+  test('a file: URI opens the local file instead of warning about the scheme', () => {
+    const url = pathToFileURL(path.resolve(__dirname, 'fixtures')).toString();
+    const html = render(`[f](${url})`);
+    assert.ok(html.includes('data-path="'), `got ${html}`);
+    assert.ok(!html.includes('link-blocked'), `got ${html}`);
+  });
+
+  test('a path without a line still opens, with no data-line', () => {
+    const html = render('[notes.md](docs/notes.md)');
+    assert.ok(html.includes('data-path="docs/notes.md"'), `got ${html}`);
+    assert.ok(!html.includes('data-line='), `got ${html}`);
+  });
+
+  test('quotes in a path are escaped, not able to break out of the attribute', () => {
+    // Angle-bracket destination: the only form CommonMark lets carry a `"`.
+    const html = render('[x](<a"b.ts>)');
+    assert.ok(html.includes('data-path="a&quot;b.ts"'), `got ${html}`);
+  });
+
+  test('http links keep taking the external channel', () => {
+    const html = render('[site](https://example.com/x#L12)');
+    assert.ok(html.includes('data-href="https://example.com/x#L12"'), `got ${html}`);
+  });
+
+  test('unknown schemes stay inert', () => {
+    for (const link of ['[x](javascript:alert(1))', '[x](command:workbench.action.closeAllEditors)', '[x](data:text/html,<b>x</b>)']) {
+      const html = render(link);
+      assert.ok(html.includes('link-blocked'), `${link} must stay blocked, got ${html}`);
+      assert.ok(!html.includes('data-path'), `${link} must not become a file link, got ${html}`);
+    }
+  });
+
+  test('a fragment on its own is not a file target', () => {
+    // Opening "line 74 of nothing" (i.e. some unrelated file at line 74) would be
+    // a worse outcome than leaving the link inert.
+    const html = render('[see](#L74)');
+    assert.ok(html.includes('link-blocked'), `got ${html}`);
+    const section = render('[see](#section)');
+    assert.ok(section.includes('link-blocked'),
+      `an anchor we cannot resolve must not silently open a file: ${section}`);
+  });
+});
+
+// [CUSTOM-20261004-185] 上下文圆环只认 usage_update。
+//
+// 起因（用户报"上下文进度会出现超过上限的情况"，截图 tooltip：`100% · 1841k / 1000k tokens`）：
+// 宿主曾在每次轮次结束时把 `PromptResponse.usage.totalTokens` 折进圆环的 `used`。而 ACP 协议里
+// 那个字段是 *Sum of all token types **across session*** —— claude-agent-acp 的实现是每轮
+// `accumulatedUsage.inputTokens += …`（cache read 每轮重算），是个只增不减的累计量；`size` 却是
+// **窗口大小**。两者不是一回事，会话一长必然出现 1841k / 1000k。
+// 这条测试钉住"响应里的 usage 不许动圆环"（旧代码在下面第二次断言处失败）。
+suite('chat panel: the context ring only trusts usage_update', () => {
+  function usageOf(harness: Harness): unknown {
+    harness.host.onFocusChanged({ agentName: harness.agentName, sessionId: harness.sessionId });
+    for (const message of [...harness.surface.sent].reverse()) {
+      if (message.type === 'focus' || message.type === 'boot') { return message.meta?.usage ?? null; }
+    }
+    return 'no snapshot was posted';
+  }
+
+  test('a prompt response carrying cumulative tokens does not touch the meter', async () => {
+    const harness = makeHarness('s-1', 'Claude Code');
+    harness.handler.handleUpdate({
+      sessionId: 's-1',
+      update: {
+        sessionUpdate: 'usage_update', used: 55642, size: 1000000,
+        // The shape the agent really sends (measured, see the log): a raw float.
+        cost: { amount: 2.6394680000000004, currency: 'USD' },
+      },
+    } as never);
+    const reported = {
+      used: 55642, size: 1000000,
+      costAmount: 2.6394680000000004, costCurrency: 'USD',
+    };
+    assert.deepStrictEqual(usageOf(harness), reported,
+      'the agent-reported context usage is what the ring shows');
+
+    Object.assign(harness.sessionManager, {
+      sendPrompt: () => Promise.resolve({
+        stopReason: 'end_turn',
+        usage: { totalTokens: 1_841_000, inputTokens: 1_840_000, outputTokens: 1000 },
+      }),
+    });
+    harness.host.onMessage({ type: 'sendPrompt', sessionId: 's-1', text: 'go' });
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    assert.deepStrictEqual(usageOf(harness), reported,
+      'a session-cumulative token total must never be rendered as context-window occupancy');
+  });
+});
+
+// [CUSTOM-20261004-186] 渲染回填只对"它就是照这段文本渲染的"那一版生效。
+//
+// 客户端发起渲染请求时给的是**那一刻**的文本（记录一落地就发，128），而正文还在流；
+// 回填补上时记录往往已经更长。旧代码把这份 html 照收进 store，下一次快照（切会话 / 重开）
+// 就会把"只渲染了开头几个字"的版本当成当前内容发给客户端 —— 记录看上去就是"显示不全"。
+suite('chat panel: a stale markdown reply is not stored', () => {
+  function chunk(harness: Harness, text: string): void {
+    harness.handler.handleUpdate({
+      sessionId: harness.sessionId,
+      update: { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text } },
+    } as never);
+  }
+
+  /** The id the host assigned to the assistant record it just appended. */
+  function assistantId(harness: Harness): string {
+    for (const message of [...harness.surface.sent].reverse()) {
+      if (message.type === 'append') {
+        const entry = message.entries.find(e => e.kind === 'assistant');
+        if (entry) { return entry.id; }
+      }
+    }
+    throw new Error('no assistant record was appended');
+  }
+
+  /** The assistant entry the host is holding, as a snapshot would carry it. */
+  function entryOf(harness: Harness, entryId: string): { text?: string; html?: string } | undefined {
+    harness.host.onFocusChanged({ agentName: harness.agentName, sessionId: harness.sessionId });
+    for (const message of [...harness.surface.sent].reverse()) {
+      if (message.type === 'focus' || message.type === 'boot') {
+        const found = (message.snapshot?.entries ?? []).find(e => e.id === entryId);
+        return found as { text?: string; html?: string } | undefined;
+      }
+    }
+    return undefined;
+  }
+
+  test('a reply rendered from an older text never reaches the record', () => {
+    const harness = makeHarness('s-1', 'Claude Code');
+    chunk(harness, '后端');
+    const id = assistantId(harness);
+    // The record grows while the reply is in flight.
+    chunk(harness, '**没事**——被终止的只是那层包装 shell');
+
+    harness.host.onMessage({
+      type: 'renderMarkdown',
+      items: [{ entryId: id, sessionId: 's-1', text: '后端' }],
+    } as never);
+
+    const entry = entryOf(harness, id);
+    assert.strictEqual(entry?.text, '后端**没事**——被终止的只是那层包装 shell', 'the record kept the text');
+    assert.strictEqual(entry?.html, undefined,
+      'the rendering of the prefix must not be stored as if it were the record');
+  });
+
+  test('a reply for the text the record actually has is stored', () => {
+    const harness = makeHarness('s-1', 'Claude Code');
+    chunk(harness, '完整正文');
+    const id = assistantId(harness);
+
+    harness.host.onMessage({
+      type: 'renderMarkdown',
+      items: [{ entryId: id, sessionId: 's-1', text: '完整正文' }],
+    } as never);
+
+    assert.ok(entryOf(harness, id)?.html, 'the matching reply is still applied (this is the normal path)');
+  });
+});
+
+// [CUSTOM-20261004-187] 轮次进行中发消息 = 注入**正在跑的那一轮**（steering），不是第二个轮次。
+//
+// 关键不变量：steering 不产生第二个 PromptResponse。走普通路径要么被"已有轮次在跑"守卫拒掉
+// （用户报的"任务进行中按回车没反应"），要么永远 await 不到响应（Stop 按钮永不熄灭、
+// finalizeTurn 永不执行）。
+suite('chat panel: a message sent mid-turn steers the running turn', () => {
+  function steerHarness(supported: boolean, outcome: 'steered' | 'idle') {
+    const harness = makeHarness('s-1', 'Claude Code');
+    const steered: Array<{ sessionId: string; blocks: unknown }> = [];
+    const prompted: string[] = [];
+    Object.assign(harness.sessionManager, {
+      hasRunningTurn: () => true,
+      supportsSteering: () => supported,
+      steerPrompt: (sessionId: string, blocks: unknown) => {
+        steered.push({ sessionId, blocks });
+        return Promise.resolve(outcome);
+      },
+      sendPrompt: (sessionId: string) => {
+        prompted.push(sessionId);
+        return Promise.resolve({ stopReason: 'end_turn' });
+      },
+    });
+    return { harness, steered, prompted };
+  }
+
+  test('the message is injected, and the running turn is left alone', async () => {
+    const { harness, steered, prompted } = steerHarness(true, 'steered');
+    harness.host.onMessage({ type: 'sendPrompt', sessionId: 's-1', text: '补充一句' });
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    assert.strictEqual(steered.length, 1, 'the message went out through the steering channel');
+    assert.strictEqual(steered[0].sessionId, 's-1');
+    assert.deepStrictEqual(steered[0].blocks, [{ type: 'text', text: '补充一句' }]);
+    assert.deepStrictEqual(prompted, [], 'and NOT as a second prompt (that would be a second turn)');
+    assert.deepStrictEqual(harness.notices.shown, [],
+      'the turn is still running — a "turn finished" notice here would be a lie');
+    const state = settle(harness, harness.agentName, harness.sessionId);
+    assert.ok(visibleText(state).includes('补充一句'), 'the message still lands in the transcript');
+  });
+
+  test('an idle agent falls back to a normal prompt instead of swallowing it', async () => {
+    const { harness, steered, prompted } = steerHarness(true, 'idle');
+    harness.host.onMessage({ type: 'sendPrompt', sessionId: 's-1', text: '补充一句' });
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    assert.strictEqual(steered.length, 1, 'steering was attempted (our own flag said a turn was running)');
+    assert.deepStrictEqual(prompted, ['s-1'],
+      'the agent said no turn was running, so the message must go out as an ordinary prompt');
+  });
+
+  test('an agent without steering never gets one', async () => {
+    const { harness, steered, prompted } = steerHarness(false, 'steered');
+    harness.host.onMessage({ type: 'sendPrompt', sessionId: 's-1', text: '补充一句' });
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    assert.deepStrictEqual(steered, [], 'a capability we do not have must not be exercised');
+    assert.deepStrictEqual(prompted, ['s-1'], 'it goes down the ordinary path');
   });
 });

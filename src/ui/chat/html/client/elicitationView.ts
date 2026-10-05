@@ -26,8 +26,14 @@
 // [CUSTOM-20261001-161] 多题时 **Submit 只在最后一题那一页可点**（用户要求防误提交：
 // 在第一页就能点，翻页只是"看看后面还有没有"时很容易顺手点掉）。禁用而不是隐藏，且带一句
 // title 说明为什么；Skip / Cancel 不受影响（它们是逃生门，任何一页都该能用）。
-// `activeTab` 超出新表单的题数时会夹回最后一页 —— 否则会一个 pane 都不显示，而且会让上面那条
+// 页号超出**当前表单**的题数时会夹回最后一页 —— 否则会一个 pane 都不显示，而且会让上面那条
 // 判据误判成"已经在最后一题"。
+//
+// [CUSTOM-20261004-188] 页号是**按表单记**的（`activeTabs[promptId]`），不是模块级的一个数字。
+// 原来那一个 `activeTab` 让 161 的夹回变成了"新表单继承上一张的页号"：上一张停在第 4 题
+// （activeTab=3）、新的一张只有 2 题 ⇒ 夹回把它落成**最后一页** ⇒ 新表单"一冒出来就停在最后
+// 一个 tab"（用户报的现象）。166 已经为 `collapsed` 踩过同一个坑，tab 是同一个错误的另一个字段。
+// 见 pitfalls #38（模块级状态 = 全局状态：先问"它属于谁"）。
 //
 // 注意：本文件是嵌在模板字符串里的客户端代码，**每个反斜杠都要写成 \\**，禁用反引号。
 // [CUSTOM-END] CUSTOM-20260929-119
@@ -56,7 +62,16 @@ export const elicitationViewClient = `
    */
   var forms = {};
   /** Index of the visible question inside the active form. */
-  var activeTab = 0;
+  // [CUSTOM-20261004-188] 当前页**按表单**记：promptId → tab 序号。没有记录 = 第 0 页，
+  // 所以新表单天然从头开始，而同一张表单的多份呈现（抽屉 / 联动的记录条）天然同页。
+  var activeTabs = {};
+
+  /** The page this form is on (0 for a form we have not paged yet). */
+  function tabIndexOf(state) {
+    var id = state && state.promptId;
+    var index = id ? activeTabs[id] : undefined;
+    return typeof index === 'number' && index >= 0 ? index : 0;
+  }
   /** True while an answer is in flight: the actions are disabled and say so. */
   var sending = false;
   /**
@@ -281,14 +296,19 @@ export const elicitationViewClient = `
           }
         }
         if (host) {
-          // appendChild MOVES the element: its typed value survives (the DOM is the form state).
-          host.appendChild(box);
+          // [CUSTOM-20261004-189] 只在**真的换了行**时才搬。appendChild 的语义是"先摘下来再插
+          // 回去"，而"摘下来"会让里面的输入框失焦 —— 这一句每敲一个键都会走一次（input →
+          // onDrawerChange → refresh → 这里），于是"输入一个字符就丢焦点"（用户报的正是它）。
+          // 框已经在目标行里时搬它是纯副作用：typed 值本来就靠 DOM，位置也没变。
+          // 实测（真 Chromium，preview-records.mjs 的 #elicfocusprobe）：把已聚焦节点的祖先
+          // appendChild 到**同一个**父级，焦点照样掉（focusAfterSameParentMove:false）。
+          if (box.parentNode !== host) { host.appendChild(box); }
           box.hidden = false;
         } else {
           // Park it back in its question block (hidden) rather than detaching it: a detached node
           // cannot be found by the next lookup, and its text would drop out of collect() too.
           var home = findByAttr(root, 'data-elic-home', group.field.name);
-          if (home) { home.appendChild(box); }
+          if (home && box.parentNode !== home) { home.appendChild(box); }
           box.hidden = true;
         }
       }
@@ -494,7 +514,11 @@ export const elicitationViewClient = `
     // [CUSTOM-20261001-161] A form with fewer tabs than the previous one must not leave the
     // drawer pointing at a tab that no longer exists — that hides every pane AND would fool
     // the "is this the last question" check below.
+    // [CUSTOM-20261004-188] 这个夹回只对**这张表单**有意义：页号现在按 promptId 存，
+    // 夹回的结果也写回它自己那一格（不再影响任何别的表单）。
+    var activeTab = tabIndexOf(state);
     if (activeTab >= groups.length) { activeTab = Math.max(0, groups.length - 1); }
+    if (state && state.promptId) { activeTabs[state.promptId] = activeTab; }
     var answered = 0;
     var panes = form.querySelectorAll('.elic-field');
     var tabs = form.querySelectorAll('.elic-tab');
@@ -702,7 +726,8 @@ export const elicitationViewClient = `
   }
 
   function selectTab(index) {
-    activeTab = index;
+    // [CUSTOM-20261004-188] 只改**这张表单**的页号（见 activeTabs）。
+    if (activeId) { activeTabs[activeId] = index; }
     var state = drawer ? formOf(activeId, pendingForms()) : null;
     if (state) { refresh(forms[activeId], state); }
   }
@@ -975,7 +1000,10 @@ export const elicitationViewClient = `
    */
   function applyDrawerHeight() {
     if (!drawer || !document.body || !document.body.style || !document.body.style.setProperty) { return; }
-    document.body.style.setProperty('--acpc-elic-h', drawer.hidden ? '0px' : drawer.offsetHeight + 'px');
+    var height = drawer.hidden ? 0 : drawer.offsetHeight;
+    document.body.style.setProperty('--acpc-elic-h', height + 'px');
+    // [CUSTOM-20261005-192] 高度变了就进滚动诊断（这条链是"到底了却看不全"的第一嫌疑）。
+    if (NS.scroll && NS.scroll.noteGeometry) { NS.scroll.noteGeometry('elic', height); }
     // [CUSTOM-20261003-176] 抽屉高度就是消息区的底部留白 ⇒ 写完要重算视口判定（见 scroll.ts 的 reflow）。
     if (NS.scroll && NS.scroll.reflowNow) { NS.scroll.reflowNow(); }
   }

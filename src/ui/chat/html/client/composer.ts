@@ -14,6 +14,10 @@ export const composerClient = `
 
   var input = null;
   var sendBtn = null;
+  // [CUSTOM-20261004-183] 停止确认条（#stopConfirm）。
+  var stopConfirmEl = null;
+  // [CUSTOM-20261004-187] "这个 agent 吃不了轮次中的补充消息"那条说明（#steerHint）。
+  var steerHintEl = null;
   var slashPopup = null;
   var attachmentsEl = null;
   var pickersEl = null;
@@ -42,7 +46,10 @@ export const composerClient = `
     // 'sessionId' — because 'send()' branches on it.
     draft: null,
     /** A create-then-send is in flight; blocks a second send. */
-    draftPending: false
+    draftPending: false,
+    // [CUSTOM-20261004-187] 当前 agent 是否吃"轮次进行中的补充消息"（steering，来自 meta）。
+    // 它决定 running 时回车是**发出去**还是**原样待着并提示**（见 send / refreshSteerHint）。
+    steering: false
   };
 
   // [CUSTOM-20260925-050] Per-session drafts. Switching sessions used to clear
@@ -96,6 +103,9 @@ export const composerClient = `
   function init() {
     input = NS.dom.qs('promptInput');
     sendBtn = NS.dom.qs('sendStopBtn');
+    // [CUSTOM-20261004-183] 停止确认条（不可逆动作的第二步；见 showStopAsk）。
+    stopConfirmEl = NS.dom.qs('stopConfirm');
+    steerHintEl = NS.dom.qs('steerHint');
     slashPopup = NS.dom.qs('slashPopup');
     attachmentsEl = NS.dom.qs('attachments');
     pickersEl = NS.dom.qs('configPickers');
@@ -106,6 +116,8 @@ export const composerClient = `
       stashDraft();
       persistDraftsSoon();
       updateSlashPopup();
+      // [CUSTOM-20261004-187] 那条说明的判据里有"输入框里有没有东西"，所以它跟着每次输入走。
+      refreshSteerHint();
     });
     // [CUSTOM-20260925-050] Restore the per-session drafts (same webview-local
     // state the scroll memory uses; each document keeps its own copy).
@@ -114,8 +126,17 @@ export const composerClient = `
       if (ui && ui.drafts) { drafts = ui.drafts; }
     }
     sendBtn.addEventListener('click', function () {
-      if (state.running) { cancel(); } else { send(); }
+      // [CUSTOM-20261004-183] 停止不再一键生效：先问一句（同 Escape 那条路）。
+      if (state.running) { showStopAsk(); } else { send(); }
     });
+    if (stopConfirmEl) {
+      stopConfirmEl.addEventListener('click', function (event) {
+        var btn = event.target && event.target.closest ? event.target.closest('[data-stop-confirm]') : null;
+        if (!btn) { return; }
+        if (btn.getAttribute('data-stop-confirm') === 'stop') { hideStopAsk(); cancel(); }
+        else { hideStopAsk(); }
+      });
+    }
     document.addEventListener('click', function (event) {
       if (!pickersEl.contains(event.target)) { closeMenus(); }
     });
@@ -142,6 +163,9 @@ export const composerClient = `
   }
 
   function refreshControls() {
+    // [CUSTOM-20261004-187] 最先算：下面两条早退分支（draftPending / draft）也会换 placeholder
+    // 与禁用态，那条说明的显隐是独立的一件事，不该被它们跳过。
+    refreshSteerHint();
     var enabled = canCompose();
     input.disabled = !enabled;
     sendBtn.disabled = !enabled && !state.running;
@@ -174,9 +198,15 @@ export const composerClient = `
   }
 
   function send() {
-    // Never send while a turn is running: the extension rejects the second
-    // prompt, and clearing the textarea first would lose the user's draft.
-    if (state.running) { return; }
+    // [CUSTOM-20261004-187] 轮次进行中：**能发就发**。
+    //
+    // 以前这里是 if (state.running) { return; }（"扩展会拒掉第二个 prompt，先清空输入框
+    // 会把草稿弄丢"）。前半句现在不成立了：宿主对支持 steering 的 agent 会把这条消息**注入**
+    // 正在跑的那一轮（_session/steering），不是第二个 prompt。用户的报障正是"任务进行中
+    // 没法回车发送"。
+    // 后半句仍然成立，所以**不支持的 agent 照旧不发** —— 但不再静默：refreshSteerHint 会在
+    // 输入卡上方写明原因（"输入框里打了字却按回车没反应"是最容易让人以为程序坏了的那种）。
+    if (state.running && !state.steering) { return; }
     var text = input.value;
     // [CUSTOM-20260928-096] 有附件（图片/文件）时允许空文字发送；纯文字则要求非空。
     if ((!text || text.trim().length === 0) && state.attachments.length === 0) { return; }
@@ -216,6 +246,40 @@ export const composerClient = `
     autoGrow();
   }
 
+  /**
+   * [CUSTOM-20261004-183] 停止确认的显隐。
+   *
+   * 用户 2026-10-04 报：「Escape 不管触发停止还是关弹窗，都是不可逆的，需要先弹二次确认框」。
+   * 事实核过：真正不可逆的只有**停止**（工具的调用会被掐断）；关菜单/浮层都能重开，表单抽屉的
+   * Escape 也只是收起、打过的字全在 —— 所以只给"停止"加这一步，其余保持一键（多一步只是添堵）。
+   *
+   * 形态是**面板内一条**（#stopConfirm，在输入卡上方、同宽同中线），不是宿主模态框：不抢焦点、
+   * 不遮住你要停的那个会话，而且它的高度会经 composer 的观察器进 --acpc-composer-h，
+   * 消息区照常让位（176 的重算也在）。
+   */
+  function showStopAsk() {
+    if (!state.running || !stopConfirmEl || !stopConfirmEl.hidden) { return; }
+    stopConfirmEl.hidden = false;
+  }
+
+  function hideStopAsk() {
+    if (!stopConfirmEl || stopConfirmEl.hidden) { return; }
+    stopConfirmEl.hidden = true;
+  }
+
+  /**
+   * [CUSTOM-20261004-187] "按了回车却什么都没发生"的说明条。
+   *
+   * 判据要求**三件事同时成立**：轮次在跑、这个 agent 不支持 steering、而输入框里确实有东西
+   * 想发（有文字或有附件）。少了最后一条它就会在每一次长轮次里无缘无故地常驻 —— 而它要说的
+   * 恰恰是"你手上这条消息发不出去"。
+   */
+  function refreshSteerHint() {
+    if (!steerHintEl) { return; }
+    var hasText = !!(input.value && input.value.trim().length > 0) || state.attachments.length > 0;
+    steerHintEl.hidden = !(state.running && !state.steering && hasText);
+  }
+
   function cancel() {
     if (!state.sessionId) { return; }
     NS.bridge.post({ type: 'cancelTurn', sessionId: state.sessionId });
@@ -234,12 +298,21 @@ export const composerClient = `
     }
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault();
-      if (state.running) { cancel(); } else { send(); }
+      // [CUSTOM-20261004-182] 回车**只发送，绝不停止**。
+      //
+      // 用户 2026-10-04 报："输入框消息发出之后，再按一次 Enter 会触发停止"。根因是回车与
+      // Send/Stop 按钮共用一条路由（state.running ? cancel() : send()）—— 而发完消息后
+      // 光标还在输入框里、手也还在键盘上，第二次回车就把**整轮**停掉了。
+      // 现在只调 send()：它自己守着两件事（跑着不发、空内容且无附件不发），于是"跑着按回车"
+      // 变成一个安全的空操作。停止是**显式动作**：Send/Stop 按钮（title/aria 就是 "Stop"）
+      // 或者 Escape —— 不该跟"发消息"共用同一个键。
+      send();
       return;
     }
     if (event.key === 'Escape' && state.running) {
       event.preventDefault();
-      cancel();
+      // [CUSTOM-20261004-183] 再按一次 Escape = 收起这一问（不停止）；要点"停止"才真停。
+      if (stopConfirmEl && !stopConfirmEl.hidden) { hideStopAsk(); } else { showStopAsk(); }
     }
   }
 
@@ -268,7 +341,10 @@ export const composerClient = `
     // setProperty ⇒ 判空跳过，别让这条新代码把客户端逻辑测试打红。
     if (!composerEl || !document.body || !document.body.style || !document.body.style.setProperty) { return; }
     function apply() {
-      document.body.style.setProperty('--acpc-composer-h', composerEl.offsetHeight + 'px');
+      var height = composerEl.offsetHeight;
+      document.body.style.setProperty('--acpc-composer-h', height + 'px');
+      // [CUSTOM-20261005-192] 高度变了就进滚动诊断（这条链是这个 bug 的第一嫌疑）。
+      if (NS.scroll && NS.scroll.noteGeometry) { NS.scroll.noteGeometry('composer', height); }
       // [CUSTOM-20261003-176] 留白变了 ⇒ 视口判定要跟着重算（scroll 事件不会来，见 scroll.ts 的 reflow）。
       if (NS.scroll && NS.scroll.reflowNow) { NS.scroll.reflowNow(); }
     }
@@ -510,10 +586,14 @@ export const composerClient = `
     return root;
   }
 
+  // [CUSTOM-20261004-190] 现在画在 DOM 里的那组数字（见 renderContext 的"数值没变就不重建"）。
+  var drawnGauge = null;
+
   function renderContext(usage) {
     lastUsage = usage || null;
     if (!lastUsage || !lastUsage.size) {
       contextMeter.hidden = true;
+      drawnGauge = null;
       return;
     }
     var pct = Math.max(0, Math.min(1, lastUsage.used / lastUsage.size));
@@ -521,17 +601,35 @@ export const composerClient = `
     var label = Math.round(lastUsage.used / 1000) + 'k / ' + Math.round(lastUsage.size / 1000) + 'k tokens';
     // The cost line used to live in the header bar; that bar is gone, so it rides in the
     // tooltip rather than being dropped.
-    if (lastUsage.costAmount !== undefined && lastUsage.costAmount !== null) {
-      label += '  ' + lastUsage.costAmount + ' ' + (lastUsage.costCurrency || '');
+    //
+    // [CUSTOM-20261004-185] 两位小数：agent 给的是一枚裸浮点（实测 2.6394680000000004
+    // —— 累计值反复相加的浮点噪声），原样拼进去就是"4.676045 USD"这种一长串。
+    // 金额只做展示、不参与计算，四舍五入到分即可；非数字（undefined/null/NaN）不显示。
+    // ⚠️ 本文件是嵌在模板字符串里的客户端代码，注释里也**不能出现反引号**（pitfalls #11）。
+    var cost = Number(lastUsage.costAmount);
+    if (lastUsage.costAmount !== undefined && lastUsage.costAmount !== null && isFinite(cost)) {
+      label += '  ' + cost.toFixed(2) + ' ' + (lastUsage.costCurrency || '');
     }
     contextMeter.hidden = false;
     contextMeter.title = percent + '%  ·  ' + label;
     contextMeter.className = 'context-meter'
       + (pct > 0.9 ? ' hot' : (pct > 0.7 ? ' warn' : ''))
       + (state.running ? ' running' : '');
-    NS.dom.clear(contextMeter);
-    contextMeter.appendChild(buildGauge(pct));
-    contextMeter.appendChild(NS.dom.el('span', 'gauge-text', String(percent)));
+    // [CUSTOM-20261004-190] 数字没变就**不要重建 DOM**，只改上面那几样（便宜、不碰结构）。
+    //
+    // 为什么必须这样：setRunning 会走到这里，而它由 sessionsChanged 驱动 —— 宿主**每收到一个
+    // agent_message_chunk 就 refreshSessions()**（见 ChatPanelHost 的 chunk 分支），于是流式
+    // 期间这里每秒重建几十次。而重建 <svg> 会让外圈那条 CSS 动画**从 0 重新开始**，它永远到不了
+    // 转起来的那一步 —— 用户看到的就是"任务进行中时外圈的闪烁失效，只剩下面多了一段圆环"。
+    // 实测（preview-records.mjs 的 #gauge-rebuild 档，判据是节点身份而非动画时钟）：
+    // sameSvgNode: false（修前）→ 修后为 true。⚠️ 本文件禁反引号，注释里也别写（pitfalls #11）。
+    var sameNumbers = drawnGauge && drawnGauge.used === lastUsage.used && drawnGauge.size === lastUsage.size;
+    if (!sameNumbers) {
+      NS.dom.clear(contextMeter);
+      contextMeter.appendChild(buildGauge(pct));
+      contextMeter.appendChild(NS.dom.el('span', 'gauge-text', String(percent)));
+      drawnGauge = { used: lastUsage.used, size: lastUsage.size };
+    }
   }
 
   // --- Attachments ---------------------------------------------------------
@@ -736,6 +834,11 @@ export const composerClient = `
     // filed under the draft's id, so clearing it first would make ownerKey() null and
     // drop the text (which is exactly the reported data loss).
     if (changed) { stashDraft(); }
+    // [CUSTOM-20261004-183] 换会话：上一轮的那一问不该跟过来。
+    if (changed) { hideStopAsk(); }
+    // [CUSTOM-20261004-187] 同理：能力是**每个 agent 一份**的，不能从上一个会话跟过来。
+    // 先按"不支持"处理（保守：宁可提示也不把消息发到不认它的 agent 上），meta 一到就更新。
+    if (changed) { state.steering = false; }
     state.draft = null;
     state.draftPending = false;
     state.sessionId = summary ? summary.sessionId : null;
@@ -754,6 +857,9 @@ export const composerClient = `
     if (meta) {
       state.commands = meta.availableCommands || [];
       state.configOptions = meta.configOptions || [];
+      // [CUSTOM-20261004-187] 只有"宿主明确说了"才改这个能力位：meta 缺失时保持原值，
+      // 免得一次 meta 丢失就把支持 steering 的会话降级成发不出去。
+      if (typeof meta.steering === 'boolean') { state.steering = meta.steering; }
     } else {
       state.commands = [];
       state.configOptions = [];
@@ -767,6 +873,8 @@ export const composerClient = `
 
   function setRunning(running) {
     state.running = running;
+    // [CUSTOM-20261004-183] 轮次自己结束了（或切走了）：那一问就没有意义了。
+    if (!running) { hideStopAsk(); }
     refreshControls();
     // [CUSTOM-20260930-129] The ring's outer arc says "a turn is running", and this path
     // has no meta of its own — redraw from the numbers we kept.
@@ -776,6 +884,8 @@ export const composerClient = `
   function setMeta(meta) {
     state.commands = meta.availableCommands || [];
     state.configOptions = meta.configOptions || [];
+    // [CUSTOM-20261004-187] 能力位（见 setFocus 的同名处理）。
+    if (typeof meta.steering === 'boolean') { state.steering = meta.steering; }
     renderPickers();
     renderContext(meta.usage);
     refreshControls();

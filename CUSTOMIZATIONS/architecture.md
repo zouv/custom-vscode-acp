@@ -95,7 +95,7 @@ webpack + ts-loader（不是 esbuild）；ESLint flat config；`@vscode/test-cli
 | `src/extension.ts` | 激活入口：装配全部服务与 UI、注册 22 个命令、把 SessionManager 事件接到视图刷新、dispose 编排 | 新增命令 / 新增事件转发 / 改装配顺序 |
 | `src/core/AgentManager.ts` | agent 子进程生命周期：`spawnAgent`/`killAgent`/`killAll`；Windows 走 `cmd.exe`+`shell:true`，macOS/Linux 走 login shell（修 `spawn npx ENOENT`）；emit `agent-stderr`/`agent-error`/`agent-closed` | agent 起不来 / 平台差异 / 进程泄漏 |
 | `src/core/ConnectionManager.ts` | 把子进程 stdio 转 Web Streams + `ndJsonStream`，建 `ClientSideConnection`，做 `initialize` 握手；`tapStream` 双向拦截供 traffic 日志 | 协议握手 / 抓包 / ACP SDK 升级 |
-| `src/core/SessionManager.ts` | **本仓库最复杂的编排器**（1300+ 行，属"用 grep 定位、勿整读"一类）：`connectToAgent`/`newConversation`/`sendPrompt`/`cancelTurn`/`setMode`/`setModel`/`setConfigOption`/`listSessions`/`loadSession`/`resumeSession`；`-32000` 认证重试；早到通知缓冲（`pendingAvailableCommands`/`pendingConfigOptions`/`pendingTitles`）；emit 13 种事件 | 会话状态机 / 新事件 / 能力协商 |
+| `src/core/SessionManager.ts` | **本仓库最复杂的编排器**（1300+ 行，属"用 grep 定位、勿整读"一类）：`connectToAgent`/`newConversation`/`sendPrompt`/`cancelTurn`/`setMode`/`setModel`/`setConfigOption`/`listSessions`/`loadSession`/`resumeSession`；`-32000` 认证重试；早到通知缓冲（`pendingAvailableCommands`/`pendingConfigOptions`/`pendingTitles`）；emit 13 种事件。**187 起还有轮次中补发**：`supportsSteering`/`hasRunningTurn`/`steerPrompt`（走 `extMethod('_session/steering')`） | 会话状态机 / 新事件 / 能力协商 |
 | `src/core/SessionHistoryStore.ts` | `workspaceState` 持久化的会话缓存（tier-2 树数据源），按 agent+cwd 分桶、有容量上限、`reconcileFromAgent` 与 agent 侧对账 | 会话列表丢失 / 缓存策略 |
 | `src/core/AcpClientImpl.ts` | ACP SDK `Client` 接口的门面，把方法转发给各 handler | 新增 ACP 客户端能力 |
 | `src/handlers/FileSystemHandler.ts` | `fs/read_text_file`（**优先返回未保存的编辑器缓冲区**，支持 `line`/`limit`）、`fs/write_text_file`（建父目录 + 打开预览） | 文件读写异常 |
@@ -142,6 +142,12 @@ webpack + ts-loader（不是 esbuild）；ESLint flat config；`@vscode/test-cli
 `SessionManager.sendPrompt` → agent 侧 `session/update` 通知 → `SessionUpdateHandler` 扇出 →
 `SessionManager` 转发 → `ChatWebviewProvider` postMessage 到 webview。
 取消走 `SessionManager.cancelTurn`。
+**187 起"轮次进行中的补发"有第二条出口**：`sendPrompt` 那条路会被 `inFlightTurns` 守卫拒掉，
+面板改为 `ChatPanelHost.handleSendPrompt` 先判 `hasRunningTurn && supportsSteering` ⇒
+`SessionManager.steerPrompt`（`extMethod('_session/steering')`，**不产生第二个 PromptResponse**，
+所以轮次状态一个都不能动）。能力来自 `initialize` 的 `_meta.steering.supported`
+（`ConnectionInfo.supportsSteering`）→ 随 `SessionMeta.steering` 下发，客户端据此决定
+"running 时回车是发出去还是原地提示"。见 [`docs/arch/chat-panel.md`](./docs/arch/chat-panel.md) §5.44。
 
 ### 2.5 聊天 UI
 **路由层**：`ChatRouterProvider`（`src/ui/chat/`）按「聚焦会话所属 agent」在

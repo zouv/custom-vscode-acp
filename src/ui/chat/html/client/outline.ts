@@ -126,7 +126,10 @@ export const outlineClient = `
     for (var i = 0; i < items.length; i++) {
       var entry = items[i];
       // [CUSTOM-20260925-047] 真 <button>：Enter/Space 免费，且进入 tab 顺序。
-      var row = NS.dom.el('button', 'outline-item');
+      // [CUSTOM-20261005-191] 行上带 kind 类：这是"这一行是**谁说的**"在列表里的唯一载体。
+      // 之前只有图标那一小格带 kind（076/077），于是整排看起来一模一样（用户报"用户消息区分度
+      // 不明显"）—— 样式需要按 kind 给**整行**换字重/颜色/缩进，所以类要挂在行上。
+      var row = NS.dom.el('button', 'outline-item kind-' + entry.kind);
       row.type = 'button';
       row.setAttribute('data-jump-id', entry.id);
       // [CUSTOM-20260926-076] 悬停显示更多：原生 title（截到 TITLE_MAX）。
