@@ -34,6 +34,17 @@ export const scrollClient = `
       logScrollState(fromProgram ? 'scroll-after-program' : 'user-scroll');
       onScroll();
     });
+    // [CUSTOM-20261005-192] 「我拖了滚动条，但它没动」——2026-10-05 那次真机日志里，
+    // 面板停在 st=43 而 max=5940+，**没有任何一次程序写接近过 43**（80 次程序写全在贴底跟到底，
+    // st 单调递增），所以问题不在"我们把他拽回去"，而在**手势没作用到 #messages 上**。
+    // 这一条就是为它加的：按下时若落在滚动条那条带子上（offsetX 超出 clientWidth），记一笔 ——
+    // 之后有没有跟着的 scroll 事件，就能判定"拖了到底动没动"。
+    container.addEventListener('pointerdown', function (event) {
+      // 只记**落在滚动条那条带子上**的按下（offsetX 超出 clientWidth）。不记"区内的普通按下"——
+      // 点工具卡、选文字都会触发，那点噪声会把这套诊断自己的配额吃光。
+      var onScrollbar = typeof event.offsetX === 'number' && event.offsetX > container.clientWidth;
+      if (onScrollbar) { logScrollState('scrollbar-press', true); }
+    }, true);
     jumpBtn.addEventListener('click', function () {
       pinned = true;
       hideJump();
@@ -74,6 +85,14 @@ export const scrollClient = `
    * "atMax 却不 pinned"，或者 "刚跟过底 distance 仍 ≥ 32"，就说明某个量在说谎** ——
    * scrollTop 被夹住了、padBottom 读不到、或者内容是在写入之后才长出来的。
    */
+  /** 这份文档是哪个面（侧边栏还是编辑区）—— 两个面各有自己的 #messages。 */
+  function surfaceId() {
+    var cls = (document.body && document.body.className) || '';
+    if (cls.indexOf('surface-editor') >= 0) { return 'editor'; }
+    if (cls.indexOf('surface-view') >= 0) { return 'view'; }
+    return cls || 'unknown';
+  }
+
   /** 读 body 上的 CSS 变量。桩 DOM 的 body 没有 style（滚动那套测试就是这么搭的），判空返回 '-'。 */
   function bodyVar(name) {
     var style = document.body && document.body.style;
@@ -159,6 +178,7 @@ export const scrollClient = `
       + ' last=' + (lastRect ? Math.round(lastRect.bottom) : '-')
       + ' comp=' + (composerRect ? Math.round(composerRect.top) : '-')
       + ' kind=' + (last ? String(last.getAttribute('data-kind') || 'x') : '-')
+      + ' sf=' + surfaceId()
       + (diagSuppressed > 0 ? ' sup=' + diagSuppressed : ''));
     diagSuppressed = 0;
   }
