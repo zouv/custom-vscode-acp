@@ -121,6 +121,8 @@
   ⓒ `atmax=1 且 pin=0`（不可能组合）**0 次**。
   而现场是：面板停在 `st=43`（近顶部）而 `max=5940+`，`user-scroll` 整场只有 8 次 —— 也就是说**用户拖的那个滚动条没有作用到 #messages 上**（拖拽会连续产生 scroll 事件，一次都没有）。
   据此加了两样东西：**`sf=view|editor`**（两个面各有自己的 #messages，先排除"看的是另一个文档"）与 **`scrollbar-press`**（按下点落在滚动条那条带子上时记一笔，`offsetX > clientWidth`；之后有没有跟着的 scroll 事件，就能判定"拖了到底动没动"）。**不记区内的普通按下** —— 点工具卡/选文字都会触发，那点噪声会把这套诊断自己的配额吃光。
+  随后又把落点从"只记滚动条"扩成**文档级四类标签**（press@messages-bar / press@outline / press@outside，messages 与 composer 不记）：右侧大纲栏与记录区**两个滚动条只隔一条边**，先分清楚他拖的是哪一个；messages-bar 的判据两种并用（offsetX > clientWidth，或 clientX 越过容器右边界 —— 后者让这一格在预览探针里也验得了，实测 `#scrolllogprobe` 打得出 press@messages-bar）。顺带修掉一处**会把我们自己的动作误标成 user-scroll** 的直写（Jump 按钮的 scrollTop 没走 writeTop）。
+  **第二次读日志（19:38）**：sf= 与新标签**一条都没有** ⇒ 那个窗口的 webview 文档还是旧构建（扩展宿主 03:32 已换新包，但文档仍是 03:11 那份）—— 诊断要生效必须让**webview 重建**（Reload Window / 关掉面板再打开）。在此之前那次的数字与上一次同源：st=43、user-scroll 稀少、程序写全在贴底跟到底。
 - **基于上游版本**：0.2.0（commit e7371659）
 
 ### 2026-10-05 - CUSTOM-20261005-191
