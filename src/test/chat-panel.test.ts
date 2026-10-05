@@ -839,6 +839,42 @@ suite('chat panel: draft page creates the session on first send', () => {
     assert.strictEqual(messagesOf(harness, 'draftFailed').length, 0);
   });
 
+  // [CUSTOM-20261005-193] 草稿页粘的图必须**跟着首条消息进 agent**。
+  // 用户报的是"New Session 的输入框没法粘贴图片"—— 以前客户端在"没有会话"处就拒了，
+  // 而现在图先本地攒着、随 createDraftAndSend 交上来，宿主建完会话再走**同一条**附件通道。
+  test('an image pasted on the draft page rides into the first prompt', async () => {
+    const { harness, manager } = draftHarness();
+    harness.host.onMessage({
+      type: 'createDraftAndSend', draftId: 'd1', cwd: '/dir', text: '看看这张图',
+      images: [{ id: 'img-1', name: 'pasted.png', mimeType: 'image/png', dataUrl: 'data:image/png;base64,QUJD' }],
+    });
+    await waitFor(() => manager.sent.length > 0, 'the prompt to be sent');
+
+    const blocks = manager.sent[0].prompt as Array<Record<string, unknown>>;
+    assert.deepStrictEqual(blocks.map(b => b.type), ['text', 'image'],
+      'the image rides with the very first prompt, not a second turn');
+    assert.strictEqual(blocks[1].data, 'QUJD', 'the data URL prefix is stripped before the wire');
+    assert.strictEqual(blocks[1].mimeType, 'image/png');
+    // 面板要被通知到（与普通 attachImage 同一条通道）。注意会有两条：一条是落账、
+    // 一条是 handleSendPrompt 发完把附件清空（`attachments: []`）—— 所以看第一条。
+    const attachmentMsgs = messagesOf(harness, 'attachments');
+    assert.ok(attachmentMsgs.length >= 1, 'the panel is told about the attachment');
+    const listed = attachmentMsgs[0].attachments as Array<Record<string, unknown>>;
+    assert.deepStrictEqual(listed.map(a => a.path), ['img-1'],
+      'and it is the same shape a normal attachImage produces (path = the image id)');
+  });
+
+  test('an image with no text is a valid draft send', async () => {
+    const { harness, manager } = draftHarness();
+    harness.host.onMessage({
+      type: 'createDraftAndSend', draftId: 'd2', cwd: '/dir', text: '   ',
+      images: [{ id: 'img-2', name: 'p.png', mimeType: 'image/png', dataUrl: 'data:image/png;base64,QUJD' }],
+    });
+    await waitFor(() => manager.sent.length > 0, 'the prompt to be sent');
+    assert.strictEqual(messagesOf(harness, 'draftFailed').length, 0,
+      'an attachment alone is something to send (the client allows it too)');
+  });
+
   test('an empty draft is refused without creating anything', async function () {
     const { harness, manager } = draftHarness();
     harness.host.onMessage({

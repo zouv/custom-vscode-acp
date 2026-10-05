@@ -233,7 +233,21 @@ export type ChatToExt =
   // 所以它们必须和其他非会话作用域消息一样，在 `verifySession` 守卫**之前**处理（§5.4 规则二）。
   | { type: 'listDirectoryChoices'; agentName?: string }
   | { type: 'pickDirectory' }
-  | { type: 'createDraftAndSend'; draftId: string; agentName?: string; cwd?: string; text: string; configSelections?: Array<{ configId: string; value: string }> }
+  /**
+   * [CUSTOM-20261005-193] 草稿页也可能带附件。
+   *
+   * 附件原本是**会话作用域**的（`attachPath`/`attachImage` 都带 sessionId，宿主按会话存），
+   * 而草稿还没有会话 —— 于是"新建会话页粘一张图"在客户端就被拒了（`attachImage` 里那句
+   * "no session is focused"），图片根本发不出去。做法是让**首条消息**把附件一起带上：
+   * 客户端在草稿上先本地攒着（它展示 chip），发送时随这条消息交给宿主，宿主建完会话再按
+   * 常规通道（`handleAttachImage` / `handleAttachPaths`）落账 —— 与已有会话走同一条路。
+   */
+  | {
+    type: 'createDraftAndSend'; draftId: string; agentName?: string; cwd?: string; text: string;
+    configSelections?: Array<{ configId: string; value: string }>;
+    images?: Array<{ id: string; name: string; mimeType: string; dataUrl: string }>;
+    paths?: string[];
+  }
   // [CUSTOM-END] CUSTOM-20260925-058
   // [CUSTOM-BEGIN] CUSTOM-20260930-151 - 草稿页要"显示完整"：问宿主有没有该 agent 上一次会话
   // 的配置项/命令快照（草稿还没有 session，这些在 ACP 里只存在于会话上）。

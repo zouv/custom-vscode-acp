@@ -738,6 +738,8 @@ export const bootClient = `
   function attachPaths(paths) {
     if (paths.length === 0) { return false; }
     if (!currentSessionId) {
+      // [CUSTOM-20261005-193] 草稿页同理（粘图那一条的兄弟）：先本地攒着，随首条消息交上去。
+      if (NS.composer && NS.composer.addDraftPaths && NS.composer.addDraftPaths(paths)) { return true; }
       NS.bridge.post({ type: 'error', message: 'Attach File: no session is focused.' });
       return false;
     }
@@ -798,7 +800,15 @@ export const bootClient = `
   // [CUSTOM-20260928-096] 把剪贴板位图作为 image 附件发到宿主。缩略图留客户端本地缓存，
   // 全图 base64 交给宿主（宿主内存持有、发送时拼进 image ContentBlock）。
   function attachImage(name, mimeType, dataUrl) {
+    // [CUSTOM-20261005-193] 草稿页（新建会话）也可以粘图：那里还没有会话，宿主收不了会话作用域的
+    // attachImage，于是先交给 composer 本地攒着（展示 chip），首条消息时随 createDraftAndSend 交上去。
+    // 用户报的正是"New Session 的输入框没法粘贴图片" —— 以前这里直接报 "no session is focused"。
     if (!currentSessionId) {
+      var id = 'img-' + Date.now() + '-' + Math.floor(Math.random() * 100000);
+      if (NS.composer && NS.composer.addDraftImage
+        && NS.composer.addDraftImage({ id: id, name: name, mimeType: mimeType, dataUrl: dataUrl })) {
+        return;
+      }
       NS.bridge.post({ type: 'error', message: 'Attach Image: no session is focused.' });
       return;
     }

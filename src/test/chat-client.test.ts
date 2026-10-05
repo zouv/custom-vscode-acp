@@ -1807,25 +1807,28 @@ suite('chat client logic: draft composer options (stub DOM)', () => {
 
   function draftComposer(): {
     NS: Record<string, any>; input: StubNode; sendBtn: StubNode; pickers: StubNode;
-    slashPopup: StubNode; posted: Array<Record<string, unknown>>;
+    slashPopup: StubNode; attachments: StubNode; posted: Array<Record<string, unknown>>;
     docListeners: Record<string, Array<(event: any) => void>>;
   } {
     const input = new StubNode('textarea');
     const sendBtn = new StubNode('button');
     const pickers = new StubNode('div');
     const slashPopup = new StubNode('div');
+    // [CUSTOM-20261005-193] 附件条也要拿到（草稿页粘图那条测试要断言 chip 真的出现了）。
+    const attachments = new StubNode('div');
     const { NS, docListeners } = loadClient({
       promptInput: input,
       sendStopBtn: sendBtn,
       slashPopup: slashPopup,
-      attachments: new StubNode('div'),
+      attachments,
       configPickers: pickers,
       contextMeter: new StubNode('div'),
     });
     const posted: Array<Record<string, unknown>> = [];
     NS.bridge.post = (message: Record<string, unknown>) => { posted.push(message); };
+    NS.bridge.postForSession = (message: Record<string, unknown>) => { posted.push(message); };
     NS.composer.init();
-    return { NS, input, sendBtn, pickers, slashPopup, posted, docListeners };
+    return { NS, input, sendBtn, pickers, slashPopup, attachments, posted, docListeners };
   }
 
   const draft = (id: string) => ({ draftId: id, cwd: '/tmp/x' });
@@ -1903,7 +1906,36 @@ suite('chat client logic: draft composer options (stub DOM)', () => {
     assert.deepStrictEqual(posted, [{
       type: 'createDraftAndSend', draftId: 'd1', cwd: '/tmp/x', text: 'build me a thing',
       configSelections: [{ configId: 'mode', value: 'bypass' }],
+      // [CUSTOM-20261005-193] 附件也随这条消息走（草稿上没有会话，宿主收不了会话作用域的
+      // attachPath/attachImage）。这里没有附件 ⇒ 两个空数组，字段本身必须在。
+      images: [], paths: [],
     }]);
+  });
+
+  // [CUSTOM-20261005-193] 新建会话页粘图：以前 boot.attachImage 见"没有会话"就直接报错，
+  // 图片根本发不出去（用户报的"New Session 的输入框没法粘贴图片"）。
+  test('a pasted image on the draft page rides along with the first message (193)', () => {
+    const { NS, input, sendBtn, posted, docListeners, attachments } = draftComposer();
+    NS.composer.setDraft(draft('d1'));
+    posted.length = 0;
+
+    // 宿主侧那条会话作用域的通道不该被用到（草稿没有会话）。
+    const draftOk = NS.composer.addDraftImage({
+      id: 'img-1', name: 'pasted.png', mimeType: 'image/png', dataUrl: 'data:image/png;base64,AAA',
+    });
+    assert.strictEqual(draftOk, true, 'the composer takes it for the draft');
+    assert.strictEqual(posted.length, 0,
+      'nothing goes to the host yet — there is no session to attach to');
+    assert.strictEqual(attachments.hidden, false, 'and the chip is shown on the draft page');
+
+    input.value = '';
+    dispatchClick(sendBtn, docListeners);   // 空文字 + 有附件 ⇒ 允许发送
+    const sent = posted.find(m => String(m.type) === 'createDraftAndSend');
+    assert.ok(sent, `expected a createDraftAndSend, got ${JSON.stringify(posted)}`);
+    assert.deepStrictEqual((sent as Record<string, any>).images, [{
+      id: 'img-1', name: 'pasted.png', mimeType: 'image/png', dataUrl: 'data:image/png;base64,AAA',
+    }]);
+    assert.strictEqual((sent as Record<string, any>).text, '');
   });
 
   test('a retry after a failed create carries the CURRENT pick, not the first one', () => {
