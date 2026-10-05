@@ -221,6 +221,22 @@ export const composerClient = `
       // happens on 'draftResolved'; on 'draftFailed' the text stays put.
       if (state.draftPending) { return; }
       state.draftPending = true;
+      // [CUSTOM-20261005-193] 草稿上攒的附件随这条消息一起交上去（草稿还没有会话，宿主没法
+      // 用 attachPath/attachImage 那种会话作用域的通道收它）。发送**不在这里清空**：这条消息
+      // 可能失败（draftFailed），那时图片和文字都得留着 —— 与 textarea 的处理同一条规矩。
+      var pending = draftFiles[state.draft.draftId] || [];
+      var draftImages = [];
+      var draftPaths = [];
+      for (var i = 0; i < pending.length; i++) {
+        if (pending[i].kind === 'image') {
+          draftImages.push({
+            id: pending[i].id, name: pending[i].name,
+            mimeType: pending[i].mimeType, dataUrl: pending[i].dataUrl,
+          });
+        } else {
+          draftPaths.push(pending[i].path);
+        }
+      }
       NS.bridge.post({
         type: 'createDraftAndSend',
         draftId: state.draft.draftId,
@@ -230,7 +246,9 @@ export const composerClient = `
         // that creates the session (there is nothing to configure until it exists).
         // Read at SEND time, not at press time: a failed attempt keeps the draft, and the
         // retry must carry the selection as it is then, not as it was.
-        configSelections: draftSelections()
+        configSelections: draftSelections(),
+        images: draftImages,
+        paths: draftPaths
       });
       refreshControls();
       return;
@@ -660,6 +678,17 @@ export const composerClient = `
         var remove = NS.dom.el('button', 'attachment-x', '\\u00d7');
         remove.title = 'Remove attachment';
         remove.addEventListener('click', function () {
+          // [CUSTOM-20261005-193] 草稿上没有会话可 detach（那条消息是会话作用域的，发出去
+          // 也只会被宿主丢掉）⇒ 就地删掉本地那一份。
+          if (state.draft) {
+            var list = draftFiles[state.draft.draftId] || [];
+            for (var k = 0; k < list.length; k++) {
+              if (list[k].path === attachment.path) { list.splice(k, 1); break; }
+            }
+            syncDraftAttachments();
+            refreshControls();
+            return;
+          }
           NS.bridge.post({ type: 'detachFile', sessionId: state.sessionId, path: attachment.path });
         });
         chip.appendChild(remove);
@@ -669,6 +698,68 @@ export const composerClient = `
   }
 
   // --- Draft mode (CUSTOM-20260925-058) ------------------------------------
+
+  // [CUSTOM-20261005-193] 草稿页攒下的附件：draftId -> [{ id, kind, name, path, mimeType, dataUrl }]。
+  //
+  // 为什么客户端要自己存一份：附件本来是**会话作用域**的（宿主按 sessionId 存），而草稿还没有
+  // 会话 —— 于是"新建会话页粘一张图"在 boot.attachImage 里就被那句 "no session is focused" 拒了，
+  // 图根本发不出去（用户报的正是它）。现在草稿先把它攒在这里（展示 chip 用其中一小部分字段），
+  // 首条消息（createDraftAndSend）时随消息交给宿主，宿主建完会话再走**同一条**附件通道落账。
+  // 按 draftId 记（同文本草稿按 draftId 存的理由一样：切走再切回不该串）。
+  // 只在内存里：base64 很大，不跟着 webview 状态持久化。
+  var draftFiles = {};
+
+  /** 这份草稿的附件（给 renderAttachments 用的轻量视图，不带 base64）。 */
+  function draftFilesOf(draftId) {
+    var list = draftId ? draftFiles[draftId] : null;
+    var out = [];
+    if (!list) { return out; }
+    for (var i = 0; i < list.length; i++) {
+      out.push({ id: list[i].id, kind: list[i].kind, name: list[i].name, path: list[i].path });
+    }
+    return out;
+  }
+
+  /** 把草稿页当前该显示的附件刷成这份草稿自己的（切草稿/进草稿都走它）。 */
+  function syncDraftAttachments() {
+    state.attachments = state.draft ? draftFilesOf(state.draft.draftId) : [];
+    renderAttachments();
+  }
+
+  /** 草稿页收到一张粘贴的位图（boot.attachImage 在没有会话时转到这里）。 */
+  function addDraftImage(info) {
+    if (!state.draft || !info || !info.id) { return false; }
+    var draftId = state.draft.draftId;
+    var list = draftFiles[draftId] || (draftFiles[draftId] = []);
+    list.push({
+      id: info.id, kind: 'image', name: info.name || 'image',
+      path: info.id, mimeType: info.mimeType || 'image/png', dataUrl: info.dataUrl,
+    });
+    rememberImage(info.id, info.dataUrl);
+    syncDraftAttachments();
+    refreshControls();
+    return true;
+  }
+
+  /** 草稿页收到拖入/粘贴的文件路径（同上）。 */
+  function addDraftPaths(paths) {
+    if (!state.draft || !paths || paths.length === 0) { return false; }
+    var draftId = state.draft.draftId;
+    var list = draftFiles[draftId] || (draftFiles[draftId] = []);
+    for (var i = 0; i < paths.length; i++) {
+      var p = String(paths[i] || '');
+      if (!p) { continue; }
+      list.push({ id: 'file-' + Date.now() + '-' + i, kind: 'file', name: basenameOf(p), path: p });
+    }
+    syncDraftAttachments();
+    refreshControls();
+    return true;
+  }
+
+  function basenameOf(p) {
+    var parts = String(p).split(/[\\\\/]/);
+    return parts[parts.length - 1] || p;
+  }
 
   /** Switch the composer into draft mode: enabled, but bound to no session yet. */
   function setDraft(draft) {
@@ -686,7 +777,8 @@ export const composerClient = `
     selections = draft ? (draft.selections || {}) : {};
     if (draft) { draft.selections = selections; }
     state.draftPending = false;
-    state.attachments = [];
+    // [CUSTOM-20261005-193] 附件也按草稿记（切走再切回不该串，同文本草稿的道理）。
+    state.attachments = draftFilesOf(state.draft ? state.draft.draftId : null);
     // No session ⇒ no 'meta' yet: mode/model/commands only arrive once the agent
     // has created the session. That is inherent to a draft, not an oversight.
     // [CUSTOM-20260930-151] …but the panel no longer leaves it at that: the HOST keeps a
@@ -807,10 +899,15 @@ export const composerClient = `
 
   /** The first message was accepted: leave draft mode and clear the box. */
   function resolveDraft() {
+    // [CUSTOM-20261005-193] 附件已随首条消息交给宿主（draftResolved 才走到这里），本地这份清掉；
+    // 与 textarea 同一条规矩 —— 失败时（failDraft）文字和图片都留着。
+    if (state.draft) { delete draftFiles[state.draft.draftId]; }
     state.draft = null;
     state.draftPending = false;
+    state.attachments = [];
     input.value = '';
     autoGrow();
+    renderAttachments();
     refreshControls();
   }
 
@@ -927,7 +1024,10 @@ export const composerClient = `
     setDraftOptions: setDraftOptions,
     updateDraftCwd: updateDraftCwd,
     resolveDraft: resolveDraft,
-    failDraft: failDraft
+    failDraft: failDraft,
+    // [CUSTOM-20261005-193] 草稿页的附件（boot 在没有会话时转到这里，见 attachImage/attachPaths）。
+    addDraftImage: addDraftImage,
+    addDraftPaths: addDraftPaths
   };
 })(window.__acpc = window.__acpc || {});
 `;

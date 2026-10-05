@@ -97,6 +97,18 @@
   **无头探针**（真 Chromium）：`initial{124} → click{foldDisplay:none, cardH:76} → click{inline, 124}`、`jumped:false`。
 - **基于上游版本**：0.2.0（commit e7371659）
 
+### 2026-10-05 - CUSTOM-20261005-193
+- **功能**：修「New Session 的输入框没法粘贴图片」—— 草稿页也能攒附件（图片与文件路径），随首条消息一起交上去
+- **改动文件**：`src/ui/chat/html/client/boot.ts`（`attachImage` / `attachPaths` 在没有会话时转给 composer，不再直接报错）、`src/ui/chat/html/client/composer.ts`（`draftFiles[draftId]` 本地附件、chip 展示、删除、随 `createDraftAndSend` 发送、`resolveDraft` 清空、导出 `addDraftImage`/`addDraftPaths`）、`src/ui/chat/protocol.ts`（该消息新增 `images`/`paths`）、`src/ui/chat/ChatPanelHost.ts`（`handleCreateDraftAndSend` 收下并转 `handleAttachImage`/`handleAttachPaths`；"空文字 + 有附件"也算有东西可发）、`src/test/chat-client.test.ts`（+1）、`src/test/chat-panel.test.ts`（+2）
+- **来源**：用户「New Session 的输入框没法粘贴图片」（截图：新建会话页，只有状态卡与输入卡）
+- **详细说明**：
+  - **①根因**：附件通道**全是会话作用域**的 —— `attachPath` / `attachImage` 都带 `sessionId`，宿主按会话存（`this.attachments` / `this.imageData`）。而草稿页**还没有会话** ⇒ `boot.attachImage` 在 `if (!currentSessionId)` 处直接报 `Attach Image: no session is focused`，图片根本到不了宿主。文件（拖入/带路径的粘贴）同病。
+  - **②做法**：草稿先在**客户端**攒着（`draftFiles[draftId]`，按 draftId 记 —— 与文本草稿同一条规矩，切走再切回不串；只在内存，base64 不跟着 webview 状态持久化），chip 复用既有的附件条；发送时随那条**创建会话的消息**（`createDraftAndSend` 新增 `images` / `paths`）交上去；宿主建完会话后**走原样的 `handleAttachImage` / `handleAttachPaths` 落账** —— 于是 `handleSendPrompt` 读 `this.attachments` / `imageData` 时天然带上，**不另存一份账**（pitfall #19）。
+  - **③空文字 + 有附件**：客户端那条判据本来就是"有附件也允许空文字"，草稿这条链同样放开（宿主侧同步放宽 `Nothing to send.`）。
+  - **④失败时不丢**：与 textarea 同一条规矩 —— 发送**不在这里清空**，`draftResolved` 才清；`draftFailed` 时文字与图片都留着（重试仍带得上）。草稿上的附件删除也改为**就地删本地那份**（`detachFile` 是会话作用域的，发出去只会被宿主丢掉）。
+- **验证方式**：`npm test` **347 passing**（新增 3 条：客户端"草稿页粘的图随首条消息走"、宿主"图进首条 prompt 的 blocks（`text` + `image`，data URL 前缀已剥）且面板收到 attachments"、"只有图没有文字也算有效发送"）。**三条都确认会咬**：把 `composer.ts`/`boot.ts`/`ChatPanelHost.ts`/`protocol.ts` 一起 `git stash` 回旧代码后跑，新增与受影响共 4 条**全部失败**，`pop` 后转绿。`lint` 0；`check-registry.mjs` 六节全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
 ### 2026-10-05 - CUSTOM-20261005-192
 - **功能**：给"滚动条到底了、面板却不在底部"加**自检日志**（不猜，等它自己开口）
 - **改动文件**：`src/ui/chat/html/client/scroll.ts`（新增 `logScrollState()`；`recompute` 在 **pinned 翻转**时调用；`reflow` 在**跟到底之后仍判没到底**时调用 `follow-fell-short`）

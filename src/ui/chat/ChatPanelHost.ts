@@ -624,6 +624,9 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
           (msg as { cwd?: string }).cwd,
           (msg as { text?: string }).text ?? '',
           (msg as { configSelections?: Array<{ configId: string; value: string }> }).configSelections ?? [],
+          // [CUSTOM-20261005-193] 草稿页攒下的附件（草稿还没有会话，客户端先本地拿着）。
+          (msg as { images?: Array<{ id: string; name: string; mimeType: string; dataUrl: string }> }).images ?? [],
+          (msg as { paths?: string[] }).paths ?? [],
           from,
         );
         return;
@@ -2386,14 +2389,18 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
     cwd: string | undefined,
     text: string,
     selections: Array<{ configId: string; value: string }>,
-    to: SurfaceKey,
+    // [CUSTOM-20261005-193] 草稿页攒的附件：客户端本地拿着（草稿没有会话），随这条消息一起交上来。
+    images: Array<{ id: string; name: string; mimeType: string; dataUrl: string }> = [],
+    paths: string[] = [],
+    to: SurfaceKey = 'view',
   ): Promise<void> {
     const agent = this.panelAgent(agentName);
     if (!agent) {
       this.post({ type: 'draftFailed', draftId, message: 'No agent to start a session with.' }, to);
       return;
     }
-    if (text.trim().length === 0) {
+    // [CUSTOM-20261005-193] 有附件就该能发（客户端那条"空文字 + 有附件也可以发"的判据同义）。
+    if (text.trim().length === 0 && images.length === 0 && paths.length === 0) {
       this.post({ type: 'draftFailed', draftId, message: 'Nothing to send.' }, to);
       return;
     }
@@ -2410,6 +2417,13 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       // 在草稿页显式选过的值：两个都是同一条连接上的 setConfigOption，后到的赢 —— 顺序反了
       // 的话用户刚选的模式会被默认值盖回去。
       await this.awaitModeApply(session.sessionId);
+      // [CUSTOM-20261005-193] 草稿页攒的附件：会话已经有了，**走与普通附件完全相同的那条路**
+      // （handleAttachImage / handleAttachPaths），于是 handleSendPrompt 读 this.attachments /
+      // imageData 时自然就带上了 —— 这里不另存一份，避免两份账（pitfall #19）。
+      for (const image of images) {
+        this.handleAttachImage(session.sessionId, image.id, image.name, image.mimeType, image.dataUrl);
+      }
+      if (paths.length > 0) { this.handleAttachPaths(session.sessionId, paths); }
       // [CUSTOM-20260930-151] 草稿页上选过的模式/模型只能在这里落到会话上（会话存在之前没有
       // 地方可下发），而且必须在首条消息**之前**——第一轮就该跑在用户选的设置上。
       await this.applyDraftSelections(session, selections);
