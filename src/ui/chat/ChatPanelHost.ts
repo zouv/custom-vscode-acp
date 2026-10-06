@@ -143,6 +143,11 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
   // `lastActive` 只用于「把某个面提到前面」（附件 chip），不参与路由决策。
   private readonly surfaces = new Map<SurfaceKey, ChatSurface>();
   private lastActive: SurfaceKey | null = null;
+  /**
+   * [CUSTOM-20261006-194] 正在连接中（postConnection('connecting') 之后、'connected'/'failed' 之前）。
+   * 只用来决定"agent 的 stderr 要不要往卡片上送" —— 连接好了以后的 stderr 是噪声。
+   */
+  private connecting = false;
   // [CUSTOM-END] CUSTOM-20260924-019
 
   private readonly transcripts = new TranscriptStore();
@@ -307,6 +312,9 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       this.sessionManager.on(event, handler);
       this.subscriptions.push({ dispose: () => this.sessionManager.off(event, handler) });
     };
+
+    // [CUSTOM-20261006-194] agent 的 stderr → 连接卡片（只在连接中显示，见 noteAgentStderr）。
+    on('agent-stderr', (evt: { line?: string }) => this.noteAgentStderr(evt?.line ?? ''));
 
     on('session-created', (sessionId: string, _agentName: string, origin?: string) => {
       // [CUSTOM-20260930-151] 会话一建好就把它的配置项/命令收进草稿页快照——下一次点「+」用的
@@ -1880,8 +1888,29 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
   }
 
   /** [CUSTOM-20260930-124] Broadcast one connection attempt's phase. */
-  private postConnection(state: 'connecting' | 'connected' | 'failed', message?: string): void {
-    this.post(message ? { type: 'connection', state, message } : { type: 'connection', state });
+  private postConnection(state: 'connecting' | 'connected' | 'failed', message?: string, detail?: string): void {
+    // [CUSTOM-20261006-194] `connecting` 期间 agent 的 stderr 会以 detail 的形式跟着这条消息下发
+    // （见 noteAgentStderr）—— 用户卡在连接界面时，那几行才是"为什么"。
+    this.connecting = state === 'connecting';
+    const payload: Record<string, unknown> = { type: 'connection', state };
+    if (message) { payload.message = message; }
+    if (detail) { payload.detail = detail; }
+    this.post(payload as never);
+  }
+
+  /**
+   * [CUSTOM-20261006-194] agent 进程的 stderr：**只在连接中**转发给面板。
+   *
+   * 起因：用户报"一直卡在连接界面"。日志里真相很清楚 —— npx 在下载新版本适配器
+   * （`The following package was not found and will be installed: …`），而 `initialize` 要等它；
+   * 可那几行只进了日志，卡片上永远只有一句 "Connecting…"，用户无从判断是在下载还是死了。
+   * 连接建立之后 stderr 就是噪声（各种无关 warn），所以那时不再往卡片上灌。
+   */
+  private noteAgentStderr(line: string): void {
+    if (!this.connecting) { return; }
+    const text = String(line ?? '').trim().slice(0, 160);
+    if (!text) { return; }
+    this.postConnection('connecting', undefined, text);
   }
 
   /**

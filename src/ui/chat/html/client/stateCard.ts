@@ -32,6 +32,10 @@ export const stateCardClient = `
   var armed = false;
   var armTimer = null;
   var slowTimer = null;
+  // [CUSTOM-20261006-194] 连接中显示的东西：agent 最近一行 stderr（说明为什么在等）与秒表。
+  var detail = '';
+  var connectStartedAt = 0;
+  var tickTimer = null;
 
   // [CUSTOM-20260930-131] 500ms 太赶：面板刚渲染完就自动连接，用户还没看清这张卡片上
   // 写着什么。1s 让"卡片出现 → 开始连接"有个可感知的先后（用户要求）。
@@ -71,13 +75,17 @@ export const stateCardClient = `
     if (!els) { return; }
     var p = phase();
     setText(els.title, TITLES[p]);
-    setText(els.hint, HINTS[p]);
+    // [CUSTOM-20261006-194] 连接中若拿到了 agent 的 stderr（npx 在下载那几行），就**用它**代替
+    // 那句套话 —— 用户卡在连接界面时要的是"为什么在等"，而不是"正在启动"。
+    setText(els.hint, (p === 'connecting' && detail) ? detail : HINTS[p]);
     setText(els.error, errorText);
     if (els.error) { els.error.hidden = !errorText; }
     if (els.busy) { els.busy.hidden = p !== 'connecting'; }
     if (els.connect) {
       els.connect.disabled = p === 'connecting';
-      setText(els.connect, p === 'connecting' ? 'Connecting\\u2026' : 'Connect Claude Code');
+      setText(els.connect, p === 'connecting'
+        ? 'Connecting\\u2026' + elapsedLabel()
+        : 'Connect Claude Code');
     }
     // ready 态的按钮整块退场（连同它的间距），不是只把它藏起来。
     if (els.actions) { els.actions.hidden = p === 'ready'; }
@@ -97,6 +105,27 @@ export const stateCardClient = `
     if (slowTimer) { window.clearTimeout(slowTimer); slowTimer = null; }
   }
 
+  // [CUSTOM-20261006-194] 连接中的秒表。用户报"一直卡在连接界面"——数字在动至少能说明
+  // "还在等"而不是"死了"。只在 connecting 期间跑，离开相位就停（别让一个计时器常驻）。
+  function elapsedLabel() {
+    if (!connectStartedAt) { return ''; }
+    var secs = Math.floor((Date.now() - connectStartedAt) / 1000);
+    if (secs < 1) { return ''; }
+    return ' ' + (secs < 60 ? secs + 's' : Math.floor(secs / 60) + 'm' + (secs % 60) + 's');
+  }
+
+  function startTick() {
+    connectStartedAt = Date.now();
+    stopTick();
+    if (typeof window.setInterval !== 'function') { return; }
+    tickTimer = window.setInterval(function () { render(); }, 1000);
+  }
+
+  function stopTick() {
+    if (tickTimer) { window.clearInterval(tickTimer); tickTimer = null; }
+    connectStartedAt = 0;
+  }
+
   function armSlowTimer() {
     clearSlowTimer();
     slowTimer = window.setTimeout(function () {
@@ -114,6 +143,8 @@ export const stateCardClient = `
     if (connecting) { return; }
     connecting = true;
     errorText = '';
+    detail = '';
+    if (!tickTimer) { startTick(); }
     render();
     armSlowTimer();
     NS.bridge.post({ type: 'connectAgent' });
@@ -124,14 +155,22 @@ export const stateCardClient = `
     if (state === 'connecting') {
       connecting = true;
       errorText = '';
+      // [CUSTOM-20261006-194] agent 的 stderr 逐行跟着这条消息下来（见 ChatPanelHost.noteAgentStderr）；
+      // 没有 detail 的那条是相位本身（发起连接），此时清掉上一轮的残留。
+      detail = (message && message.detail) || '';
+      if (!tickTimer) { startTick(); }
       armSlowTimer();
     } else if (state === 'connected') {
       connecting = false;
       connected = true;
       errorText = '';
+      detail = '';
+      stopTick();
       clearSlowTimer();
     } else if (state === 'failed') {
       connecting = false;
+      detail = '';
+      stopTick();
       errorText = (message && message.message) || 'Could not connect to the agent.';
       clearSlowTimer();
     } else {

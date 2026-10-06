@@ -180,7 +180,12 @@ export type ExtToChat =
   // 这条路上宿主一条消息都不会发，客户端的「连接中」会**永久卡死**（pitfall #29 的形态：
   // 效果上没变化 ≠ 可以不回话）。
   // 没有 'disconnected'：断开方向由 `agentConnected` 单独表达，不设第二条真相（pitfall #19）。
-  | { type: 'connection'; state: 'connecting' | 'connected' | 'failed'; message?: string }
+  /**
+   * [CUSTOM-20261006-194] `detail` 只在 `connecting` 时出现：agent 进程的 stderr 里最近一行
+   * （最典型的是 npx 的 "…will be installed: …"）。用户卡在连接界面时，那一行才说明**为什么**在等
+   * —— 此前它只进日志，卡片上永远只有一句 "Connecting…"。
+   */
+  | { type: 'connection'; state: 'connecting' | 'connected' | 'failed'; message?: string; detail?: string }
   // [CUSTOM-END] CUSTOM-20260930-124
   // [CUSTOM-BEGIN] CUSTOM-20260930-125 - 设置项 acpc.autoConnectOnOpen 的当前值。
   // 走**广播**：两个面渲染的是同一个开关，不能各显示各的。
