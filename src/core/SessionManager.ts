@@ -274,6 +274,15 @@ export class SessionManager extends EventEmitter {
       this.emit('agent-error', evt.agentId, evt.error, agentName);
     });
 
+    // [CUSTOM-20261006-194] agent 的 stderr 值得往上传一手：**连不上时用户唯一能看到的
+    // "为什么"就在那几行里**（最典型的是 npx 的 "The following package was not found and will
+    // be installed: …" —— 那说明它在下载，等就是了）。此前 AgentManager 只是把它 emit 出去、
+    // 顺手写进日志，没有任何订阅者 ⇒ 面板里永远只有一句干巴巴的 "Connecting…"。
+    // 这里只做转发；"要不要显示给人看"由面板决定（连接好了以后的 stderr 是噪声）。
+    this.agentManager.on('agent-stderr', (evt: { agentId: string; line: string }) => {
+      this.emit('agent-stderr', evt);
+    });
+
     this.agentManager.on('agent-closed', (evt: { agentId: string; code: number | null; name?: string }) => {
       const agentName = this.agentProcessNames.get(evt.agentId) ?? evt.name;
       log(`Agent ${agentName ?? evt.agentId} closed with code ${evt.code}`);

@@ -3542,3 +3542,45 @@ suite('chat panel: a message sent mid-turn steers the running turn', () => {
     assert.deepStrictEqual(prompted, ['s-1'], 'it goes down the ordinary path');
   });
 });
+
+// [CUSTOM-20261006-194] 连接期间，agent 的 stderr 要送到面板上。
+//
+// 用户报"一直卡在连接界面"。日志里的原因是 npx 在下载新版本适配器
+// （`The following package was not found and will be installed: …`），而 `initialize` 要等它 ——
+// 那几行此前只进日志，卡片上永远只有 "Connecting…"。这条把"送上去"这一跳钉住；
+// "连上之后不再送"同样钉住（那时的 stderr 只是噪声）。
+suite('chat panel: the connecting card hears why it is slow', () => {
+  function connectionMessages(harness: Harness): Array<Record<string, unknown>> {
+    return harness.surface.sent.filter(m => m.type === 'connection') as Array<Record<string, unknown>>;
+  }
+
+  test('an agent stderr line rides the connecting phase, and stops after it', async () => {
+    const harness = makeHarness('s-1', 'Claude Code');
+    // 让 ensureConnected 永远挂着：停在 connecting 相位，不去真的 spawn 一个进程。
+    Object.assign(harness.sessionManager, { ensureConnected: () => new Promise(() => { /* never */ }) });
+    harness.host.onMessage({ type: 'connectAgent', agentName: 'Claude Code' });
+    await new Promise(resolve => setTimeout(resolve, 5));
+    assert.ok(connectionMessages(harness).some(m => m.state === 'connecting'),
+      'the connecting phase went out first');
+
+    harness.sessionManager.emit('agent-stderr', {
+      agentId: 'agent_1',
+      line: 'npm warn exec The following package was not found and will be installed: @agentclientprotocol/claude-agent-acp@0.86.0',
+    });
+
+    const withDetail = connectionMessages(harness).filter(m => m.detail !== undefined);
+    assert.strictEqual(withDetail.length, 1, `expected one detail line, got ${JSON.stringify(withDetail)}`);
+    assert.match(String(withDetail[0].detail), /will be installed/);
+    assert.strictEqual(withDetail[0].state, 'connecting', 'and it stays in the connecting phase');
+
+    // 相位结束（让这次连接失败收尾）之后，同样的 stderr 不再上卡片。
+    Object.assign(harness.sessionManager, { ensureConnected: () => Promise.reject(new Error('nope')) });
+    harness.host.onMessage({ type: 'connectAgent', agentName: 'Claude Code' });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(connectionMessages(harness).some(m => m.state === 'failed'), 'the phase is over');
+
+    const before = connectionMessages(harness).length;
+    harness.sessionManager.emit('agent-stderr', { agentId: 'agent_1', line: 'a later, harmless warning' });
+    assert.strictEqual(connectionMessages(harness).length, before, 'no stderr noise once the phase is over');
+  });
+});

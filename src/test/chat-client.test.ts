@@ -3477,6 +3477,36 @@ suite('chat client logic: connect card (stub DOM, CUSTOM-20260930-123)', () => {
     assert.strictEqual(NS.stateCard.takeDraftIntent(), true);
     assert.strictEqual(NS.stateCard.takeDraftIntent(), false, 'consumed, not sticky');
   });
+
+  // [CUSTOM-20261006-194] 卡在连接界面时，卡片要说得出"为什么在等"。
+  //
+  // 用户报"一直卡在连接界面"。日志里原因是 npx 在下载新版本适配器（`will be installed: …`），
+  // 而那几行只进了日志 —— 卡片上永远只有一句 "Connecting…"，用户无从判断是在下载还是死了。
+  // 现在 agent 的 stderr 会逐行下来，连接中就用它代替那句套话。
+  test('the connecting card shows the agent stderr line instead of the canned sentence (194)', () => {
+    const { NS, els } = cardWith();
+    NS.stateCard.onConnection({ type: 'connection', state: 'connecting' });
+    const canned = String(els.stateHint.textContent);
+    assert.ok(canned.length > 0, 'a canned hint while connecting');
+
+    NS.stateCard.onConnection({
+      state: 'connecting',
+      detail: 'npm warn exec The following package was not found and will be installed: @agentclientprotocol/claude-agent-acp@0.86.0',
+    });
+    assert.match(String(els.stateHint.textContent), /will be installed/,
+      'the real reason replaces the canned sentence');
+
+    // 相位本身那条（没有 detail）表示"新一轮连接"⇒ 上一轮的残留要清掉。
+    NS.stateCard.onConnection({ type: 'connection', state: 'connecting' });
+    assert.strictEqual(String(els.stateHint.textContent), canned, 'a phase-only update clears it');
+
+    // 连上之后不再显示它（那时 stderr 是噪声，宿主也停止转发了）。
+    NS.stateCard.onConnection({
+      state: 'connecting', detail: 'some later warning',
+    });
+    NS.stateCard.onConnection({ type: 'connection', state: 'connected' });
+    assert.ok(!String(els.stateHint.textContent).includes('later warning'), 'cleared once connected');
+  });
 });
 
 // [CUSTOM-20260930-128] 助手/思考记录的 markdown 请求必须**自己**发得出去。

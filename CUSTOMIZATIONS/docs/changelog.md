@@ -97,6 +97,18 @@
   **无头探针**（真 Chromium）：`initial{124} → click{foldDisplay:none, cardH:76} → click{inline, 124}`、`jumped:false`。
 - **基于上游版本**：0.2.0（commit e7371659）
 
+### 2026-10-06 - CUSTOM-20261006-194
+- **功能**：连接卡住时，卡片要说得出**为什么**（把 agent 的 stderr 送上来）+ 一个走动的秒表
+- **改动文件**：`src/core/SessionManager.ts`（re-emit `agent-stderr`）、`src/ui/chat/ChatPanelHost.ts`（`noteAgentStderr`，只在 connecting 相位转发）、`src/ui/chat/protocol.ts`（`connection` 新增 `detail`）、`src/ui/chat/html/client/stateCard.ts`（连接中用它代替套话 + 秒表）、`src/test/chat-panel.test.ts`（+1）、`src/test/chat-client.test.ts`（+1）
+- **来源**：用户「一直卡在连接界面」（截图：状态卡停在 Connecting to Claude Code…）
+- **详细说明**：
+  - **①日志里的真相**：`23:47:15` 发起连接 → spawn → `initialize` 发出 → **`23:48:21` 才出现一行 stderr**：`npm warn exec The following package was not found and will be installed: @agentclientprotocol/claude-agent-acp@0.86.0`，而 `initialize` 要等它装完 ⇒ 面板看起来"卡死"。**不是我们的 bug**（npx 遇到 `@latest` 的新版本要先下载；这次正好是 0.86.0 没缓存过）。用户重试了几次（`23:48:06` 又一遍），期间卡片上只有一句 "Connecting…"。
+  - **②真正的缺陷是"信息没给用户"**：`AgentManager` 一直在 emit `agent-stderr`，但**零订阅者**（只顺手写进日志）。于是用户唯一的判断依据是"等"。
+  - **③修法**：`SessionManager` re-emit → 宿主 `noteAgentStderr` **仅在 connecting 相位**转发（连接建立后 stderr 是噪声，不该往卡片上灌）→ 卡片用它**代替**那句 "Starting the agent process…"，并给按钮加一个 `1s` 走的秒表（`Connecting… 45s`）。慢启动那条既有兜底（45s 后放开按钮 + "npx may be downloading"）保留不动。
+  - **④给用户的即时建议**（不改代码）：`npx @agentclientprotocol/claude-agent-acp@latest --version` 预装一次；或在 `acpc.agents` 里把它**钉死在某个版本**（每天首次连接受上游发版影响才会下载）。
+- **验证方式**：`npm test` **349 passing**（新增 2 条：宿主"stderr 只在 connecting 相位上卡片、相位结束后不再送"；客户端"连接中用它代替套话、相位更新时清掉、连上后不再显示"）。**两条都确认会咬**：把 `stateCard.ts`/`ChatPanelHost.ts`/`SessionManager.ts` 一起 `git stash` 回旧代码后 2 条**全部失败**，`pop` 后转绿。`lint` 0；`check-registry.mjs` 六节全绿。
+- **基于上游版本**：0.2.0（commit e7371659）
+
 ### 2026-10-05 - CUSTOM-20261005-193
 - **功能**：修「New Session 的输入框没法粘贴图片」—— 草稿页也能攒附件（图片与文件路径），随首条消息一起交上去
 - **改动文件**：`src/ui/chat/html/client/boot.ts`（`attachImage` / `attachPaths` 在没有会话时转给 composer，不再直接报错）、`src/ui/chat/html/client/composer.ts`（`draftFiles[draftId]` 本地附件、chip 展示、删除、随 `createDraftAndSend` 发送、`resolveDraft` 清空、导出 `addDraftImage`/`addDraftPaths`）、`src/ui/chat/protocol.ts`（该消息新增 `images`/`paths`）、`src/ui/chat/ChatPanelHost.ts`（`handleCreateDraftAndSend` 收下并转 `handleAttachImage`/`handleAttachPaths`；"空文字 + 有附件"也算有东西可发）、`src/test/chat-client.test.ts`（+1）、`src/test/chat-panel.test.ts`（+2）
