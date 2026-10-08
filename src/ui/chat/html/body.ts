@@ -156,6 +156,16 @@ export function body(surface: SurfaceKey = 'view'): string {
              用户是在「面板空着、想让它自动连」的这一刻才需要它。
              [CUSTOM-20260930-127] 已连接时整行退场（stateCard.render）——那一刻用户要的是
              去下面打字，而"下次打开面板要不要自动连"留在这里只是噪音。 -->
+        <!-- [CUSTOM-20261009-209] 会话恢复：重开面板时问一句要不要恢复上次开着的几个会话。
+             与 #stateActions 同形但**分开两块** —— 两组的显隐条件不同（提问时连接按钮要退场）。 -->
+        <div id="restoreActions" class="state-actions" hidden>
+          <button id="restoreAccept" class="state-connect"></button>
+          <button id="restoreFresh" class="state-fresh">Start fresh</button>
+        </div>
+        <label id="restoreRememberRow" class="state-opt" hidden>
+          <input type="checkbox" id="restoreRemember">
+          <span>Remember my choice (don't ask again)</span>
+        </label>
         <label id="autoConnectRow" class="state-opt">
           <input type="checkbox" id="autoConnectToggle">
           <span>Connect automatically when a panel opens</span>

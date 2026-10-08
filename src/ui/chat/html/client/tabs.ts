@@ -17,6 +17,9 @@ export const tabsClient = `
   // exist yet. They are client state on purpose — the host knows nothing about
   // them, so 'sessionsChanged' / 'boot' must never clear this list.
   var state = { sessions: [], focusedId: null, focusedAgent: null, drafts: [], focusedDraftId: null };
+  // [CUSTOM-20261009-209] 「待恢复的会话」：本地 tab（宿主里还不存在），带 sessionId/agentName/cwd/title。
+  // 与草稿一样是纯客户端状态 —— 点它才真去 load（懒恢复）；收到那个会话的 focus/sessionsChanged 时让位。
+  var restoring = [];
   // [CUSTOM-20261007-198] 手工 tab 顺序（会话 id 数组）：宿主 globalState 里那份的本地副本
   // （uiPrefs 消息带回，见 applyPrefs）。**不在表里的会话按原顺序排在其后** —— 新会话永远
   // 不会因为"你没拖过它"而消失或跑到最前。
@@ -45,21 +48,27 @@ export const tabsClient = `
     var i;
     // [CUSTOM-20261007-198] 会话按**手工顺序**排（tabOrder 里没有的按原顺序接在后面）；
     // 草稿永远在最后 —— 它们是本地页，还没有 id 可排。
-    var sessions = state.sessions;
+    // [CUSTOM-20261009-209] **待恢复的会话与真会话一起排**：它们本来就在上次那张 tabOrder 里，
+    // 一起排队才恢复得出原来的位置（否则恢复出来的 tab 会全挤在真会话后面）。
+    var entries = [];
+    for (i = 0; i < state.sessions.length; i++) {
+      entries.push({ kind: 'session', id: state.sessions[i].sessionId, summary: state.sessions[i] });
+    }
+    for (i = 0; i < restoring.length; i++) {
+      entries.push({ kind: 'restore', id: restoring[i].sessionId, restore: restoring[i] });
+    }
     if (tabOrder.length > 0) {
       var rank = {};
       for (i = 0; i < tabOrder.length; i++) { rank[tabOrder[i]] = i; }
       var known = [], unknown = [];
-      for (i = 0; i < sessions.length; i++) {
-        if (rank[sessions[i].sessionId] === undefined) { unknown.push(sessions[i]); }
-        else { known.push(sessions[i]); }
+      for (i = 0; i < entries.length; i++) {
+        if (rank[entries[i].id] === undefined) { unknown.push(entries[i]); }
+        else { known.push(entries[i]); }
       }
-      known.sort(function (a, b) { return rank[a.sessionId] - rank[b.sessionId]; });
-      sessions = known.concat(unknown);
+      known.sort(function (a, b) { return rank[a.id] - rank[b.id]; });
+      entries = known.concat(unknown);
     }
-    for (i = 0; i < sessions.length; i++) {
-      out.push({ kind: 'session', id: sessions[i].sessionId, summary: sessions[i] });
-    }
+    out = entries;
     for (i = 0; i < state.drafts.length; i++) {
       out.push({ kind: 'draft', id: state.drafts[i].draftId, draft: state.drafts[i] });
     }
@@ -77,6 +86,20 @@ export const tabsClient = `
       if (NS.draft) { NS.draft.focus(model.id); }
       return;
     }
+    // [CUSTOM-20261009-209] 待恢复的 tab：点它才真去把那个会话 load 回来（懒恢复）。
+    // 'keepOthers: true' —— 恢复是"多开"，不该像历史选择器那样关掉当前聚焦的那个（099）。
+    if (model.kind === 'restore') {
+      var r = model.restore || {};
+      NS.bridge.post({
+        type: 'openHistorySession',
+        agentName: r.agentName,
+        sessionId: model.id,
+        cwd: r.cwd,
+        title: r.title,
+        keepOthers: true
+      });
+      return;
+    }
     if (model.id !== state.focusedId) {
       NS.bridge.post({ type: 'focusSession', sessionId: model.id });
     }
@@ -85,6 +108,13 @@ export const tabsClient = `
   function closeModel(model) {
     if (model.kind === 'draft') {
       if (NS.draft) { NS.draft.drop(model.id); }
+      return;
+    }
+    // [CUSTOM-20261009-209] 关掉一个"还没加载"的：只丢本地那条，并让宿主把它从快照里忘掉
+    // —— 否则下次重载还会拿它问你（而用户的动作明确是"不要它"）。
+    if (model.kind === 'restore') {
+      dropRestoring(model.id);
+      NS.bridge.post({ type: 'forgetRestorable', sessionId: model.id });
       return;
     }
     NS.bridge.post({ type: 'closeSession', sessionId: model.id });
@@ -389,26 +419,34 @@ export const tabsClient = `
       (function (model, index) {
         var active = isActiveModel(model);
         var isDraft = model.kind === 'draft';
-        var label = isDraft ? 'New session' : tabLabel(model.summary);
+        var isRestore = model.kind === 'restore';
+        var label = isDraft ? 'New session'
+          : (isRestore ? tabLabel(model.restore) : tabLabel(model.summary));
+        var idAttr = isDraft ? 'data-draft-id' : (isRestore ? 'data-restore-id' : 'data-session-id');
         // [CUSTOM-20260925-047] A real <button>, not a div with a click handler:
         // the strip was unreachable by keyboard before, and Enter/Space on a
         // button fires 'click' natively (no keydown branch needed).
-        var tab = NS.dom.el('button', 'tab' + (isDraft ? ' tab-draft' : '') + (active ? ' active' : ''));
+        var tab = NS.dom.el('button', 'tab' + (isDraft ? ' tab-draft' : '')
+          + (isRestore ? ' tab-restore' : '') + (active ? ' active' : ''));
         tab.type = 'button';
         tab.setAttribute('role', 'tab');
-        tab.setAttribute(isDraft ? 'data-draft-id' : 'data-session-id', model.id);
+        tab.setAttribute(idAttr, model.id);
         tab.setAttribute('aria-selected', active ? 'true' : 'false');
         tab.tabIndex = active || (!activeSeen && index === 0) ? 0 : -1;
         tab.title = isDraft
           ? (model.draft.cwd || 'Default directory') + '\\n(not created yet)'
-          : label + '\\n' + model.id;
+          : (isRestore
+            ? label + '\\n' + model.id + '\\n(not loaded yet \\u2014 click to open)'
+            : label + '\\n' + model.id);
 
-        tab.appendChild(NS.dom.el('span', isDraft ? 'tab-dot draft' : dotClass(model.summary)));
+        tab.appendChild(NS.dom.el('span', isDraft ? 'tab-dot draft'
+          : (isRestore ? 'tab-dot restore' : dotClass(model.summary))));
         tab.appendChild(NS.dom.el('span', 'tab-label', label));
 
         var close = NS.dom.el('button', 'tab-close', '\\u00d7');
         close.type = 'button';
-        close.title = isDraft ? 'Discard this draft' : 'Close this session';
+        close.title = isDraft ? 'Discard this draft'
+          : (isRestore ? 'Forget this session (do not offer it again)' : 'Close this session');
         close.setAttribute('aria-label', (isDraft ? 'Discard ' : 'Close ') + label);
         // [CUSTOM-20260927-089] OUT of the tab order. The × lives inside the tab button,
         // so with the default tabindex every session's close button was its own tab stop
@@ -429,7 +467,7 @@ export const tabsClient = `
         // 排它没有意义（它连会话都不是）。
         // [CUSTOM-20261008-201] 这里只留"谁被拖"与"拖完清理"；落点（dragover/drop/dragleave）
         // 在条带上，见 installDrag。
-        if (!isDraft) {
+        if (!isDraft && !isRestore) {
           tab.setAttribute('draggable', 'true');
           tab.addEventListener('dragstart', function (event) { dragStart(tab, model, event); });
           tab.addEventListener('dragend', function () { endDrag(); });
@@ -529,8 +567,31 @@ export const tabsClient = `
 
   function setSessions(sessions) {
     state.sessions = sessions || [];
+    // [CUSTOM-20261009-209] 某个待恢复的会话已经活了（用户点了它、或它被别处 load 回来）⇒
+    // 真 tab 顶替本地那条，别两处并存。
+    var live = {};
+    var i;
+    for (i = 0; i < state.sessions.length; i++) { live[state.sessions[i].sessionId] = true; }
+    var kept = [];
+    for (i = 0; i < restoring.length; i++) { if (!live[restoring[i].sessionId]) { kept.push(restoring[i]); } }
+    restoring = kept;
     renderTabs();
     renderAgentBar();
+  }
+
+  /** [CUSTOM-20261009-209] 建一批"待恢复"的本地 tab（点 Restore 时由 boot 调）。 */
+  function setRestoring(list) {
+    restoring = (list || []).slice();
+    renderTabs();
+  }
+
+  function dropRestoring(sessionId) {
+    var kept = [];
+    for (var i = 0; i < restoring.length; i++) {
+      if (restoring[i].sessionId !== sessionId) { kept.push(restoring[i]); }
+    }
+    restoring = kept;
+    renderTabs();
   }
 
   function setFocus(summary) {
@@ -617,7 +678,9 @@ export const tabsClient = `
     // [CUSTOM-20261007-198] 手工 tab 顺序：宿主 globalState 那份，随 uiPrefs 消息到达。
     applyPrefs: applyPrefs,
     // [CUSTOM-20261008-199] 空态地址栏显示的那份默认目录（随 boot 消息到达）。
-    setDefaultCwd: setDefaultCwd
+    setDefaultCwd: setDefaultCwd,
+    // [CUSTOM-20261009-209] 待恢复的会话（本地 tab）：由 boot 的 restoreChoice 喂。
+    setRestoring: setRestoring
   };
 })(window.__acpc = window.__acpc || {});
 `;

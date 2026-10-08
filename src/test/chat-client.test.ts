@@ -28,6 +28,10 @@ import { composerClient } from '../ui/chat/html/client/composer';
 import { tabsClient } from '../ui/chat/html/client/tabs';
 // [CUSTOM-20261008-200] Times 开关的状态机（按会话记 + 默认值）。
 import { timesClient } from '../ui/chat/html/client/times';
+// [CUSTOM-20261008-203] 目录抽屉（草稿页/会话页的 Working directory 浮层）。
+import { directoryMenuClient } from '../ui/chat/html/client/directoryMenu';
+// [CUSTOM-20261008-202] 长任务看门狗。
+import { perfClient } from '../ui/chat/html/client/perf';
 import { toolCallViewClient } from '../ui/chat/html/client/toolCallView';
 import { transcriptViewClient } from '../ui/chat/html/client/transcriptView';
 import { outlineClient } from '../ui/chat/html/client/outline';
@@ -376,7 +380,7 @@ function loadClient(
   // [CUSTOM-20260926-079] `sessionMenu` joined the list for its own suite: unlike
   // boot, its IIFE runs nothing at load time (init() is called by boot, and here by
   // the test), so loading it costs the record-layer tests nothing.
-  for (const source of [domClient, iconsClient, linksClient, toolCallViewClient, transcriptViewClient, permissionViewClient, permissionDrawerClient, outlineClient, sessionMenuClient, composerClient, tabsClient, timesClient, stickyUserClient, elicitationViewClient, stateCardClient, contextMenuClient]) {
+  for (const source of [domClient, iconsClient, linksClient, toolCallViewClient, transcriptViewClient, permissionViewClient, permissionDrawerClient, outlineClient, sessionMenuClient, directoryMenuClient, composerClient, tabsClient, timesClient, perfClient, stickyUserClient, elicitationViewClient, stateCardClient, contextMenuClient]) {
     new Function('window', 'document', source)(win, doc);
   }
   return { NS, metrics, doc, docListeners, jumps, timers };
@@ -4012,6 +4016,176 @@ suite('chat client logic: markdown asks for itself (stub DOM, CUSTOM-20260930-12
   // (the stub has none). That path is exercised by the replay suite in chat-panel.test.ts.
 });
 
+// [CUSTOM-20261008-202] markdown 回填的**应用**分帧。
+//
+// 现场：在草稿页打开一条 581 条记录、两千多个工具卡的历史会话，客户端连续 **50 秒**没有写下一行
+// 日志（输入事件被浏览器压后/丢掉），恢复后攒下的 4 条回填一次性涌出 —— 而用户那时正在点标签栏
+// （"loading 的过程中没法切换到其他会话 tab"）。同一个批次的 139 条回填是一条**长任务**：
+// 每条都要解析 HTML、消毒、插 DOM，并读一次几何（patch 收尾的 follow()、refreshPreview），
+// 交错的读写就是几百次强制整页重排。
+suite('chat client logic: markdown 回填分帧（stub DOM, CUSTOM-20261008-202）', () => {
+  function withBatch() {
+    const harness = loadClient({}, { syncFrames: true });
+    const NS = harness.NS;
+    NS.transcriptView.init(new StubNode('div'));
+    NS.transcriptView.hydrate({ sessionId: 's1', entries: [] });
+    const applied: string[] = [];
+    let slices = 0;
+    NS.toolCallView.applyMarkdown = (key: string) => { applied.push(key); };
+    // 收尾是"每片之后一次"（reassert/rail.reflow/stickyUser.schedule 都排到下一帧）——
+    // 用它当**片的边界**来数：这就是"分帧"这一个动作本身。
+    NS.scroll.reassert = () => { slices++; };
+    NS.rail.reflow = () => { /* stub */ };
+    NS.stickyUser.schedule = () => { /* stub */ };
+    return { NS, applied, sliceCount: () => slices };
+  }
+
+  const items = (keys: string[]) => keys.map(k => ({ key: k, html: '<b>' + k + '</b>' }));
+
+  test('一批回填按顺序、逐片落地 —— 不是一次跑完', () => {
+    const realNow = Date.now;
+    let clock = 0;
+    try {
+      // 每一片都刚好用完预算 ⇒ 一条一片。真实时钟下"几百条挤在一帧"正是要避免的那种长任务。
+      Date.now = () => (clock += 100);
+      const h = withBatch();
+      h.NS.transcriptView.queueMarkdown(items(['k1', 'k2', 'k3']));
+      assert.deepStrictEqual(h.applied, ['k1', 'k2', 'k3'], '顺序就是队列顺序，一条不丢');
+      assert.strictEqual(h.sliceCount(), 3, '每条一片（预算用完就交回下一帧）');
+    } finally { Date.now = realNow; }
+  });
+
+  test('跨多条回填也不丢：队列接着上一批的队尾', () => {
+    const h = withBatch();
+    h.NS.transcriptView.queueMarkdown(items(['k1', 'k2']));
+    h.NS.transcriptView.queueMarkdown(items(['k3']));
+    assert.deepStrictEqual(h.applied, ['k1', 'k2', 'k3']);
+    assert.ok(h.sliceCount() >= 2, '每片之后都要收尾（几何是随片一起长的）');
+  });
+
+  test('一条坏回填不会拖住整批，也不会被每帧重试', () => {
+    const h = withBatch();
+    (h.NS.toolCallView as { applyMarkdown: (k: string) => void }).applyMarkdown = (key: string) => {
+      if (key === 'boom') { throw new Error('bad html'); }
+      h.applied.push(key);
+    };
+    h.NS.transcriptView.queueMarkdown(items(['boom', 'k2']));
+    assert.deepStrictEqual(h.applied, ['k2'], '后面的照常落地');
+    assert.ok(h.sliceCount() >= 1, '整批仍然收尾（不会因为一条坏的就停摆）');
+    // 那一条抛错时客户端会打一行 console.warn（同 patch dropped / applyMarkdown failed 的家法）。
+    // 这里**不断言**那一行：扩展宿主的 console 与裸 node 未必是同一个对象，往全局 console 打补丁
+    // 抓不到（chat-client.test.ts 里那条既有说明）—— 行为对了就够。
+  });
+});
+
+// [CUSTOM-20261008-203] 目录抽屉的候选**每次打开都要回头问**。
+//
+// 用户报：「刚通过 Browse 选择的目录（并且发起了对话），但最近使用里没有这个记录」。
+// 真机日志确认那次会话确实建在那个目录里（`session/new` 的 `cwd` 是 `d:\Git\zgithub\custom-marktext`，
+// 不是本工作区）⇒ 宿主那份"最近用过"里**有**它，问题出在客户端：`choices` 是一次拉取、终身缓存
+// （连 `reset()` 都不清），于是当天新用过的目录永远进不了「Recently used」。
+suite('chat client logic: 目录抽屉的候选每次打开都刷新（stub DOM, CUSTOM-20261008-203）', () => {
+  function drawer() {
+    const head = new StubNode('div');
+    head.className = 'outline-head';
+    const list = new StubNode('div');
+    list.className = 'outline-list';
+    const menu = new StubNode('div');
+    menu.appendChild(head);
+    menu.appendChild(list);
+    const els: Record<string, StubNode> = { cwdBtn: new StubNode('button'), cwdMenu: menu };
+    const harness = loadClient(els, { syncFrames: true });
+    const NS = harness.NS;
+    const posted: Array<Record<string, unknown>> = [];
+    NS.bridge.post = (m: Record<string, unknown>) => { posted.push(m); };
+    // 这两个抽屉的邻居：show() 会去关它们（真模块，未初始化，替掉最省事）。
+    NS.outline = { close: () => { /* stub */ } };
+    NS.sessionMenu = { reset: () => { /* stub */ } };
+    NS.draft = {
+      get: (id: string) => ({ draftId: id, cwd: '' }),
+      focusedId: () => 'd1',
+      setCwd: () => { /* stub */ },
+    };
+    NS.directoryMenu.init();
+    NS.directoryMenu.refresh({ draftId: 'd1' });   // boot 在 focusDraft 时就是这么喂的
+    return {
+      NS, els, list, posted,
+      // 打开抽屉走**真路径**（点标题栏那一格）—— show/toggle 都是私有的。
+      open: () => dispatchClick(els.cwdBtn, harness.docListeners),
+      choices: (recent: string[]) => NS.directoryMenu.setChoices({
+        workspaceFolders: ['/ws'], recent, defaultCwd: '/ws',
+      }),
+    };
+  }
+
+  const rows = (list: StubNode) =>
+    list.querySelectorAll('.outline-item').map(item => item.getAttribute('data-cwd-choice'));
+
+  test('先渲染手上那份，再回头问一次；回复到了就重渲染', () => {
+    const d = drawer();
+    d.choices(['/old']);                    // 宿主回了 boot 那一次请求
+    d.posted.length = 0;
+    d.open();
+    assert.deepStrictEqual(d.posted.map(m => m.type), ['listDirectoryChoices'],
+      '**打开就回头问一次** —— 这就是那个 bug（旧版一次拉取、终身缓存）');
+    // 渲染顺序：工作区文件夹 → 最近用过 → 「Browse…」（那一行没有 data-cwd-choice）。
+    assert.deepStrictEqual(rows(d.list), ['/ws', '/old', null],
+      '而且手上那份立刻画出来，不闪 Loading…（pending 只在一条候选都没有时）');
+
+    d.NS.directoryMenu.close();
+    d.posted.length = 0;
+    d.open();
+    assert.deepStrictEqual(d.posted.map(m => m.type), ['listDirectoryChoices'], '每次打开都问');
+
+    d.choices(['/new', '/old']);             // 这次回复里带上了刚用过的那个目录
+    assert.deepStrictEqual(rows(d.list), ['/ws', '/new', '/old', null],
+      '新用过的目录（Browse 选的）出现在「Recently used」里');
+  });
+
+  test('boot 那条"切草稿/切会话"的路径只在**首次**问一次，之后不再打扰宿主', () => {
+    const d = drawer();
+    // 首次必须问：草稿要据此采用默认目录，头部不能停在 "Default directory"（058 的第一条坑）。
+    assert.deepStrictEqual(d.posted.map(m => m.type), ['listDirectoryChoices'], '首次 refresh 必须问一次');
+    d.choices(['/a']);
+
+    d.posted.length = 0;
+    d.NS.directoryMenu.refresh({ draftId: 'd1' });   // 抽屉关着
+    assert.deepStrictEqual(d.posted.map(m => m.type), [],
+      '已有数据 + 抽屉关着 ⇒ 只渲染手上那份（宿主的回复可能带一次 session/list，不该每次切会话都付）');
+  });
+});
+
+// [CUSTOM-20261008-202] 长任务看门狗（"点了没反应"的常驻证据）。
+suite('chat client logic: 长任务看门狗（stub DOM, CUSTOM-20261008-202）', () => {
+  test('一条长任务会带着"当时在做哪一段"落到日志里', () => {
+    const { NS } = loadClient({}, { syncFrames: true });
+    const globals = globalThis as Record<string, unknown>;
+    const realObserver = globals.PerformanceObserver;
+    let handler: ((list: unknown) => void) | null = null;
+    const observed: string[] = [];
+    globals.PerformanceObserver = class {
+      constructor(fn: (list: unknown) => void) { handler = fn; }
+      observe(opts: { entryTypes: string[] }) { observed.push(opts.entryTypes.join(',')); }
+    };
+    try {
+      NS.perf.init();
+      NS.perf.init();                       // 幂等：第二次不该再装一遍（否则每条长任务报两次）
+      NS.perf.phase('markdown-apply');
+      // 驱动一次观察回调：阈值以下不该被报，以上该被报。**判据只问纯函数**，不去抓 console.warn ——
+      // 扩展宿主的 console 与裸 node 未必是同一个对象（chat-client.test.ts 里那条既有说明，
+      // 别再用"往全局 console 打补丁"来断言客户端日志）。
+      handler!({ getEntries: () => [{ duration: 5200 }, { duration: 40 }] });
+      assert.strictEqual(NS.perf.shouldReport(40), false, '40ms 不值得占日志桥的配额');
+      assert.strictEqual(NS.perf.shouldReport(299), false);
+      assert.strictEqual(NS.perf.shouldReport(300), true, '300ms 是人能感觉到的下限');
+      assert.strictEqual(NS.perf.shouldReport(5200), true);
+    } finally {
+      globals.PerformanceObserver = realObserver;
+    }
+    assert.deepStrictEqual(observed, ['longtask'], '只装一次');
+  });
+});
+
 // [CUSTOM-20260930-132 / 137 / 138] 面板静态标记的**结构断言**（不是布局断言 —— 布局仍然只能量）。
 //
 // 它守的是底部栏与消息列那几处"谁在谁里面"：
@@ -4251,6 +4425,32 @@ suite('scroll: 几何（内容 / 留白）变化后视口判定要重算 (CUSTOM
     assert.strictEqual(NS.scroll.isPinned(), true, '不再需要滚动 ⇒ 判定为贴底');
     assert.strictEqual(jump.hidden, true, '这时 Jump 必须自己消失（旧实现会一直挂着）');
   });
+
+  // [CUSTOM-20261008-202] `follow()` 在"用户没贴底"那一格里只为了**诊断**读一次 scrollHeight，
+  // 而它每条记录都被调一次（记录 patch 的收尾）—— 大会话里那是一个批次几百次强制重排。
+  // 真机日志（2026-10-08 打开一条 581 条记录的历史会话）里 `skip-unpinned` / `grew-unpinned`
+  // 就是这条链打出来的，而客户端同一时间连续 50 秒写不出日志（输入被压后/丢掉）。
+  test('不贴底时也不再为每条记录读几何（诊断只在它真会记下来时才读）', () => {
+    const { NS, el } = mountScroll('0px');
+    // 排帧的回调**不在这里跑**：这一条量的是"50 次调用里同步读了几次几何"，
+    // 而排帧那一份本来就是一帧一次（followPending 去重），不是每条记录一次。
+    NS.dom = { schedule: () => { /* 收下不跑 */ } };
+    let reads = 0;
+    Object.defineProperty(el, 'scrollHeight', { get() { reads++; return 1000; }, configurable: true });
+
+    NS.scroll.toBottom();                     // 贴底 ⇒ pinned（这一格走排帧的写路径，不读）
+    reads = 0;
+    for (let i = 0; i < 50; i++) { NS.scroll.follow(); }
+    assert.strictEqual(reads, 0, '贴底时不读');
+
+    el.scrollTop = 100;                       // 用户往上翻：pinned 变 false（onScroll 里读那一次）
+    el.fire('scroll');
+    reads = 0;
+    for (let i = 0; i < 50; i++) { NS.scroll.follow(); }
+    assert.ok(reads <= 2,
+      `50 次 follow() 最多读一两次（诊断节流窗口），实际读了 ${reads} 次 ——`
+      + ' 旧实现这里每次都读，那正是几百次强制重排的来源');
+  });
 });
 
 // [CUSTOM-20261004-180] rail.measure() 的**读写分离**。
@@ -4468,5 +4668,416 @@ suite('chat client logic: context menu items (stub DOM, CUSTOM-20261007-197)', (
     const items = NS.contextMenu.itemsFor(blank) as Array<{ label: string }>;
     assert.ok(!items.some(i => i.label === 'Copy message'),
       `an unknown id must not offer a copy that would copy nothing: ${labels(items)}`);
+  });
+});
+
+// [CUSTOM-20261008-204] 右侧大纲栏的**开/关**按会话记（+ 一个默认值），而且"关"必须落盘。
+//
+// 用户报的两条是同一个根因：关侧栏只改 isOpen（`mode` 仍是 sidebar），于是
+//   ① 重启后 applyPrefs 把它重新算成 `mode === 'sidebar'` ⇒ 自己回来；
+//   ② 宿主的 `uiPrefs` 是**广播**的（任何 `setUiPref` 之后都回一次），客户端收到就走 applyPrefs
+//      ⇒ 点一下 Times（200 起它会发 setUiPref）/ 拖一下 tab（198）就能让刚关掉的侧栏弹回来。
+suite('chat client logic: 大纲侧栏的开/关按会话记（stub DOM, CUSTOM-20261008-204）', () => {
+  function sideOutline() {
+    const mk = (cls: string) => { const n = new StubNode('div'); n.className = cls; return n; };
+    const drawer = mk('div');
+    const drawerHead = mk('outline-head'); drawerHead.appendChild(mk('outline-head-info'));
+    drawer.appendChild(drawerHead);
+    drawer.appendChild(mk('outline-list'));
+    const sidebar = mk('div');
+    const sideHead = mk('outline-head'); sideHead.appendChild(mk('outline-head-info'));
+    sidebar.appendChild(sideHead);
+    sidebar.appendChild(mk('outline-list'));
+    const els: Record<string, StubNode> = {
+      outline: drawer,
+      outlineSidebar: sidebar,
+      outlineBtn: new StubNode('button'),
+      outlinePin: new StubNode('button'),
+      outlineUnpin: new StubNode('button'),
+      outlineResize: new StubNode('div'),
+      messageArea: new StubNode('div'),
+    };
+    const harness = loadClient(els, { syncFrames: true });
+    const NS = harness.NS;
+    const posted: Array<Record<string, unknown>> = [];
+    NS.bridge.post = (m: Record<string, unknown>) => { posted.push(m); };
+    NS.transcriptView.init(new StubNode('div'));
+    // 有锚点侧栏才可能可见（081：没有可导航的东西就不显示）。
+    NS.transcriptView.append({ id: 'u1', kind: 'user', at: 1, text: 'hi' }, undefined);
+    NS.transcriptView.append({ id: 'a1', kind: 'assistant', at: 2, text: 'yo' }, undefined);
+    NS.outline.init(new StubNode('div'), drawer, els.outlineBtn);
+    NS.outline.invalidate();
+    return { NS, sidebar, posted };
+  }
+
+  const visible = (sidebar: StubNode) => sidebar.hidden === false;
+
+  test('①回话只是收敛：不许把刚关掉的侧栏打开（点 Times / 拖 tab 都会引发一次这样的回话）', () => {
+    const h = sideOutline();
+    h.NS.outline.applyPrefs({
+      outlineMode: 'sidebar', outlineOpenBySession: { s1: false }, outlineOpenDefault: false,
+    });
+    h.NS.outline.setSession('s1');
+    assert.strictEqual(h.NS.outline.isOpen(), false, '这个会话记的是"关"');
+    assert.strictEqual(visible(h.sidebar), false);
+
+    // 宿主广播回来的那一次（内容一模一样）
+    h.NS.outline.applyPrefs({
+      outlineMode: 'sidebar', outlineWidth: 240,
+      outlineOpenBySession: { s1: false }, outlineOpenDefault: false,
+    });
+    assert.strictEqual(h.NS.outline.isOpen(), false, '回话不是"打开"的命令 —— 这正是用户报的第 1 条');
+    assert.strictEqual(visible(h.sidebar), false);
+  });
+
+  test('②每个会话各自记着；没有记录的会话跟默认值', () => {
+    const h = sideOutline();
+    h.NS.outline.applyPrefs({
+      outlineMode: 'sidebar', outlineOpenBySession: { A: true }, outlineOpenDefault: false,
+    });
+    h.NS.outline.setSession('A');
+    assert.strictEqual(visible(h.sidebar), true, 'A 记着开');
+    h.NS.outline.setSession('B');
+    assert.strictEqual(visible(h.sidebar), false, 'B 没有记录 ⇒ 默认值（关）');
+    h.NS.outline.setSession('A');
+    assert.strictEqual(visible(h.sidebar), true, '回到 A 又开着');
+  });
+
+  test('③关掉侧栏要落盘 —— 这一句就是"重启后它自己回来"的解药', () => {
+    const h = sideOutline();
+    h.NS.outline.applyPrefs({ outlineMode: 'sidebar', outlineOpenBySession: {}, outlineOpenDefault: true });
+    h.NS.outline.setSession('s9');
+    assert.strictEqual(visible(h.sidebar), true, '默认开着');
+
+    h.posted.length = 0;
+    h.NS.outline.toggle();                    // ☰ 收起（Escape 走的是同一个 hide()）
+    assert.strictEqual(visible(h.sidebar), false);
+    const pref = h.posted.find(m => m.type === 'setUiPref') as Record<string, unknown>;
+    assert.ok(pref, '必须落盘（旧版只改 isOpen，重启就翻回来）');
+    assert.strictEqual(pref.outlineOpenDefault, false);
+    assert.deepStrictEqual(pref.outlineOpenBySession, { s9: false });
+
+    // 重启：宿主把这条记录带回来 ⇒ 仍然是关的
+    const again = sideOutline();
+    again.NS.outline.applyPrefs({
+      outlineMode: 'sidebar', outlineWidth: 240,
+      outlineOpenBySession: { s9: false }, outlineOpenDefault: false,
+    });
+    again.NS.outline.setSession('s9');
+    assert.strictEqual(visible(again.sidebar), false, '重启后不该自己回来');
+  });
+
+  test('④旧记录（还没有这两项）按老行为补一次：钉住过的人升级后侧栏不该无声消失', () => {
+    const h = sideOutline();
+    h.NS.outline.applyPrefs({ outlineMode: 'sidebar', outlineWidth: 240 });
+    h.NS.outline.setSession('s1');
+    assert.strictEqual(visible(h.sidebar), true, '以前"钉住"就等于每个会话都开着');
+  });
+});
+
+// [CUSTOM-20261008-206] 输入框引用栏里的「编辑器当前文件」格。
+//
+// 与官方插件同一件事：不用先去别处找文件、Attach File —— 正在看的那个文件就在引用栏里，
+// 未引用时前面是 `+`（点一下加进来、变 `×`），已引用时是 `×`（点一下移出去）；
+// 编辑器里框选了多行就在 tag 末尾写上行区间。
+suite('chat client logic: 引用栏的当前文件格（stub DOM, CUSTOM-20261008-206）', () => {
+  function refBar() {
+    const attachments = new StubNode('div');
+    const sent: Array<Record<string, unknown>> = [];
+    const { NS } = loadClient({
+      promptInput: new StubNode('textarea'),
+      sendStopBtn: new StubNode('button'),
+      slashPopup: new StubNode('div'),
+      attachments,
+      configPickers: new StubNode('div'),
+      contextMeter: new StubNode('div'),
+      steerHint: new StubNode('div'),
+    });
+    NS.bridge.post = (m: Record<string, unknown>) => { sent.push(m); };
+    NS.bridge.postForSession = (m: Record<string, unknown>) => { sent.push(m); };
+    NS.composer.init();
+    NS.composer.setFocus({
+      sessionId: 's1', agentName: 'Claude Code', title: null, cwd: '/tmp',
+      createdAt: '', running: false, loading: false, unread: false,
+    }, null);
+    return { NS, attachments, sent };
+  }
+
+  const FILE = { path: 'f:/P4/x/PianoGameplayDefine.cs', name: 'PianoGameplayDefine.cs' };
+  const chipOf = (att: StubNode) => att.querySelector('.ref-chip');
+  const toggleOf = (att: StubNode) => att.querySelector('.ref-toggle')!;
+  const labelOf = (att: StubNode) => {
+    const el = att.querySelector('.ref-label');
+    return el ? String(el.textContent) : null;
+  };
+
+  test('编辑器里打开一个文件 ⇒ 引用栏出现一格，`+` 表示还没引用', () => {
+    const h = refBar();
+    assert.strictEqual(h.attachments.hidden, true, '既没附件也没文件 ⇒ 整条收起来');
+    h.NS.composer.setActiveFile(FILE);
+    assert.strictEqual(h.attachments.hidden, false, '有文件就要显示这一格（那就是"点 + 加进来"的入口）');
+    assert.ok(chipOf(h.attachments), '出现了候选格');
+    assert.strictEqual(String(toggleOf(h.attachments).textContent), '+', '没引用 ⇒ +');
+    assert.strictEqual(labelOf(h.attachments), 'PianoGameplayDefine.cs');
+  });
+
+  test('多行选区 ⇒ tag 末尾带行区间，点 `+` 连区间一起交上去', () => {
+    const h = refBar();
+    h.NS.composer.setActiveFile({ ...FILE, lineStart: 12, lineEnd: 40 });
+    assert.strictEqual(labelOf(h.attachments), 'PianoGameplayDefine.cs:12-40');
+    dispatchClick(toggleOf(h.attachments), {});
+    const post = h.sent.find(m => m.type === 'attachPath') as Record<string, any>;
+    assert.ok(post, '会话页走 attachPath');
+    assert.deepStrictEqual(post.paths, [FILE.path]);
+    assert.deepStrictEqual(post.meta,
+      [{ name: 'PianoGameplayDefine.cs:12-40', lineStart: 12, lineEnd: 40 }]);
+  });
+
+  test('宿主回了附件列表 ⇒ `+` 变 `×`；再点就移出去', () => {
+    const h = refBar();
+    h.NS.composer.setActiveFile(FILE);
+    h.NS.composer.setAttachments([{ path: FILE.path, name: FILE.name, kind: 'file' }]);
+    assert.strictEqual(String(toggleOf(h.attachments).textContent), '\u00d7', '已引用 ⇒ ×');
+    h.sent.length = 0;
+    dispatchClick(toggleOf(h.attachments), {});
+    assert.strictEqual((h.sent.find(m => m.type === 'detachFile') as Record<string, unknown>).path, FILE.path);
+  });
+
+  test('草稿页：`+` 先攒在本地（草稿没有会话，attachPath 会被宿主丢掉）', () => {
+    const h = refBar();
+    h.NS.composer.setDraft({ draftId: 'd1', cwd: '/tmp' });
+    h.NS.composer.setActiveFile(FILE);
+    dispatchClick(toggleOf(h.attachments), {});
+    assert.strictEqual(h.sent.filter(m => m.type === 'attachPath').length, 0, '草稿不发会话作用域的消息');
+    assert.ok(h.attachments.querySelectorAll('.attachment').length >= 1, '本地附件列里有了它');
+    assert.strictEqual(String(toggleOf(h.attachments).textContent), '\u00d7', '本地也算已引用 ⇒ ×');
+  });
+});
+
+// [CUSTOM-20261008-207] 文件引用的三条修正：图标在前、开关在后、**同一个文件可引用多段**。
+//
+// 引用同一性 = 路径 + 行区间：编辑器里框选的行与已引用的不同 ⇒ 仍是 `+`（可以再引用一段），
+// 相同 ⇒ `×`（那一段已经在引用里了）。宿主的附件列表也按这个同一性去重/摘除。
+suite('chat client logic: 同一文件可引用多段（stub DOM, CUSTOM-20261008-207）', () => {
+  function refBar() {
+    const attachments = new StubNode('div');
+    const sent: Array<Record<string, unknown>> = [];
+    const { NS } = loadClient({
+      promptInput: new StubNode('textarea'),
+      sendStopBtn: new StubNode('button'),
+      slashPopup: new StubNode('div'),
+      attachments,
+      configPickers: new StubNode('div'),
+      contextMeter: new StubNode('div'),
+      steerHint: new StubNode('div'),
+    });
+    NS.bridge.post = (m: Record<string, unknown>) => { sent.push(m); };
+    NS.bridge.postForSession = (m: Record<string, unknown>) => { sent.push(m); };
+    NS.composer.init();
+    NS.composer.setFocus({
+      sessionId: 's1', agentName: 'Claude Code', title: null, cwd: '/tmp',
+      createdAt: '', running: false, loading: false, unread: false,
+    }, null);
+    return { NS, attachments, sent };
+  }
+
+  const PATH = 'f:/P4/x/PianoGameplayDefine.cs';
+  const NAME = 'PianoGameplayDefine.cs';
+  const ref = (lineStart?: number, lineEnd?: number) =>
+    ({ path: PATH, name: NAME, ...(lineStart ? { lineStart, lineEnd } : {}) });
+  const toggleOf = (att: StubNode) => att.querySelector('.ref-toggle')!;
+  const childrenOf = (att: StubNode) => ((att.querySelector('.ref-chip') as any).childNodes as StubNode[]);
+
+  test('开关排在文件 tag **之后**（与附件 chip 的 × 一致），tag 里的图标在最前面', () => {
+    const h = refBar();
+    h.NS.composer.setActiveFile(ref());
+    const kids = childrenOf(h.attachments);
+    assert.ok(String(kids[0].className).includes('ref-tag'), '先 tag');
+    assert.ok(String(kids[1].className).includes('ref-toggle'), '开关在后（用户要求）');
+    const tag = h.attachments.querySelector('.ref-tag')!;
+    assert.ok(String(tag.childNodes[0].className).includes('chip-icon'), '图标在文件名前（不在后）');
+  });
+
+  test('框选的行与已引用的不同 ⇒ 仍显示 `+`（可以再引用一段）', () => {
+    const h = refBar();
+    h.NS.composer.setAttachments([{ path: PATH, name: NAME + ':12-40', kind: 'file', lineStart: 12, lineEnd: 40 }]);
+    h.NS.composer.setActiveFile(ref(5, 9));
+    assert.strictEqual(String(toggleOf(h.attachments).textContent), '+', '5-9 那一段还没引用过');
+    dispatchClick(toggleOf(h.attachments), {});
+    const post = h.sent.find(m => m.type === 'attachPath') as Record<string, any>;
+    assert.deepStrictEqual(post.meta, [{ name: NAME + ':5-9', lineStart: 5, lineEnd: 9 }], '加的是这一段的区间');
+  });
+
+  test('框选的行与已引用的**相同** ⇒ 显示 `×`，点它只摘这一段', () => {
+    const h = refBar();
+    h.NS.composer.setAttachments([
+      { path: PATH, name: NAME + ':12-40', kind: 'file', lineStart: 12, lineEnd: 40 },
+      { path: PATH, name: NAME + ':5-9', kind: 'file', lineStart: 5, lineEnd: 9 },
+    ]);
+    h.NS.composer.setActiveFile(ref(12, 40));
+    assert.strictEqual(String(toggleOf(h.attachments).textContent), '\u00d7', '这一段已经在引用里');
+    h.sent.length = 0;
+    dispatchClick(toggleOf(h.attachments), {});
+    const post = h.sent.find(m => m.type === 'detachFile') as Record<string, any>;
+    assert.strictEqual(post.path, PATH);
+    assert.strictEqual(post.lineStart, 12, '带区间 ⇒ 宿主只摘这一段（5-9 那条留着）');
+    assert.strictEqual(post.lineEnd, 40);
+  });
+
+  test('整文件（没有选区）与"某一段"是两条不同的引用', () => {
+    const h = refBar();
+    h.NS.composer.setAttachments([{ path: PATH, name: NAME + ':12-40', kind: 'file', lineStart: 12, lineEnd: 40 }]);
+    h.NS.composer.setActiveFile(ref());
+    assert.strictEqual(String(toggleOf(h.attachments).textContent), '+', '整文件还没引用过');
+  });
+
+  test('草稿页也按"路径 + 区间"记：换一段再点 + 会攒下第二条', () => {
+    const h = refBar();
+    h.NS.composer.setDraft({ draftId: 'd1', cwd: '/tmp' });
+    h.NS.composer.setActiveFile(ref(12, 40));
+    dispatchClick(toggleOf(h.attachments), {});
+    assert.strictEqual(String(toggleOf(h.attachments).textContent), '\u00d7', '这一段已攒下');
+    h.NS.composer.setActiveFile(ref(5, 9));            // 换了选区
+    assert.strictEqual(String(toggleOf(h.attachments).textContent), '+', '新的一段还没攒');
+    dispatchClick(toggleOf(h.attachments), {});
+    assert.strictEqual(h.attachments.querySelectorAll('.attachment').length, 2, '本地攒下两条');
+  });
+});
+
+// [CUSTOM-20261009-209] 会话恢复：卡片上的提问态 + 「待恢复的会话」本地 tab。
+//
+// 卡片只负责**画**与**把回答交出去**（`NS.boot.restoreChoice`，因为它才知道怎么建本地 tab）；
+// 点开一条待恢复的 tab 才真去 load（懒恢复），关掉它则让宿主把它从快照里忘掉。
+suite('chat client logic: 会话恢复（stub DOM, CUSTOM-20261009-209）', () => {
+  function restoreCard() {
+    const els: Record<string, StubNode> = {
+      stateCard: new StubNode('div'),
+      stateBusy: new StubNode('span'),
+      stateTitle: new StubNode('p'),
+      stateHint: new StubNode('p'),
+      stateError: new StubNode('p'),
+      stateActions: new StubNode('div'),
+      emptyConnect: new StubNode('button'),
+      autoConnectRow: new StubNode('label'),
+      autoConnectToggle: new StubNode('input'),
+      restoreActions: new StubNode('div'),
+      restoreAccept: new StubNode('button'),
+      restoreFresh: new StubNode('button'),
+      restoreRememberRow: new StubNode('label'),
+      restoreRemember: new StubNode('input'),
+    };
+    const { NS } = loadClient(els);
+    const answered: Array<{ kind: string; remember: boolean }> = [];
+    NS.boot.restoreChoice = (kind: string, remember: boolean) => { answered.push({ kind, remember }); };
+    NS.stateCard.init();
+    NS.stateCard.setConnected(true);
+    return { NS, els, answered };
+  }
+
+  const SESSIONS = [
+    { agentName: 'Claude Code', sessionId: 'aaaaaaaa-1', cwd: '/tmp', title: 'Piano gameplay' },
+    { agentName: 'Claude Code', sessionId: 'bbbbbbbb-2', cwd: '/tmp', title: 'Commit both repos' },
+  ];
+
+  test('面板空着 + 上次有会话 ⇒ 卡片问一句，连接按钮退场', () => {
+    const { NS, els } = restoreCard();
+    NS.stateCard.setRestore({ sessions: SESSIONS, pref: 'ask', askable: true });
+    assert.strictEqual(NS.stateCard.phase(), 'restore', '提问压过 ready');
+    assert.strictEqual(els.stateTitle.textContent, 'Restore 2 sessions from your last window?');
+    assert.strictEqual(els.restoreAccept.textContent, 'Restore 2 sessions');
+    assert.strictEqual(String(els.stateHint.textContent),
+      'Piano gameplay · Commit both repos', 'hint 里列出那几条的标题');
+    assert.strictEqual(els.restoreActions.hidden, false);
+    assert.strictEqual(els.restoreRememberRow.hidden, false);
+    assert.strictEqual(els.stateActions.hidden, true, '这一刻不该摆着 Connect');
+    assert.strictEqual(els.autoConnectRow.hidden, true);
+  });
+
+  test('设置 never / 面板不空 / 未连接 ⇒ 都不问', () => {
+    const a = restoreCard();
+    a.NS.stateCard.setRestore({ sessions: SESSIONS, pref: 'never', askable: true });
+    assert.strictEqual(a.NS.stateCard.phase(), 'ready', 'never ⇒ 不问，保持现在的逻辑');
+    assert.strictEqual(a.els.restoreActions.hidden, true);
+
+    const b = restoreCard();
+    b.NS.stateCard.setRestore({ sessions: SESSIONS, pref: 'ask', askable: false });
+    assert.strictEqual(b.NS.stateCard.phase(), 'ready', '面板里有会话/草稿时不问');
+
+    const c = restoreCard();
+    c.NS.stateCard.setConnected(false);
+    c.NS.stateCard.setRestore({ sessions: SESSIONS, pref: 'ask', askable: true });
+    assert.strictEqual(c.NS.stateCard.phase(), 'disconnected', '没连上就是"没连上"');
+  });
+
+  test('两个按钮 + 勾选：回答交给 boot（勾了才记）', () => {
+    const { NS, els, answered } = restoreCard();
+    NS.stateCard.setRestore({ sessions: SESSIONS, pref: 'ask', askable: true });
+
+    dispatchClick(els.restoreRemember, {});      // 勾上"记住我的选择"
+    els.restoreRemember.checked = true;
+    dispatchClick(els.restoreAccept, {});
+    assert.deepStrictEqual(answered, [{ kind: 'restore', remember: true }]);
+
+    els.restoreRemember.checked = false;
+    dispatchClick(els.restoreFresh, {});
+    assert.deepStrictEqual(answered[1], { kind: 'fresh', remember: false });
+    assert.strictEqual(NS.stateCard.isRestorePending(), true, '回答由 boot 收尾（它随后会更新状态）');
+  });
+
+  test('待恢复的 tab：按 tabOrder 排原位、点开才发 openHistorySession、关掉就忘掉它', () => {
+    const els: Record<string, StubNode> = {
+      tabs: new StubNode('div'), tabStrip: new StubNode('div'), newTab: new StubNode('button'),
+      agentBar: new StubNode('div'), agentSelect: new StubNode('select'), cwdBtn: new StubNode('button'),
+    };
+    els.tabStrip.appendChild(els.tabs);
+    const { NS } = loadClient(els);
+    const sent: Array<Record<string, unknown>> = [];
+    NS.bridge.post = (m: Record<string, unknown>) => { sent.push(m); };
+    NS.tabs.init();
+    NS.tabs.applyPrefs({ tabOrder: ['bbbbbbbb-2', 'aaaaaaaa-1'] });
+    NS.tabs.setRestoring([
+      { agentName: 'Claude Code', sessionId: 'aaaaaaaa-1', cwd: '/tmp', title: 'Piano gameplay' },
+      { agentName: 'Claude Code', sessionId: 'bbbbbbbb-2', cwd: '/tmp', title: 'Commit both repos' },
+    ]);
+
+    const tabs = els.tabs.querySelectorAll('.tab');
+    assert.deepStrictEqual(tabs.map(t => t.getAttribute('data-restore-id')), ['bbbbbbbb-2', 'aaaaaaaa-1'],
+      '与真会话同一张 tabOrder ⇒ 恢复出原来的位置');
+    assert.strictEqual(tabs[0].querySelector('.tab-label')!.textContent, 'Commit both repos');
+    assert.ok(String(tabs[0].title).includes('not loaded yet'), 'tooltip 说明它还没加载');
+    assert.strictEqual(tabs[0].getAttribute('draggable'), null, '待恢复的不可拖拽（顺序已由 tabOrder 决定）');
+
+    dispatchClick(tabs[1], {});
+    const open = sent.find(m => m.type === 'openHistorySession') as Record<string, unknown>;
+    assert.ok(open, '点它才真去加载');
+    assert.strictEqual(open.sessionId, 'aaaaaaaa-1');
+    assert.strictEqual(open.keepOthers, true, '恢复是"多开"，不许像历史选择器那样关掉别的');
+
+    sent.length = 0;
+    dispatchClick(tabs[0].querySelector('.tab-close') as StubNode, {});
+    assert.deepStrictEqual(sent, [{ type: 'forgetRestorable', sessionId: 'bbbbbbbb-2' }], '关掉 = 让宿主忘掉它');
+    assert.deepStrictEqual(els.tabs.querySelectorAll('.tab').map(t => t.getAttribute('data-restore-id')),
+      ['aaaaaaaa-1'], '本地那条也没了');
+  });
+
+  test('会话活了 ⇒ 真 tab 顶替那条本地 tab', () => {
+    const els: Record<string, StubNode> = {
+      tabs: new StubNode('div'), tabStrip: new StubNode('div'), newTab: new StubNode('button'),
+      agentBar: new StubNode('div'), agentSelect: new StubNode('select'), cwdBtn: new StubNode('button'),
+    };
+    els.tabStrip.appendChild(els.tabs);
+    const { NS } = loadClient(els);
+    NS.tabs.init();
+    NS.tabs.setRestoring([{ agentName: 'Claude Code', sessionId: 'aaaaaaaa-1', cwd: '/tmp' }]);
+    assert.strictEqual(els.tabs.querySelectorAll('.tab').length, 1);
+
+    NS.tabs.setSessions([{
+      sessionId: 'aaaaaaaa-1', agentName: 'Claude Code', title: 'Piano gameplay', cwd: '/tmp',
+      createdAt: '', loading: false, running: false, unread: false,
+    }]);
+    const tabs = els.tabs.querySelectorAll('.tab');
+    assert.strictEqual(tabs.length, 1, '不该两处并存');
+    assert.strictEqual(tabs[0].getAttribute('data-session-id'), 'aaaaaaaa-1');
+    assert.strictEqual(tabs[0].getAttribute('data-restore-id'), null);
   });
 });

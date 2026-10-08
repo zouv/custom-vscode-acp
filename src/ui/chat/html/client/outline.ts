@@ -43,6 +43,19 @@ export const outlineClient = `
   var mode = 'popup';     // 'popup' | 'sidebar'（持久化）
   var isOpen = false;     // 当前形态是否可见
   var width = 240;        // 侧栏宽度 px（持久化）
+  // [CUSTOM-20261008-204] 侧栏的**开/关**按会话记 + 一个默认值（与 Times 200 同一套语义）：
+  //   · openBySession —— 用户在那个会话里最后一次的开/关；
+  //   · openDefault   —— 用户最后一次在**任何地方**做的选择；没有记录的会话用它。
+  // 为什么必须按会话：侧栏里是**这个会话**的对话大纲，A 开着不代表 B 要开着（用户明确要求）。
+  // 为什么"关"也必须落盘（这是两个 bug 的公共根因）：以前关侧栏只改 isOpen（'mode' 仍是
+  // sidebar），于是 ①重启后 'applyPrefs' 把它重新算成 'mode === 'sidebar'' ⇒ 自己回来；
+  // ②宿主的 'uiPrefs' 是**广播**的（任何 'setUiPref' 之后都会回一次），客户端收到就走
+  // 'applyPrefs' ⇒ 同一句又把 isOpen 算成 true。于是"点一下 Times / 拖一下 tab"就能让刚关掉的
+  // 侧栏弹回来（用户报的第 1 条）。现在 isOpen 从**这两份持久状态**推出来，回话只是让两边收敛。
+  var openBySession = {};
+  var openDefault = false;
+  // [CUSTOM-20261008-204] 焦点会话（boot 在焦点咽喉点喂进来，与 stickyUser.setSession 同形）。
+  var currentSessionId = null;
   var dragging = false;   // 是否正在拖调宽手柄
   var dragStartX = 0;
   var dragStartW = 0;
@@ -267,15 +280,18 @@ export const outlineClient = `
 
   function show() {
     isOpen = true;
+    // [CUSTOM-20261008-204] 打开侧栏 = 一次**持久的**选择（下拉是临时的，不动这套状态）。
+    if (mode === 'sidebar') { rememberSidebarOpen(true); }
     renderVisibility();
     render();
     NS.dom.schedule(function () { if (isOpen) { tops = null; syncActive(); } });
   }
 
-  /** 隐藏当前可见形态（isOpen = false），形态（mode）不变。 */
+  /** 隐藏当前可见形态（isOpen = false）。下拉是临时的；**侧栏的关闭要记下来并落盘**（见 204）。 */
   function hide() {
     if (!isOpen) { return; }
     isOpen = false;
+    if (mode === 'sidebar') { rememberSidebarOpen(false); }
     renderVisibility();
   }
 
@@ -293,7 +309,7 @@ export const outlineClient = `
     isOpen = true;
     renderVisibility();
     render();
-    persistPrefs();
+    rememberSidebarOpen(true);
     NS.dom.schedule(function () { if (isOpen) { tops = null; syncActive(); } });
   }
 
@@ -302,7 +318,43 @@ export const outlineClient = `
     mode = 'popup';
     isOpen = false;
     renderVisibility();
+    rememberSidebarOpen(false);
+  }
+
+  /** [CUSTOM-20261008-204] 这个会话的侧栏该不该显示（没有记录就跟默认值走）。 */
+  function sidebarOpenFor(sessionId) {
+    if (sessionId && Object.prototype.hasOwnProperty.call(openBySession, sessionId)) {
+      return openBySession[sessionId] === true;
+    }
+    return openDefault === true;
+  }
+
+  /**
+   * [CUSTOM-20261008-204] 记一笔"用户对侧栏做了什么"，并落盘。
+   * 一律**两处都写**：这个会话名下 + 默认值（新会话沿用最后一次的选择）—— 与 Times 同一套语义。
+   * 只由**用户动作**调（show/hide/pin/unpin）；'applyPrefs' 是收别人的话，不许调它（否则回话会写回自己）。
+   */
+  function rememberSidebarOpen(on) {
+    openDefault = on === true;
+    if (currentSessionId) { openBySession[currentSessionId] = openDefault; }
     persistPrefs();
+  }
+
+  /**
+   * [CUSTOM-20261008-204] 换会话：侧栏跟着**那个会话**的记录走。
+   * boot 在焦点咽喉点调（与 'stickyUser.setSession' 同一形态）——换会话、切草稿、回到空态都经过它。
+   */
+  function setSession(sessionId) {
+    currentSessionId = sessionId || null;
+    if (mode !== 'sidebar') { return; }   // 下拉形态有自己的开关，不受影响
+    var next = sidebarOpenFor(currentSessionId);
+    if (next === isOpen) { return; }
+    isOpen = next;
+    renderVisibility();
+    if (isOpen) {
+      render();
+      NS.dom.schedule(function () { if (isOpen) { tops = null; syncActive(); } });
+    }
   }
 
   // [CUSTOM-20260926-077] 持久化搬到扩展宿主 globalState：webview 本地 setState 只在
@@ -310,22 +362,53 @@ export const outlineClient = `
   // 'setUiPref'，宿主存 globalState，boot 时通过 'uiPrefs' 消息带回。
   function persistPrefs() {
     if (NS.bridge && NS.bridge.post) {
-      NS.bridge.post({ type: 'setUiPref', outlineMode: mode, outlineWidth: width });
+      NS.bridge.post({
+        type: 'setUiPref',
+        outlineMode: mode,
+        outlineWidth: width,
+        // [CUSTOM-20261008-204] "侧栏开/关"也一起落盘（整份表 + 一个默认值，同 Times）。
+        outlineOpenBySession: openBySession,
+        outlineOpenDefault: openDefault === true,
+      });
     }
   }
 
-  /** 应用宿主带回来的偏好（boot 后由 boot.ts 调一次，幂等）。 */
+  /** 应用宿主带回来的偏好（boot 后由 boot.ts 调一次，之后**每次** setUiPref 的广播也会到这儿）。 */
   function applyPrefs(prefs) {
     if (!prefs) { return; }
     mode = prefs.outlineMode === 'sidebar' ? 'sidebar' : 'popup';
-    isOpen = mode === 'sidebar';
+    if (prefs.outlineOpenBySession && typeof prefs.outlineOpenBySession === 'object') {
+      var next = {};
+      for (var key in prefs.outlineOpenBySession) {
+        if (Object.prototype.hasOwnProperty.call(prefs.outlineOpenBySession, key)) {
+          next[key] = prefs.outlineOpenBySession[key] === true;
+        }
+      }
+      openBySession = next;
+    }
+    if (typeof prefs.outlineOpenDefault === 'boolean') { openDefault = prefs.outlineOpenDefault; }
+    // 旧记录（203 之前）里没有这两项：那时"钉住"等于"每个会话都开着"，所以按 mode 补一次默认值，
+    // 免得升级后用户的侧栏无声消失（之后由用户的下一次动作接管）。
+    else if (mode === 'sidebar' && !hasOpenState()) { openDefault = true; }
     if (typeof prefs.outlineWidth === 'number') { width = clamp(prefs.outlineWidth, MIN_WIDTH, 9999); }
     applyWidth();
+    // [CUSTOM-20261008-204] **不再**是 isOpen = (mode === 'sidebar')：那一句让"任何一次回话"
+    // 都变成"重新打开侧栏"（用户报的第 1 条：点一下 Times 就弹回来）。开/关一律从上面那两份
+    // 按会话的状态推出来 —— 回话只是让两端收敛，不再是"命令"。
+    if (mode === 'sidebar') { isOpen = sidebarOpenFor(currentSessionId); }
     renderVisibility();
     if (isOpen) {
       render();
       NS.dom.schedule(function () { if (isOpen) { tops = null; syncActive(); } });
     }
+  }
+
+  /** 这份记录里已经有"按会话的开/关"了吗（迁移判据，见 applyPrefs）。 */
+  function hasOpenState() {
+    for (var key in openBySession) {
+      if (Object.prototype.hasOwnProperty.call(openBySession, key)) { return true; }
+    }
+    return false;
   }
 
   function applyWidth() {
@@ -470,7 +553,9 @@ export const outlineClient = `
     close: close,
     isOpen: function () { return isOpen; },
     invalidate: invalidate,
-    applyPrefs: applyPrefs
+    applyPrefs: applyPrefs,
+    // [CUSTOM-20261008-204] 焦点会话（boot 在焦点咽喉点喂）：侧栏的开/关是按会话记的。
+    setSession: setSession
   };
 })(window.__acpc = window.__acpc || {});
 `;

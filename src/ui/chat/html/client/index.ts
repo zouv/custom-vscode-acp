@@ -33,6 +33,9 @@ import { stickyUserClient } from './stickyUser';
 // [CUSTOM-20261008-200] 记录区「Times」开关的状态机（按会话记 + 一个默认值）。与 stateCard 同类：
 // 加载期不碰 DOM，全部由 boot 的 init() 驱动，因此能在桩 DOM 里被单独加载。
 import { timesClient } from './times';
+// [CUSTOM-20261008-202] 长任务看门狗（记录区 markdown 回填分帧的验收手段，也是"点了没反应"
+// 这类症状的常驻证据）。
+import { perfClient } from './perf';
 import { bootClient } from './boot';
 
 const MODULES: ReadonlyArray<string> = [
@@ -68,6 +71,8 @@ const MODULES: ReadonlyArray<string> = [
   stickyUserClient,
   // [CUSTOM-20261008-200] Times 开关（它 apply 时要重渲染置顶副本，所以排在 stickyUser 之后）。
   timesClient,
+  // [CUSTOM-20261008-202] 看门狗：boot 的 init 里装（加载期不碰 DOM，可在桩里单独驱动）。
+  perfClient,
   bootClient,
 ];
 

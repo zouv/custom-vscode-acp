@@ -54,7 +54,12 @@ import type { ChatSurface, SurfaceKey } from '../ui/chat/ChatSurface';
 import { ChatPanelHost, resolveAutoConnect, type PanelPrefsIO } from '../ui/chat/ChatPanelHost';
 // [CUSTOM-20261001-156] The notification seam (see RecordingChannel).
 import type { NoticeChannel } from '../ui/chat/SessionNotifier';
-import { stopReasonText, turnOutcome } from '../ui/chat/ChatPanelHost';
+import {
+  stopReasonText, turnOutcome, readActiveFileFrom,
+  resolveRestoreChoice,
+} from '../ui/chat/ChatPanelHost';
+import type { RestoreChoice } from '../ui/chat/protocol';
+import type { ActiveEditorLike } from '../ui/chat/ChatPanelHost';
 import type { ExtToChatMessage, TranscriptSnapshotWire } from '../ui/chat/protocol';
 import type { TranscriptEntry } from '../ui/chat/transcript/types';
 
@@ -222,12 +227,20 @@ class RecordingChannel implements NoticeChannel {
 class StubPrefs implements PanelPrefsIO {
   readonly writes: boolean[] = [];
   failWith: Error | null = null;
-  constructor(private value = false) {}
+  // [CUSTOM-20261009-209] 「重开面板要不要恢复上次的会话」也在这一条注入缝上。
+  readonly restoreWrites: RestoreChoice[] = [];
+  constructor(private value = false, private restore: RestoreChoice = 'ask') {}
   getAutoConnect(): boolean { return this.value; }
   async setAutoConnect(value: boolean): Promise<void> {
     this.writes.push(value);
     if (this.failWith) { throw this.failWith; }
     this.value = value;
+  }
+  getRestore(): RestoreChoice { return this.restore; }
+  async setRestore(value: RestoreChoice): Promise<void> {
+    this.restoreWrites.push(value);
+    if (this.failWith) { throw this.failWith; }
+    this.restore = value;
   }
 }
 
@@ -2299,6 +2312,52 @@ suite('chat panel: replay fidelity (CUSTOM-20260928-100)', () => {
     assert.strictEqual(state.entries.filter(e => e.kind === 'notice').length, 1);
   });
 
+  // [CUSTOM-20261008-205] IDE 注入的"当前打开的文件"上下文（`<ide_opened_file>…</ide_opened_file>`）
+  // 是**上下文**，不是用户说过的话。它以前按普通 user chunk 走 ⇒ 同一条消息渲染成**两个**蓝色气泡
+  // （用户报："附加的文件没有合并到一个对话里（预期是跟图片附件一样显示），现在是分成了两条对话"）。
+  // 现在：块不建记录，文件作为 **chip 挂到同一条消息的用户气泡**上（与官方插件同款：chip 在上、正文在下）。
+  const IDE_BLOCK = '<ide_opened_file>The user opened the file f:/P4/x/PianoGameplayDefine.cs in the IDE. '
+    + 'This may or may not be related to the current task.</ide_opened_file>';
+
+  function feedUserChunks(sessionId: string, chunks: string[]): Harness {
+    const harness = makeHarness(sessionId, 'Claude Code');
+    harness.surface.sent.length = 0;
+    for (const text of chunks) {
+      harness.handler.handleUpdate({
+        sessionId,
+        update: { sessionUpdate: 'user_message_chunk', messageId: 'm-ide', content: { type: 'text', text } },
+      } as any);
+    }
+    return harness;
+  }
+
+  test('an ide_opened_file block becomes a file chip on the message, not a second bubble', () => {
+    const harness = feedUserChunks('ide', [IDE_BLOCK, '两边都提交git']);
+    const state = settle(harness, 'Claude Code', 'ide');
+
+    const users = state.entries.filter(e => e.kind === 'user');
+    assert.strictEqual(users.length, 1, '一条消息 = 一个气泡（以前是两条：ide 原文 + 正文）');
+    assert.strictEqual(users[0].text, '两边都提交git', '气泡里是正文，不是那段注入文本');
+    const attachments = (users[0] as { attachments?: Array<{ path?: string; name?: string }> }).attachments ?? [];
+    assert.strictEqual(attachments.length, 1, '文件成了这条消息上的 chip');
+    assert.strictEqual(attachments[0].path, 'f:/P4/x/PianoGameplayDefine.cs', '点它走 openFile');
+    assert.strictEqual(attachments[0].name, 'PianoGameplayDefine.cs', 'chip 显示文件名（官方插件同款）');
+    assert.strictEqual(state.entries.filter(e => e.kind === 'notice').length, 0, '也不是提示条');
+  });
+
+  test('an ide_opened_file block with no message after it adds no record at all', () => {
+    const harness = feedUserChunks('ide-only', [IDE_BLOCK]);
+    const state = settle(harness, 'Claude Code', 'ide-only');
+    assert.strictEqual(state.entries.length, 0, '只开了个文件，没有消息 ⇒ 什么都不该冒出来');
+  });
+
+  test('other <ide_…> context blocks are notices, not user bubbles', () => {
+    const harness = feedUserChunks('ide-sel', ['<ide_selection>The user selected lines 1 to 9 from piano.cs</ide_selection>']);
+    const state = settle(harness, 'Claude Code', 'ide-sel');
+    assert.strictEqual(state.entries.filter(e => e.kind === 'user').length, 0, 'IDE 上下文不是"我说过的话"');
+    assert.strictEqual(state.entries.filter(e => e.kind === 'notice').length, 1);
+  });
+
   test('a plain user message is still a user bubble', () => {
     const harness = makeHarness('plain', 'Claude Code');
     harness.surface.sent.length = 0;
@@ -2917,8 +2976,32 @@ suite('chat panel: Times prefs (CUSTOM-20261008-200)', () => {
     assert.deepStrictEqual(prefsOf(harness).timesBySession, {}, 'a non-map leaves nothing behind');
   });
 
-  test('the per-session table is capped', async () => {
+  // [CUSTOM-20261008-204] 大纲侧栏的"按会话开/关"与 Times **同一形状**（`sanitizeSessionFlags`
+  // 一份消毒器管两张表），也走同一条记录 —— 第四个写者。
+  test('the outline sidebar open/closed rides the same record (204)', async () => {
     const harness = makeHarness('s-1');
+    harness.surface.sent.length = 0;
+
+    harness.host.onMessage({
+      type: 'setUiPref',
+      outlineMode: 'sidebar',
+      outlineOpenBySession: { A: true, B: false },
+      outlineOpenDefault: false,
+    });
+    await waitForPrefs(harness);
+    assert.deepStrictEqual(prefsOf(harness).outlineOpenBySession, { A: true, B: false });
+    assert.strictEqual(prefsOf(harness).outlineOpenDefault, false);
+
+    // 只写 Times 的那一笔不该把侧栏那一半抹掉（缺字段 = 这一轮没改它）。
+    harness.surface.sent.length = 0;
+    harness.host.onMessage({ type: 'setUiPref', timesDefault: true });
+    await waitForPrefs(harness);
+    assert.deepStrictEqual(prefsOf(harness).outlineOpenBySession, { A: true, B: false }, '侧栏那一半留着');
+    assert.strictEqual(prefsOf(harness).timesDefault, true, '而 Times 那一半生效了');
+    assert.strictEqual(prefsOf(harness).outlineMode, 'sidebar', 'mode 也没被碰');
+  });
+
+  test('the per-session table is capped', async () => {    const harness = makeHarness('s-1');
     harness.surface.sent.length = 0;
     const big: Record<string, boolean> = {};
     for (let i = 0; i < 300; i++) { big[`s-${i}`] = true; }
@@ -3742,5 +3825,328 @@ suite('chat panel: the connecting card hears why it is slow', () => {
     const before = connectionMessages(harness).length;
     harness.sessionManager.emit('agent-stderr', { agentId: 'agent_1', line: 'a later, harmless warning' });
     assert.strictEqual(connectionMessages(harness).length, before, 'no stderr noise once the phase is over');
+  });
+});
+
+// [CUSTOM-20261008-206] 编辑器「当前文件 + 多行选区」→ 输入框引用栏那一格。
+//
+// 判据都是纯函数/协议层的：真 `vscode.window.activeTextEditor` 在测试宿主里造不出来，所以
+// `readActiveFileFrom` 收一个**结构子集**（同 `pickDefaultCwd` 的既有做法）。
+suite('chat panel: active editor file → composer reference (CUSTOM-20261008-206)', () => {
+  const editor = (over: Partial<ActiveEditorLike> = {}): ActiveEditorLike => ({
+    document: { uri: { scheme: 'file', fsPath: 'f:/P4/x/PianoGameplayDefine.cs' } },
+    selection: { isEmpty: true, start: { line: 0, character: 0 }, end: { line: 0, character: 0 } },
+    ...over,
+  });
+
+  test('no editor, or a non-file document, yields nothing', () => {
+    assert.strictEqual(readActiveFileFrom(undefined), null);
+    assert.strictEqual(
+      readActiveFileFrom(editor({ document: { uri: { scheme: 'untitled', fsPath: 'Untitled-1' } } })),
+      null,
+      'untitled: / 虚拟文档没有可引用的路径');
+  });
+
+  test('a file with no selection is the whole file', () => {
+    assert.deepStrictEqual(readActiveFileFrom(editor()), {
+      path: 'f:/P4/x/PianoGameplayDefine.cs', name: 'PianoGameplayDefine.cs',
+    });
+  });
+
+  test('a multi-line selection becomes a 1-based range; "ends at the next line start" does not count it', () => {
+    // 0 基 2..5 → 界面上的 3-5
+    assert.deepStrictEqual(
+      readActiveFileFrom(editor({ selection: { isEmpty: false, start: { line: 2, character: 4 }, end: { line: 5, character: 9 } } })),
+      { path: 'f:/P4/x/PianoGameplayDefine.cs', name: 'PianoGameplayDefine.cs', lineStart: 3, lineEnd: 6 });
+    // 拖到下一行行首（character 0）时那一行不算选中 ⇒ 3-5 而不是 3-6（与编辑器显示一致）
+    assert.deepStrictEqual(
+      readActiveFileFrom(editor({ selection: { isEmpty: false, start: { line: 2, character: 4 }, end: { line: 5, character: 0 } } })),
+      { path: 'f:/P4/x/PianoGameplayDefine.cs', name: 'PianoGameplayDefine.cs', lineStart: 3, lineEnd: 5 });
+    // 单行选区不带区间（引用整个文件）
+    assert.deepStrictEqual(
+      readActiveFileFrom(editor({ selection: { isEmpty: false, start: { line: 4, character: 1 }, end: { line: 4, character: 8 } } })),
+      { path: 'f:/P4/x/PianoGameplayDefine.cs', name: 'PianoGameplayDefine.cs' });
+  });
+
+  test('attachPath 的 meta 进了附件（显示名带行区间），发送时 uri 带 #L 片段', async () => {
+    class RecordingSendManager extends SessionManager {
+      readonly sent: Array<unknown> = [];
+      override async sendPrompt(_sessionId: string, prompt: unknown): Promise<PromptResponse> {
+        this.sent.push(prompt);
+        return { stopReason: 'end_turn' } as PromptResponse;
+      }
+    }
+    let manager!: RecordingSendManager;
+    const harness = makeHarness('ref-session', 'Claude Code', handler => {
+      manager = new RecordingSendManager(new AgentManager(), new ConnectionManager(handler), handler);
+      return manager;
+    });
+    harness.surface.sent.length = 0;
+
+    harness.host.onMessage({
+      type: 'attachPath', sessionId: 'ref-session', paths: ['f:/P4/x/PianoGameplayDefine.cs'],
+      meta: [{ name: 'PianoGameplayDefine.cs:12-40', lineStart: 12, lineEnd: 40 }],
+    });
+    const attachments = harness.surface.sent.filter(m => m.type === 'attachments').pop() as unknown as
+      { attachments: Array<Record<string, unknown>> };
+    assert.ok(attachments, '宿主必须把附件列回给客户端（chat 才会把 + 变成 ×）');
+    assert.strictEqual(attachments.attachments[0].name, 'PianoGameplayDefine.cs:12-40');
+    assert.strictEqual(attachments.attachments[0].lineStart, 12);
+
+    harness.host.onMessage({ type: 'sendPrompt', sessionId: 'ref-session', text: '两边都提交git' });
+    for (let i = 0; i < 100 && manager.sent.length === 0; i++) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    // `sendPrompt` 收到的是**内容块数组**本身（不是 { content: [...] } 包着的那种）。
+    const blocks = (manager.sent[0] ?? []) as Array<{ type: string; uri?: string; name?: string }>;
+    const link = blocks.find(b => b.type === 'resource_link');
+    assert.ok(link, '提示里应有 resource_link：' + JSON.stringify(blocks));
+    assert.ok(String(link!.uri).endsWith('#L12-40'), '行区间进 uri 片段（agent 也看得到）: ' + link!.uri);
+    assert.strictEqual(link!.name, 'PianoGameplayDefine.cs:12-40');
+  });
+});
+
+// [CUSTOM-20261008-207] 引用的同一性 = 路径 + 行区间：同一个文件可以引用**多段**，
+// 摘除也只摘那一段（不带区间的拖拽/粘贴仍按路径去重/全摘，行为不变）。
+suite('chat panel: one file, several referenced ranges (CUSTOM-20261008-207)', () => {
+  const PATH = 'f:/P4/x/PianoGameplayDefine.cs';
+
+  function listed(harness: Harness): Array<Record<string, unknown>> {
+    const msg = harness.surface.sent.filter(m => m.type === 'attachments').pop() as unknown as
+      { attachments: Array<Record<string, unknown>> } | undefined;
+    return msg ? msg.attachments : [];
+  }
+
+  test('two ranges of one file are two references; the same range twice is one', () => {
+    const harness = makeHarness('multi-ref', 'Claude Code');
+    harness.surface.sent.length = 0;
+    harness.host.onMessage({
+      type: 'attachPath', sessionId: 'multi-ref', paths: [PATH], meta: [{ name: 'a.cs:12-40', lineStart: 12, lineEnd: 40 }],
+    });
+    harness.host.onMessage({
+      type: 'attachPath', sessionId: 'multi-ref', paths: [PATH], meta: [{ name: 'a.cs:5-9', lineStart: 5, lineEnd: 9 }],
+    });
+    assert.strictEqual(listed(harness).length, 2, '同一个文件的两段是两条引用');
+    assert.deepStrictEqual(listed(harness).map(a => a.lineStart), [12, 5]);
+
+    harness.host.onMessage({
+      type: 'attachPath', sessionId: 'multi-ref', paths: [PATH], meta: [{ name: 'a.cs:12-40', lineStart: 12, lineEnd: 40 }],
+    });
+    assert.strictEqual(listed(harness).length, 2, '同一段再引用一次不重复');
+
+    // 拖拽那条路没有区间：仍然按路径去重（原有的行为）
+    harness.host.onMessage({ type: 'attachPath', sessionId: 'multi-ref', paths: [PATH] });
+    assert.strictEqual(listed(harness).length, 3, '不带区间的一条是**第三**条引用（整文件）');
+    harness.host.onMessage({ type: 'attachPath', sessionId: 'multi-ref', paths: [PATH] });
+    assert.strictEqual(listed(harness).length, 3, '同一路径的整文件引用只留一份');
+  });
+
+  test('detachFile 带区间只摘那一段；不带则整条路径全摘', () => {
+    const harness = makeHarness('detach-ref', 'Claude Code');
+    harness.surface.sent.length = 0;
+    for (const [start, end] of [[12, 40], [5, 9]] as Array<[number, number]>) {
+      harness.host.onMessage({
+        type: 'attachPath', sessionId: 'detach-ref', paths: [PATH],
+        meta: [{ name: `a.cs:${start}-${end}`, lineStart: start, lineEnd: end }],
+      });
+    }
+    harness.host.onMessage({ type: 'detachFile', sessionId: 'detach-ref', path: PATH, lineStart: 12, lineEnd: 40 });
+    assert.deepStrictEqual(listed(harness).map(a => a.lineStart), [5], '只摘 12-40 那一段');
+
+    harness.host.onMessage({ type: 'detachFile', sessionId: 'detach-ref', path: PATH });
+    assert.strictEqual(listed(harness).length, 0, '不带区间 = 整条路径全摘');
+  });
+
+  test('发送时每一段各是一个 resource_link，各带自己的 #L 片段', async () => {
+    class RecordingSendManager extends SessionManager {
+      readonly sent: Array<unknown> = [];
+      override async sendPrompt(_sessionId: string, prompt: unknown): Promise<PromptResponse> {
+        this.sent.push(prompt);
+        return { stopReason: 'end_turn' } as PromptResponse;
+      }
+    }
+    let manager!: RecordingSendManager;
+    const harness = makeHarness('multi-send', 'Claude Code', handler => {
+      manager = new RecordingSendManager(new AgentManager(), new ConnectionManager(handler), handler);
+      return manager;
+    });
+    harness.surface.sent.length = 0;
+    for (const [start, end] of [[12, 40], [5, 9]] as Array<[number, number]>) {
+      harness.host.onMessage({
+        type: 'attachPath', sessionId: 'multi-send', paths: [PATH],
+        meta: [{ name: `a.cs:${start}-${end}`, lineStart: start, lineEnd: end }],
+      });
+    }
+    harness.host.onMessage({ type: 'sendPrompt', sessionId: 'multi-send', text: '看这两段' });
+    for (let i = 0; i < 100 && manager.sent.length === 0; i++) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    const blocks = (manager.sent[0] ?? []) as Array<{ type: string; uri?: string }>;
+    const links = blocks.filter(b => b.type === 'resource_link');
+    assert.strictEqual(links.length, 2, '两段 = 两个引用块');
+    assert.ok(links.some(l => String(l.uri).endsWith('#L12-40')));
+    assert.ok(links.some(l => String(l.uri).endsWith('#L5-9')));
+  });
+});
+
+// 四件事分开测：①快照写盘（globalState）并端给下一个窗口；②恢复时**不关**别的会话（与 099 的
+// 替换语义相反）；③有可恢复会话时**不自动建新会话**（否则用户既拿到新空会话又被打扰）；
+// ④四条新消息（startRestore / dismissSessions / forgetRestorable / setRestorePref）。
+suite('chat panel: session restore (CUSTOM-20261009-209)', () => {
+  const OPEN_KEY = 'acpc.openSessions.v1';
+  type Snap = { sessions: Array<{ sessionId: string; agentName: string; cwd?: string }>; focused: string | null };
+  const snapshotOf = (memento: FakeMemento): Snap | undefined => memento.get<Snap>(OPEN_KEY);
+
+  async function waitFor(check: () => boolean, label: string): Promise<void> {
+    for (let i = 0; i < 200; i++) {
+      if (check()) { return; }
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.fail('timed out waiting for ' + label);
+  }
+
+  test('the setting value is sanitized (a hand-edited settings.json cannot invent a phase)', () => {
+    assert.strictEqual(resolveRestoreChoice('always'), 'always');
+    assert.strictEqual(resolveRestoreChoice('never'), 'never');
+    assert.strictEqual(resolveRestoreChoice('ask'), 'ask');
+    assert.strictEqual(resolveRestoreChoice('sometimes'), 'ask');
+    assert.strictEqual(resolveRestoreChoice(undefined), 'ask');
+  });
+
+  test('the open sessions are snapshotted, and offered to the next window', async () => {
+    const memento = new FakeMemento();
+    const first = makeHarness('s-1', 'Claude Code', undefined, new StubPrefs(), {}, memento);
+    // 快照挂在 created / closed / **focus** 三个事件上（harness 直接塞会话，不发 created），
+    // 所以这里用一次聚焦把它触发 —— 真实路径上"打开一个会话"本来就带这次聚焦。
+    first.host.onMessage({ type: 'focusSession', sessionId: 's-1' });
+    await waitFor(() => (snapshotOf(memento)?.sessions.length ?? 0) === 1, 'the snapshot to be written');
+    assert.deepStrictEqual(snapshotOf(memento)!.sessions.map(s => s.sessionId), ['s-1']);
+    assert.strictEqual(snapshotOf(memento)!.focused, 's-1', '聚焦的那条也记着 —— 恢复时先加载它');
+
+    // 新窗口：同一个 globalState，但宿主重启过（那条会话不再活）
+    const second = makeHarness('s-2', 'Claude Code', undefined, new StubPrefs(), {}, memento);
+    const boot = second.surface.sent.find(m => m.type === 'boot') as unknown as
+      { recoverable?: Array<{ sessionId: string }> };
+    assert.deepStrictEqual(boot.recoverable?.map(r => r.sessionId), ['s-1'], '上一次开着的会被端上来');
+  });
+
+  test('a restore adds a session instead of replacing one (keepOthers)', async () => {
+    class ClosingManager extends SessionManager {
+      readonly closed: string[] = [];
+      readonly opened: string[] = [];
+      override async closeSession(_agentName: string, sessionId: string): Promise<void> { this.closed.push(sessionId); }
+      override async openExistingSession(
+        _agentName: string, sessionId: string, _opts: { cwd?: string; title?: string } = {},
+      ): Promise<'live' | 'load' | 'resume'> {
+        this.opened.push(sessionId);
+        return 'live';
+      }
+    }
+    let manager!: ClosingManager;
+    const memento = new FakeMemento();
+    const harness = makeHarness('focused-one', 'Claude Code', handler => {
+      manager = new ClosingManager(new AgentManager(), new ConnectionManager(handler), handler);
+      return manager;
+    }, new StubPrefs(), {}, memento);
+    harness.surface.sent.length = 0;
+
+    harness.host.onMessage({
+      type: 'openHistorySession', agentName: 'Claude Code', sessionId: 'restored-one',
+      cwd: '/tmp', title: 'restored', keepOthers: true,
+    });
+    await waitFor(() => manager.opened.length === 1, 'the restore to open the session');
+    assert.deepStrictEqual(manager.closed, [], '恢复是"多开"：不许像历史选择器那样关掉聚焦的那个');
+  });
+
+  test('with sessions to restore, connecting does NOT create a new one (never 时照旧建)', async () => {
+    class CountingManager extends SessionManager {
+      readonly created: string[] = [];
+      override async ensureConnected(agentName: string): Promise<ConnectionInfo> {
+        void agentName;
+        return {} as ConnectionInfo;
+      }
+      override isAgentConnected(): boolean { return true; }
+      override getSessionIdsForAgent(): string[] { return []; }
+      override async createSession(agentName: string): Promise<SessionInfo> {
+        this.created.push(agentName);
+        return { sessionId: 'fresh', agentName } as unknown as SessionInfo;
+      }
+    }
+    const seed = async (memento: FakeMemento) => memento.update(OPEN_KEY, {
+      sessions: [{ agentName: 'Claude Code', sessionId: 'gone', cwd: '/tmp' }], focused: 'gone',
+    });
+
+    const askingMemento = new FakeMemento();
+    await seed(askingMemento);
+    let asking!: CountingManager;
+    const first = makeHarness('placeholder', 'Claude Code', handler => {
+      asking = new CountingManager(new AgentManager(), new ConnectionManager(handler), handler);
+      return asking;
+    }, new StubPrefs(), {}, askingMemento);
+    first.host.onMessage({ type: 'connectAgent' });
+    await waitFor(() => first.surface.sent.some(m => m.type === 'connection' && m.state === 'connected'), 'connected');
+    assert.deepStrictEqual(asking.created, [], '有可恢复的会话 ⇒ 先问用户，别当场建一个新的');
+
+    // never：用户说了不要那些 tab ⇒ 回到"保持现在的逻辑"（照建）
+    const neverMemento = new FakeMemento();
+    await seed(neverMemento);
+    let following!: CountingManager;
+    const second = makeHarness('placeholder', 'Claude Code', handler => {
+      following = new CountingManager(new AgentManager(), new ConnectionManager(handler), handler);
+      return following;
+    }, new StubPrefs(false, 'never'), {}, neverMemento);
+    second.host.onMessage({ type: 'connectAgent' });
+    await waitFor(() => second.surface.sent.some(m => m.type === 'connection' && m.state === 'connected'), 'connected (never)');
+    assert.deepStrictEqual(following.created, ['Claude Code'], '设置 never ⇒ 不问、照旧建一个');
+  });
+
+  test('dismiss / forget / setRestorePref 三条都落地', async () => {
+    const memento = new FakeMemento();
+    const prefs = new StubPrefs();
+    const harness = makeHarness('s-1', 'Claude Code', undefined, prefs, {}, memento);
+    harness.host.onMessage({ type: 'focusSession', sessionId: 's-1' });
+    await waitFor(() => (snapshotOf(memento)?.sessions.length ?? 0) === 1, 'the snapshot to be written');
+
+    harness.host.onMessage({ type: 'forgetRestorable', sessionId: 's-1' });
+    await waitFor(() => (snapshotOf(memento)?.sessions.length ?? 1) === 0, 'the entry to be forgotten');
+
+    harness.surface.sent.length = 0;
+    harness.host.onMessage({ type: 'setRestorePref', value: 'always' });
+    await waitFor(() => harness.surface.sent.some(m => m.type === 'restorePref'), 'the pref reply');
+    assert.deepStrictEqual(prefs.restoreWrites, ['always']);
+    const reply = harness.surface.sent.filter(m => m.type === 'restorePref').pop() as unknown as { value: string };
+    assert.strictEqual(reply.value, 'always', '回话带上真正的值（另一个面/设置面板改了也要跟上）');
+
+    harness.host.onMessage({ type: 'dismissSessions' });
+    await waitFor(() => snapshotOf(memento) === undefined, 'the snapshot to be dropped');
+  });
+
+  test('startRestore loads the session that was focused, and leaves the rest lazy', async () => {
+    class RecordingOpen extends SessionManager {
+      readonly opened: string[] = [];
+      override async openExistingSession(
+        _agentName: string, sessionId: string, _opts: { cwd?: string; title?: string } = {},
+      ): Promise<'live' | 'load' | 'resume'> {
+        this.opened.push(sessionId);
+        return 'load';
+      }
+    }
+    const memento = new FakeMemento();
+    await memento.update(OPEN_KEY, {
+      sessions: [
+        { agentName: 'Claude Code', sessionId: 'a', cwd: '/tmp' },
+        { agentName: 'Claude Code', sessionId: 'b', cwd: '/tmp' },
+      ],
+      focused: 'b',
+    });
+    let manager!: RecordingOpen;
+    const harness = makeHarness('placeholder', 'Claude Code', handler => {
+      manager = new RecordingOpen(new AgentManager(), new ConnectionManager(handler), handler);
+      return manager;
+    }, new StubPrefs(), {}, memento);
+
+    harness.host.onMessage({ type: 'startRestore' });
+    await waitFor(() => manager.opened.length === 1, 'the focused session to load');
+    assert.deepStrictEqual(manager.opened, ['b'], '只把那一条真加载（其余点开才加载）');
   });
 });

@@ -76,6 +76,45 @@ export const bootClient = `
   }
   NS.bridge.postForSession = postForSession;
 
+  // [CUSTOM-20261009-209] 会话恢复（重载/关闭后重开面板）：上次开着的会话由宿主随 boot 带来，
+  // 面板**空着**时在卡片上问一句。回答在这里落地 —— 因为"怎么建本地 tab"是客户端的事。
+  var recoverSessions = [];
+  var restorePref = 'ask';
+  var restoreAnswered = false;
+
+  /** 把"可恢复的会话 / 设置值 / 现在问不问"同步给卡片（问不问取决于面板是否空着）。 */
+  function syncRestore() {
+    if (!NS.stateCard || !NS.stateCard.setRestore) { return; }
+    NS.stateCard.setRestore({
+      sessions: recoverSessions,
+      pref: restorePref,
+      askable: !restoreAnswered && !currentSessionId && !focusedDraftId,
+    });
+  }
+
+  /**
+   * 用户在卡片上回答了。
+   * - 'remember'：把这次的选择记进设置（Restore ⇒ always、Start fresh ⇒ never），下次不再问。
+   * - restore：让宿主开始恢复（它把**上次聚焦的那条**加载起来），客户端把 N 条变成**本地 tab**
+   *   —— 其余的点开才加载（懒恢复）。
+   * - fresh：丢掉快照 + 走现有的连接/建会话逻辑（= 保持现在的行为）。
+   */
+  function restoreChoice(kind, remember) {
+    restoreAnswered = true;
+    if (remember && NS.bridge && NS.bridge.post) {
+      NS.bridge.post({ type: 'setRestorePref', value: kind === 'restore' ? 'always' : 'never' });
+    }
+    if (kind === 'fresh') {
+      NS.bridge.post({ type: 'dismissSessions' });
+      syncRestore();
+      NS.bridge.post({ type: 'connectAgent' });
+      return;
+    }
+    NS.bridge.post({ type: 'startRestore' });
+    if (NS.tabs && NS.tabs.setRestoring) { NS.tabs.setRestoring(recoverSessions.slice()); }
+    syncRestore();
+  }
+
   function showEmpty(show) {
     // [CUSTOM-20260930-123] 状态卡接管消息区时，置顶副本必须让位：它是
     // .messages-column 的绝对定位子元素，transcriptView.reset() 清不掉它，而卡片
@@ -115,6 +154,10 @@ export const bootClient = `
     // [CUSTOM-20261001-166] 置顶条按会话记着自己的收缩状态 —— 在重置它之前把会话同步过去
     // （这是焦点变化唯一的咽喉点，与 elicitationView.setSession 同一形态）。
     if (NS.stickyUser && NS.stickyUser.setSession) { NS.stickyUser.setSession(currentSessionId); }
+    // [CUSTOM-20261009-209] 面板空不空会变（切会话/回空态）⇒ 恢复提问的可见性跟着重算。
+    syncRestore();
+    // [CUSTOM-20261008-204] 右侧大纲栏的开/关也是**按会话**记的（用户要求），同一个咽喉点同步。
+    if (NS.outline && NS.outline.setSession) { NS.outline.setSession(currentSessionId); }
     NS.tabs.setFocus(summary);
     NS.composer.setFocus(summary, meta);
     // [CUSTOM-20260930-129] 这里原有一行 NS.tabs.renderUsage(meta)（顶部那条进度条）。
@@ -235,7 +278,9 @@ export const bootClient = `
   NS.boot = {
     requestMarkdown: requestMarkdown,
     persistUi: persistUi,
-    recallUi: recallUi
+    recallUi: recallUi,
+    // [CUSTOM-20261009-209] 会话恢复：卡片上的两个按钮回答到这里（stateCard 只管画）。
+    restoreChoice: restoreChoice
   };
 
   // --- Draft page (CUSTOM-20260925-058) -------------------------------------
@@ -370,6 +415,9 @@ export const bootClient = `
   NS.draft = {
     start: startDraft,
     focus: focusDraft,
+    // [CUSTOM-20261009-209] 卡片上的两个按钮回答到这里（stateCard 只管画）。
+    // ⚠️ 它是 **NS.boot** 的成员（卡片调 NS.boot.restoreChoice）—— 别放进 NS.draft：
+    // 本行的原位置在 NS.draft 里（drop: dropDraft 那一节），挪错过一次，症状是"点了没反应"。
     drop: dropDraft,
     setCwd: setDraftCwd,
     // [CUSTOM-20260925-058] Read-only accessor for the directory drawer: it
@@ -435,6 +483,9 @@ export const bootClient = `
 
     switch (message.type) {
       case 'boot':
+        // [CUSTOM-20261009-209] 上次开着的会话 + 恢复策略（都在 boot 上，定向发）。
+        recoverSessions = message.recoverable || [];
+        restorePref = message.restorePref || 'ask';
         NS.tabs.setSessions(message.sessions || []);
         if (NS.times) { NS.times.noteSessions(message.sessions || []); }
         // [CUSTOM-20261008-199] 没有聚焦会话时地址栏显示什么（宿主解析的默认目录）。
@@ -470,6 +521,13 @@ export const bootClient = `
 
       // [CUSTOM-20260930-125] The auto-connect setting's live value: changed on the other
       // surface, or in the Settings UI. The boot-time value rides along with 'boot'.
+      // [CUSTOM-20261009-209] 恢复策略改了（设置里改的，或另一个面上的卡片勾的）。
+      case 'restorePref':
+        restorePref = message.value || 'ask';
+        if (NS.stateCard && NS.stateCard.setRestorePref) { NS.stateCard.setRestorePref(restorePref); }
+        syncRestore();
+        break;
+
       case 'autoConnectPref':
         if (NS.stateCard) { NS.stateCard.setAutoConnect(message.value === true); }
         break;
@@ -561,25 +619,16 @@ export const bootClient = `
         // [CUSTOM-20260930-147] 临时诊断：宿主回填到了哪几条。
         console.warn('[acpc] markdownRendered: ' + items.length + ' item(s) ['
           + items.map(function (it) { return it.entryId; }).join(',') + ']');
-        for (var j = 0; j < items.length; j++) {
-          // [CUSTOM-20260930-147] **不再**拿 item.sessionId 跟 currentSessionId 比：两端的来源不同
-          // （这里是 boot 的聚焦会话，item 带的是请求方 transcriptView 的），不一致时会把回填
-          // **静默丢掉** —— 那条记录于是一直停在原文。而宿主其实已经把 html 写进 store 了，
-          // 所以"重开会话就正常"（重开走快照，不经过这里）。
-          // entryId 在 store 里是全局唯一的，按它回填本来就串不了台（找不到就 patch 忽略）。
-          if (items[j].key) { NS.toolCallView.applyMarkdown(items[j].key, items[j].html); }
-          else { NS.transcriptView.patch(items[j].entryId, { html: items[j].html }); }
-        }
-        // [CUSTOM-20260924-022] Markdown grew the transcript, so a restored
-        // scroll position has to be re-applied (no-op once the user scrolled).
-        NS.scroll.reassert();
-        // [CUSTOM-20260924-023] ...and the rail's cached dot positions are stale
-        // (text became HTML, heights changed). Measure-only, no rebuild.
-        NS.rail.reflow();
-        // [CUSTOM-20261002-172] 同理：回填 markdown 会长高下方内容。
-        NS.stickyUser.schedule();
+        // [CUSTOM-20261008-202] 交给记录层**分帧**应用（原来是在这里 for 一整个批次，大会话回放
+        // 时那个批次有 100+ 条 ⇒ 几十秒的长任务，期间的输入事件被浏览器压后/丢掉）。
+        NS.transcriptView.queueMarkdown(items);
         break;
       }
+
+      // [CUSTOM-20261008-206] 编辑器里当前打开的文件（含选区行区间）→ 输入框的引用栏那一格。
+      case 'activeFile':
+        if (NS.composer && NS.composer.setActiveFile) { NS.composer.setActiveFile(message.file); }
+        break;
 
       case 'meta':
         if (message.sessionId === currentSessionId) {
@@ -663,7 +712,10 @@ export const bootClient = `
           // A '+' pressed while offline is honoured unconditionally: it asked for a NEW
           // draft, not for whichever session happens to be newest.
           var wanted = NS.stateCard ? NS.stateCard.takeDraftIntent() : false;
-          if (wanted || (!focusedDraftId && !currentSessionId)) { startDraft(); }
+          // [CUSTOM-20261009-209] 但"恢复提问"还等着回答时**不要**开草稿：草稿页会把提问顶掉
+          // （它一开面板就不空了），而用户此刻要回答的正是那个问题。按了 '+'（wanted）则照开。
+          var asking = NS.stateCard && NS.stateCard.isRestorePending && NS.stateCard.isRestorePending();
+          if (wanted || (!asking && !focusedDraftId && !currentSessionId)) { startDraft(); }
         }
         break;
       }
@@ -875,6 +927,8 @@ export const bootClient = `
   function init() {
     emptyState = NS.dom.qs('emptyState');
     loadOverlay = NS.dom.qs('loadOverlay');
+    // [CUSTOM-20261008-202] 长任务看门狗（"点了没反应"的常驻证据；不支持就静默不装）。
+    if (NS.perf) { NS.perf.init(); }
 
     NS.scroll.init(NS.dom.qs('messages'), NS.dom.qs('jumpToLatest'));
     NS.transcriptView.init(NS.dom.qs('messages'));

@@ -378,6 +378,14 @@ export const toolCallViewClient = `
         linkChip.title = String(block.uri || '') + ' (this link type cannot be opened)';
       }
       var row = el('div', 'chip-row');
+      // [CUSTOM-20261008-206] 本地文件 chip 前面加个 '</>' 图标（与官方插件的文件 tag 同款）。
+      // 只给**文件**加：真正的链接（data-href）没有"文件"这层意思，给它一个代码图标会误导。
+      if (block.path && NS.icons && NS.icons.icon) {
+        var chipIcon = NS.icons.icon('file', 'chip-icon');
+        // [CUSTOM-20261008-207] **插在最前面**：'el('button', 'chip', text)' 已经把文件名写进去了，
+        // 用 appendChild 会把图标放到名字**后面**（用户截图里就是这样反的）。
+        if (chipIcon) { linkChip.insertBefore(chipIcon, linkChip.firstChild); }
+      }
       row.appendChild(linkChip);
       return row;
     }

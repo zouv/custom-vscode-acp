@@ -29,6 +29,11 @@ export const stateCardClient = `
   // [CUSTOM-20261006-195] 草稿页的首条消息已经交上去、会话还没回来（第四个相位，见 HINTS.creating）。
   var creating = false;
   var autoConnect = false;
+  // [CUSTOM-20261009-209] 会话恢复：上次开着的会话 + 设置值 + "面板此刻空着、可以问"。
+  // 三者都由 boot 喂（它才知道有没有聚焦会话/草稿），本模块只负责画。
+  var recoverSessions = [];
+  var restorePref = 'ask';
+  var restoreAskable = false;
   var errorText = '';
   // [CUSTOM-20260930-126] 「+」在未连接时按下的意图：它要的是一张**新草稿**，不是一个已有会话。
   // 连接成功后由 boot 消费（见 boot 的 case 'connection'）。
@@ -72,8 +77,31 @@ export const stateCardClient = `
     creating: 'Starting the agent for this session \\u2014 the first message waits for it.'
   };
 
+  /** [CUSTOM-20261009-209] 该不该问"要不要恢复上次那几个会话"。 */
+  function restoreVisible() {
+    return restoreAskable && recoverSessions.length > 0 && restorePref !== 'never';
+  }
+
+  function restoreTitle() {
+    var n = recoverSessions.length;
+    return 'Restore ' + n + (n === 1 ? ' session' : ' sessions') + ' from your last window?';
+  }
+
+  /** 列几条标题当预览（与 tab 上那条兜底链一致：title → id 前 8 位），超过三条收成省略号。 */
+  function restoreHintText() {
+    var parts = [];
+    for (var i = 0; i < recoverSessions.length && i < 3; i++) {
+      var s = recoverSessions[i] || {};
+      parts.push(s.title || String(s.sessionId || '').slice(0, 8) || 'session');
+    }
+    if (recoverSessions.length > 3) { parts.push('\u2026'); }
+    return parts.join(' \u00b7 ');
+  }
+
   function phase() {
     if (connecting) { return 'connecting'; }
+    // [CUSTOM-20261009-209] 提问**压过 ready**：面板空着、上次还有会话时，用户先要回答这个。
+    if (connected && restoreVisible()) { return 'restore'; }
     // [CUSTOM-20261006-195] 建会话只在**已连接**时成立：socket 若半路掉了，就退回 disconnected
     // （那时 Connect 按钮该回来），而不是把用户留在一张永远转圈的卡片上。
     if (creating && connected) { return 'creating'; }
@@ -94,13 +122,16 @@ export const stateCardClient = `
     // [CUSTOM-20261006-195] 「在等」的两态：连接中 / 建会话中。转圈、aria-busy 与"按钮退场"
     // 三条都按它算 —— 免得两个相位各写一遍、迟早漏一处。
     var waiting = (p === 'connecting' || p === 'creating');
-    setText(els.title, TITLES[p]);
+    var asking = p === 'restore';
+    setText(els.title, asking ? restoreTitle() : TITLES[p]);
     // [CUSTOM-20261006-194] 连接中若拿到了 agent 的 stderr（npx 在下载那几行），就**用它**代替
     // 那句套话 —— 用户卡在连接界面时要的是"为什么在等"，而不是"正在启动"。
     // [CUSTOM-20261006-195] 建会话中：套话 + **秒表**（同 194 的道理：数字在动才说明"还在等"）。
-    setText(els.hint, p === 'creating'
-      ? HINTS.creating + elapsedLabel()
-      : ((p === 'connecting' && detail) ? detail : HINTS[p]));
+    setText(els.hint, asking
+      ? restoreHintText()
+      : (p === 'creating'
+        ? HINTS.creating + elapsedLabel()
+        : ((p === 'connecting' && detail) ? detail : HINTS[p])));
     setText(els.error, errorText);
     if (els.error) { els.error.hidden = !errorText; }
     if (els.busy) { els.busy.hidden = !waiting; }
@@ -112,11 +143,18 @@ export const stateCardClient = `
     }
     // ready 态的按钮整块退场（连同它的间距），不是只把它藏起来。[195] 建会话中同理：
     // 那一刻按 Connect 没有意义（而且 connect 按钮的相位文案会跟卡片的标题打架）。
-    if (els.actions) { els.actions.hidden = p === 'ready' || p === 'creating'; }
+    if (els.actions) { els.actions.hidden = asking || p === 'ready' || p === 'creating'; }
+    // [CUSTOM-20261009-209] 提问那一组自己一套按钮 + 一行"记住我的选择"。
+    if (els.restoreActions) { els.restoreActions.hidden = !asking; }
+    if (els.restoreAccept) {
+      var n = recoverSessions.length;
+      setText(els.restoreAccept, 'Restore ' + n + (n === 1 ? ' session' : ' sessions'));
+    }
+    if (els.restoreRememberRow) { els.restoreRememberRow.hidden = !asking; }
     // [CUSTOM-BEGIN] CUSTOM-20260930-127 - 已连接时也不问"要不要自动连接"：连上了，用户要的是
     // 去下面打字，而开关管的是"下次打开这个面板"，留在这儿只是噪音。它仍然只在**未连接**时
     // 出现——那正是用户会想关掉它的时刻。
-    if (els.autoRow) { els.autoRow.hidden = p === 'ready' || p === 'creating'; }
+    if (els.autoRow) { els.autoRow.hidden = asking || p === 'ready' || p === 'creating'; }
     // [CUSTOM-END] CUSTOM-20260930-127
     if (els.card) { els.card.setAttribute('aria-busy', waiting ? 'true' : 'false'); }
     // [CUSTOM-20260930-131] 相位是**整块面板**的状态，不只属于卡片：header 上的按钮要不要
@@ -293,13 +331,32 @@ export const stateCardClient = `
       // alone would leave its label text sitting there.
       autoRow: NS.dom.qs('autoConnectRow'),
       connect: NS.dom.qs('emptyConnect'),
-      toggle: NS.dom.qs('autoConnectToggle')
+      toggle: NS.dom.qs('autoConnectToggle'),
+      // [CUSTOM-20261009-209] 会话恢复那一组（两个按钮 + 一行"记住我的选择"）。
+      restoreActions: NS.dom.qs('restoreActions'),
+      restoreAccept: NS.dom.qs('restoreAccept'),
+      restoreFresh: NS.dom.qs('restoreFresh'),
+      restoreRememberRow: NS.dom.qs('restoreRememberRow'),
+      restoreRemember: NS.dom.qs('restoreRemember')
     };
     if (els.connect) {
       els.connect.addEventListener('click', function (event) {
         event.preventDefault();
         beginConnect(false);
       });
+    }
+    // [CUSTOM-20261009-209] 恢复那一组：回答交给 boot（它才知道会话/草稿有没有、怎么建本地 tab），
+    // 这里只把"要不要记住"一起带过去（勾了才写设置）。
+    function answerRestore(kind) {
+      if (NS.boot && NS.boot.restoreChoice) {
+        NS.boot.restoreChoice(kind, !!(els.restoreRemember && els.restoreRemember.checked === true));
+      }
+    }
+    if (els.restoreAccept) {
+      els.restoreAccept.addEventListener('click', function (event) { event.preventDefault(); answerRestore('restore'); });
+    }
+    if (els.restoreFresh) {
+      els.restoreFresh.addEventListener('click', function (event) { event.preventDefault(); answerRestore('fresh'); });
     }
     if (els.toggle) {
       els.toggle.addEventListener('change', function () {
@@ -313,8 +370,24 @@ export const stateCardClient = `
     render();
   }
 
+  /**
+   * [CUSTOM-20261009-209] boot 喂进来的"可恢复的会话 + 设置值 + 现在问不问"。
+   * 'askable' 由 boot 算（只有它知道有没有聚焦会话/草稿），本模块只按它决定画不画提问态。
+   */
+  function setRestore(payload) {
+    var next = (payload && payload.sessions) || [];
+    recoverSessions = next;
+    restorePref = (payload && payload.pref) || 'ask';
+    restoreAskable = !!(payload && payload.askable);
+    render();
+  }
+
   NS.stateCard = {
     init: init,
+    // [CUSTOM-20261009-209] 会话恢复：喂数据 + 问"现在是不是该问用户"。
+    setRestore: setRestore,
+    setRestorePref: function (value) { restorePref = value || 'ask'; render(); },
+    isRestorePending: function () { return phase() === 'restore'; },
     noteBoot: noteBoot,
     setConnected: setConnected,
     setAutoConnect: setAutoConnect,

@@ -30,6 +30,13 @@ export const iconsClient = `
       ['circle', { cx: 6, cy: 4.5, r: 2.1 }],
       ['path', { d: 'M2.4 10.8c0-1.9 1.6-3.1 3.6-3.1s3.6 1.2 3.6 3.1' }]
     ],
+    // [CUSTOM-20261008-206] 文件 chip 的图标：'</>'（官方插件的文件 tag 用的就是它）。
+    // 三条 path 与原样式同规格（12×12、stroke=currentColor、无 fill），所以自动跟随主题色。
+    file: [
+      ['path', { d: 'M4.4 2.6 1.4 6l3 3.4' }],
+      ['path', { d: 'M7.6 2.6 10.6 6l-3 3.4' }],
+      ['path', { d: 'M8.6 1.9 3.4 10.1' }]
+    ],
     assistant: [
       ['path', { d: 'M2.4 3.2h7.2v4.4H5.8L3.6 9.6V7.6H2.4Z' }]
     ],

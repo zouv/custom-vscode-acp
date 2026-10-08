@@ -118,13 +118,19 @@ export const directoryMenuClient = `
   /** Point the drawer at a draft (or at nothing = "an existing session"). */
   function refresh(forDraft) {
     draftId = forDraft ? forDraft.draftId : null;
-    if (!choices) {
-      pending = true;
-      render();
-      NS.bridge.post({ type: 'listDirectoryChoices' });
-      return;
-    }
+    var hadChoices = !!choices;
+    if (!hadChoices) { pending = true; }
     render();
+    // [CUSTOM-20261008-203] **每开一次都回头问一次**（先渲染手上这份，回复到了再重渲染）。
+    //
+    // 这份候选会变：Browse 选过的目录、刚用过的目录都要等宿主把它们算进最近列表 —— 而 'choices'
+    // 以前是"一次拉取、终身缓存"（'reset()' 都不清），于是**当天新用过的目录永远进不了
+    // 「Recently used」**。用户报的正是它：「刚通过 Browse 选择的目录（还发起了对话），最近使用里
+    // 没有这个记录」。
+    //
+    // 只在**第一次**（还没数据）与**打开时**问：boot 在切草稿/切会话时也会调这里（那时抽屉是关的），
+    // 那条路径上一次都不能多问 —— 宿主的回复里可能带一次 'session/list'（真 RPC）。
+    if (!hadChoices || open) { NS.bridge.post({ type: 'listDirectoryChoices' }); }
   }
 
   function show() {

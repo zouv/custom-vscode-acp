@@ -253,6 +253,93 @@ export const transcriptViewClient = `
   }
   // [CUSTOM-END] CUSTOM-20260930-128
 
+  // [CUSTOM-BEGIN] CUSTOM-20261008-202 - markdown 回填的**应用**分帧（一次回填可能是 100+ 条）。
+  //
+  // 为什么必须分：大会话重放时每落一条记录都会排一次请求，攒到下一次 rAF 就成了一大批
+  // （2026-10-08 真机日志里是 139 条），而**每一条**都要解析 HTML、按白名单消毒、插进 DOM，
+  // 并且读一次几何（patch 收尾的 follow() 读 scrollHeight、refreshPreview 读 textContent）——
+  // 在一条几百条记录、两千多个工具卡的会话里，这几百次"写一段又读一次几何"交错起来就是几百次
+  // **强制整页重排**。整批跑完是一个几十秒的**长任务**，而长任务期间浏览器会把输入事件压后、
+  // 甚至丢掉 —— 现场就是"loading 里点 tab 没反应"（日志实证：客户端连续 50 秒一行日志都没有，
+  // 恢复后攒下的 4 条回填一次性涌出；同一份转录的 markdown 在宿主侧渲染只要 0.6 秒，所以卡的
+  // 不是宿主，是这里）。
+  //
+  // 按时间片跑（每片 ≤ MARKDOWN_SLICE_MS），剩下的排到下一帧 ⇒ 单任务不超过一帧，输入始终能被
+  // 处理。应用顺序与到达顺序一致（队列本身就是顺序）。看门狗见 client/perf.ts。
+  var MARKDOWN_SLICE_MS = 8;
+  var markdownQueue = [];
+  var markdownHead = 0;
+  var markdownDraining = false;
+
+  /** 一条回填：工具正文按它的稳定 key，记录正文按 entryId（147：两者都不该按聚焦会话过滤）。 */
+  function applyMarkdownItem(item) {
+    if (item.key) { NS.toolCallView.applyMarkdown(item.key, item.html); }
+    else { patch(item.entryId, { html: item.html }); }
+  }
+
+  /**
+   * 一片落完之后的收尾。**刻意只有那两个"排到下一帧、可重复调用"的便宜货**：
+   *   · reassert —— restoreTarget 为空时是空操作；
+   *   · stickyUser.schedule —— 置标志 + 排帧。
+   * 'rail.reflow()' **不在这里**：它会让 rail 在**每一帧**做一遍全量量测，而这条链本来就由 070 的
+   * ResizeObserver 盯着每个记录节点（内容变高它自己会重排）—— 每片再点名一次等于把同一件事做两遍。
+   * 量出来过：真面板 + 600 条记录下，逐片点名时那一趟量测自己就成了 50ms+ 的长任务（probe
+   * '#mdsliceprobe'），而整批结束时点一次就够了。
+   */
+  function afterMarkdownSlice() {
+    // [CUSTOM-20260924-022] Markdown grew the transcript, so a restored scroll position
+    // has to be re-applied (no-op once the user scrolled).
+    NS.scroll.reassert();
+    // [CUSTOM-20261002-172] 回填 markdown 会长高下方内容 ⇒ 置顶卡的位置要重算。
+    NS.stickyUser.schedule();
+  }
+
+  /** 整批落完之后的收尾（这里才是 rail 那一趟全量量测的位置）。 */
+  function afterMarkdownDrained() {
+    // [CUSTOM-20260924-023] ...and the rail's cached dot positions are stale
+    // (text became HTML, heights changed). Measure-only, no rebuild.
+    NS.rail.reflow();
+  }
+
+  function drainMarkdown() {
+    if (markdownDraining || markdownHead >= markdownQueue.length) { return; }
+    markdownDraining = true;
+    NS.dom.schedule(function () {
+      markdownDraining = false;
+      if (NS.perf) { NS.perf.phase('markdown-apply'); }
+      var started = Date.now();
+      var applied = 0;
+      // 至少做一条：单片也要有进展，哪怕某一条自己就超了预算（否则队列永远排不空）。
+      while (markdownHead < markdownQueue.length
+        && (applied === 0 || Date.now() - started < MARKDOWN_SLICE_MS)) {
+        var item = markdownQueue[markdownHead];
+        // 先推游标再干活：某一条抛错**不能**让它被每帧重试一次（那是个死循环，而且日志会刷屏）。
+        markdownHead++;
+        applied++;
+        try { applyMarkdownItem(item); }
+        catch (e) {
+          console.warn('[acpc] applyMarkdown failed for '
+            + String(item && (item.key || item.entryId)) + ': ' + e);
+        }
+      }
+      afterMarkdownSlice();
+      if (markdownHead >= markdownQueue.length) {
+        markdownQueue = [];
+        markdownHead = 0;
+        afterMarkdownDrained();
+        return;
+      }
+      drainMarkdown();
+    });
+  }
+
+  /** 收到一批回填（host 的 markdownRendered）：入队后按时间片落地。 */
+  function queueMarkdown(items) {
+    for (var i = 0; i < items.length; i++) { markdownQueue.push(items[i]); }
+    drainMarkdown();
+  }
+  // [CUSTOM-END] CUSTOM-20261008-202
+
   /**
    * [CUSTOM-20260925-061] The fold triangle for a <details>.
    *
@@ -1169,6 +1256,8 @@ export const transcriptViewClient = `
     patch: patch,
     updateTool: updateTool,
     pendingMarkdown: pendingMarkdown,
+    // [CUSTOM-20261008-202] 收到一批回填（host 的 markdownRendered）—— 唯一的生产调用点在 boot。
+    queueMarkdown: queueMarkdown,
     // [CUSTOM-20260930-149] boot 用每条带记录的消息自带的 sessionId 校正它（reset 之后会是 null）。
     setSessionId: setSessionId,
     // [CUSTOM-20261004-179] 折叠状态的唯一真相（置顶卡与记录共用；boot 在焦点咽喉点同步会话）。
