@@ -2777,6 +2777,166 @@ suite('chat panel: the tab dot and the waiting state', () => {
     await waitFor(() => summaries(harness).some(row => row.waiting === false), 'the flag cleared');
     assert.strictEqual(summaries(harness).find(row => row.sessionId === 's-1')?.waiting, false);
   });
+
+  // [CUSTOM-20261006-195] 与上一条同构，但走**表单**那条桥。用户报的正是这个形态：
+  // 「已经处于"弹出选项框等待用户选择"的会话，会话 tab 的圆点看不出在等（蓝色）」——
+  // 而 130 当初只钉过权限那一半：权限桥与表单桥是**两条独立的桥**，宿主那句 `waiting` 是
+  // 二者的或。表单这条一旦不生效，圆点就会退回 running/attention（都是蓝色）⇒ 正是用户看到的。
+  test('a session parked on a form is marked waiting, and cleared once answered', async () => {
+    const elicitation = new ElicitationBridge();
+    const harness = makeHarness('s-1', 'Claude Code', undefined, new StubPrefs(), { elicitation });
+    harness.surface.sent.length = 0;
+
+    void elicitation.request(
+      { sessionId: 's-1', message: 'Which one?', requestedSchema: { type: 'object', properties: {} } } as never,
+      (async () => ({ action: 'cancel' })) as never,
+    );
+
+    await waitFor(() => summaries(harness).some(row => row.waiting), 'a waiting summary (form)');
+    assert.strictEqual(summaries(harness).find(row => row.sessionId === 's-1')?.waiting, true,
+      'a form parked on a session stops the turn just as hard as a permission prompt');
+
+    elicitation.cancelSession('s-1');
+    await waitFor(() => summaries(harness).some(row => row.waiting === false), 'the form flag cleared');
+    assert.strictEqual(summaries(harness).find(row => row.sessionId === 's-1')?.waiting, false);
+  });
+});
+
+// [CUSTOM-20261007-198] Tab 手工顺序落在**同一条** globalState 记录上（与大纲偏好同一条）。
+// 两个写者各发自己那几个字段，所以宿主的处理必须是**合并**：重建会把对方那一半抹掉 —— 症状是
+// "拖了一下 tab，大纲宽度被重置了"，而那要等到用户下次拖大纲栏才会发现（先记进测试）。
+suite('chat panel: ui prefs merge (CUSTOM-20261007-198)', () => {
+  function prefMessages(harness: Harness): Array<Record<string, unknown>> {
+    return harness.surface.sent.filter(m => m.type === 'uiPrefs') as Array<Record<string, unknown>>;
+  }
+
+  function prefsOf(harness: Harness): Record<string, unknown> {
+    const sent = prefMessages(harness);
+    assert.ok(sent.length > 0, 'the host answers every write (pitfall #29)');
+    return sent[sent.length - 1];
+  }
+
+  // `uiPrefs` is a coalescable (non-structural) message: it goes out on the outbox's
+  // next flush, not synchronously. Wait for it instead of asserting through the queue.
+  async function waitForPrefs(harness: Harness): Promise<void> {
+    for (let i = 0; i < 100; i++) {
+      if (prefMessages(harness).length > 0) { return; }
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.fail('timed out waiting for the uiPrefs reply');
+  }
+
+  test('a tab-order write keeps the outline prefs, and vice versa', async () => {
+    const harness = makeHarness('s-1');
+    harness.surface.sent.length = 0;
+
+    harness.host.onMessage({ type: 'setUiPref', outlineMode: 'sidebar', outlineWidth: 320 });
+    harness.host.onMessage({ type: 'setUiPref', tabOrder: ['b', 'a'] });
+    await waitForPrefs(harness);
+    assert.deepStrictEqual(prefsOf(harness), {
+      type: 'uiPrefs', outlineMode: 'sidebar', outlineWidth: 320, tabOrder: ['b', 'a'],
+    }, 'the second write must not wipe what the first one set');
+
+    harness.surface.sent.length = 0;
+    harness.host.onMessage({ type: 'setUiPref', outlineMode: 'popup', outlineWidth: 200 });
+    await waitForPrefs(harness);
+    assert.deepStrictEqual(prefsOf(harness).tabOrder, ['b', 'a'], 'and it survives the reverse order');
+  });
+
+  test('junk in the order never reaches globalState', async () => {
+    const harness = makeHarness('s-1');
+    harness.surface.sent.length = 0;
+
+    harness.host.onMessage({ type: 'setUiPref', tabOrder: ['a', 'a', 7, '', 'b'] });
+    await waitForPrefs(harness);
+    assert.deepStrictEqual(prefsOf(harness).tabOrder, ['a', 'b'], 'strings only, no duplicates');
+
+    harness.surface.sent.length = 0;
+    harness.host.onMessage({ type: 'setUiPref', tabOrder: 'not a list' });
+    await waitForPrefs(harness);
+    assert.deepStrictEqual(prefsOf(harness).tabOrder, [], 'a non-list is not a list');
+  });
+});
+
+// [CUSTOM-20261008-200] Times 的两份状态（按会话记的那张表 + 一个默认值）落在**同一条**
+// globalState 记录上 —— 它成了这条记录的第三个写者。形态与 tabOrder 一致：webview 整份发上来，
+// 宿主按"缺的字段 = 这一轮没改它"合并、消毒后落盘并广播。
+suite('chat panel: Times prefs (CUSTOM-20261008-200)', () => {
+  function prefMessages(harness: Harness): Array<Record<string, unknown>> {
+    return harness.surface.sent.filter(m => m.type === 'uiPrefs') as Array<Record<string, unknown>>;
+  }
+
+  function prefsOf(harness: Harness): Record<string, unknown> {
+    const sent = prefMessages(harness);
+    assert.ok(sent.length > 0, 'the host answers every write (pitfall #29)');
+    return sent[sent.length - 1];
+  }
+
+  async function waitForPrefs(harness: Harness): Promise<void> {
+    for (let i = 0; i < 100; i++) {
+      if (prefMessages(harness).length > 0) { return; }
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.fail('timed out waiting for the uiPrefs reply');
+  }
+
+  test('the three writers share one record without wiping each other', async () => {
+    const harness = makeHarness('s-1');
+    harness.surface.sent.length = 0;
+
+    harness.host.onMessage({ type: 'setUiPref', outlineMode: 'sidebar', outlineWidth: 320, tabOrder: ['b', 'a'] });
+    harness.host.onMessage({ type: 'setUiPref', timesBySession: { s1: true, s2: false }, timesDefault: true });
+    await waitForPrefs(harness);
+    assert.deepStrictEqual(prefsOf(harness), {
+      type: 'uiPrefs', outlineMode: 'sidebar', outlineWidth: 320, tabOrder: ['b', 'a'],
+      timesBySession: { s1: true, s2: false }, timesDefault: true,
+    });
+
+    // 反过来：只写默认值的那一笔不该把那张表抹掉（缺字段 = 这一轮没改它）。
+    harness.surface.sent.length = 0;
+    harness.host.onMessage({ type: 'setUiPref', timesDefault: false });
+    await waitForPrefs(harness);
+    assert.deepStrictEqual(prefsOf(harness).timesBySession, { s1: true, s2: false }, 'the table survives');
+    assert.strictEqual(prefsOf(harness).timesDefault, false, 'and the default moved');
+    assert.strictEqual(prefsOf(harness).outlineMode, 'sidebar', 'and neither writer touched the outline');
+  });
+
+  test('junk never reaches globalState', async () => {
+    const harness = makeHarness('s-1');
+    harness.surface.sent.length = 0;
+
+    harness.host.onMessage({ type: 'setUiPref', timesBySession: { ok: true, bad: 'yes', s1: false } });
+    await waitForPrefs(harness);
+    assert.deepStrictEqual(prefsOf(harness).timesBySession, { ok: true, s1: false }, 'booleans only');
+
+    // 字段**在但内容不是表**：与 `sanitizeTabOrder` 对"不是数组"的处理同形 —— 什么都不留下。
+    // （"这一轮没改它"是另一件事，靠"字段缺不缺"判断，见上面那条用例。）
+    harness.surface.sent.length = 0;
+    harness.host.onMessage({ type: 'setUiPref', timesBySession: 'not a map' });
+    await waitForPrefs(harness);
+    assert.deepStrictEqual(prefsOf(harness).timesBySession, {}, 'a non-map leaves nothing behind');
+  });
+
+  test('the per-session table is capped', async () => {
+    const harness = makeHarness('s-1');
+    harness.surface.sent.length = 0;
+    const big: Record<string, boolean> = {};
+    for (let i = 0; i < 300; i++) { big[`s-${i}`] = true; }
+
+    harness.host.onMessage({ type: 'setUiPref', timesBySession: big });
+    await waitForPrefs(harness);
+    const kept = prefsOf(harness).timesBySession as Record<string, boolean>;
+    assert.strictEqual(Object.keys(kept).length, 200, 'a broken client cannot grow this without bound');
+  });
+
+  // [CUSTOM-20261008-199] 没有聚焦会话时地址栏显示的就是它 —— 所以它必须一直在 boot 上，
+  // 而且永远不为空（空字符串会把"已连接、还没有会话"那几十秒又变成一格空白）。
+  test('boot carries a non-empty default working directory (199)', async () => {
+    const harness = makeHarness('s-1');
+    const boot = harness.surface.sent.find(m => m.type === 'boot') as Record<string, unknown>;
+    assert.strictEqual(typeof boot.defaultCwd, 'string');
+    assert.ok((boot.defaultCwd as string).length > 0, 'the empty address bar falls back to wording, not to nothing');
+  });
 });
 
 // [CUSTOM-20261001-156] 后台会话的权限 / 表单请求：从"窗口顶部的 QuickPick"改成"面板拥有 +

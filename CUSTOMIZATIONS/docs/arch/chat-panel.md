@@ -55,7 +55,7 @@
 | `html/index.ts` | `renderChatHtml(webview, nonce, surface = 'view')`：外壳 + 样式 + 标记 + 脚本。**`surface` 会变成 `<body class="surface-view\|surface-editor">`**（050），供 CSS 区分侧边栏与编辑区底色 | 装配顺序变更 |
 | `html/shell.ts` / `styles.ts` / `body.ts` | CSP 与文档外壳 / 全部 CSS / 静态标记 | UI 外观 |
 | `html/nonce.ts` | CSP nonce 生成 | — |
-| `html/client/*.ts` | webview 内联客户端 JS，**每个模块是一个字符串**，统一挂到 `window.__acpc`。058 新增 `directoryMenu.ts`（草稿页的目录抽屉，形态照抄 `sessionMenu.ts`）；097 新增 `lightbox.ts`（图片点击放大）；102 新增 `stickyUser.ts`（置顶最近一条用户消息，判据见 §5.25）；123 新增 `stateCard.ts`（**连接状态卡**：未连接/连接中/已就绪三态 + 自动连接开关，见 §5.28——它同时接管了原先散在 `sessionMenu.ts` 与 `boot.ts` 的空态文案和 Connect 按钮）。151 起 `composer.ts` 也接管**草稿页**的输入卡（模式/模型/斜杠命令来自宿主的快照，见 §5.32）；152 起 `elicitationView.ts` 从"记录里的内联卡"改成**悬浮抽屉**（记录只留一行待答条，见 §5.33） | 改前端交互 |
+| `html/client/*.ts` | webview 内联客户端 JS，**每个模块是一个字符串**，统一挂到 `window.__acpc`。058 新增 `directoryMenu.ts`（草稿页的目录抽屉，形态照抄 `sessionMenu.ts`）；097 新增 `lightbox.ts`（图片点击放大）；102 新增 `stickyUser.ts`（置顶最近一条用户消息，判据见 §5.25）；123 新增 `stateCard.ts`（**连接状态卡**：未连接/连接中/已就绪/**建会话中**四态 + 自动连接开关，见 §5.28——它同时接管了原先散在 `sessionMenu.ts` 与 `boot.ts` 的空态文案和 Connect 按钮）。151 起 `composer.ts` 也接管**草稿页**的输入卡（模式/模型/斜杠命令来自宿主的快照，见 §5.32）；152 起 `elicitationView.ts` 从"记录里的内联卡"改成**悬浮抽屉**（记录只留一行待答条，见 §5.33） | 改前端交互 |
 
 **终端输出通路**（CUSTOM-20260923-012）：ACP 的 `Terminal` 工具内容只是引用（`{terminalId}`），终端归客户端所有。
 链路为：`ConnectionInfo.terminals`（`ConnectionManager` 暴露）→ `TerminalHandler.readOutput(terminalId)`
@@ -514,16 +514,19 @@ pending ──用户点按钮──► selected        （回答 optionId）
 | 兜底弹框 | 无面板时**逐字段**问（VS Code 没有表单对话框）：select/multi → QuickPick、boolean → Yes/No、文本/数字 → InputBox。**取消某一步 = decline（跳过）**；面板里的 Cancel 才是硬中止 |
 | **重开别人的会话不会重抛（实测）** | `session/load` 一个"卡在提问上"的会话时，adapter **只回放工具卡**、不会重新发 elicitation（`probe-elicitation.mjs --no-answer` 造出该状态再 `--reopen` 实测：0 次）。官方插件能弹是因为**那个未决请求在它自己的进程里**；我们重开时是另一个进程，替它回答不了。详见 pitfalls #32 |
 
-### 5.28 连接状态卡与自动连接（CUSTOM-20260930-123..126）
+### 5.28 连接状态卡与自动连接（CUSTOM-20260930-123..126、194、195）
 
 **它修的是什么**：点 Connect 之后面板立刻切到草稿页，而真正的 spawn + initialize（首次 `npx` 可能下载几分钟）
 **在界面上完全不可见**；而草稿页中央是空的（`focusDraft` 调 `showEmpty(false)`）。结果是用户反复点按钮，
-连上之后又只看到一片空白。现在这一层是三态卡片（`html/client/stateCard.ts`）。
+连上之后又只看到一片空白。现在这一层是四态卡片（`html/client/stateCard.ts`）：未连接 / 连接中 / 已就绪 /
+**建会话中**（195 —— 草稿页首条消息发出去到会话回来之间）。
 
 | 关注点 | 规则 |
 |---|---|
-| 三态 | `phase = connecting ? 'connecting' : (connected ? 'ready' : 'disconnected')`。`connected` 有**两个来源**（`boot`/`focus`/`sessionsChanged` 的 `agentConnected` 说的是"进程还活着/已死"，`connection{state:'connected'}` 说的是"刚连上"），`connecting` 也有两个（本地点击、宿主广播）。 |
+| 四态 | `phase = connecting ? 'connecting' : (creating && connected ? 'creating' : (connected ? 'ready' : 'disconnected'))`。`connected` 有**两个来源**（`boot`/`focus`/`sessionsChanged` 的 `agentConnected` 说的是"进程还活着/已死"，`connection{state:'connected'}` 说的是"刚连上"），`connecting` 也有两个（本地点击、宿主广播）。`creating` 只有一条路：`composer.send()` 的草稿分支（见下行的"建会话中"）。**`creating` 以 `connected` 为前提**：socket 半路掉了要退回 `disconnected`（Connect 按钮回来），不能把用户留在一张永远转圈的卡上。 |
+| **建会话中也属于"在等"（195）** | 用户报「发出第一条消息后要等很久、消息区才有反应」。实测那段时间**全在 `session/new` 这一发请求里**：agent 侧 `session/create` 的 `sdk-initialize` 一步 675ms / 11116ms / 13194ms（三次采样），而"建完会话 → 应用草稿选择 → 发出消息"只要 ~160ms。原本屏幕上**没有一处**能看出"已经在建了"：卡片还写着 "Claude Code is ready"、输入框的字故意留着（058）⇒ placeholder 被内容挡着、按钮只是 disabled。所以这一相位只干一件事：把等待说出来（标题 + 转圈 + 秒表）。`render()` 里把"在等"的两态收成一个 `waiting` 变量（转圈 / `aria-busy` / Connect 按钮退场三处共用）。 |
 | **`connection` 必须无条件回话** | `refreshSessions` 靠签名去重（`conn:` 位），而 `ensureConnected` 在进程已起时**不发任何事件** ⇒「已连接 + 无会话 + 点 Connect」这条路上宿主原本一句话都不会说，客户端的"连接中"会**永久卡死**（pitfalls #29 的形态：效果上没变化 ≠ 可以不回话）。三种出口（无 agent / 成功 / 失败）各发一次。 |
+| **建会话中的进出（195）** | 进：`composer.send()` 的草稿分支（与 `state.draftPending = true` 同一帧）→ `stateCard.beginCreating()`。出：`boot` 的 `resolveDraft`（成功）/ `failDraft`（失败，**先收相位再写错误**，反了报错会被压在下面）/ `dropDraft`。失败与丢弃都必须把相位收干净，否则下一个草稿页会带着上一轮的"建会话中"进来。 |
 | 顺序是承重的 | `handleConnectAgent` 里 `focusSession(newest)` 必须排在 `connection{connected}` **之前**——客户端靠这个顺序决定开不开草稿，反了会在刚打开的会话旁边多出一张空标签。`connection` 因此也进了 `STRUCTURAL_MESSAGE_TYPES`（排进合帧队列就可能反过来）。 |
 | 谁写 `display` | **仍然只有 `boot.showEmpty()`**。卡片模块只写内容（textContent / checked / disabled / 子节点 hidden）。卡片是 `role="status"`，所以文本**先比较再写**——每写一次读屏就播报一次。 |
 | 草稿的时机 | 点 Connect **不再立即开草稿**。`handleConnectAgent` 成功后：**有会话就聚焦最新的那条**，**没有会话就建一个**（131，用户在三方案里选的）。"未连接时输入框禁用"因此自然成立——`composer.ts` 的 `canCompose()` 一个字节没改。**为什么无会话时是"建会话"而不是"开草稿"**：草稿页**永远**做不到"和正常会话一样"——图片要挂在会话上，模式/模型选择器来自 `session/new` 的响应，没有会话就没有（`composer.setDraft` 的注释里写着这条）。代价：连上后不说话就离开会在 agent 历史里留一条空会话（`session/close` 不删历史，058）。 |
@@ -939,4 +942,58 @@ SDK 侧走 `ClientSideConnection.extMethod(method, params)`（就是普通 JSON-
 不产生第二个轮次 / idle 回落 / 不支持的 agent 不走这条路）与
 `chat client logic: composer input bar` 里的 187 三条（回车发得出 / 不支持的保持不发并给提示 /
 能力不跨会话泄漏）。**真机未跑**：要拉起 agent 且让一轮真的跑着才能验，见"自动化能覆盖到哪"那张表。
+
+### 5.45 空态地址栏 / Times 的按会话记忆 / 拖拽落点（CUSTOM-20261008-199..201）
+
+**199 空态地址栏**。没有聚焦会话、也没有草稿时（"已连接、还没有会话"是**真实且常见**的一态：连接首次
+要 npx 下载适配器，日志里 02:06:05 `no focused session … opening empty panel` 之后 20 多秒才发出
+`session/new`），`#cwdBtn` **不再隐藏**（090 的相反决定），显示宿主随 boot 下发的 `defaultCwd`
+（`SessionManager.resolveDefaultCwd()`）并且 `disabled`。两件事值得记住：
+
+- **为什么敢显示**：090 反对的是"能点开目录抽屉、抽屉却在讲一个没有会话的面板"。`disabled` 之后
+  按钮在**事件层**就点不动，那条顾虑按构造成立；而"地址栏空着"本身是用户看得见的坏相。
+- **顺带修掉的是纯布局病**：`.session-title` 是这一行唯一的弹性项（`flex: 1`），它一消失，
+  `Times` / `Sub-agents` / `☰` 那一组就整组滑到左边。现在 `#timeToggle` 带 `margin-left: auto`
+  兜底 —— 有弹性项时 auto margin 分不到任何空间，所以对原有布局是零变化。
+- **同源的后果**：`currentCwd()`（155 的历史默认筛选）在空态也答 `defaultCwd` ——
+  "地址栏显示了什么就默认筛什么"这条不变量是 155 建立起来的，不让它在这里断掉。
+
+**200 Times 按会话记**。状态从"webview 本地的一个全局布尔"（`vscode.setState` 的 `showTimes`，
+关掉编辑器面板就没了）搬到**宿主 globalState**，与大纲偏好、tab 顺序共用**同一条**记录
+⇒ `setUiPref` 自此有三个写者，合并语义（缺字段 = 这一轮没改它）是硬约束。
+
+- 规则一句话：有效值 = `timesBySession[会话] ?? timesDefault`。拨一次**既**记到当前会话名下、
+  **又**把 `timesDefault` 改掉（用户要的"新会话沿用最后一次拨的值"）。
+- 草稿页与空态没有会话 id ⇒ 跟随 `timesDefault`；新会话第一次聚焦时同理（它还没有记录）。
+- **缺字段 ≠ 设为 false**：只带大纲偏好（或只带 tab 顺序）的消息里 times 两项是 `undefined`，
+  那时必须**保留本地值** —— 否则拖一次大纲宽度就把用户开着的 Times 关掉。
+- 状态机独立成 `html/client/times.ts`（与 `stateCard` 同类：加载期不碰 DOM，因此能在桩 DOM 里
+  单独驱动）。boot 只发三声通知：`init` / `setFocus` / `noteSessions`。**留在 boot 里会重演
+  pitfalls #38 的老路**（"模块级布尔 = 全局状态"，而这里的状态是**属于某个会话**的）。
+- 写回前按"本面知道的会话"裁表（`pruned`），宿主那侧还有 200 条上限 —— 这张表随用户拨开关增长。
+- **迁移只有一次**：本地那个旧的 `showTimes=true` 被播上去一次（本地记 `timesMigrated`）。
+  本地值胜出的理由：它是用户真拨过的，而宿主那一份是本次改动才出现的。
+
+**201 拖拽落点**。198 把 `dragover`/`drop` 挂在**每个 `.tab`** 上，而 `.tabs` 是 `flex: 0 0 auto`：
+最后一个 tab 右边的空白属于 `.tab-strip`、tab 之间还有 2px 的缝，指针落在这些地方**没有落点**
+（松手即复位）；更糟的是**指示线没有 dragleave 清除**，用户看到的正是"线还在那儿、松手却没插进去"。
+现在落点容器是**整条 `#tabStrip`**：
+
+- 插入位由**指针横坐标与各 tab 中点**算（`boundaryFor` → 0..n），指示线由同一个数字决定
+  （`markBoundary`：中间那位画左线、`n` 画在最后一个的右边）；草稿 tab 没有 `data-session-id`，
+  指针落在它上面就等于"插到最后一条会话之后"。
+- `dragleave` **只清线、不清拖动**（`relatedTarget` 仍在条带内则不动）——
+  指示线是"此刻落在哪"的提示，不是拖动本身。
+- 落点算不出来（合成事件没有 `clientX`）时**不搬**，也不写盘；搬完原地不动（`moveTo` 判的是
+  搬动前后的数组内容）同样不写盘。
+- 先落盘再重渲染：渲染若抛错，顺序也已经交上去了（两件事不共享失败点）。
+- 三条常驻诊断：`[acpc] tabdrag start=…` 与 `drop from=… to=… order=…`（走日志桥落进
+  `~/.claude/acp-client-custom.log`）。真机若仍复位，这两行能直接区分"dragstart 没跑 /
+  drop 没到 / 落了但顺序被覆盖"。
+
+**验收**：客户端桩 DOM 新增「Times 开关按会话记忆」6 条 + tab 条带 6 条（末尾空白 / 缝隙 /
+草稿 tab / 离开条带 / 无坐标 / 原位不写盘）+ 地址栏 2 条；宿主 `npm test` 新增
+`chat panel: Times prefs` 4 条（三个写者互不覆盖、垃圾进不去、200 条上限、boot 的 `defaultCwd` 非空）。
+布局用 `preview-records.mjs` 的 `#nosessionheaderprobe` **读数字**：`gapRight == padRight`（Times 贴右缘）、
+`cwdDisabled: true`、`cwdText` 是默认目录。**201 的真机拖拽不在自动覆盖范围**（见 dev-workflow 验收 210）。
 

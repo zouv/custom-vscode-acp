@@ -43,10 +43,23 @@ export const contextMenuClient = `
   }
 
   /** The entry a node belongs to (records carry data-entry-id, see transcriptView.place). */
+  function entryIdOf(node) {
+    if (!node || !node.closest) { return ''; }
+    var holder = node.closest('[data-entry-id]');
+    if (holder) { return holder.getAttribute('data-entry-id') || ''; }
+    // [CUSTOM-20261007-197] 置顶悬浮卡是**另一棵树**：卡外壳（.sticky-card / .sticky-body）与
+    // 它里面的克隆体都在 .sticky-user 下，而用户右键点中的常常是卡片那一圈留白/边框 ——
+    // 那里没有 data-entry-id，菜单于是只剩一条**灰掉的** "Copy"（它复制的是**选区**，右键时
+    // 通常没有选区）+ "Select all"，没有任何办法复制这条消息（用户报的就是这个）。
+    // 卡片自己带着这条记录的 id（stickyUser 写的 data-sticky-id），在这一层认下来即可。
+    var card = node.closest('.sticky-card');
+    return card && card.getAttribute ? (card.getAttribute('data-sticky-id') || '') : '';
+  }
+
   function entryTextOf(node) {
-    var holder = node && node.closest ? node.closest('[data-entry-id]') : null;
-    if (!holder || !NS.transcriptView.entry) { return ''; }
-    var entry = NS.transcriptView.entry(holder.getAttribute('data-entry-id'));
+    var id = entryIdOf(node);
+    if (!id || !NS.transcriptView.entry) { return ''; }
+    var entry = NS.transcriptView.entry(id);
     return entry && typeof entry.text === 'string' ? entry.text : '';
   }
 
@@ -158,6 +171,8 @@ export const contextMenuClient = `
     close();
   }
 
-  NS.contextMenu = { install: install, close: close };
+  // itemsFor 是给桩 DOM 测试用的（"右键这一处会给哪些项"是这套菜单的全部语义，
+  // 而菜单本身的显示/定位属于布局，见 preview-records.mjs）。
+  NS.contextMenu = { install: install, close: close, itemsFor: itemsFor };
 })(window.__acpc = window.__acpc || {});
 `;

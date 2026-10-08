@@ -674,13 +674,35 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       // [CUSTOM-20260926-077] Outline pin/width prefs: NOT session-scoped, persist
       // to globalState so they survive webview disposal (window reload / editor panel).
       case 'setUiPref': {
-        const outlineMode = (msg as { outlineMode?: string }).outlineMode === 'sidebar' ? 'sidebar' : 'popup';
+        // [CUSTOM-20261007-198] **合并**而不是重建。原先这里按消息里的字段重建整个对象 ——
+        // 那时只有一个写者（大纲）。现在有了第二个（tab 手工顺序），重建会把对方那一半抹掉
+        // （同一条记录两个写者 = 后到的赢，而"赢"的代价是另一项被重置）。
+        const previous = this.uiPrefs ?? { outlineMode: 'popup' as const, outlineWidth: 240 };
+        const mode = (msg as { outlineMode?: unknown }).outlineMode;
         const outlineWidth = Number((msg as { outlineWidth?: unknown }).outlineWidth);
-        this.uiPrefs = {
-          outlineMode,
-          outlineWidth: Number.isFinite(outlineWidth) ? outlineWidth : 240,
+        const tabOrder = (msg as { tabOrder?: unknown }).tabOrder;
+        // [CUSTOM-20261008-200] Times（第三个写者，同一条记录）：整份表 + 一个默认值。
+        const timesBySession = (msg as { timesBySession?: unknown }).timesBySession;
+        const timesDefault = (msg as { timesDefault?: unknown }).timesDefault;
+        const next: UiPrefs = {
+          outlineMode: mode === undefined
+            ? previous.outlineMode
+            : (mode === 'sidebar' ? 'sidebar' : 'popup'),
+          outlineWidth: Number.isFinite(outlineWidth) ? outlineWidth : previous.outlineWidth,
         };
+        // 缺的字段 = 这一轮没改它 ⇒ 保留上一次的值。**从没写过的**那一项不落进记录里
+        // （undefined 键会让 globalState 里那条记录读起来像"写过但没值"，也会让断言多出一堆噪声）。
+        const order = tabOrder === undefined ? previous.tabOrder : sanitizeTabOrder(tabOrder);
+        if (order !== undefined) { next.tabOrder = order; }
+        const times = timesBySession === undefined ? previous.timesBySession : sanitizeTimesMap(timesBySession);
+        if (times !== undefined) { next.timesBySession = times; }
+        const def = timesDefault === undefined ? previous.timesDefault : timesDefault === true;
+        if (def !== undefined) { next.timesDefault = def; }
+        this.uiPrefs = next;
         this.globalState?.update(UI_PREFS_KEY, this.uiPrefs);
+        // [CUSTOM-20261007-198] 另外那个面（侧边栏 / 编辑区）也要跟着换序，否则它下次被重开
+        // 之前会一直用旧顺序 —— 同一份偏好，两个写者，必须回话（pitfall #29 的老规矩）。
+        this.post({ type: 'uiPrefs', ...this.uiPrefs });
         return;
       }
       // [CUSTOM-20260930-125] The start card's auto-connect switch. NOT session-scoped
@@ -2599,6 +2621,10 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       // [CUSTOM-20260930-125] 首屏值随 boot 一起走：客户端的自动连接布防需要
       // {agentConnected, focused, autoConnect} 三者同时成立。
       autoConnect: this.prefs.getAutoConnect(),
+      // [CUSTOM-20261008-199] 没有聚焦会话时地址栏显示它：连接适配器（npx 下载）那几十秒里
+      // 面板就是"已连接、还没有会话"，那时地址栏空着会看着像坏了（090 当初把这一格整个隐藏）。
+      // 与草稿页显示的是**同一份**语义（下次会话建在这里），所以也复用宿主这一个解析器。
+      defaultCwd: this.sessionManager.resolveDefaultCwd(),
     }, to);
     // [CUSTOM-20260926-077] Bring the outline pin/width prefs along with the boot,
     // so a recreated webview (editor panel reopen / window reload) restores them.
@@ -2907,6 +2933,43 @@ function wireCommands(session: SessionInfo | undefined): SessionMeta['availableC
     description: c.description,
     inputHint: (c.input as any)?.hint ?? null,
   }));
+}
+
+/**
+ * [CUSTOM-20261007-198] Tab 顺序来自 webview，只信它是个字符串数组，并且有上限：
+ * 一个坏掉的客户端（或手改过的 state）不该让这条偏好无限长，也不该把非字符串写进 globalState。
+ */
+function sanitizeTabOrder(value: unknown): string[] {
+  if (!Array.isArray(value)) { return []; }
+  const out: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== 'string' || entry.length === 0 || out.includes(entry)) { continue; }
+    out.push(entry);
+    if (out.length >= 200) { break; }
+  }
+  return out;
+}
+
+/**
+ * [CUSTOM-20261008-200] Times 的按会话表：`{ 会话 id → 开/关 }`。
+ *
+ * 来源是 webview，所以只信它的**形状**：键必须是非空短字符串（会话 id 的实际字符集，防手改过的
+ * state 塞进来一整篇文本）、值只收布尔、条数有上限（同 `sanitizeTabOrder`：这张表随用户拨开关增长，
+ * 客户端已经在写之前裁到"当前已知会话"，上限是第二道闸）。非对象 = 什么都没留下 ⇒ 空表 ——
+ * 与 `sanitizeTabOrder` 对"不是数组"的处理**同形**（那个也是回空表）。"这一轮没改它"是
+ * 另一件事，由调用方按"字段缺不缺"判断，不靠这里的返回值。
+ */
+function sanitizeTimesMap(value: unknown): Record<string, boolean> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) { return {}; }
+  const out: Record<string, boolean> = {};
+  let count = 0;
+  for (const [key, on] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof on !== 'boolean' || !/^[A-Za-z0-9._-]{1,80}$/.test(key)) { continue; }
+    out[key] = on;
+    count += 1;
+    if (count >= 200) { break; }
+  }
+  return out;
 }
 
 /** Validate that a message's sessionId names a live session; else return null. */

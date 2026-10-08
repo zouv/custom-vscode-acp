@@ -7,6 +7,8 @@
 //   disconnected  未连接   —— 标题 + 一句说明 + Connect 按钮 + 自动连接复选框
 //   connecting    连接中   —— 转圈 + 按钮禁用（这就是「不要重复点」的那道闸）
 //   ready         已就绪   —— 引导用户去下面的输入框；按钮退场（用户选择：纯引导卡不放按钮）
+//   creating      建会话中 —— [195] 草稿页首条消息发出 → 会话回来之间。与 connecting 同形：
+//                             转圈 + 秒表；理由见 HINTS.creating 里的真机采样。
 //
 // 三条纪律（破了任何一条都会重演本仓库付过账的问题）：
 //   1. **本模块绝不写 #emptyState 的 display** —— 那是 boot.showEmpty() 一个人的活（081/082 的
@@ -24,6 +26,8 @@ export const stateCardClient = `
   var els = null;
   var connected = false;
   var connecting = false;
+  // [CUSTOM-20261006-195] 草稿页的首条消息已经交上去、会话还没回来（第四个相位，见 HINTS.creating）。
+  var creating = false;
   var autoConnect = false;
   var errorText = '';
   // [CUSTOM-20260930-126] 「+」在未连接时按下的意图：它要的是一张**新草稿**，不是一个已有会话。
@@ -50,16 +54,29 @@ export const stateCardClient = `
     // [CUSTOM-20260930-130] 不是 'Connected to Claude Code'：那串字在扫读时会被当成
     // 'Connect to Claude Code'（动词短语），于是"已经连上了"被读成"还需要连接"。
     // 状态句比被动语态难误读。
-    ready: 'Claude Code is ready'
+    ready: 'Claude Code is ready',
+    // [CUSTOM-20261006-195] 首条消息正在建会话（见 HINTS.creating）。
+    creating: 'Creating this session\\u2026'
   };
   var HINTS = {
     disconnected: 'Connect to start a session in this panel.',
     connecting: 'Starting the agent process. npx may need to download the package the first time.',
-    ready: 'Type your first message below to start a session.'
+    ready: 'Type your first message below to start a session.',
+    // [CUSTOM-20261006-195] 用户报：「在这个界面发出第一条消息后，要等较长时间消息区才有反应」。
+    //
+    // 那段时间**全在 session/new 这一发请求里**（真机日志三次采样：agent 侧 session/create 的
+    // sdk-initialize 一步 675ms / 11116ms / 13194ms，而"建完会话 → 应用草稿选择 → 发出消息"
+    // 一共只要 ~160ms）。它不可缩短（agent 内部），但**必须可见**：原本这段时间卡片还写着
+    // "Claude Code is ready"、输入框里的字又故意留着（058 不清空，失败时要保命）⇒ placeholder
+    // 被内容挡着 ⇒ 屏幕上没有任何一处能看出"已经在建了"。
+    creating: 'Starting the agent for this session \\u2014 the first message waits for it.'
   };
 
   function phase() {
     if (connecting) { return 'connecting'; }
+    // [CUSTOM-20261006-195] 建会话只在**已连接**时成立：socket 若半路掉了，就退回 disconnected
+    // （那时 Connect 按钮该回来），而不是把用户留在一张永远转圈的卡片上。
+    if (creating && connected) { return 'creating'; }
     if (connected) { return 'ready'; }
     return 'disconnected';
   }
@@ -74,27 +91,34 @@ export const stateCardClient = `
   function render() {
     if (!els) { return; }
     var p = phase();
+    // [CUSTOM-20261006-195] 「在等」的两态：连接中 / 建会话中。转圈、aria-busy 与"按钮退场"
+    // 三条都按它算 —— 免得两个相位各写一遍、迟早漏一处。
+    var waiting = (p === 'connecting' || p === 'creating');
     setText(els.title, TITLES[p]);
     // [CUSTOM-20261006-194] 连接中若拿到了 agent 的 stderr（npx 在下载那几行），就**用它**代替
     // 那句套话 —— 用户卡在连接界面时要的是"为什么在等"，而不是"正在启动"。
-    setText(els.hint, (p === 'connecting' && detail) ? detail : HINTS[p]);
+    // [CUSTOM-20261006-195] 建会话中：套话 + **秒表**（同 194 的道理：数字在动才说明"还在等"）。
+    setText(els.hint, p === 'creating'
+      ? HINTS.creating + elapsedLabel()
+      : ((p === 'connecting' && detail) ? detail : HINTS[p]));
     setText(els.error, errorText);
     if (els.error) { els.error.hidden = !errorText; }
-    if (els.busy) { els.busy.hidden = p !== 'connecting'; }
+    if (els.busy) { els.busy.hidden = !waiting; }
     if (els.connect) {
       els.connect.disabled = p === 'connecting';
       setText(els.connect, p === 'connecting'
         ? 'Connecting\\u2026' + elapsedLabel()
         : 'Connect Claude Code');
     }
-    // ready 态的按钮整块退场（连同它的间距），不是只把它藏起来。
-    if (els.actions) { els.actions.hidden = p === 'ready'; }
+    // ready 态的按钮整块退场（连同它的间距），不是只把它藏起来。[195] 建会话中同理：
+    // 那一刻按 Connect 没有意义（而且 connect 按钮的相位文案会跟卡片的标题打架）。
+    if (els.actions) { els.actions.hidden = p === 'ready' || p === 'creating'; }
     // [CUSTOM-BEGIN] CUSTOM-20260930-127 - 已连接时也不问"要不要自动连接"：连上了，用户要的是
     // 去下面打字，而开关管的是"下次打开这个面板"，留在这儿只是噪音。它仍然只在**未连接**时
     // 出现——那正是用户会想关掉它的时刻。
-    if (els.autoRow) { els.autoRow.hidden = p === 'ready'; }
+    if (els.autoRow) { els.autoRow.hidden = p === 'ready' || p === 'creating'; }
     // [CUSTOM-END] CUSTOM-20260930-127
-    if (els.card) { els.card.setAttribute('aria-busy', p === 'connecting' ? 'true' : 'false'); }
+    if (els.card) { els.card.setAttribute('aria-busy', waiting ? 'true' : 'false'); }
     // [CUSTOM-20260930-131] 相位是**整块面板**的状态，不只属于卡片：header 上的按钮要不要
     // 露出来（未连接时只剩历史和地址）由 CSS 按这个属性决定。写在 body 上，而不是让每个
     // 按钮自己监听相位——那会有三次同步，且本地点击发起的 connecting 到不了它们。
@@ -115,8 +139,11 @@ export const stateCardClient = `
   }
 
   function startTick() {
-    connectStartedAt = Date.now();
+    // [CUSTOM-20261006-195] 顺序是承重的：stopTick() 会把 connectStartedAt 清零，原来写在
+    // 它前面的 connectStartedAt = Date.now() 因此**当场被抹掉** ⇒ elapsedLabel() 永远返回 ''
+    // ⇒ 194 那个秒表其实一次都没显示过数字（"数字在动"是它存在的唯一理由）。
     stopTick();
+    connectStartedAt = Date.now();
     if (typeof window.setInterval !== 'function') { return; }
     tickTimer = window.setInterval(function () { render(); }, 1000);
   }
@@ -200,6 +227,30 @@ export const stateCardClient = `
   }
 
   /**
+   * [CUSTOM-20261006-195] 草稿页的首条消息交出去了，会话还没回来。
+   *
+   * 谁调：composer.send() 的草稿分支（state.draftPending = true 那一步，同一帧）。
+   * 谁收尾：boot 的 resolveDraft（成功）/ failDraft（失败）/ dropDraft（用户把草稿页关掉）。
+   *
+   * 幂等：重复调用不重启秒表。判据用 creating 自己（而不是 tickTimer）—— 秒表在桩 DOM 里
+   * 根本起不来（没有 setInterval），那时 tickTimer 永远是 null，"已在等"会被误判成"刚开始等"。
+   */
+  function beginCreating() {
+    var wasCreating = creating;
+    creating = true;
+    errorText = '';
+    if (!wasCreating) { startTick(); }
+    render();
+  }
+
+  function endCreating() {
+    if (!creating) { return; }
+    creating = false;
+    stopTick();
+    render();
+  }
+
+  /**
    * Arm the auto-connect timer, once per document. Re-checked when it fires:
    * the panel may have connected, or the user may already be typing in another
    * draft, by the time 500ms are up.
@@ -270,8 +321,12 @@ export const stateCardClient = `
     setError: setError,
     onConnection: onConnection,
     beginConnect: beginConnect,
+    // [CUSTOM-20261006-195] 「建会话中」这一相位（草稿页首条消息 —— 见 beginCreating）。
+    beginCreating: beginCreating,
+    endCreating: endCreating,
     takeDraftIntent: takeDraftIntent,
     isConnecting: function () { return connecting; },
+    isCreating: function () { return creating; },
     isConnected: function () { return connected; },
     phase: phase
   };

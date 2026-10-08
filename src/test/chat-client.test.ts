@@ -26,6 +26,8 @@ import { permissionDrawerClient } from '../ui/chat/html/client/permissionDrawer'
 import { elicitationViewClient } from '../ui/chat/html/client/elicitationView';
 import { composerClient } from '../ui/chat/html/client/composer';
 import { tabsClient } from '../ui/chat/html/client/tabs';
+// [CUSTOM-20261008-200] Times 开关的状态机（按会话记 + 默认值）。
+import { timesClient } from '../ui/chat/html/client/times';
 import { toolCallViewClient } from '../ui/chat/html/client/toolCallView';
 import { transcriptViewClient } from '../ui/chat/html/client/transcriptView';
 import { outlineClient } from '../ui/chat/html/client/outline';
@@ -38,6 +40,8 @@ import { body as chatPanelMarkup } from '../ui/chat/html/body';
 import { bootClient } from '../ui/chat/html/client/boot';
 // [CUSTOM-20261003-176] 视口判定的再计算（scroll.reflowNow）。
 import { scrollClient } from '../ui/chat/html/client/scroll';
+// [CUSTOM-20261007-197] 右键菜单按上下文给项（含置顶悬浮卡那条路）。
+import { contextMenuClient } from '../ui/chat/html/client/contextMenu';
 // [CUSTOM-20261004-180] 圆点量测的读写分离。
 import { railClient } from '../ui/chat/html/client/rail';
 // [CUSTOM-20261002-173] 宿主侧构建指纹。
@@ -86,11 +90,18 @@ class StubNode {
   /** [CUSTOM-20260928-105] Their difference is the scrollbar the pinned bar has to clear. */
   offsetWidth = 0;
   clientWidth = 0;
+  /** [CUSTOM-20261008-201] 横向几何：标签栏的落点是按**指针横坐标与各 tab 中点**算的，
+   *  没有 left/width 就量不出落点（默认 0 = "没布局"，与上面那批字段同一约定）。 */
+  rectLeft = 0;
+  rectWidth = 0;
 
   constructor(tag: string) { this.tagName = tag.toUpperCase(); }
 
-  getBoundingClientRect(): { height: number; top: number; bottom: number } {
-    return { height: this.rectHeight, top: this.rectTop, bottom: this.rectBottom };
+  getBoundingClientRect(): { height: number; top: number; bottom: number; left: number; width: number } {
+    return {
+      height: this.rectHeight, top: this.rectTop, bottom: this.rectBottom,
+      left: this.rectLeft, width: this.rectWidth,
+    };
   }
 
   private readonly listeners: Record<string, Array<(event: any) => void>> = {};
@@ -365,7 +376,7 @@ function loadClient(
   // [CUSTOM-20260926-079] `sessionMenu` joined the list for its own suite: unlike
   // boot, its IIFE runs nothing at load time (init() is called by boot, and here by
   // the test), so loading it costs the record-layer tests nothing.
-  for (const source of [domClient, iconsClient, linksClient, toolCallViewClient, transcriptViewClient, permissionViewClient, permissionDrawerClient, outlineClient, sessionMenuClient, composerClient, tabsClient, stickyUserClient, elicitationViewClient, stateCardClient]) {
+  for (const source of [domClient, iconsClient, linksClient, toolCallViewClient, transcriptViewClient, permissionViewClient, permissionDrawerClient, outlineClient, sessionMenuClient, composerClient, tabsClient, timesClient, stickyUserClient, elicitationViewClient, stateCardClient, contextMenuClient]) {
     new Function('window', 'document', source)(win, doc);
   }
   return { NS, metrics, doc, docListeners, jumps, timers };
@@ -891,12 +902,16 @@ suite('chat client logic: tab strip (stub DOM)', () => {
 
   function tabStrip(): { NS: Record<string, any>; els: Record<string, StubNode> } {
     const els: Record<string, StubNode> = {
+      tabStrip: new StubNode('div'),
       tabs: new StubNode('div'),
       agentBar: new StubNode('div'),
       agentSelect: new StubNode('select'),
       cwdBtn: new StubNode('button'),
       newTab: new StubNode('button'),
     };
+    // [CUSTOM-20261008-201] 落点监听挂在条带上，所以桩里 #tabs 必须是它的子节点 ——
+    // 否则 stripEl.querySelectorAll('.tab') 一个都找不到（桩的 dispatch 也不冒泡）。
+    els.tabStrip.appendChild(els.tabs);
     const { NS } = loadClient(els);
     NS.tabs.init();
     return { NS, els };
@@ -946,21 +961,349 @@ suite('chat client logic: tab strip (stub DOM)', () => {
     assert.strictEqual(tabbable.length, 1, 'roving tabindex: exactly one tab reachable by Tab');
   });
 
-  test('the directory button disappears when there is nothing to point at', () => {
+  test('the address bar shows the default directory — not clickable — with nothing focused (199)', () => {
     const { NS, els } = tabStrip();
-    // No session: an empty button that still opens the directory drawer explains that
-    // "this session has already started" about a panel that has no session at all.
+    NS.tabs.setDefaultCwd('/work/default');
+    // [CUSTOM-20261008-199] 090 当初整格隐藏，代价是这一行失去了唯一的弹性项
+    // （.session-title 是 flex: 1）⇒ Times 那一组右侧控件整组滑到左边、地址栏位置空着。
+    // 现在它显示"下次会话会建在哪"，但**禁用** —— 090 反对的其实是"点开抽屉、抽屉却在讲
+    // 一个没有会话的面板"，禁用后抽屉根本打不开，那条顾虑按构造成立。
     NS.tabs.setFocus(null);
-    assert.strictEqual(els.cwdBtn.hidden, true);
+    assert.strictEqual(els.cwdBtn.hidden, false, 'no longer hidden');
+    assert.strictEqual(els.cwdBtn.disabled, true, 'nothing to pick a directory for yet');
+    assert.strictEqual(els.cwdBtn.textContent, '/work/default');
 
-    // A session has a directory…
+    // A session has a directory — and the button is live again…
     NS.tabs.setFocus(summary('s1'));
     assert.strictEqual(els.cwdBtn.hidden, false);
+    assert.strictEqual(els.cwdBtn.disabled, false);
     // …and so does a draft (that is what the drawer is for).
     NS.tabs.setDraftFocus({ draftId: 'd1', cwd: '/tmp/x' });
-    assert.strictEqual(els.cwdBtn.hidden, false);
+    assert.strictEqual(els.cwdBtn.disabled, false);
+    assert.strictEqual(els.cwdBtn.textContent, '/tmp/x');
+    // A draft that has not picked one yet falls back to the same wording as the empty state.
+    NS.tabs.setDraftFocus({ draftId: 'd1' });
+    assert.strictEqual(els.cwdBtn.textContent, '/work/default');
+  });
+
+  test('the empty address bar has a wording of its own before the host value arrives (199)', () => {
+    const { NS, els } = tabStrip();
     NS.tabs.setFocus(null);
-    assert.strictEqual(els.cwdBtn.hidden, true, 'and it goes away again');
+    assert.strictEqual(els.cwdBtn.textContent, 'Default directory');
+    // 宿主值后到也要重绘（boot 里 setDefaultCwd 排在 applyFocus 之前，但两个面/迟到都算）。
+    NS.tabs.setDefaultCwd('/late/arrival');
+    assert.strictEqual(els.cwdBtn.textContent, '/late/arrival');
+  });
+
+  // [CUSTOM-20261007-198] 手工排序：按住左键把 tab 拖到目标位置，顺序就变成那样，并且
+  // **立刻落盘**（setUiPref → globalState）—— 顺序是工作区级的，另一个面/下次重开面板看到同一条。
+  // [CUSTOM-20261008-201] 落点是**指针在条带上的横坐标**（不再要求"命中某个 tab 元素"）：
+  // 下面三条用例分别落在左半边、tab 之间的缝隙、最后一个 tab 右边的空白 —— 后两种正是 198
+  // 没有落点、松手即复位的现场。
+  function orderOf(els: Record<string, StubNode>): Array<string | null> {
+    return els.tabs.querySelectorAll('.tab').map(t => t.getAttribute('data-session-id'));
+  }
+
+  /**
+   * 给条带上的 tab 排一个确定的横向几何：各 `width` 宽、从 `left` 起每隔 `step` 一个。
+   * 返回各 tab 的中点与"落在第一、二个之间的缝隙里"的 x。
+   */
+  function layOut(tabs: StubNode[], left = 100, width = 40, step = 60) {
+    const mids: number[] = [];
+    for (let i = 0; i < tabs.length; i++) {
+      tabs[i].rectLeft = left + i * step;
+      tabs[i].rectWidth = width;
+      mids.push(left + i * step + width / 2);
+    }
+    return { mids, gap: left + width + (step - width) / 2, past: left + tabs.length * step + width };
+  }
+
+  /** 条带上派发的拖拽事件（落点监听在条带上，不在 tab 上）。 */
+  function dragOver(strip: StubNode, clientX: number) {
+    strip.dispatch('dragover', { preventDefault: () => {}, clientX, dataTransfer: { dropEffect: '' } });
+  }
+
+  function dropAt(strip: StubNode, clientX: number | null) {
+    const event: Record<string, unknown> = { preventDefault: () => {} };
+    if (clientX !== null) { event.clientX = clientX; }
+    strip.dispatch('drop', event);
+  }
+
+  test('dragging a tab to the left half of another inserts it in front, and saves the order (198)', () => {
+    const { NS, els } = tabStrip();
+    const posted: Array<Record<string, unknown>> = [];
+    NS.bridge.post = (message: Record<string, unknown>) => { posted.push(message); };
+    NS.tabs.setSessions([summary('s1'), summary('s2'), summary('s3')]);
+    assert.deepStrictEqual(orderOf(els), ['s1', 's2', 's3'], 'the host order until you drag');
+
+    const tabs = els.tabs.querySelectorAll('.tab');
+    const box = layOut(tabs);
+
+    tabs[1].dispatch('dragstart', {
+      target: tabs[1], preventDefault: () => {}, dataTransfer: { setData: () => {}, effectAllowed: '' },
+    });
+    assert.ok(String(tabs[1].className).includes('dragging'), 'the tab being moved says so');
+
+    // 指针落在第一个 tab 的左半边 ⇒ 插到它前面。
+    dragOver(els.tabStrip, box.mids[0] - 10);
+    assert.ok(String(tabs[0].className).includes('drop-before'), 'the landing side is drawn');
+    dropAt(els.tabStrip, box.mids[0] - 10);
+
+    assert.deepStrictEqual(orderOf(els), ['s2', 's1', 's3'], 'moved in front of the target');
+    const saved = posted.filter(m => m.type === 'setUiPref');
+    assert.strictEqual(saved.length, 1, 'exactly one write per drop');
+    assert.deepStrictEqual(saved[0].tabOrder, ['s2', 's1', 's3'], 'and it carries the whole order');
+    assert.ok(!String(tabs[0].className).includes('drop-'), 'no leftover landing mark');
+    assert.ok(!String(tabs[1].className).includes('dragging'), 'no leftover drag state');
+  });
+
+  test('dropping past the last tab — its right-hand空白 — moves the tab to the end (201)', () => {
+    const { NS, els } = tabStrip();
+    const posted: Array<Record<string, unknown>> = [];
+    NS.bridge.post = (message: Record<string, unknown>) => { posted.push(message); };
+    NS.tabs.setSessions([summary('s1'), summary('s2'), summary('s3')]);
+    const tabs = els.tabs.querySelectorAll('.tab');
+    const box = layOut(tabs);
+
+    tabs[0].dispatch('dragstart', { target: tabs[0], preventDefault: () => {}, dataTransfer: { setData: () => {} } });
+    // 那片空白属于 .tab-strip（'.tabs' 是 flex: 0 0 auto）——198 时它没有任何 drop 目标。
+    dropAt(els.tabStrip, box.past);
+    assert.deepStrictEqual(orderOf(els), ['s2', 's3', 's1'], 'moved to the end');
+    assert.deepStrictEqual(
+      (posted.find(m => m.type === 'setUiPref') as { tabOrder: string[] }).tabOrder,
+      ['s2', 's3', 's1']);
+  });
+
+  test('dropping into the gap between two tabs still lands (201)', () => {
+    const { NS, els } = tabStrip();
+    NS.tabs.setSessions([summary('s1'), summary('s2'), summary('s3')]);
+    const tabs = els.tabs.querySelectorAll('.tab');
+    const box = layOut(tabs);
+
+    tabs[2].dispatch('dragstart', { target: tabs[2], preventDefault: () => {}, dataTransfer: { setData: () => {} } });
+    dragOver(els.tabStrip, box.gap);
+    // 缝隙落在第一个与第二个之间 ⇒ 指示线画在第二个的左侧，草稿之外的标记一个都不许有。
+    assert.ok(String(tabs[1].className).includes('drop-before'), 'the gap belongs to the next tab');
+    dropAt(els.tabStrip, box.gap);
+    assert.deepStrictEqual(orderOf(els), ['s1', 's3', 's2']);
+  });
+
+  test('a draft tab is never a landing mark, and dropping on it means "the end" (201)', () => {
+    const { NS, els } = tabStrip();
+    NS.tabs.setSessions([summary('s1'), summary('s2')]);
+    NS.tabs.setDrafts([{ draftId: 'd1' }], 'd1');
+    const tabs = els.tabs.querySelectorAll('.tab');
+    layOut(tabs);
+    const draftTab = tabs[tabs.length - 1];
+    assert.strictEqual(draftTab.getAttribute('data-draft-id'), 'd1', 'the draft sits last');
+
+    tabs[0].dispatch('dragstart', { target: tabs[0], preventDefault: () => {}, dataTransfer: { setData: () => {} } });
+    dragOver(els.tabStrip, 10000);
+    assert.ok(!String(draftTab.className).includes('drop-'), 'a draft is not a session — no mark on it');
+    assert.ok(String(tabs[1].className).includes('drop-after'), 'the mark lands on the last SESSION');
+    dropAt(els.tabStrip, 10000);
+    assert.deepStrictEqual(orderOf(els).slice(0, 2), ['s2', 's1'], 'and the drop means "after the last session"');
+  });
+
+  test('leaving the strip clears the line but keeps the drag alive (201)', () => {
+    const { NS, els } = tabStrip();
+    NS.tabs.setSessions([summary('s1'), summary('s2')]);
+    const tabs = els.tabs.querySelectorAll('.tab');
+    const box = layOut(tabs);
+
+    tabs[1].dispatch('dragstart', { target: tabs[1], preventDefault: () => {}, dataTransfer: { setData: () => {} } });
+    dragOver(els.tabStrip, box.mids[0] - 10);
+    assert.ok(String(tabs[0].className).includes('drop-before'));
+
+    els.tabStrip.dispatch('dragleave', { relatedTarget: null });
+    assert.ok(!String(tabs[0].className).includes('drop-'), 'the line goes away with the pointer');
+    // 指示线是"此刻落在哪"的提示，不是拖动本身：回来还能落。
+    dropAt(els.tabStrip, box.mids[0] - 10);
+    assert.deepStrictEqual(orderOf(els), ['s2', 's1']);
+  });
+
+  test('a drop with no coordinates, and a drop back onto your own place, change nothing (201)', () => {
+    const { NS, els } = tabStrip();
+    const posted: Array<Record<string, unknown>> = [];
+    NS.bridge.post = (message: Record<string, unknown>) => { posted.push(message); };
+    NS.tabs.setSessions([summary('s1'), summary('s2'), summary('s3')]);
+    const tabs = els.tabs.querySelectorAll('.tab');
+    const box = layOut(tabs);
+
+    tabs[1].dispatch('dragstart', { target: tabs[1], preventDefault: () => {}, dataTransfer: { setData: () => {} } });
+    dropAt(els.tabStrip, null);
+    assert.deepStrictEqual(orderOf(els), ['s1', 's2', 's3'], 'no coordinates = no landing point');
+    assert.strictEqual(posted.filter(m => m.type === 'setUiPref').length, 0, 'and nothing is written');
+
+    // 指针过了自己的中点 = 落在自己的位置上 ⇒ 顺序没变，就不该白写一次 globalState。
+    tabs[1].dispatch('dragstart', { target: tabs[1], preventDefault: () => {}, dataTransfer: { setData: () => {} } });
+    dropAt(els.tabStrip, box.mids[1] + 5);
+    assert.deepStrictEqual(orderOf(els), ['s1', 's2', 's3']);
+    assert.strictEqual(posted.filter(m => m.type === 'setUiPref').length, 0, 'an unchanged order is not a write');
+  });
+
+  test('a saved order wins, and a brand-new session joins at the end (198)', () => {
+    const { NS, els } = tabStrip();
+    NS.tabs.applyPrefs({ tabOrder: ['s3', 's1'] });
+    NS.tabs.setSessions([summary('s1'), summary('s2'), summary('s3')]);
+    assert.deepStrictEqual(orderOf(els), ['s3', 's1', 's2'],
+      'known ids in the saved order, ids it does not mention keep the host order after them');
+
+    NS.tabs.setSessions([summary('s1'), summary('s2'), summary('s3'), summary('s4')]);
+    assert.deepStrictEqual(orderOf(els), ['s3', 's1', 's2', 's4'], 'a new session lands last, not first');
+  });
+
+  test('a drag that starts on the close button does not move anything (198)', () => {
+    const { NS, els } = tabStrip();
+    const posted: Array<Record<string, unknown>> = [];
+    NS.bridge.post = (message: Record<string, unknown>) => { posted.push(message); };
+    NS.tabs.setSessions([summary('s1'), summary('s2')]);
+    const tabs = els.tabs.querySelectorAll('.tab');
+    const box = layOut(tabs);
+
+    const close = tabs[0].querySelector('.tab-close') as StubNode;
+    tabs[0].dispatch('dragstart', {
+      target: close, preventDefault: () => {}, dataTransfer: { setData: () => {} },
+    });
+    // 这一次**真的**落在条带上（201 之后落点在条带；落在一个 tab 上就不到处理器了）——
+    // 不动的原因只能是 dragStart 那个 × 守卫，而不是"事件没到"。
+    dropAt(els.tabStrip, box.past);
+    assert.deepStrictEqual(orderOf(els), ['s1', 's2'], 'the × is not a handle');
+    assert.strictEqual(posted.filter(m => m.type === 'setUiPref').length, 0, 'and nothing was saved');
+  });
+});
+
+suite('chat client logic: Times 开关按会话记忆 (stub DOM, CUSTOM-20261008-200)', () => {
+  // 「Times」以前只是 webview 本地的一个全局布尔（showTimes）：不按会话记，关掉编辑器面板
+  // 或重载窗口就回落到关。现在它按会话记 + 一个"最后一次拨的值"当默认（新会话与草稿页用它），
+  // 存在宿主 globalState 里（与大纲、tab 顺序同一条记录）。
+
+  function timesWith(): {
+    NS: Record<string, any>; els: Record<string, StubNode>; posted: Array<Record<string, unknown>>;
+    persistUi: Array<Record<string, unknown>>;
+  } {
+    const els: Record<string, StubNode> = {
+      messages: new StubNode('div'),
+      timeToggle: new StubNode('button'),
+      stickyUser: new StubNode('div'),
+    };
+    const { NS } = loadClient(els);
+    const posted: Array<Record<string, unknown>> = [];
+    const persistUi: Array<Record<string, unknown>> = [];
+    NS.bridge.post = (message: Record<string, unknown>) => { posted.push(message); };
+    NS.boot.persistUi = (patch: Record<string, unknown>) => { persistUi.push(patch); };
+    return { NS, els, posted, persistUi };
+  }
+
+  const setUiPrefPosts = (posted: Array<Record<string, unknown>>) =>
+    posted.filter(m => m.type === 'setUiPref');
+
+  const isOn = (els: Record<string, StubNode>) => els.messages.className.includes('show-times');
+
+  test('拨开一次：记到当前会话名下，并成为默认值', () => {
+    const { NS, els, posted } = timesWith();
+    NS.times.init();
+    assert.strictEqual(isOn(els), false, 'off until asked for');
+
+    NS.times.setFocus('A');
+    els.timeToggle.dispatch('click', {});
+    assert.strictEqual(isOn(els), true, 'the class IS the mechanism');
+    assert.strictEqual(els.timeToggle.className, 'nest-toggle', 'and the button does not read as off');
+    assert.deepStrictEqual(setUiPrefPosts(posted), [{
+      type: 'setUiPref', timesBySession: { A: true }, timesDefault: true,
+    }], 'one write, both halves of the state');
+  });
+
+  test('换会话看的是那个会话自己的记录；没有记录就跟随默认值', () => {
+    const { NS, els } = timesWith();
+    NS.times.init();
+    NS.times.noteSessions([{ sessionId: 'A' }, { sessionId: 'B' }]);
+
+    NS.times.setFocus('A');
+    els.timeToggle.dispatch('click', {});        // A: 开（默认也变成开）
+    assert.strictEqual(isOn(els), true);
+
+    NS.times.setFocus('B');                      // B 没有记录 ⇒ 用默认（刚被拨成开）
+    assert.strictEqual(isOn(els), true, 'a session with no record follows the default');
+    els.timeToggle.dispatch('click', {});        // B: 关（默认随之变成关）
+    assert.strictEqual(isOn(els), false);
+
+    NS.times.setFocus('A');                      // 回到 A：它自己的记录仍然是开
+    assert.strictEqual(isOn(els), true, 'its own record outranks the default');
+    NS.times.setFocus(null);                     // 空态 / 草稿页 ⇒ 默认（关）
+    assert.strictEqual(isOn(els), false);
+  });
+
+  test('宿主那份 prefs 一到，就按当前焦点应用（另一个面改的也算）', () => {
+    const { NS, els } = timesWith();
+    NS.times.init();
+    NS.times.setFocus('A');
+    assert.strictEqual(isOn(els), false);
+
+    NS.times.applyPrefs({ timesBySession: { A: true }, timesDefault: false });
+    assert.strictEqual(isOn(els), true, 'this session was recorded as on');
+    NS.times.setFocus('B');
+    assert.strictEqual(isOn(els), false, 'B is not in the table, so the default holds');
+  });
+
+  test('缺字段的消息（只带大纲偏好 / 只带 tab 顺序）不会把用户开着的 Times 关掉', () => {
+    const { NS, els } = timesWith();
+    NS.times.init();
+    NS.times.setFocus('A');
+    els.timeToggle.dispatch('click', {});
+    assert.strictEqual(isOn(els), true);
+
+    NS.times.applyPrefs({ outlineMode: 'sidebar', outlineWidth: 320 });
+    assert.strictEqual(isOn(els), true, 'a message that says nothing about times says nothing');
+    NS.times.applyPrefs({ tabOrder: ['A'] });
+    assert.strictEqual(isOn(els), true);
+    // 而它**明确**给出的那一半才算数：默认值被改成关 —— 但这个会话自己记着"开"，
+    // 记录优先于默认（这正是"按会话记"的意思）。
+    NS.times.applyPrefs({ timesDefault: false });
+    assert.strictEqual(isOn(els), true, 'this session has a record of its own');
+    NS.times.setFocus(null);
+    assert.strictEqual(isOn(els), false, 'the default is what a draft/empty panel follows');
+  });
+
+  test('写回前裁到"本面知道的会话"，关掉的会话不再拖着这张表长', () => {
+    const { NS, posted } = timesWith();
+    NS.times.init();
+    NS.times.noteSessions([{ sessionId: 'A' }, { sessionId: 'B' }]);
+    NS.times.setFocus('A');
+    (NS.dom.qs('timeToggle') as StubNode).dispatch('click', {});   // A: 开
+    NS.times.setFocus('B');
+    (NS.dom.qs('timeToggle') as StubNode).dispatch('click', {});   // B: 关
+    NS.times.noteSessions([{ sessionId: 'A' }, { sessionId: 'C' }]);  // B 关掉了
+    NS.times.setFocus('C');
+    (NS.dom.qs('timeToggle') as StubNode).dispatch('click', {});   // C: 开
+
+    const last = setUiPrefPosts(posted).pop() as { timesBySession: Record<string, boolean> };
+    assert.deepStrictEqual(last.timesBySession, { A: true, C: true },
+      'the closed session is not carried along forever');
+  });
+
+  test('一次性迁移：本地那个旧的 showTimes=true 被播上去一次', () => {
+    const els: Record<string, StubNode> = {
+      messages: new StubNode('div'), timeToggle: new StubNode('button'), stickyUser: new StubNode('div'),
+    };
+    const { NS } = loadClient(els);
+    const posted: Array<Record<string, unknown>> = [];
+    const persistUi: Array<Record<string, unknown>> = [];
+    NS.bridge.post = (message: Record<string, unknown>) => { posted.push(message); };
+    NS.boot.persistUi = (patch: Record<string, unknown>) => { persistUi.push(patch); };
+    // 旧版本把它存在 webview 本地（vscode.setState）。
+    let local: Record<string, unknown> = { showTimes: true };
+    NS.boot.recallUi = () => local;
+
+    NS.times.init();
+    assert.deepStrictEqual(persistUi, [{ timesMigrated: true }], 'the marker lands in the same store');
+    assert.deepStrictEqual(setUiPrefPosts(posted),
+      [{ type: 'setUiPref', timesBySession: {}, timesDefault: true }], 'the user setting is carried over');
+
+    // 只跑一次：第二次 init（同一份本地 state）不再播。
+    local = { showTimes: true, timesMigrated: true };
+    NS.times.init();
+    assert.strictEqual(setUiPrefPosts(posted).length, 1, 'once per document');
   });
 });
 
@@ -3507,6 +3850,72 @@ suite('chat client logic: connect card (stub DOM, CUSTOM-20260930-123)', () => {
     NS.stateCard.onConnection({ type: 'connection', state: 'connected' });
     assert.ok(!String(els.stateHint.textContent).includes('later warning'), 'cleared once connected');
   });
+
+  // [CUSTOM-20261006-195] 草稿页的首条消息：建会话要等**十几秒**（真机：agent 侧 sdk-initialize
+  // 那一步 0.7s/11.1s/13.2s），这段时间卡片必须说出来 —— 否则屏幕上没有任何一处显示"已经在建了"
+  // （用户报"发出第一条消息后要等很久，消息区才有反应"）。
+  test('the creating card says so, and its stopwatch really counts (195)', () => {
+    const { NS, els } = cardWith();
+    NS.stateCard.setConnected(true);
+    assert.strictEqual(NS.stateCard.phase(), 'ready');
+
+    const realNow = Date.now;
+    try {
+      let now = 1_000_000;
+      Date.now = () => now;
+      NS.stateCard.beginCreating();
+      assert.strictEqual(NS.stateCard.phase(), 'creating');
+      assert.match(String(els.stateTitle.textContent), /Creating this session/);
+      assert.match(String(els.stateHint.textContent), /waits for it/);
+      assert.strictEqual(els.stateBusy.hidden, false, 'a spinner while the session is made');
+      assert.strictEqual(els.stateCard.getAttribute('aria-busy'), 'true');
+      assert.strictEqual(els.stateActions.hidden, true, 'no Connect button on offer here');
+      assert.strictEqual(els.autoConnectRow.hidden, true);
+
+      // 秒表：这条同时钉住 startTick 的写入顺序（原来 connectStartedAt 当场被 stopTick 抹掉，
+      // 于是 194 那个秒表一次都没显示过数字）。
+      now += 13_000;
+      NS.stateCard.beginCreating();   // 幂等：重试之外不该重启秒表
+      assert.match(String(els.stateHint.textContent), /13s/, 'the elapsed seconds are on screen');
+    } finally {
+      Date.now = realNow;
+    }
+
+    // 收尾在 boot：resolveDraft（成功）/ failDraft（失败）。两条路都必须把相位复位 ——
+    // 否则下一个草稿页会带着上一轮的"建会话中"进来。
+    NS.stateCard.endCreating();
+    assert.strictEqual(NS.stateCard.phase(), 'ready');
+    assert.strictEqual(els.stateBusy.hidden, true, 'the spinner goes away');
+    assert.strictEqual(els.stateCard.getAttribute('aria-busy'), 'false');
+    assert.strictEqual(String(els.stateTitle.textContent), 'Claude Code is ready');
+  });
+
+  // [CUSTOM-20261006-195] socket 在半路掉了（或从没连上）时不装"建会话中"：那一刻用户能做的
+  // 只有重连，卡在一张转圈的卡片上是最糟的一种。
+  test('a lost connection wins over "creating" (195)', () => {
+    const { NS, els } = cardWith();
+    NS.stateCard.setConnected(true);
+    NS.stateCard.beginCreating();
+    assert.strictEqual(NS.stateCard.phase(), 'creating');
+
+    NS.stateCard.setConnected(false);
+    assert.strictEqual(NS.stateCard.phase(), 'disconnected');
+    assert.strictEqual(els.stateBusy.hidden, true);
+    assert.strictEqual(els.stateActions.hidden, false, 'the Connect button is back');
+  });
+
+  // [CUSTOM-20261006-195] 失败这条路：先收相位、再写错误（顺序反了报错会被压在下面）。
+  test('the failure lands on the card after the wait is over (195)', () => {
+    const { NS, els } = cardWith();
+    NS.stateCard.setConnected(true);
+    NS.stateCard.beginCreating();
+    NS.stateCard.endCreating();
+    NS.stateCard.setError('spawn npx ENOENT');
+    assert.strictEqual(NS.stateCard.phase(), 'ready');
+    assert.strictEqual(els.stateError.hidden, false);
+    assert.strictEqual(String(els.stateError.textContent), 'spawn npx ENOENT');
+    assert.match(String(els.stateHint.textContent), /Type your first message/, 'back to the guide');
+  });
 });
 
 // [CUSTOM-20260930-128] 助手/思考记录的 markdown 请求必须**自己**发得出去。
@@ -3986,5 +4395,78 @@ suite('chat client logic: file links in prose (stub DOM)', () => {
     assert.deepStrictEqual(clickOnAttr('data-href', 'https://example.com'), [
       { type: 'openLink', href: 'https://example.com' },
     ]);
+  });
+});
+
+// [CUSTOM-20261007-197] 右键菜单「按上下文给项」。
+//
+// 用户报：「用户消息的悬浮卡片，鼠标右键弹出的 Copy 现在是灰置的，需要支持拷贝消息」。
+// `Copy`（复制**选区**）在没选区时禁用是 067 故意的（装作能用比禁用更糟），问题在**菜单里除了
+// 它 + Select all 什么都没有**：置顶悬浮卡是另一棵树（.sticky-user > .sticky-card > .sticky-body >
+// 克隆体），而卡片外壳不带 `data-entry-id` —— 用户右键点的往往正是那圈留白/边框，于是「复制
+// 这条消息」这件事在这一处**完全不可达**。卡片的 `data-sticky-id` 就是这条记录的 id（stickyUser
+// 写上的），菜单把它一起认下来即可。
+suite('chat client logic: context menu items (stub DOM, CUSTOM-20261007-197)', () => {
+  const text = '把这条消息拷走';
+
+  function withEntry() {
+    const messages = new StubNode('div');
+    const harness = loadClient({ messages });
+    const { NS } = harness;
+    const posted: Array<Record<string, unknown>> = [];
+    NS.bridge.post = (message: Record<string, unknown>) => { posted.push(message); };
+    // 记录的正文要**真的进过转录**（entry(id) 才解析得到）—— 这是 067 那条老路
+    // 「entryTextOf → transcriptView.entry」的前提，桩里同样要走一遍。
+    NS.transcriptView.init(messages);
+    NS.transcriptView.append({ id: 'u1', kind: 'user', at: 1, text }, undefined);
+    return { NS, posted };
+  }
+
+  function labels(items: Array<{ label: string }>): string {
+    return items.map(i => i.label).join(' / ');
+  }
+
+  test('a record node offers Copy message', () => {
+    const { NS, posted } = withEntry();
+    const record = new StubNode('div');
+    record.setAttribute('data-entry-id', 'u1');
+
+    const items = NS.contextMenu.itemsFor(record) as Array<{ label: string; run: () => void }>;
+    const copyMessage = items.find(i => i.label === 'Copy message');
+    assert.ok(copyMessage, `expected Copy message, got: ${labels(items)}`);
+    copyMessage.run();
+    assert.deepStrictEqual(posted, [{ type: 'copy', text }], 'the record正文 goes to the clipboard channel');
+  });
+
+  test('the sticky card offers it from its own whitespace (197)', () => {
+    const { NS, posted } = withEntry();
+    // 卡片的留白：既不在克隆体里，也不带 data-entry-id —— 正是用户右键点中的那一处。
+    const card = new StubNode('div');
+    card.className = 'sticky-card';
+    card.setAttribute('data-sticky-id', 'u1');
+    const body = new StubNode('div');
+    body.className = 'sticky-body';
+    card.appendChild(body);
+    const blank = new StubNode('div');
+    body.appendChild(blank);
+
+    const items = NS.contextMenu.itemsFor(blank) as Array<{ label: string; run: () => void }>;
+    const copyMessage = items.find(i => i.label === 'Copy message');
+    assert.ok(copyMessage, `expected Copy message, got: ${labels(items)}`);
+    copyMessage.run();
+    assert.deepStrictEqual(posted, [{ type: 'copy', text }]);
+  });
+
+  test('a card whose record is gone degrades to the old menu', () => {
+    const { NS } = withEntry();
+    const card = new StubNode('div');
+    card.className = 'sticky-card';
+    card.setAttribute('data-sticky-id', 'gone');
+    const blank = new StubNode('div');
+    card.appendChild(blank);
+
+    const items = NS.contextMenu.itemsFor(blank) as Array<{ label: string }>;
+    assert.ok(!items.some(i => i.label === 'Copy message'),
+      `an unknown id must not offer a copy that would copy nothing: ${labels(items)}`);
   });
 });
