@@ -109,6 +109,9 @@ export const bootClient = `
     // DOM is replaced - the same session may come back later (tab switch).
     NS.scroll.remember(currentSessionId);
     currentSessionId = summary ? summary.sessionId : null;
+    // [CUSTOM-20261008-200] Times 按会话记：换会话就要换成**那个会话**的值（没有记录就是默认值，
+    // 草稿页与空态走的也是这一条）。状态机在 client/times.ts，这里只做"焦点变了"这一声通知。
+    if (NS.times) { NS.times.setFocus(currentSessionId); }
     // [CUSTOM-20261001-166] 置顶条按会话记着自己的收缩状态 —— 在重置它之前把会话同步过去
     // （这是焦点变化唯一的咽喉点，与 elicitationView.setSession 同一形态）。
     if (NS.stickyUser && NS.stickyUser.setSession) { NS.stickyUser.setSession(currentSessionId); }
@@ -344,6 +347,9 @@ export const bootClient = `
     // 'focus' normally arrived first (the host focuses the new session), which
     // already moved the composer to it — this is the safety net.
     NS.composer.resolveDraft();
+    // [CUSTOM-20261006-195] 建会话这条路走完了。成功时卡片马上就会藏起来（真会话接管），
+    // 但相位本身必须复位 —— 否则下一个草稿页会带着上一轮的"建会话中"进来。
+    if (NS.stateCard) { NS.stateCard.endCreating(); }
     renderDrafts();
   }
 
@@ -353,6 +359,9 @@ export const bootClient = `
     // [CUSTOM-20260930-123] The draft page's "page" is the status card. Appending a notice
     // to an empty transcript would be hidden behind the card (and showEmpty(false) hid the
     // card outright), so the failure goes where the user is actually looking.
+    // [CUSTOM-20261006-195] 先收"建会话中"相位，再写错误 —— 反了的话卡片停在建会话相位上、
+    // 报错被压在下面（顺序就是承重的，同 §5.28 里 focusSession 与 connection 那条）。
+    if (NS.stateCard) { NS.stateCard.endCreating(); }
     if (NS.stateCard) { NS.stateCard.setError(message); }
     showEmpty(true);
     console.warn('[acpc] draft failed:', draftId, message);
@@ -407,19 +416,9 @@ export const bootClient = `
     if (toggle) { toggle.className = flat ? 'nest-toggle off' : 'nest-toggle'; }
   }
 
-  /** [CUSTOM-20260925-065] Show the per-record wall-clock stamp (see .rec-time). */
-  function applyTimes(on) {
-    var messages = NS.dom.qs('messages');
-    var toggle = NS.dom.qs('timeToggle');
-    if (messages) {
-      if (on) { messages.classList.add('show-times'); } else { messages.classList.remove('show-times'); }
-    }
-    if (toggle) { toggle.className = on ? 'nest-toggle' : 'nest-toggle off'; }
-    // [CUSTOM-20260928-103] The pinned copy is a clone outside '#messages', so it carries
-    // its own copy of this class (stickyUser.render mirrors it). Re-render it here: the
-    // class alone would not reach a copy that is already on screen.
-    if (NS.stickyUser) { NS.stickyUser.refresh(); }
-  }
+  // [CUSTOM-20261008-200] 「Times」的整块状态机搬去了 client/times.ts（按会话记 + 默认值 +
+  // 落盘 + 迁移）—— 它有自己的状态与控件，值得单独测（boot 的 init() 桩不出来）。
+  // boot 只负责三声通知：init 时 init()、焦点变了 setFocus()、会话列表变了 noteSessions()。
 
   function onMessage(event) {
     var message = event.data;
@@ -437,6 +436,9 @@ export const bootClient = `
     switch (message.type) {
       case 'boot':
         NS.tabs.setSessions(message.sessions || []);
+        if (NS.times) { NS.times.noteSessions(message.sessions || []); }
+        // [CUSTOM-20261008-199] 没有聚焦会话时地址栏显示什么（宿主解析的默认目录）。
+        if (NS.tabs && NS.tabs.setDefaultCwd) { NS.tabs.setDefaultCwd(message.defaultCwd); }
         applyEmptyState(message.agentConnected);
         // [CUSTOM-20260930-123] Arm the auto-connect timer here: this is the only place
         // that knows all three inputs at once (agentConnected + focused + the setting).
@@ -459,6 +461,11 @@ export const bootClient = `
       // [CUSTOM-20260926-077] Outline pin/width prefs come back with boot.
       case 'uiPrefs':
         NS.outline.applyPrefs(message);
+        // [CUSTOM-20261007-198] 同一条记录里还有 tab 的手工顺序（宿主在 setUiPref 之后
+        // 也会广播一次，所以**另一个面**改了顺序这边立刻跟上）。
+        if (NS.tabs && NS.tabs.applyPrefs) { NS.tabs.applyPrefs(message); }
+        // [CUSTOM-20261008-200] 同一条记录里还有 Times 的两份状态（按会话 + 默认值）。
+        if (NS.times) { NS.times.applyPrefs(message); }
         break;
 
       // [CUSTOM-20260930-125] The auto-connect setting's live value: changed on the other
@@ -469,6 +476,7 @@ export const bootClient = `
 
       case 'sessionsChanged':
         NS.tabs.setSessions(message.sessions || []);
+        if (NS.times) { NS.times.noteSessions(message.sessions || []); }
         applyEmptyState(message.agentConnected);
         syncFocusedState(message.sessions || []);
         break;
@@ -928,16 +936,10 @@ export const bootClient = `
     // A CLASS on #messages rather than re-rendering: the .rec-time spans are always
     // in the DOM (see transcriptView.place), so toggling is a pure style flip —
     // exactly the mechanism applyGrouping above uses.
-    applyTimes(ui.showTimes === true);
-    var timeToggle = NS.dom.qs('timeToggle');
-    if (timeToggle) {
-      timeToggle.addEventListener('click', function () {
-        var messages = NS.dom.qs('messages');
-        var on = !(messages && messages.classList.contains('show-times'));
-        applyTimes(on);
-        persistUi({ showTimes: on });
-      });
-    }
+    // [CUSTOM-20261008-200] 而它的"要不要显示"现在**不是**这一个哨位说了算：状态在宿主
+    // globalState 里按会话记（client/times.ts），由这里的 init 与另外三声通知驱动
+    // （applyFocus / uiPrefs / sessionsChanged）。
+    if (NS.times) { NS.times.init(); }
 
     window.addEventListener('message', onMessage);
     NS.bridge.post({ type: 'ready' });

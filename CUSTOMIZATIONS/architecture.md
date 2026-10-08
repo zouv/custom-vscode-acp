@@ -106,7 +106,7 @@ webpack + ts-loader（不是 esbuild）；ESLint flat config；`@vscode/test-cli
 | `src/handlers/PermissionBridge.ts` | **权限请求的唯一出口**（020 新增）：面板卡片 vs 弹框的判定、并发请求 FIFO 队列、`cancelSession`/`cancelAll` 保证每个请求恰好被回答一次。不 import vscode UI 类型 | 权限策略 / 超时 / 队列行为 |
 | `src/handlers/SessionUpdateHandler.ts` | `session/update` 通知的监听器扇出（try/catch 隔离单个订阅者） | 流式更新丢事件 |
 | `src/ui/ChatWebviewProvider.ts` | **legacy 面板（单会话、未改造）**：webview 视图 + 内联 HTML 字符串（`getHtmlContent()`，CSP+nonce）；webview↔扩展 postMessage 协议；`marked` 渲染 markdown。CUSTOM-20260923-011 起由 `LegacyPanelAdapter` 用 **facade** 包装后接入路由层，**本文件零改动** | 仅在必须跟上游同步时动；旧缺陷不在此文件里修 |
-| `src/ui/chat/` | **新 Chat 面板子系统**（CUSTOM-20260923-011，30+ 个模块）。入口 `index.ts` 只导出 `ChatRouterProvider`。细节见 [`docs/arch/chat-panel.md`](./docs/arch/chat-panel.md)（原 §5，按模块拆出）；记录区（折叠 / markdown / 时间 / 右键 / 切换提示）见 [`docs/arch/chat-panel-records.md`](./docs/arch/chat-panel-records.md) | 聊天 UI / 面板路由 / 多会话 |
+| `src/ui/chat/` | **新 Chat 面板子系统**（CUSTOM-20260923-011，30+ 个模块）。入口 `index.ts` 只导出 `ChatRouterProvider`。细节见 [`docs/arch/chat-panel.md`](./docs/arch/chat-panel.md)（原 §5，按模块拆出）；记录区（折叠 / markdown / 时间 / 右键 / 切换提示）见 [`docs/arch/chat-panel-records.md`](./docs/arch/chat-panel-records.md)；记录区时刻开关的状态机在 `html/client/times.ts`（§5.45） | 聊天 UI / 面板路由 / 多会话 |
 | `src/ui/SessionTreeProvider.ts` | 两层树 `AgentNode`/`ChildNode`：`AgentTreeItem`/`SessionTreeItem`/`InfoTreeItem`（loading/empty/unsupported/error/auth-required/load-more） | 树结构 / 右键菜单行为 |
 | `src/ui/StatusBarManager.ts` | 状态栏 `$(hubot) ACP: <status>`，订阅 5 个 SessionManager 事件；点击触发 `acpc.connectAgent` | 状态显示 |
 | `src/config/AgentConfig.ts` | 读 `acpc.agents` 设置，导出 `getAgentConfigs`/`getAgentNames`/`getAgentConfig` | agent 列表读取逻辑 |
@@ -165,6 +165,20 @@ webpack + ts-loader（不是 esbuild）；ESLint flat config；`@vscode/test-cli
 `show()`（建记录 + `notifySession`）→ `SessionNotifier`（右下角通知，点「打开会话」）→
 `revealSession`；客户端侧 `permissionDrawer` / `elicitationView` 两个抽屉由 boot 的
 `syncDrawers()` 对账。见 [`docs/arch/chat-panel.md`](./docs/arch/chat-panel.md) §5.34/§5.35。
+
+**header（地址栏 / Times / Sub-agents / ☰）**：`html/client/tabs.ts` 的 `renderHeader` 管"有会话"与
+**空态**（没有聚焦会话时显示宿主随 `boot` 下发的 **`defaultCwd`**，且 `disabled` 不可点）、
+`renderDraftHeader` 管草稿页；`currentCwd()` 是这三者同源的读口（155 的历史默认筛选靠它）。
+`.session-title` 是这一行**唯一的弹性项**，右侧那一组由 `#timeToggle { margin-left: auto }` 兜底。
+
+**记录区的「Times」开关（时刻显隐）**：有效值 = `timesBySession[会话] ?? timesDefault`，
+状态机在 `html/client/times.ts`（**200**），落盘走 `setUiPref`/`uiPrefs` —— 与大纲偏好、tab 顺序
+**共用同一条** globalState 记录，所以那个 handler 有**三个写者**，必须**合并**而不是重建。
+boot 只发三声通知：`init` / `setFocus` / `noteSessions`。
+
+**tab 手工顺序与拖拽**（198/201）：`tabs.ts` 的 `applyPrefs`（宿主那份顺序）/ `installDrag`
+（**落点在整条 `#tabStrip`**，插入位由指针横坐标与各 tab 中点算，不是"命中了哪个 tab 元素"）。
+两者都在 [`docs/arch/chat-panel.md`](./docs/arch/chat-panel.md) §5.45。
 
 webview→扩展消息类型（**按"要不要带 sessionId"分组——这正是 §5.4 规则二的依据**）：
 - **会话作用域**（带 `sessionId`，在 `verifySession` 守卫**之后**处理）：

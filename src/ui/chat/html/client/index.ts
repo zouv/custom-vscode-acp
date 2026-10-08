@@ -30,6 +30,9 @@ import { composerClient } from './composer';
 import { contextMenuClient } from './contextMenu';
 import { lightboxClient } from './lightbox';
 import { stickyUserClient } from './stickyUser';
+// [CUSTOM-20261008-200] 记录区「Times」开关的状态机（按会话记 + 一个默认值）。与 stateCard 同类：
+// 加载期不碰 DOM，全部由 boot 的 init() 驱动，因此能在桩 DOM 里被单独加载。
+import { timesClient } from './times';
 import { bootClient } from './boot';
 
 const MODULES: ReadonlyArray<string> = [
@@ -63,6 +66,8 @@ const MODULES: ReadonlyArray<string> = [
   lightboxClient,
   // [CUSTOM-20260928-102] 最近一条已滚出视口的用户消息，克隆到消息区顶部。
   stickyUserClient,
+  // [CUSTOM-20261008-200] Times 开关（它 apply 时要重渲染置顶副本，所以排在 stickyUser 之后）。
+  timesClient,
   bootClient,
 ];
 

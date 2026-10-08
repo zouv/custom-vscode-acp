@@ -17,6 +17,54 @@
 
 ---
 
+### 2026-10-08 - CUSTOM-20261008-199/200/201
+- **功能**：三条用户回报 —— ①空态（已连接、还没有会话）**地址栏没内容 + Times 被挤到左边**；②`Times` 开关**按会话记住**、新会话沿用最后一次的值；③tab 拖拽**松手后复位**（落点根本不接）
+- **改动文件**：`src/ui/chat/protocol.ts`、`src/ui/chat/ChatPanelHost.ts`、`src/ui/chat/html/client/tabs.ts`、`src/ui/chat/html/client/boot.ts`、`src/ui/chat/html/client/times.ts`（**新增**）、`src/ui/chat/html/client/index.ts`、`src/ui/chat/html/styles.ts`、`src/test/chat-client.test.ts`、`src/test/chat-panel.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（文档：`architecture.md` §1/§2.5、`chat-panel.md` §5.45、`dev-workflow.md` 验收 208-210、`pitfalls.md` #52、`registry.md` 总览）
+- **来源**：用户 F5 复验后报三条（附截图）：「1. 新连接后，会出现会话地址栏没内容的情况，times 也变成左对齐了；2. 如果打开了 times 选项，需要记录下该状态（按会话记录），并且下次新开会话也默认读取该 times 状态；3. 会话 tab 的拖拽功能，现在能拖动了，但是松开鼠标左键后就复位了（没有插入到预期的位置）」
+- **详细说明**：
+  - **199 空态地址栏**：先用**落盘日志**定死了现场 —— `02:06:05 no focused session … opening empty panel` → `02:06:07` 点连接 → **`02:06:30` 才发出 `session/new`**。这 20 多秒里面板是"已连接、还没有会话"，而 `renderHeader(null)` 把 `#cwdBtn` 整格**隐藏**（090 的决定）⇒ 这一行**唯一的弹性项**（`.session-title` 是 `flex: 1`）消失，`Times`/`Sub-agents`/`☰` 那一组整组滑到左边，地址栏位置空着。修法：`#cwdBtn` 改为**显示默认目录但禁用**（`defaultCwd` 随 `boot` 下发，来自 `SessionManager.resolveDefaultCwd()`，与草稿页"下次会话建在这里"同一份值），CSS 另给 `#timeToggle { margin-left: auto }` 兜底（有弹性项时 auto margin 分不到空间 ⇒ 原有布局零变化）。090 反对的是"点开抽屉、抽屉却在讲一个没有会话的面板"，`disabled` 让按钮在事件层就点不动，那条按构造成立。**顺带**：`currentCwd()`（155 的历史默认筛选）在空态也答 `defaultCwd` —— "地址栏显示什么就筛什么"这条不变量不在空态断掉。
+  - **200 Times 按会话记**：状态从"webview 本地的一个全局布尔"（`vscode.setState` 的 `showTimes`，关掉编辑器面板就没）搬到**宿主 globalState**，与大纲偏好、tab 顺序**共用同一条**记录 ⇒ `setUiPref` 自此**三个写者**，合并语义（缺字段 = 这一轮没改它）成了硬约束。规则一句话：有效值 = `timesBySession[会话] ?? timesDefault`；拨一次**既**记到当前会话名下、**又**改掉默认值（新会话与草稿页跟随默认值 —— 用户要的"下次新开会话默认读取该状态"）。状态机独立成 `html/client/times.ts`（与 stateCard 同类：加载期不碰 DOM，可在桩 DOM 里单独驱动），boot 只发三声通知（`init`/`setFocus`/`noteSessions`）—— 留在 boot 里会重演 pitfalls #38（"模块级布尔 = 全局状态"，而这里的状态**属于某个会话**）。写回前按"本面知道的会话"裁表（`pruned`），宿主那侧 `sanitizeTimesMap` 再兜一层（布尔值 + 键字符集 + 200 条上限）。**缺字段 ≠ false**：只带大纲偏好或 tab 顺序的消息里 times 两项是 `undefined`，那时保留本地值 —— 否则拖一次大纲宽度就把用户开着的 Times 关掉。旧的本地值只**迁移一次**（本地记 `timesMigrated`）。
+  - **201 拖拽落点**：198 把 `dragover`/`drop` 挂在**每个 `.tab`** 上，而 `.tabs` 是 `flex: 0 0 auto` ⇒ 最后一个 tab 右边的空白属于 `.tab-strip`、tab 之间的 2px 缝也不属于任何 tab，指针落在这些地方**没有落点**（松手即复位）；更糟的是**指示线没有 dragleave 清除**，画面上"有落点"、实际"已无落点" ⇒ 失败完全静默。两种最自然的拖法（拖到最后、拖到两个之间）正好都落在这里。修法：落点容器换成**整条 `#tabStrip`**，插入位由**指针横坐标与各 tab 中点**算（`boundaryFor` → 0..n，草稿 tab 及其后的空白都算"最后"），指示线由**同一个数字**决定（`markBoundary`）；`dragleave` 只清线不清拖动；无坐标或"搬完原地不动"都不写盘；**先落盘再重渲染**。另加两条常驻诊断（`[acpc] tabdrag start=` / `drop from=… to=… order=…`），真机若再复位，日志能直接区分"start 没跑 / drop 没到 / 落了被覆盖"。
+- **验证方式**：客户端 `npx mocha --ui tdd out/test/chat-client.test.js` → **187 passing**（新增：「Times 开关按会话记忆」6 条、tab 条带 6 条（末尾空白 / 缝隙 / 草稿 tab / 离开条带只清线 / 无坐标不搬 / 原位不动不写盘）、地址栏 2 条；198 的四条用例改为**在条带上派发**，桩补齐 `rectLeft/rectWidth`）；宿主 `npm test` → **377 passing**（新增 `chat panel: Times prefs` 4 条：三个写者互不覆盖、垃圾进不去、200 条上限、boot 的 `defaultCwd` 非空）；布局用 `preview-records.mjs` 的 `#nosessionheaderprobe` **读数字**：`gapRight == padRight == 10`（Times 贴右缘）、`cwdDisabled: true`、`cwdText: /work/example-project`；`node CUSTOMIZATIONS/scripts/check-registry.mjs` 六节全绿；`npm run lint` 0 warning；`npm run compile` 成功。⚠ **201 的真机拖拽尚未复验**（预览是一次性 `--dump-dom` 模式，合成 DragEvent 只跑得到我们自己的处理器）—— 见 dev-workflow 验收 210。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-07 - CUSTOM-20261007-198
+- **功能**：会话 tab **手工排序**（按住左键拖到另一个 tab 的哪一侧），顺序跨面/跨重载存活
+- **改动文件**：`src/ui/chat/html/client/tabs.ts`、`src/ui/chat/html/styles.ts`、`src/ui/chat/html/client/boot.ts`、`src/ui/chat/protocol.ts`、`src/ui/chat/ChatPanelHost.ts`、`src/test/chat-client.test.ts`、`src/test/chat-panel.test.ts`
+- **来源**：用户「会话 tab 现在不支持长按鼠标左键拖拽 tab 位置，请支持下」
+- **详细说明**：
+  - **交互**：原生 HTML5 拖拽（不需要自定义"长按"计时器；按住左键拖即可）。落点按**指针在目标 tab 水平中点的哪一侧**算，目标 tab 边缘画一条 2px 指示线（`.drop-before/.drop-after`，inset 阴影跟着圆角走），被搬走的那个淡化（`.dragging`）。**从关闭按钮起拖不算**（用户点的是 ×）。点击、roving tabindex、方向键切换一个字节没改。
+  - **顺序存在哪**：宿主 `globalState` 的**同一条** `UiPrefs` 记录（key 仍是 `acpc.outlinePrefs.v1`，见下面的合并说明），字段 `tabOrder: string[]`。顺序是**工作区级**的，不是会话作用域 —— 两个面、两个窗口看到同一条。
+  - **宿主处理改成合并**：`setUiPref` 的字段**全部可选**，缺的 = 这一轮没改它。原先按消息里的字段**重建**整个对象 —— 那时只有一个写者（大纲），现在有了第二个（tab 顺序），重建会把对方那一半抹掉（症状：拖一下 tab，大纲宽度被悄悄重置）。写完之后**广播** `uiPrefs` 给所有面，另一个面立刻换序（同一份偏好、两个写者，必须回话）。`tabOrder` 过 `sanitizeTabOrder()`：只收非空字符串、去重、上限 200 条 —— 坏掉的客户端不该把垃圾写进 globalState。
+  - **渲染**：`tabModels()` 按 `tabOrder` 排；**表里没有的会话按宿主原顺序接在其后**（新会话永远落在最后，不会因为你没拖过它就跑到最前或消失）；草稿仍在最末（它是本地页，还没有可排的 id）。首帧的顺序由 boot 后的 `uiPrefs` 消息带回（`NS.tabs.applyPrefs`）。
+  - **没做的**：拖到 strip 边缘的自动滚动、跨面拖拽（VS Code 的两个 webview 之间）。宽度不够时 strip 本身是横向滚动的（既有行为），拖动时可以先滚到位置再拖。
+- **验证方式**：客户端 `npx mocha --ui tdd out/test/chat-client.test.js` → 新增 4 条（左半边插到前面并落盘、右半边插到后面、已存顺序生效且新会话排最后、从 × 起拖什么都不动）；宿主 `npm test` 新增 2 条（两个写者互不覆盖、垃圾顺序进不去 globalState）；`check-registry` 六节全绿、`lint` 0 warning、`webpack` 成功。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-07 - CUSTOM-20261007-197
+- **功能（bug 修复）**：右键菜单认出**置顶悬浮卡**，于是卡片上也能「Copy message」
+- **改动文件**：`src/ui/chat/html/client/contextMenu.ts`、`src/test/chat-client.test.ts`
+- **来源**：用户报「用户消息的悬浮卡片，鼠标右键弹出的 Copy 现在是灰置的，需要支持下"拷贝消息"操作」
+- **详细说明**：
+  - `Copy`（复制**选区**）在没选区时禁用是 067 故意的（装作能用比禁用更糟）。真正的问题是**菜单里除了它 + `Select all` 什么都没有**：置顶悬浮卡是另一棵树（`.sticky-user > .sticky-card > .sticky-body > 克隆体`），卡片外壳不带 `data-entry-id`，而用户右键点中的常常正是卡片那一圈留白/边框 ⇒ 「复制这条消息」在这一处完全不可达。
+  - 修法：`entryTextOf` 拆出 `entryIdOf(node)` —— 先走老路 `closest('[data-entry-id]')`，没有再认一层 `closest('.sticky-card')` 上的 `data-sticky-id`（stickyUser 往卡片上写的就是这条记录的 id）。未知 id（记录已被清掉）**仍退化回原菜单**，不会提供一条"复制空"的项。
+  - `itemsFor` 因此导出（`NS.contextMenu.itemsFor`）给桩 DOM 测试用：「右键这一处会给哪些项」是这套菜单的全部语义；显示与定位属于布局，仍归 `preview-records.mjs`。
+- **验证方式**：`npx mocha --ui tdd out/test/chat-client.test.js` → **172 passing**（新增 3 条：记录节点给 `Copy message` 且复制的正是正文、悬浮卡留白处同样给、卡片指向的记录已不在时退化）；`node CUSTOMIZATIONS/scripts/check-registry.mjs` 全绿；`npm run lint` 0 warning；`npm run compile`（webpack + webview 客户端模板解析）成功。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-06 - CUSTOM-20261006-195
+- **功能**：草稿页「首条消息 → 会话就绪」这段等待**变得可见** —— 状态卡新增第四个相位「建会话中」（标题 "Creating this session…" + 转圈 + 秒表）；同时修掉 194 那个秒表**一次都没显示过数字**的 bug
+- **改动文件**：`src/ui/chat/html/client/stateCard.ts`、`src/ui/chat/html/client/composer.ts`、`src/ui/chat/html/client/boot.ts`、`src/test/chat-client.test.ts`（文档：`registry.md` 总览、`chat-panel.md` §5.28）
+- **来源**：用户报「在这个界面（Claude Code is ready）发出第一次消息后，需要等较长的时间，消息界面才会有反应（是因为此时还没创建 session？），需要优化下体验」
+- **详细说明**：
+  - **实测那段时间在哪**（真机日志三次采样，`~/.claude/acp-client-custom.log`）：`session/create` 的 `sdk-initialize` 一步 **675ms / 11116ms / 13194ms**；而 `session/new` 响应回来之后，"应用草稿选择 → 发出首条消息"只要 **~160ms**。所以慢的**在 agent 那一发请求里**（`session/new` 要等 `sdk-initialize` 才返回），不是我们建完会话后的编排。它不可缩短，但**必须可见**。
+  - **为什么原本屏幕上什么都没有**：卡片一直写着 "Claude Code is ready"（已连接 ≠ 已建会话）；输入框的字**故意不清空**（058：建会话可能失败，文字与图片要保命）⇒ 那条 "Creating this session…" 的 placeholder 被内容挡着，用户根本看不见；发送按钮只是 disabled。三处都不说"已经在建了"。
+  - **做法**：新增相位 `creating`。`composer.send()` 的草稿分支在 `state.draftPending = true` 的同一帧调 `NS.stateCard.beginCreating()` → 卡片立刻变成标题 + 套话 + **秒表**（复用 194 的 `elapsedLabel`/`startTick`），转圈与 `aria-busy` 与 connecting 同形；`render()` 把"在等"的两态收成一个 `waiting` 变量（转圈 / aria-busy / Connect 按钮退场三处共用，免得各写一遍漏一处）。收尾在 boot 的 `resolveDraft`（成功）/ `failDraft`（失败：**先收相位再写错误**）/ `dropDraft`。`phase()` 里 `creating` 以 `connected` 为前提 —— socket 半路掉了要退回 `disconnected`（Connect 按钮回来），不能把用户留在一张永远转圈的卡上。
+  - **顺带修的 bug（194 的秒表）**：`startTick()` 里 `connectStartedAt = Date.now()` 写在 `stopTick()` **之前**，被后者当场清零 ⇒ `elapsedLabel()` 永远返回 '' —— "数字在动"是那个秒表存在的唯一理由，而它一次都没显示过。顺序已调正（先 stop 再记起点）。
+  - **幂等判据**：`beginCreating()` 用 `creating` 自身判断"是不是已经在等"，**不用** `tickTimer` —— 桩 DOM 没有 `setInterval`，那时 `tickTimer` 永远是 null，会把"已在等"误判成"刚开始等"而重启秒表。
+- **验证方式**：`npm run compile-tests` + `npx mocha --ui tdd out/test/chat-client.test.js` → **169 passing**（新增 3 条：相位/转圈/退场 + 秒表真的走秒、掉线优先于建会话、失败先收相位再写错误）；`node CUSTOMIZATIONS/scripts/check-registry.mjs` 六节全绿；`npm run lint` 0 warning；`npm run compile`（webpack）成功。⚠ **那条 13 秒的真实路径尚未在真机复验**（需要在新会话草稿页发一次首条消息）。
+- **基于上游版本**：0.2.0（commit e7371659）
+
 ### 2026-10-02 - CUSTOM-20261002-172
 - **功能**：置顶卡从「只钉一条」改成**整段前缀** —— 卡堆式**推挤 + 抽回**（原生 `position: sticky` 分区头语义）：新提问顶边碰到旧卡底边时两张一起悬浮，旧卡被逐渐顶出上沿直到不再渲染，反向滚动又从上沿抽回；同时补上"消息新增后不同步"的缺口
 - **改动文件**：`src/ui/chat/html/client/stickyUser.ts`（核心重写）、`src/ui/chat/html/body.ts`（`#stickyUser` 留空容器）、`src/ui/chat/html/styles.ts`（删 `max-height:40%`、入场动画改按卡、`.sticky-card` 按卡一份）、`src/ui/chat/html/client/boot.ts`（四条转录变更路径补 `stickyUser.schedule()`、`applyFocus` 改走 `schedule()`）、`src/test/chat-client.test.ts`（夹具与用例改写 + 桩补 `insertBefore` 的移动语义）、`CUSTOMIZATIONS/scripts/preview-records.mjs`（sticky 探针改卡堆口径 + 三个新档）。（文档：`chat-panel.md` §5.25 重写、`pitfalls.md` #40/#41、`chat-panel-records.md` 订正陈旧引用、`dev-workflow.md` 验收 191-199）

@@ -307,6 +307,17 @@ function driver() {
   if (location.hash.indexOf('times') >= 0) {
     messages.classList.add('show-times');
   }
+  // [CUSTOM-20261008-199] #nosessionheader：**已连接但还没有会话**时的那条 header ——
+  // 用户报的现场就是它（连接适配器要下载几十秒，这期间地址栏空着、Times 被挤到左边）。
+  // 状态照真面板来：stateCard 置成已连接（它写 body[data-phase]，Times 的显隐由那个属性决定），
+  // 再喂一份宿主会发的默认目录。
+  if (location.hash.indexOf('nosessionheader') >= 0) {
+    NS.tabs.init();
+    NS.stateCard.init();
+    NS.stateCard.setConnected(true);
+    NS.tabs.setDefaultCwd('/work/example-project');
+    NS.tabs.setFocus(null);
+  }
   // [CUSTOM-20260930-129] #gauge：底部那颗上下文圆环。#gaugehot 造高用量（红），
   // #gaugebusy 造"有轮次在跑"（外圈转起来）。composer.init 需要的那几个元素 body 里都有。
   if (location.hash.indexOf('gauge') >= 0) {
@@ -1412,6 +1423,30 @@ function driver() {
         kind: 'times', visible: visibleCount, total: stamps.length, rows: rows,
       }));
     }
+    // [CUSTOM-20261008-199] 空态 header 的几何（#nosessionheader 档）：地址栏该有内容且点不动，
+    // 而 Times 该被顶到右边 —— 它原先靠 '.session-title' 的 flex:1 顶，那一格一隐藏整组就滑到左边。
+    if (location.hash.indexOf('nosessionheader') >= 0) {
+      var headerEl = document.getElementById('sessionHeader');
+      var cwdEl = document.getElementById('cwdBtn');
+      var timeEl = document.getElementById('timeToggle');
+      if (headerEl && cwdEl && timeEl) {
+        var hr = headerEl.getBoundingClientRect();
+        var tr = timeEl.getBoundingClientRect();
+        var cr2 = cwdEl.getBoundingClientRect();
+        out.push(JSON.stringify({
+          kind: 'header',
+          phase: document.body.getAttribute('data-phase'),
+          cwdHidden: cwdEl.hidden === true,
+          cwdDisabled: cwdEl.disabled === true,
+          cwdText: cwdEl.textContent,
+          cwdWidth: Math.round(cr2.width),
+          timeVisible: tr.width > 0,
+          // Times 右缘与 header 右缘之差：应当只剩 header 的右内边距。
+          gapRight: Math.round(hr.right - tr.right),
+          padRight: Math.round(parseFloat(getComputedStyle(headerEl).paddingRight) || 0),
+        }));
+      }
+    }
     var drawerEl3 = document.getElementById('history');
     var filterMenuEl3 = document.getElementById('historyFilterMenu');    if (drawerEl3 && filterMenuEl3) {
       out.push(JSON.stringify({
@@ -1809,6 +1844,9 @@ const SHOTS = [
   // [CUSTOM-20260930-145] 窄面板下的 Times：工具卡的时刻到底贴不贴右缘（用户报的"不对齐"）。
   ['#timesnarrow', 'times-narrow', '1440,900'],
   ['#timescollapsed', 'times-collapsed'],
+  // [CUSTOM-20261008-199] 空态 header（已连接、还没有会话）：地址栏该有内容、Times 该贴右缘。
+  // 带 probe：判据是数字（Times 右缘与 header 右缘之差），不是肉眼看截图。
+  ['#nosessionheaderprobe', 'no-session-header', '1440,900'],
   ['#gauge', 'gauge'],
   ['#gaugewarn', 'gauge-warn'],
   ['#gaugehot', 'gauge-hot'],

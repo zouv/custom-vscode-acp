@@ -85,6 +85,17 @@ export interface Attachment {
 export interface UiPrefs {
   outlineMode: 'popup' | 'sidebar';
   outlineWidth: number;
+  // [CUSTOM-20261007-198] Tab 栏的手工顺序（会话 id 数组）。与大纲偏好共用**同一条**
+  // globalState 记录：顺序是工作区级的事（两个面、两个窗口看到的是同一条），
+  // 而 **不是**会话作用域的（`setUiPref` 因此仍在 verifySession 守卫之前处理）。
+  tabOrder?: string[];
+  // [CUSTOM-20261008-200] 记录区「Times」（每条记录的时刻）开关。**不是**一个布尔：
+  //   · timesBySession 记用户**在那个会话里**最后一次拨动的值；
+  //   · timesDefault 是用户最后一次在**任何地方**拨动的值 —— 没有记录的会话与草稿页用它。
+  // 有效值 = timesBySession[id] ?? timesDefault。存在宿主而不是 webview 本地：关掉编辑器面板、
+  // 重载窗口之后它还该在（vscode.setState 会随文档一起没），两个面也该看到同一条。
+  timesBySession?: Record<string, boolean>;
+  timesDefault?: boolean;
 }
 
 /**
@@ -129,11 +140,17 @@ export type ExtToChat =
   // its button is "Connect Claude Code" or "New session"): a sessionless panel can have
   // a live agent process — closing the last session does not stop it. Optional so an
   // older surface simply keeps the old copy.
-  | { type: 'boot'; focused: SessionSummary | null; sessions: SessionSummary[]; snapshot: TranscriptSnapshotWire | null; meta: SessionMeta | null; agentConnected?: boolean; autoConnect?: boolean }
+  // [CUSTOM-20261008-199] `defaultCwd` 是「没有聚焦会话时地址栏该显示什么」的那份内容
+  // （宿主 `resolveDefaultCwd()`：下次会话将建在这里）。随 boot 走而不是客户端自己猜：
+  // 默认目录的三级回退（配置 → 第一个工作区文件夹 → cwd）只有宿主知道，且 058 的草稿页
+  // 展示的是**同一份**值（pitfalls #19：同一份知识不要存两份）。
+  | { type: 'boot'; focused: SessionSummary | null; sessions: SessionSummary[]; snapshot: TranscriptSnapshotWire | null; meta: SessionMeta | null; agentConnected?: boolean; autoConnect?: boolean; defaultCwd?: string }
   | { type: 'focus'; summary: SessionSummary | null; snapshot: TranscriptSnapshotWire | null; meta: SessionMeta | null; agentConnected?: boolean }
   | { type: 'sessionsChanged'; sessions: SessionSummary[]; agentConnected?: boolean }
   // [CUSTOM-20260926-077] 大纲钉住/宽度偏好，随 boot 一起带回（跨窗口重载存活）。
-  | { type: 'uiPrefs'; outlineMode: 'popup' | 'sidebar'; outlineWidth: number }
+  // [CUSTOM-20261007-198] 外加 tab 栏的手工顺序（同一条记录）。
+  // [CUSTOM-20261008-200] 外加 Times 的按会话记录 + 默认值（同一条记录）。
+  | { type: 'uiPrefs'; outlineMode: 'popup' | 'sidebar'; outlineWidth: number; tabOrder?: string[]; timesBySession?: Record<string, boolean>; timesDefault?: boolean }
   // [CUSTOM-BEGIN] CUSTOM-20260925-033 - 历史会话列表（回复 `listHistory`）。
   // `source` 说明这份列表从哪来：agent 侧 `session/list`，还是本地 workspaceState 缓存
   // （未连接时不去 spawn agent，见 ChatPanelHost.handleListHistory）。
@@ -207,7 +224,11 @@ export interface TranscriptSnapshotWire {
 export type ChatToExt =
   | { type: 'ready' }
   // [CUSTOM-20260926-077] 大纲钉住/宽度偏好：非会话作用域，宿主存 globalState。
-  | { type: 'setUiPref'; outlineMode: 'popup' | 'sidebar'; outlineWidth: number }
+  // [CUSTOM-20261007-198] 字段**全部可选**：两个写者（大纲、tab 顺序）各发自己那几个，
+  // 由宿主**合并**（重建会把对方那一半抹掉）。缺的字段 = 这一轮没改它。
+  // [CUSTOM-20261008-200] Times 同样走这条（第三个写者）：timesBySession 整份发上来
+  // （与 tabOrder 同一形态 —— 顺序与开关都是"一整张表"，逐条 delta 反而要宿主维护版本）。
+  | { type: 'setUiPref'; outlineMode?: 'popup' | 'sidebar'; outlineWidth?: number; tabOrder?: string[]; timesBySession?: Record<string, boolean>; timesDefault?: boolean }
   // [CUSTOM-20260930-125] 状态卡上的自动连接开关。**非会话作用域**（正是没有会话时
   // 才需要它），所以必须放在 verifySession 守卫**之前**处理，与 setUiPref 同一位置。
   | { type: 'setAutoConnect'; value: boolean }

@@ -221,6 +221,11 @@ export const composerClient = `
       // happens on 'draftResolved'; on 'draftFailed' the text stays put.
       if (state.draftPending) { return; }
       state.draftPending = true;
+      // [CUSTOM-20261006-195] 面板上立刻要有反应。建会话是**秒级到十几秒**的等待（真机：agent 侧
+      // session/create 的 sdk-initialize 一步 0.7s/11.1s/13.2s），而这段时间里输入框的字故意留着
+      // （058：失败时要保命）、placeholder 被内容挡着 ⇒ 不加这一句，屏幕上没有任何一处能看出
+      // "已经在建了"（用户报的就是这个）。相位由状态卡渲染，收尾在 boot 的 draftResolved/draftFailed。
+      if (NS.stateCard) { NS.stateCard.beginCreating(); }
       // [CUSTOM-20261005-193] 草稿上攒的附件随这条消息一起交上去（草稿还没有会话，宿主没法
       // 用 attachPath/attachImage 那种会话作用域的通道收它）。发送**不在这里清空**：这条消息
       // 可能失败（draftFailed），那时图片和文字都得留着 —— 与 textarea 的处理同一条规矩。

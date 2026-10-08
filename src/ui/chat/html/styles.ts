@@ -123,6 +123,9 @@ export function styles(): string {
     font-size: inherit;
     white-space: nowrap;
     opacity: 0.75;
+    /* [CUSTOM-20261007-198] 手工拖拽排序。button（047 为了键盘可达性选的）在 Blink 里
+       光靠 draggable 属性有时不起拖 —— 这一行是官方给"可拖元素"的兜底。 */
+    -webkit-user-drag: element;
   }
   .tab:hover { background: var(--vscode-list-hoverBackground); opacity: 1; }
   .tab.active {
@@ -160,6 +163,12 @@ export function styles(): string {
     0% { transform: scale(0.7); opacity: 0.9; }
     100% { transform: scale(1.9); opacity: 0; }
   }
+  /* [CUSTOM-20261007-198] 手工排序的落点指示：目标 tab 的哪一侧会被插进去。
+     2px 的竖线用 inset 阴影画（跟着 .tab 的圆角走），拖动中的那个自己淡化 —— 让人看清
+     "被搬走的是哪一个"。 */
+  .tab.dragging { opacity: 0.45; }
+  .tab.drop-before { box-shadow: inset 2px 0 0 var(--vscode-focusBorder); }
+  .tab.drop-after { box-shadow: inset -2px 0 0 var(--vscode-focusBorder); }
   .tab-close {
     border: none; background: transparent; color: inherit; cursor: pointer;
     padding: 0 2px; line-height: 1; opacity: 0.6; font-size: 11px;
@@ -185,6 +194,14 @@ export function styles(): string {
     color: var(--vscode-descriptionForeground);
   }
   .session-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  /* [CUSTOM-20261008-199] 没有聚焦会话/草稿时这一格**显示默认目录但点不动**（090 当初是整格
+     隐藏）。禁用态必须看起来像一句说明而不是一个坏掉的按钮：不换手型、没有 hover 反馈，
+     并且比真实路径淡一点（同一个 .tab/.tab-close 用 opacity 表达"弱化"的习惯）。 */
+  .session-title:disabled { cursor: default; opacity: 0.8; }
+  /* [CUSTOM-20261008-199] 把右侧那一组（Times / Sub-agents / ☰）钉在右边。原先靠 '.session-title'
+     的 flex: 1 吃掉剩余宽度把它们顶过去 —— 那一格一旦不显示了（上面那种空态），整组就会滑到
+     ↺ 旁边。有 flex 项能成长时 auto margin 分不到任何空间，所以这条对原有布局零影响。 */
+  .session-header > #timeToggle { margin-left: auto; }
   /* --- Conversation outline (CUSTOM-20260924-021) ---------------------- */
   /* 抽屉从标题栏下沿展开。.session-header 没有 overflow: hidden（已核对），
      否则绝对定位的抽屉会被裁掉——这是这类浮层最常见的失灵原因。 */
