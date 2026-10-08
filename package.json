@@ -403,6 +403,16 @@
           "default": true,
           "description": "Connect the agent automatically 0.5s after the ACP chat panel is opened. The panel's start card shows the same switch; changing either one updates the other."
         },
+        "acpc.restoreSessionsOnOpen": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "always",
+            "never"
+          ],
+          "default": "ask",
+          "description": "What to do with the sessions that were open when the window last closed: 'ask' shows a card on the empty panel offering to restore them (the card also offers a remember-my-choice switch), 'always' restores them without asking, 'never' ignores them and starts a fresh session."
+        },
         "acpc.defaultWorkingDirectory": {
           "type": "string",
           "default": "",

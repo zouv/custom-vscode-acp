@@ -147,6 +147,7 @@ ACP 没有"改会话 cwd"的请求——cwd 只在 `session/new` / `session/load
 | 失败时 | 草稿**和已输入的文字都保留**——所以 composer 在草稿模式下**刻意不清空输入框**，清空发生在 `draftResolved` |
 | 消息位置 | 三条请求都**非会话作用域**，因此在 `verifySession` 守卫**之前**（§5.4 规则二）；四条应答都**定向**给发起请求的那个面 |
 | 目录候选 | 工作区文件夹（**含多根**，此前只用了 `workspaceFolders[0]`）/ 最近用过（本地 `recentDirectories` 与 agent 侧 `session/list` 的 cwd **合并**——前者是 `workspaceState` 作用域的，新工作区开局为空）/ 默认目录 / 「浏览…」走宿主 `showOpenDialog`（webview 打不开） |
+| **目录候选的刷新（203）** | 这份列表会变（Browse 选的目录、刚用过的目录要等宿主把它们算进最近列表），所以**每次打开抽屉都回头问一次**：先用手上那份渲染（列表永远瞬间出来），回复到了再重渲染。**只在"还没数据"与"打开时"问** —— boot 在切草稿/切会话时也会调 `refresh`，那时抽屉是关的，不能每次都付一次宿主往返（它的回复可能带一次 `session/list`）。此前 `choices` 是**一次拉取、终身缓存**（连 `reset()` 都不清）⇒ 当天新用过的目录永远进不了「Recently used」（用户报的就是它） |
 | 已开始的会话 | 目录**只读**（协议固定），抽屉里点候选 = 在那个目录里开一个**新草稿**（不假装能改） |
 | 空态 Connect | 改为 `ensureConnected` + 草稿：只拉进程、**不建会话**（按钮的意义"我这个 agent 起得来吗"靠 `ensureConnected` 仍会抛错来保留）；该 agent 已有会话则聚焦最新那条 |
 | 键盘 | `#cwdBtn` 是真 `<button>`（047 的规矩）；三个抽屉（outline / history / cwd）**互斥**，开一个关掉另外两个 |
@@ -199,3 +200,35 @@ ACP 没有"改会话 cwd"的请求——cwd 只在 `session/new` / `session/load
   没有顺手改它们——那会改变会话列表与"最近使用目录"的既有行为，需要单独一轮。
   `directoryKey` 已经是那个现成的工具（纯函数、已测）。
 
+
+### 5.48 会话恢复：重载/关闭后问一句要不要恢复上次的 tab（CUSTOM-20261009-209）
+
+**为什么需要它**：`Reload Window`（或关掉编辑器再打开）会让扩展宿主重启 ⇒ agent 子进程被杀、
+`SessionManager` 的内存态（`sessions` / `activeSessionId` / `agentProcesses` …）**全清**。而此前
+**没有任何"上次开着哪些会话、最后聚焦哪一个"的持久化**（`SessionHistoryStore` 是"见过的会话"，
+`uiPrefs.tabOrder` 只是顺序）⇒ 重开面板时只能走 CUSTOM-20260930-131 那条：**当场建一个新的空会话**，
+用户开着的 N 个 tab 全丢，还在 agent 历史里白留一条。
+
+| 关注点 | 规则 |
+|---|---|
+| 快照存哪 | globalState `acpc.openSessions.v1`：`{ sessions: [{agentName, sessionId, cwd, title}], focused }`，**顺序就是 tabOrder 的顺序**（那样恢复出来的 tab 才回到原位）。写点：`session-created` / `session-closed` / `active-session-changed`，**防抖 300ms**（focus 会因为切标签频繁发生） |
+| 不许把快照写空 | **只有"本生命周期里出现过会话"之后**才允许写空表 —— 否则重载后刚启动、一个会话都还没有的那一瞬间就会把上一次的快照抹掉（而那正是要读它的时刻）。`sawLiveSession` 就是这道闸 |
+| 端给客户端 | `pushBoot` 加两个字段：`recoverable`（快照里**当前不活**的那些，且**只保留 modern agent** —— legacy 交给旧面板会换文档）与 `restorePref`。一条都没有时不带 `recoverable` |
+| 问不问 | 客户端：面板**空着**（无聚焦会话、无草稿）且设置不是 `never` 时才问。卡片的 `restore` 相位**压过 `ready`**（那张"Claude Code is ready"要让位）。设置项 `acpc.restoreSessionsOnOpen`（ask/always/never，默认 ask），读写走 125 那套 `PanelPrefsIO` 注入缝 |
+| 谁让位 | 提问待决期间：①宿主 `handleConnectAgent` **跳过 createSession**（否则用户既拿到新空会话又被打扰）；②客户端 `connection === 'connected'` 那句 `startDraft()` 也跳过（草稿页会把提问顶掉）。按 `+`（draftIntent）例外 —— 那是用户明确要一张新草稿 |
+| 懒恢复 | 点【Restore】只做两件事：宿主把**上次聚焦的那条**现在就 `openExistingSession` 起来（面板立刻有内容），客户端把 N 条变成**本地 tab**（`tabs.ts` 的 `restoring`，形态同草稿：有 id/agent/cwd/title 但宿主里还不存在）。**其余点开才加载**（`openHistorySession … keepOthers: true`）。实测：8 个大会话若逐个 eager load，replay 是秒级到十几秒 × 8 ⇒ 这条路不能走 |
+| 顺序 | 待恢复的 tab 与真会话**放进同一张 `tabOrder` 排名**（`tabModels()` 先把两者合成一个列表再排）—— 否则恢复出来的会全挤到真会话后面 |
+| `keepOthers` | `handleOpenHistorySession` 的**替换语义（099）只属于历史选择器**（那是导航，不该越点越多）。恢复是"多开" ⇒ 新增 `keepOthers` 跳过"关掉当前聚焦会话"那一段；其余（preload times → `openExistingSession`）一字未改 |
+| 关掉一个未加载的 | 只丢本地那条 + `forgetRestorable`（宿主把它从快照里摘掉）—— 否则下次重载还会拿它问你，而用户的动作明确是"不要它"。会话**已经活了**时反之：`setSessions` 里让真 tab 顶替那条本地 tab |
+| 【Start fresh】 | `dismissSessions`（清快照 + 本次不再问）+ `connectAgent` ⇒ 走现有的"连接就建一个"逻辑 = 用户要的"保持现在的逻辑" |
+| 记住选择 | 卡片上勾了「Remember my choice」再点按钮 ⇒ Restore → `always`、Start fresh → `never`（写设置并回话广播，另一个面/设置面板改了也跟上） |
+| 失败不纠缠 | `startRestore` 里那条加载失败（会话在 agent 侧已经没了）⇒ 把它从快照里摘掉 + 报错，下次不再问 |
+
+**不做**：不恢复草稿页（未发出的内容只在客户端，重载即失 —— 同浏览器不恢复未提交表单）；
+不恢复 legacy agent 的会话；「未加载」的 tab 不可拖拽（顺序已由 tabOrder 决定，与草稿同规矩）。
+
+**验收**：客户端桩 5 条（卡片提问态与退场规则、两个按钮 + 勾选把回答交给 boot、待恢复 tab 的
+排序/点击/关闭、活了就让位）；宿主 6 条（设置消毒、快照写盘并端给下一个窗口、`keepOthers` 不关别的、
+有快照时不自动建会话而 `never` 时照建、三条消息落地、`startRestore` 只加载聚焦那条）；
+真 Chromium `#restorecard` / `#restorecardprobe`（相位/文案/三个待恢复 tab + 点一下发出去的是
+`startRestore`）。

@@ -175,18 +175,31 @@ export const scrollClient = `
   var diagWindowStart = 0;
   var diagInWindow = 0;
 
-  function logScrollState(reason, force) {
-    if (!container) { return; }
+  /**
+   * [CUSTOM-20261008-202] 这一条**现在会被记下来吗**？（只看节流与配额：不改序号、不写日志。）
+   *
+   * 抽出来是给热路径用的：诊断里有些量要**读几何**，而"反正不会记"的那些调用不该付这个代价 ——
+   * 'follow()' 在"用户没贴底"那一格里只为诊断读 'scrollHeight'，而它每条记录都被调一次
+   * （大会话回放里一个批次 139 条 ⇒ 139 次强制重排）。注意它会顺手把窗口计数归零
+   * （与 'logScrollState' 开头同一动作、同一语义）。
+   */
+  function diagAllows(force) {
+    if (!container) { return false; }
     var now = Date.now();
     if (now - diagWindowStart >= DIAG_WINDOW_MS) { diagWindowStart = now; diagInWindow = 0; }
-    if (diagInWindow >= DIAG_MAX_PER_WINDOW || (!force && now - diagLastAt < 700)) {
+    return !(diagInWindow >= DIAG_MAX_PER_WINDOW || (!force && now - diagLastAt < 700));
+  }
+
+  function logScrollState(reason, force) {
+    if (!container) { return; }
+    if (!diagAllows(force)) {
       // 同一个原因连续来很多次（流式里每次 append 都会走一遍 follow）时只记一次，其余计数。
       diagSuppressed++;
       return;
     }
     diagSeq++;
     diagInWindow++;
-    diagLastAt = now;
+    diagLastAt = Date.now();
     var pad = 0;
     if (window.getComputedStyle) { pad = parseFloat(window.getComputedStyle(container).paddingBottom) || 0; }
     var max = container.scrollHeight - container.clientHeight;
@@ -275,9 +288,14 @@ export const scrollClient = `
       // [CUSTOM-20261005-192] 用户在往上翻：**不跟是对的**（不该抢他的视口）。但"面板没到底"
       // 的正当来源就是这里，而本 bug 的嫌疑正是"他其实在底部、我们却判成不在" —— 所以每次
       // append 记一笔（有节流 + 序号，流式期间不会刷屏）。内容是否同时长高也一并记下。
-      var now = container.scrollHeight;
-      var grew = lastScrollHeight >= 0 && now > lastScrollHeight + 40;
-      lastScrollHeight = now;
+      // [CUSTOM-20261008-202] 但**只在它真会被记下来的时候读几何** —— 'scrollHeight' 是一次
+      // 强制重排，而这条链是"每条记录一次"（见 diagAllows）。代价是 'grew' 与 'skip' 的基准
+      // （lastScrollHeight）只跟着被记下来的那些调用走：两者都只是**日志里的一个词**，不影响
+      // 任何行为，判据宁可粗一点也不该在热路径上读几何。
+      if (!diagAllows(false)) { return; }
+      var height = container.scrollHeight;
+      var grew = lastScrollHeight >= 0 && height > lastScrollHeight + 40;
+      lastScrollHeight = height;
       logScrollState(grew ? 'grew-unpinned' : 'skip-unpinned');
       return;
     }

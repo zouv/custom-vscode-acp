@@ -262,6 +262,7 @@ pending ──用户点按钮──► selected        （回答 optionId）
 | 关注点 | 规则 |
 |---|---|
 | 持久化 | `mode` / `width`（180px~50%）走**宿主 `globalState`**（077）：`setUiPref`（webview→ext）存 `acpc.outlinePrefs.v1`，`uiPrefs`（ext→webview）随 boot 带回、`applyPrefs()` 恢复——跨窗口重载/编辑器面板重开存活（webview 本地 `vscode.setState` 只活在同一实例 reload） |
+| **开/关按会话记（204）** | `mode` 是**布局**偏好（"允不允许出现侧栏"），而"这个会话里它开着吗"是**另一件事**，按会话记：`outlineOpenBySession` + `outlineOpenDefault`（与 Times 200 同一套语义：有效值 = 表里的记录 ?? 默认值；拨一次两处都写）。焦点咽喉点同步（`boot.applyFocus` → `NS.outline.setSession`，与 `stickyUser.setSession` 同形）。**两个 bug 的公共根因就在这一行**：以前关侧栏只改瞬态 `isOpen`（`mode` 仍是 sidebar），于是 ①重启后 `applyPrefs` 把它重新算成 `mode === 'sidebar'` ⇒ 自己回来；②`uiPrefs` 是**广播**的（宿主在**任何** `setUiPref` 之后都回一次），客户端收到就走 `applyPrefs` ⇒ **点一下 Times（200 起它会发 setUiPref）或拖一下 tab（198）就能让刚关掉的侧栏弹回来**（用户报的两条）。现在 `isOpen` 一律由那两份持久状态推出来，**回话只是收敛、不是命令**；关（☰ / Escape / ✕）一律落盘。旧记录（没有这两项）按老行为补一次 `openDefault = true`（钉住过的人升级后侧栏不该无声消失） |
 | 跳转 | 侧栏模式**不关**（常驻导航）；下拉模式维持「跳完收起」 |
 | `close()` 语义 | **只关下拉**：`boot.ts` 会话切换调 `close()`，侧栏模式 no-op——否则刚恢复的侧栏会被 boot 的 close 关掉 |
 | 点击外部 | 只关下拉；侧栏是常驻面板，在 transcript 里点来点去不关 |
@@ -997,3 +998,92 @@ SDK 侧走 `ClientSideConnection.extMethod(method, params)`（就是普通 JSON-
 布局用 `preview-records.mjs` 的 `#nosessionheaderprobe` **读数字**：`gapRight == padRight`（Times 贴右缘）、
 `cwdDisabled: true`、`cwdText` 是默认目录。**201 的真机拖拽不在自动覆盖范围**（见 dev-workflow 验收 210）。
 
+
+### 5.46 回填分帧、滚动诊断不读几何、长任务看门狗（CUSTOM-20261008-202）
+
+**症状**：在草稿页打开一条 581 条记录的历史会话，**loading 期间点标签栏没反应**。
+
+**证据**（`~/.claude/acp-client-custom.log`，2026-10-08 08:55）：客户端连续 **50 秒**一行日志都没有，
+恢复后攒下的 4 条 `markdownRendered` 一次性涌出（12.158–12.168），而 `press@outside` 那一行出现在
+恢复后的第一刻（11.249）—— 也就是**那次点击被压后了约 50 秒**。同一时间宿主也是一行没写，但
+`session/load` 的响应 08:55:36 就到了 ⇒ 卡的是**客户端**，不是宿主。
+
+**为什么**：那一批回填 139 条，每条都要消毒 + 插 DOM + 读几何（`patch` 收尾的 `follow()` 读
+`scrollHeight`、`refreshPreview` 读 `textContent`），而这条会话的转录有 2428 个工具卡、17000px 高 ——
+几百次"写一段又读一次几何"交错起来就是几百次**强制整页重排**，合成了一个几十秒的长任务。
+长任务期间浏览器会把输入压后、甚至丢掉：症状于是长得像"处理器没接上"。
+
+**修法（两处，都是小改）**：
+
+1. **`scroll.follow()` 在"用户没贴底"那一格里只为诊断读 `scrollHeight`** —— 现在只在**它真会被记下来**
+   时才读（`diagAllows`，与日志那套节流/配额同一判据）。这是那个长任务里最值得砍的一半：真机日志里
+   `skip-unpinned` / `grew-unpinned` 就是这条链打出来的，流式/回放期间几十次每秒。
+2. **回填应用分帧**：`transcriptView.queueMarkdown` 按时间片（每片 ≤ 8ms）落地，剩下的排到下一帧
+   ⇒ 单任务不超过一帧。每片只做两个便宜收尾（`reassert` / `stickyUser.schedule`），`rail.reflow()`
+   只在整批结束时点一次 —— 逐片点名时那趟全量量测自己就成 50ms+ 的长任务（`#mdsliceprobe` 量到过）。
+   一条回填抛错只跳过它自己（**先推游标再干活**），否则它会被每帧重试一次（死循环 + 刷屏）。
+
+**诊断**：新增 `html/client/perf.ts` —— `PerformanceObserver('longtask')`，>300ms 才记一行
+（`[acpc] longtask NNNNms during=<阶段>`），自己也有 1s 节流（173 的配额规矩）。下次再"点了没反应"，
+日志里就有数字，不必再靠"日志突然断了"反推。
+
+**验收**：桩 DOM 5 条（顺序 / 跨批 / 坏条不拖累 / 不贴底不读几何 / 看门狗安装与阈值）+ 真 Chromium 的
+`#mdsliceprobe` 档（同一条 DOM 上"整批一次"与"分帧"对照）。
+⚠️ **探针复现不出真机那 50 秒**：合成条目（300×5KB）整批只花 ~20ms、分帧反而 ~165ms（多出来的帧各自
+要重排），而真机是 **~360ms/条**（50s/139）—— 差两个数量级。所以它只能说明"分帧之后一个批次绝不落在
+单个任务里"，**不能**证明真机修好；真机判据是下一次的 `longtask` 日志行（dev-workflow 验收 211）。
+
+### 5.47 文件引用的三种呈现（CUSTOM-20261008-206）
+
+用户提的三条，其实是"文件引用"在三个位置上的形状问题：
+
+**① 用户气泡里的文件 chip 与 caret 同栏（气泡内）**。108/112 的"chip 与图标同在第一行"只做给了
+**图片** chip：CSS 的 flex 判据是 `summary:has(.content-image-chip)`，而文件 chip 外面还套着一个
+`.chip-row`（块级 div）⇒ 它自己占一行（用户报"引用的文件 Tag 应该放在折叠按钮同栏"）。
+修法两条一起：flex 判据补上 `:has(.chip-row)`，并让那层包装**不占盒**（`.entry-user ... .chip-row
+{ display: contents }`，于是 chip 自己成为 flex 项）。同一轮把 tag **加高**（`.chip` 默认 `padding: 0 5px`
+是零纵向内边距，文件名被上下描边紧压着）并加上 `</>` 图标（`NS.icons` 新增 `file` 形状；只给**本地文件**
+chip 加 —— 真链接给代码图标会误导）。实测：`caretTop 85 / chipTop 86`（同栏）、tag 高 16→23px。
+
+**② 输入框引用栏里的「编辑器当前文件」格**：宿主订阅 `onDidChangeActiveTextEditor` /
+`onDidChangeTextEditorSelection`，把当前文件 + 多行选区的行区间推给客户端（`activeFile` 消息，
+**非会话作用域**、两个面都发）；客户端在 `#attachments` 那一行渲染一格：
+`+`（还没引用）/ `×`（已引用）的圆形开关 + 文件 tag（图标 + 文件名 + `:12-40`）。
+
+- **已引用与否从附件列表现算**（`state.attachments` 里有没有同 `path` 的一条），不另存一份状态：
+  宿主的 `attachments` 回复一到，`+` 自己变 `×`（pitfall #19 的老规矩）。
+- **点 `+` 的路径**：会话页发 `attachPath`（新增 `meta`，与 `paths` 下标平行，带显示名与行区间）；
+  草稿页走 193 的本地列表（`addDraftPaths(paths, meta)`）—— 草稿没有会话，会话作用域的消息会被宿主丢掉。
+- **点 `×`**：会话页 `detachFile`；草稿页就地删本地那份。
+- **tag 本体可点**（`data-path` → 既有的 `openFile` 通道，与记录里的文件 chip 一致）。
+- **行区间**：`readActiveFileFrom(editor)` 把 0 基行号换成 1 基，并处理"拖到下一行行首不算那一行"
+  （与编辑器自己的显示一致）；单行选区不带区间。**抽成接收结构子集的纯函数**是为了可测 —— 真
+  `vscode.window.activeTextEditor` 在测试宿主里造不出来（同 `pickDefaultCwd` 的既有做法）。
+- **推的方式**：按"路径 + 行区间"签名去重（`onDidChangeTextEditorSelection` 每次光标移动都回调，
+  叠成行号之后同一行里动就不发），面刚挂上来时 `force` 推一次（签名是全局的，第二个面不该因为
+  "另一个面拿过了"而拿不到）。
+
+**③ agent 也看得到行区间**：发送时把区间挂进资源链接的 uri 片段
+（`file:///….cs#L12-40`，`name` 里已经有给人看的 `文件名:12-40`）—— 不认片段的实现照旧忽略它。
+
+**②b 三条修正（207）**：①气泡里那个 `</>` 图标**插在最前面** —— 原来 `el('button','chip', text)`
+已经把文件名写进去了，`appendChild` 会把图标放到名字**后面**（用户截图就是反的），改成
+`insertBefore(icon, firstChild)`；②引用栏那个开关**排在 tag 之后**（与附件 chip 的 `×` 一致）；③**同一个
+文件支持引用多段** —— 同一性从"路径"改成"路径 + 行区间"（`sameRef`），于是"当前框选与已引用的不同 ⇒
+显示 `+`（可以再引用一段）、相同 ⇒ `×`（点它只摘这一段）"。为此宿主两处按路径写的判断必须跟着改：
+`addAttachments` 的去重（原来同文件的第二段**根本入不了列**）与 `detachFile`（原来会把这个文件的**所有**段
+一起摘掉）；`detachFile` 因此加上可选区间（带 = 只摘那一段，不带 = 整条路径全摘，拖拽/粘贴的旧行为不变）。
+顺带修了草稿页的投影函数 `draftFilesOf` —— 它只手抄了 `{id,kind,name,path}`，区间在投影时掉了，
+"这一段加过没有"永远答"没有"（见 pitfalls #58）。
+
+**②c 两态一个 chip（208）**：开关（`+`/`×`）**收进 chip 里面**（原来露在 tag 外面，用户嫌突兀），
+外层 `.ref-chip` 负责描边 + 底色，里面是**两个平级的真按钮**（`.ref-tag` 点开文件 / `.ref-toggle` 切换引用）
+—— button 里不能嵌 button，所以是平级而不是嵌套，键盘各自可达。两态用底色 + 描边一起区分：
+**预选**（还没引用）= 中性 chip 底色**混入**主题强调色（`color-mix`，见 pitfalls #59）+ **虚线**；
+**已引用** = 与其它附件 chip 同观感（`--vscode-textCodeBlock-background` + 实线）。
+
+**验收**：客户端桩 4 条（出现 `+` / 行区间进 `meta` / 宿主回复后变 `×` 再点走 `detachFile` /
+草稿页攒本地）；宿主 4 条（无编辑器与非本地文件 ⇒ 不显示、整文件、1 基行区间与"下一行行首"边界、
+`attachPath` 的 meta → 附件与发送时的 uri 片段）；真 Chromium 的 `#refchip` 档
+（`toggle:'+'`、`label:'PianoGameplayDefine.cs:12-40'`、`href` 为真实路径）+ `#filechip` 档
+（气泡里的文件 chip：`caretTop/chipTop` 同栏、`chipH`、`hasIcon`）。

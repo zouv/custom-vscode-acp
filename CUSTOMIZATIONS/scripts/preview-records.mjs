@@ -307,6 +307,180 @@ function driver() {
   if (location.hash.indexOf('times') >= 0) {
     messages.classList.add('show-times');
   }
+  // [CUSTOM-20261008-202] markdown 回填"整批一次跑完" vs "分帧"的**对照读数**。
+  //
+  // 现场（2026-10-08 真机）：在草稿页打开一条 581 条记录的历史会话，客户端连着 50 秒写不出一行
+  // 日志（输入被浏览器压后/丢掉），用户那时正在点标签栏 —— "loading 里切不了 tab"。同一批 139 条
+  // 回填是一条长任务：每条都要解析 HTML、消毒、插 DOM，还要读一次几何（patch 收尾的 follow()）。
+  // 这里把两种形状放在**同一份 DOM、同一批条目**上各量一次，数字写进 #probe：
+  //   lump  = 旧形状（driver 里直接 for 一遍应用全部，就是切分前 boot 那段循环）
+  //   slice = 新形状（NS.transcriptView.queueMarkdown，按时间片落地）
+  // 读数：总时长 / 最长单任务 / 长任务条数。判据不是"总时长变小"（总量本来就一样），
+  // 而是 **slice 的最长单任务必须远小于 lump 的**（输入能不能被处理，只看最长那一个）。
+  if (hash.indexOf('mdsliceprobe') >= 0) {
+    // 这一档量的就是**真面板**里的代价：先把 boot 补起来（模块加载时 document 还是 'loading'，
+    // 它把 init 挂给了 DOMContentLoaded，而这个事件在预览里早就过去了）—— 否则 scroll/rail/
+    // sticky 全是未初始化的空壳，patch 收尾的那次几何读就成了免费操作（第一版就是这么量出
+    // "8ms"的：不是不贵，是根本没在量真东西）。
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+    var perfTasks = [];
+    try {
+      if (typeof PerformanceObserver === 'function') {
+        new PerformanceObserver(function (list) {
+          var es = list.getEntries();
+          for (var pi = 0; pi < es.length; pi++) { perfTasks.push(Math.round(es[pi].duration)); }
+        }).observe({ entryTypes: ['longtask'] });
+      }
+    } catch (e) { /* 不支持就只读总时长 */ }
+
+    var RECORDS = 600;
+    var OPS = 300;
+    function bigHtml(i) {
+      return '<p>回填 ' + i + '</p><ul>'
+        + '<li>' + '一段不短的正文，用来看消毒与插入的真实代价。'.repeat(6) + '</li>'
+        + '<li>' + '第二行同样长，再来一段凑到几 KB。'.repeat(6) + '</li>'
+        + '</ul><pre><code>' + ('const x = 1;' + String.fromCharCode(10)).repeat(40) + '</code></pre>';
+    }
+    var started = Date.now();
+    function makeEntries() {
+      var out = [];
+      for (var i = 0; i < RECORDS; i++) {
+        // 一半助手、一半工具卡（回放里的体量主要来自这两类；工具卡没有 view model 时
+        // place() 会建一张最简卡，仍是真 DOM、真占位）。
+        if (i % 2 === 0) {
+          out.push({ id: 'p-a' + i, kind: 'assistant', at: started + i * 10, streaming: false,
+            text: '条目 ' + i + '：' + '很长的一段正文，用来把 DOM 撑大。'.repeat(12) });
+        } else {
+          out.push({ id: 'p-t' + i, kind: 'tool', at: started + i * 10, toolCallId: 'call-' + i });
+        }
+      }
+      return out;
+    }
+    function batchItems() {
+      var out = [];
+      // 助手记录的 id 是偶数位（见 makeEntries）。
+      for (var i = 0; i < OPS; i++) { out.push({ entryId: 'p-a' + (i * 2), html: bigHtml(i) }); }
+      return out;
+    }
+    function runLump(items) {
+      var t0 = performance.now();
+      for (var i = 0; i < items.length; i++) { NS.transcriptView.patch(items[i].entryId, { html: items[i].html }); }
+      return performance.now() - t0;
+    }
+    function runSliced(items, done) {
+      var t0 = performance.now();
+      NS.transcriptView.queueMarkdown(items);
+      // 排空的判据：这一批落的正文都进了 DOM（队列是排帧跑的，不能只看一帧）。
+      // 用 querySelectorAll 数类名，别用 innerHTML —— 后者每帧序列化整棵树，量出来的就是它自己。
+      var frames = 0;
+      var wait = function () {
+        frames++;
+        var body = NS.dom.qs('messages');
+        var landed = body && body.querySelectorAll('.bubble-body.md').length >= items.length;
+        if (landed || frames >= 600) { done(performance.now() - t0, frames); return; }
+        requestAnimationFrame(wait);
+      };
+      requestAnimationFrame(wait);
+    }
+    (function () {
+      var report = { kind: 'mdslice' };
+      NS.transcriptView.reset();
+      NS.transcriptView.hydrate({ sessionId: 'perf', entries: makeEntries() });
+      var tLump = runLump(batchItems());
+      report.lumpMs = Math.round(tLump);
+      report.lumpLongest = perfTasks.length > 0 ? Math.max.apply(null, perfTasks) : 0;
+      report.lumpTasks = perfTasks.length;
+      perfTasks.length = 0;
+      NS.transcriptView.reset();
+      NS.transcriptView.hydrate({ sessionId: 'perf', entries: makeEntries() });
+      runSliced(batchItems(), function (ms) {
+        report.slicedMs = Math.round(ms);
+        report.slicedLongest = perfTasks.length > 0 ? Math.max.apply(null, perfTasks) : 0;
+        report.slicedTasks = perfTasks.length;
+        var pre = document.getElementById('probe') || (function () {
+          var el = document.createElement('pre'); el.id = 'probe'; document.body.appendChild(el); return el;
+        })();
+        pre.textContent += String.fromCharCode(10) + JSON.stringify(report);
+      });
+    })();
+  }
+  // [CUSTOM-20261009-209] #restorecard：会话恢复的提问态（真 boot + 真卡片）。
+  // 走真路径：补一次 DOMContentLoaded 让 boot 真的 init，再喂一条带 recoverable 的 boot 消息。
+  // 带 probe 时**额外点一次【Restore】**，然后读"客户端发出去的是什么"与 tab 栏里那几个待恢复的 tab
+  // —— 这一段（boot 里的 restoreChoice）桩 DOM 够不着，只有真环境能验。
+  if (hash.indexOf('restorecard') >= 0) {
+    document.dispatchEvent(new Event('DOMContentLoaded'));
+    var restorePosts = [];
+    NS.bridge.post = function (m) { restorePosts.push(m); };
+    window.postMessage({
+      type: 'boot', focused: null, sessions: [], snapshot: null, meta: null,
+      agentConnected: true, autoConnect: false, defaultCwd: '/work/example-project',
+      recoverable: [
+        { agentName: 'Claude Code', sessionId: 'aaaaaaaa-1111', cwd: '/tmp', title: 'Piano gameplay' },
+        { agentName: 'Claude Code', sessionId: 'bbbbbbbb-2222', cwd: '/tmp', title: 'Commit both repos' },
+        { agentName: 'Claude Code', sessionId: 'cccccccc-3333', cwd: '/tmp', title: 'Restore tabs' }
+      ],
+      restorePref: 'ask'
+    }, '*');
+    if (hash.indexOf('probe') >= 0) {
+      window.setTimeout(function () {
+        var accept = document.getElementById('restoreAccept');
+        if (accept) { accept.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
+        var restoreTabs = document.querySelectorAll('.tab[data-restore-id]');
+        var pre = document.getElementById('probe') || (function () {
+          var el = document.createElement('pre'); el.id = 'probe'; document.body.appendChild(el); return el;
+        })();
+        pre.textContent += String.fromCharCode(10) + JSON.stringify({
+          kind: 'restoreclick',
+          phase: document.body.getAttribute('data-phase'),
+          title: (document.getElementById('stateTitle') || {}).textContent,
+          accept: (document.getElementById('restoreAccept') || {}).textContent,
+          acceptHidden: (document.getElementById('restoreActions') || {}).hidden === true,
+          hasChoice: !!(NS.boot && NS.boot.restoreChoice),
+          bootKeys: Object.keys(NS.boot || {}),
+          sameNs: window.__acpc === NS,
+          posted: restorePosts.map(function (m) { return m.type; }),
+          restoreTabs: restoreTabs.length,
+          labels: Array.prototype.map.call(restoreTabs, function (t) { return String(t.textContent).trim(); }),
+        });
+      }, 200);
+    }
+  }
+
+  // [CUSTOM-20261008-206] #filechip：用户气泡里的**文件** chip（走真渲染路径 hydrate）。
+  // 判据两条：①它与 caret / 图片 chip **同在第一行**（以前文件 chip 掉到第二行）；
+  // ②tag 高一点、带 </> 图标。图片那一条是对照（它一直就在第一行）。
+  if (hash.indexOf('filechip') >= 0) {
+    NS.transcriptView.reset();
+    NS.transcriptView.hydrate({ sessionId: 'filechip', entries: [
+      { id: 'f1', kind: 'user', at: 1000, text: '两边都提交git', attachments: [{
+        type: 'resource_link', uri: 'f:/P4/x/PianoGameplayDefine.cs',
+        name: 'PianoGameplayDefine.cs', title: 'PianoGameplayDefine.cs',
+        path: 'f:/P4/x/PianoGameplayDefine.cs',
+      }] },
+      { id: 'f2', kind: 'user', at: 2000, text: '带图片的', attachments: [{
+        type: 'image', mimeType: 'image/png', name: 'shot.png',
+        dataUri: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8AAAwAB/AGtQ9RvAAAAAElFTkSuQmCC',
+      }] },
+    ] });
+  }
+  // [CUSTOM-20261008-206] #refchip：输入框引用栏里的「编辑器当前文件」格（'+' 还没引用）。
+  // 走真路径：composer.init + setFocus（有会话）+ setActiveFile（宿主推来的那个文件）。
+  if (hash.indexOf('refchip') >= 0) {
+    // 相位必须是"已连接"：未连接时整块底栏 display:none（143），引用栏根本看不见。
+    NS.stateCard.init();
+    NS.stateCard.setConnected(true);
+    NS.transcriptView.init(messages);
+    NS.transcriptView.reset();
+    NS.composer.init();
+    NS.composer.setFocus({ sessionId: 'ref-session', agentName: 'Claude Code', title: null,
+      cwd: '/tmp', createdAt: '', running: false, loading: false, unread: false }, null);
+    NS.composer.setActiveFile({
+      path: 'f:/P4/x/PianoGameplayDefine.cs', name: 'PianoGameplayDefine.cs',
+      lineStart: 12, lineEnd: 40,
+    });
+  }
+
   // [CUSTOM-20261008-199] #nosessionheader：**已连接但还没有会话**时的那条 header ——
   // 用户报的现场就是它（连接适配器要下载几十秒，这期间地址栏空着、Times 被挤到左边）。
   // 状态照真面板来：stateCard 置成已连接（它写 body[data-phase]，Times 的显隐由那个属性决定），
@@ -1447,6 +1621,63 @@ function driver() {
         }));
       }
     }
+    // [CUSTOM-20261008-206] 引用栏那一格：#refchip 档下读"开关字形 / tag 文本 / 是否算出可点"。
+    if (location.hash.indexOf('refchip') >= 0) {
+      var refChip = document.querySelector('.ref-chip');
+      var refToggle = document.querySelector('.ref-toggle');
+      var refTag = document.querySelector('.ref-tag');
+      out.push(JSON.stringify({
+        kind: 'refchip',
+        present: !!refChip,
+        on: !!(refChip && String(refChip.className).indexOf('ref-on') >= 0),
+        toggle: refToggle ? String(refToggle.textContent) : null,
+        label: refTag ? String(refTag.textContent).trim() : null,
+        href: refTag ? refTag.getAttribute('data-path') : null,
+        barHidden: (function () { var b = document.getElementById('attachments'); return b ? b.hidden === true : null; })(),
+        // [CUSTOM-20261008-207] 开关排在 tag **之后**（用户要求 + 与 × 一致）。
+        toggleAfterTag: !!(refChip && refChip.lastChild && String(refChip.lastChild.className || '').indexOf('ref-toggle') >= 0),
+        // [CUSTOM-20261008-208] 开关要在 **chip 里面**，且"预选 / 已引用"两态的底色+描边必须一眼不同。
+        // 探针自己翻一次状态（把这一格标成已引用）再读第二遍 —— 两态各一次读数。
+        toggleInside: !!(refChip && refToggle && refChip.contains && refChip.contains(refToggle)),
+        styleOff: readRefStyle(refChip),
+        styleOn: (function () {
+          if (!refChip || !NS.composer.setAttachments) { return null; }
+          // 区间必须与当前选区一致 —— 同一性 = 路径 + 区间（207），不然这里翻不过去。
+          NS.composer.setAttachments([{ path: 'f:/P4/x/PianoGameplayDefine.cs', name: 'x', kind: 'file', lineStart: 12, lineEnd: 40 }]);
+          return readRefStyle(document.querySelector('.ref-chip'));
+        })(),
+      }));
+      function readRefStyle(node) {
+        if (!node || !window.getComputedStyle) { return null; }
+        var cs = window.getComputedStyle(node);
+        return { bg: cs.backgroundColor, border: cs.borderStyle };
+      }
+    }
+
+    // [CUSTOM-20261008-206] 文件 chip 的几何：#filechip 档下量"同栏"与"tag 高度"。
+    if (location.hash.indexOf('filechip') >= 0) {
+      var bubbles = messages.querySelectorAll('.entry-user');
+      for (var bi = 0; bi < bubbles.length; bi++) {
+        var caret = bubbles[bi].querySelector('.fold-caret');
+        var chip = bubbles[bi].querySelector('.chip');
+        var img = bubbles[bi].querySelector('.content-image-chip');
+        var cRect = caret ? caret.getBoundingClientRect() : null;
+        var chipRect = chip ? chip.getBoundingClientRect() : null;
+        var imgRect = img ? img.getBoundingClientRect() : null;
+        out.push(JSON.stringify({
+          kind: 'filechip',
+          which: chip ? 'file' : (img ? 'image' : 'none'),
+          // 同一行 ⇒ 两个 top 相差不到半个行高；差一整个 tag 高就是"掉到第二行"。
+          caretTop: cRect ? Math.round(cRect.top) : null,
+          chipTop: chipRect ? Math.round(chipRect.top) : (imgRect ? Math.round(imgRect.top) : null),
+          chipH: chipRect ? Math.round(chipRect.height) : (imgRect ? Math.round(imgRect.height) : null),
+          hasIcon: !!(chip && chip.querySelector('.chip-icon')),
+          // [CUSTOM-20261008-207] 图标必须在**最前**（appendChild 会把它放到名字后面）。
+          iconFirst: !!(chip && chip.firstChild && String(chip.firstChild.className || '').indexOf('chip-icon') >= 0),
+          label: chip ? String(chip.textContent || '').trim() : '',
+        }));
+      }
+    }
     var drawerEl3 = document.getElementById('history');
     var filterMenuEl3 = document.getElementById('historyFilterMenu');    if (drawerEl3 && filterMenuEl3) {
       out.push(JSON.stringify({
@@ -1844,6 +2075,12 @@ const SHOTS = [
   // [CUSTOM-20260930-145] 窄面板下的 Times：工具卡的时刻到底贴不贴右缘（用户报的"不对齐"）。
   ['#timesnarrow', 'times-narrow', '1440,900'],
   ['#timescollapsed', 'times-collapsed'],
+  // [CUSTOM-20261009-209] 会话恢复的提问卡片（空态 + 上次开着的三个会话）。
+  ['#restorecard', 'restore-card'],
+  // [CUSTOM-20261008-206] 输入框引用栏的当前文件格（`+` + 文件名 + 行区间）。
+  ['#refchip', 'ref-chip'],
+  // [CUSTOM-20261008-206] 用户气泡里的文件 chip（与 caret 同栏 + 加高 + </> 图标）。
+  ['#filechip', 'file-chip'],
   // [CUSTOM-20261008-199] 空态 header（已连接、还没有会话）：地址栏该有内容、Times 该贴右缘。
   // 带 probe：判据是数字（Times 右缘与 header 右缘之差），不是肉眼看截图。
   ['#nosessionheaderprobe', 'no-session-header', '1440,900'],

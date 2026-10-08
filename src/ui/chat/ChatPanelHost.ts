@@ -28,6 +28,8 @@ import type {
   ExtToChat,
   ExtToChatMessage,
   MarkdownRendered,
+  RecoverableSession,
+  RestoreChoice,
   SessionMeta,
   SessionSummary,
   TranscriptSnapshotWire,
@@ -134,6 +136,11 @@ type LastModeStore = Record<string, RememberedMode>;
  * in either place has to reach the other (see the configuration listener below).
  */
 const AUTO_CONNECT_KEY = 'acpc.autoConnectOnOpen';
+// [CUSTOM-20261009-209] 「上次打开过的会话」快照（globalState）：重载/关闭重开后问一句要不要恢复它们。
+const OPEN_SESSIONS_KEY = 'acpc.openSessions.v1';
+const RESTORE_KEY = 'acpc.restoreSessionsOnOpen';
+/** [CUSTOM-20261009-209] 快照写入的防抖：它挂在 created/closed/focus 三个事件上。 */
+const SNAPSHOT_DEBOUNCE_MS = 300;
 
 export class ChatPanelHost implements IChatPanel, PermissionPresenter, ElicitationPresenter {
   readonly id = 'modern' as const;
@@ -201,6 +208,20 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
   // [CUSTOM-20260928-111] sessionId → (messageId → 图片视图)。replay 把图片并回用户气泡
   // （100 的教训：文本与非文本块分成两条 chunk 到达，气泡里没有可合并的东西）。
   private readonly replayUserImages: Map<string, Map<string, ContentBlockView[]>> = new Map();
+  /**
+   * [CUSTOM-20261008-205] IDE 上下文块（`<ide_opened_file>`）按「会话::messageId」暂存，
+   * 等**同一条消息**的正文 chunk 到了再挂到那个气泡上（回放里两条 chunk 同 messageId，
+   * 而代码顺序不保证 —— 用 messageId 配对就不必赌顺序）。见 user_message_chunk 分支。
+   */
+  private readonly ideFilesByMessage: Map<string, ContentBlockView> = new Map();
+  /** [CUSTOM-20261008-206] 上一次推给客户端的"编辑器当前文件"签名（选区每次移动都会回调）。 */
+  private activeFileSignature: string | null = null;
+  // [CUSTOM-20261009-209] 会话恢复：上次退出时开着的会话（globalState 里的快照）+ 本次是否已经答复过。
+  private openSessions: OpenSessionsSnapshot | null = null;
+  private restoreDismissed = false;
+  private snapshotTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 本生命周期里出现过会话吗 —— 只有出现过，才允许把快照写成空表（启动时的空态会把它抹掉）。 */
+  private sawLiveSession = false;
 
   private focused: PanelContext = { agentName: null, sessionId: null };
   // [CUSTOM-20261001-156] 会话状态通知（等待权限 / 等待表单 / 轮次完成）。默认实现打到
@@ -277,6 +298,8 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
     );
     this.sessionUpdateHandler = sessionUpdateHandler;
     this.uiPrefs = this.globalState?.get<UiPrefs>(UI_PREFS_KEY) ?? null;
+    // [CUSTOM-20261009-209] 上一次退出时开着的会话（可能是上一次进程留下的 —— 本次还没人写它）。
+    this.openSessions = this.globalState?.get<OpenSessionsSnapshot>(OPEN_SESSIONS_KEY) ?? null;
     // [CUSTOM-20260930-151] 草稿页的配置项/命令快照（重载窗口后仍可用）。
     const storedOptions = this.globalState?.get<DraftOptionsStore>(DRAFT_OPTIONS_KEY) ?? {};
     for (const agentName of Object.keys(storedOptions)) {
@@ -320,6 +343,9 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       // [CUSTOM-20260930-151] 会话一建好就把它的配置项/命令收进草稿页快照——下一次点「+」用的
       // 就是这一份。
       this.rememberAgentOptions(sessionId);
+      // [CUSTOM-20261009-209] 快照跟着"开着哪些会话"变（重载后要按它恢复）。
+      this.sawLiveSession = true;
+      this.saveOpenSessions();
       refresh();
       // [CUSTOM-20261001-159] 只有**新建**的会话套用记住的模式。打开历史（load）/恢复（resume）
       // 走的是同一个事件：那个会话有自己的模式，那是"重新打开它"的一部分，覆盖掉就是改坏它。
@@ -333,12 +359,16 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       // Release everything keyed by this session, then tell the client so a
       // closed tab disappears immediately rather than waiting for the focus
       // change that follows.
+      this.saveOpenSessions();
       this.transcripts.drop(sessionId);
       this.tools.drop(sessionId);
       this.attachments.delete(sessionId);
       this.imageData.delete(sessionId);
       this.replayTimes.delete(sessionId);
       this.replayUserImages.delete(sessionId);
+      for (const key of Array.from(this.ideFilesByMessage.keys())) {
+        if (key.startsWith(`${sessionId}::`)) { this.ideFilesByMessage.delete(key); }
+      }
       this.usage.delete(sessionId);
       this.planEntryIds.delete(sessionId);
       // [CUSTOM-20260926-073] Session ids are never reused, so a stale switch
@@ -387,6 +417,7 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       // [CUSTOM-20260925-063] Focusing a session consumes its unread marker, and
       // the strip has to be told — otherwise the attention dot lingers.
       if (sessionId) { this.unread.delete(sessionId); }
+      this.saveOpenSessions();
       this.pushFocus();
       this.refreshSessions();
     });
@@ -408,6 +439,15 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
     this.subscriptions.push(
       vscode.workspace.onDidChangeConfiguration(e => {
         if (e.affectsConfiguration(AUTO_CONNECT_KEY)) { this.postAutoConnectPref(); }
+        if (e.affectsConfiguration(RESTORE_KEY)) { this.postRestorePref(); }
+      }),
+    );
+    // [CUSTOM-20261008-206] 编辑器里"当前打开的文件/选区"→ 输入框的引用栏（见 pushActiveFile）。
+    // 选中变化**每次光标移动都会回调**，所以推送那边按签名去重（叠成行区间之后，同一行里动就不发）。
+    this.subscriptions.push(
+      vscode.window.onDidChangeActiveTextEditor(() => this.pushActiveFile()),
+      vscode.window.onDidChangeTextEditorSelection(e => {
+        if (e.textEditor === vscode.window.activeTextEditor) { this.pushActiveFile(); }
       }),
     );
   }
@@ -426,6 +466,8 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
    */
   attachSurface(surface: ChatSurface, ctx: PanelContext): void {
     this.surfaces.set(surface.key, surface);
+    // [CUSTOM-20261008-206] 新面立刻拿到编辑器当前文件（签名是全局的，这里必须 force）。
+    this.pushActiveFile(true);
     this.lastActive = surface.key;
     this.focused = ctx;
     surface.webview.options = {
@@ -507,19 +549,29 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
   private addAttachments(sessionId: string, incoming: Attachment[]): void {
     const list = this.attachments.get(sessionId) ?? [];
     for (const attachment of incoming) {
-      if (!list.some(existing => existing.path === attachment.path)) { list.push(attachment); }
+      // [CUSTOM-20261008-207] 去重按**引用**而不是按路径：同一个文件可以引用**多段**
+      // （`foo.cs:12-40` 与 `foo.cs:5-9` 是两条引用，用户明确要求）。拖拽/粘贴没有区间，
+      // 于是它们仍然按路径去重（同一条路径拖两次只留一份）。
+      if (!list.some(existing => sameReference(existing, attachment))) { list.push(attachment); }
     }
     this.attachments.set(sessionId, list);
     this.post({ type: 'attachments', sessionId, attachments: list });
   }
 
   /** Files dropped onto (or pasted into) the panel. */
-  private handleAttachPaths(sessionId: string, paths: unknown): void {
+  private handleAttachPaths(sessionId: string, paths: unknown, meta?: unknown): void {
     if (!Array.isArray(paths)) { return; }
+    const labels = Array.isArray(meta) ? (meta as Array<{ name?: unknown; lineStart?: unknown; lineEnd?: unknown }>) : [];
     const incoming: Attachment[] = [];
-    for (const raw of paths) {
+    for (let i = 0; i < paths.length; i++) {
+      const raw = paths[i];
       if (typeof raw !== 'string' || raw.length === 0) { continue; }
-      incoming.push({ path: raw, name: basename(raw) });
+      const m = labels[i] ?? {};
+      const lineStart = typeof m.lineStart === 'number' ? m.lineStart : undefined;
+      const lineEnd = typeof m.lineEnd === 'number' ? m.lineEnd : undefined;
+      // [CUSTOM-20261008-206] 显示名优先用调用方给的（编辑器那条带行区间），否则 basename。
+      const name = typeof m.name === 'string' && m.name.length > 0 ? m.name : basename(raw);
+      incoming.push({ path: raw, name, ...(lineStart ? { lineStart, lineEnd } : {}) });
     }
     if (incoming.length === 0) { return; }
     this.addAttachments(sessionId, incoming);
@@ -600,6 +652,45 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
         return;
       }
       // [CUSTOM-END] CUSTOM-20260928-095
+      // [CUSTOM-20261009-209] 会话恢复的三条（都非会话作用域：快照里的会话此刻都还没活）。
+      case 'startRestore': {
+        // 「开始恢复」：快照**留着**（下一次重载还要用），本次不再问了 —— 客户端负责建那些"未加载"的
+        // 本地 tab（懒恢复：点开才 load）。宿主这边只做一件事：把**上次聚焦的那条**现在就加载起来，
+        // 好让面板一恢复就有内容（那也正是用户刚刚在看的那个会话）。
+        const snapshot = this.openSessions;
+        const sessions = snapshot?.sessions ?? [];
+        const target = snapshot?.focused && sessions.some(s => s.sessionId === snapshot.focused)
+          ? snapshot.focused
+          : sessions[0]?.sessionId;
+        this.restoreDismissed = true;
+        log(`${LOG_PREFIX}: restoring the open-session snapshot (${sessions.length} tab(s), loading ${target ?? 'none'} now)`);
+        if (target) {
+          const entry = sessions.find(s => s.sessionId === target);
+          if (entry) { void this.openSnapshotSession(entry); }
+        }
+        return;
+      }
+      case 'dismissSessions':
+        // 「开始新的」：用户不要这些 tab 了 —— 清掉快照，别再拿它问。
+        this.restoreDismissed = true;
+        this.openSessions = null;
+        this.globalState?.update(OPEN_SESSIONS_KEY, undefined);
+        log(`${LOG_PREFIX}: open-session snapshot dismissed`);
+        return;
+      case 'forgetRestorable': {
+        const sessionId = (msg as { sessionId?: unknown }).sessionId;
+        if (typeof sessionId === 'string' && this.openSessions) {
+          this.openSessions = {
+            ...this.openSessions,
+            sessions: this.openSessions.sessions.filter(s => s.sessionId !== sessionId),
+          };
+          this.globalState?.update(OPEN_SESSIONS_KEY, this.openSessions);
+        }
+        return;
+      }
+      case 'setRestorePref':
+        void this.handleSetRestorePref((msg as { value?: unknown }).value);
+        return;
       case 'openHistorySession': {
         void this.handleOpenHistorySession(
           (msg as { agentName?: string }).agentName ?? '',
@@ -612,6 +703,8 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
           // [CUSTOM-20260928-100] The CLIENT was on a draft page: that draft is what
           // steps aside, not the session the host still has focused.
           !!(msg as { fromDraft?: boolean }).fromDraft,
+          // [CUSTOM-20261009-209] 恢复多个会话时：**别**关掉当前聚焦的那个（099 的替换语义不适用）。
+          !!(msg as { keepOthers?: boolean }).keepOthers,
         );
         return;
       }
@@ -684,6 +777,9 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
         // [CUSTOM-20261008-200] Times（第三个写者，同一条记录）：整份表 + 一个默认值。
         const timesBySession = (msg as { timesBySession?: unknown }).timesBySession;
         const timesDefault = (msg as { timesDefault?: unknown }).timesDefault;
+        // [CUSTOM-20261008-204] 大纲侧栏的"按会话开/关"（第四个写者，同一形状）。
+        const outlineOpenBySession = (msg as { outlineOpenBySession?: unknown }).outlineOpenBySession;
+        const outlineOpenDefault = (msg as { outlineOpenDefault?: unknown }).outlineOpenDefault;
         const next: UiPrefs = {
           outlineMode: mode === undefined
             ? previous.outlineMode
@@ -694,10 +790,16 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
         // （undefined 键会让 globalState 里那条记录读起来像"写过但没值"，也会让断言多出一堆噪声）。
         const order = tabOrder === undefined ? previous.tabOrder : sanitizeTabOrder(tabOrder);
         if (order !== undefined) { next.tabOrder = order; }
-        const times = timesBySession === undefined ? previous.timesBySession : sanitizeTimesMap(timesBySession);
+        const times = timesBySession === undefined ? previous.timesBySession : sanitizeSessionFlags(timesBySession);
         if (times !== undefined) { next.timesBySession = times; }
         const def = timesDefault === undefined ? previous.timesDefault : timesDefault === true;
         if (def !== undefined) { next.timesDefault = def; }
+        const openMap = outlineOpenBySession === undefined
+          ? previous.outlineOpenBySession
+          : sanitizeSessionFlags(outlineOpenBySession);
+        if (openMap !== undefined) { next.outlineOpenBySession = openMap; }
+        const openDef = outlineOpenDefault === undefined ? previous.outlineOpenDefault : outlineOpenDefault === true;
+        if (openDef !== undefined) { next.outlineOpenDefault = openDef; }
         this.uiPrefs = next;
         this.globalState?.update(UI_PREFS_KEY, this.uiPrefs);
         // [CUSTOM-20261007-198] 另外那个面（侧边栏 / 编辑区）也要跟着换序，否则它下次被重开
@@ -761,7 +863,14 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
         return;
       case 'detachFile': {
         const path = (msg as { path?: string }).path;
-        const list = (this.attachments.get(sessionId) ?? []).filter(a => a.path !== path);
+        // [CUSTOM-20261008-207] 带区间 = 只摘那一段（同一个文件的多段引用各自能删）；不带 = 整条路径
+        // 全摘（拖拽/粘贴的 chip 没有区间，行为不变）。
+        const start = (msg as { lineStart?: unknown }).lineStart;
+        const end = (msg as { lineEnd?: unknown }).lineEnd;
+        const ranged = typeof start === 'number';
+        const list = (this.attachments.get(sessionId) ?? []).filter(a => ranged
+          ? !(a.path === path && (a.lineStart ?? 0) === start && (a.lineEnd ?? 0) === (typeof end === 'number' ? end : start))
+          : a.path !== path);
         this.attachments.set(sessionId, list);
         if (path) { this.imageData.get(sessionId)?.delete(path); }
         this.post({ type: 'attachments', sessionId, attachments: list });
@@ -769,7 +878,12 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       }
       // [CUSTOM-20260925-049] Session-scoped: sits AFTER the guard above.
       case 'attachPath':
-        this.handleAttachPaths(sessionId, (msg as { paths?: unknown }).paths);
+        this.handleAttachPaths(
+          sessionId,
+          (msg as { paths?: unknown }).paths,
+          // [CUSTOM-20261008-206] 与 paths 平行的显示名/行区间（只有"编辑器当前文件"那条带）。
+          (msg as { meta?: unknown }).meta,
+        );
         return;
       // [CUSTOM-END] CUSTOM-20260925-049
       // [CUSTOM-BEGIN] CUSTOM-20260928-096 - 输入框图片：会话作用域，守卫之后（同 attachPath）。
@@ -956,7 +1070,10 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
         blocks.push({ type: 'image', data: img.data, mimeType: img.mimeType });
       } else {
         // ACP `ResourceLink.uri` is a plain string (file:// URI per convention).
-        blocks.push({ type: 'resource_link', uri: fileUri(a.path).toString(), name: a.name });
+        // [CUSTOM-20261008-206] 带选区行区间时挂一个 `#L12-40` 片段：`name` 里已经有它是给人看的，
+        // 片段则是让 agent 也能看到"引用的是哪几行"（不认识片段的实现会照旧忽略它）。
+        const range = a.lineStart ? `#L${a.lineStart}-${a.lineEnd ?? a.lineStart}` : '';
+        blocks.push({ type: 'resource_link', uri: fileUri(a.path).toString() + range, name: a.name });
       }
     }
 
@@ -1205,6 +1322,13 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       case 'user_message_chunk': {
         // Replay path (`session/load`).
         const text = textOf(data.content);
+        // [CUSTOM-20261008-205] IDE 上下文块：**不建记录**，挂到同一条消息的用户气泡上。
+        // 放在注入块判据之前 —— 它也是 `<ide_` 开头，但这里认得出来该做成 chip。
+        const idePath = ideOpenedFilePath(text);
+        if (idePath) {
+          this.rememberIdeFile(sessionId, data.messageId, ideFileChip(idePath));
+          return;
+        }
         // [CUSTOM-20260928-111] Images of this user message were read from the
         // transcript BEFORE replay started (preloadTranscriptTimes); merge them
         // into the bubble. The separate image chunk that follows (100) is dropped
@@ -1242,7 +1366,10 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
         // turn here too ("finalizes pending assistant turn", its
         // user_message_chunk branch).
         this.finalizeEntries(sessionId, { only: 'assistant' });
-        const entry = this.transcripts.appendUser(sessionId, text, images);
+        // [CUSTOM-20261008-205] 同一条消息的 IDE 上下文（若到过）与图片一起进气泡：chip 在前、正文在下。
+        const ideChip = this.takeIdeFile(sessionId, data.messageId);
+        const views = (ideChip ? [ideChip] : []).concat(images ?? []);
+        const entry = this.transcripts.appendUser(sessionId, text, views.length > 0 ? views : undefined);
         if (entry) {
           this.stampReplayTime(sessionId, entry, data.messageId);
           this.post({ type: 'append', sessionId, entries: [entry] });
@@ -1397,6 +1524,33 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
   private replayImagesFor(sessionId: string, messageId: unknown): ContentBlockView[] | undefined {
     if (typeof messageId !== 'string' || messageId.length === 0) { return undefined; }
     return this.replayUserImages.get(sessionId)?.get(messageId);
+  }
+
+  /**
+   * [CUSTOM-20261008-205] 存一个"这条消息的 IDE 上下文文件"，等同一条消息的正文 chunk 来取。
+   * 认不出 messageId 的 chunk 直接丢掉 —— 没有配对的键，挂到别人身上比不显示更糟。
+   */
+  private rememberIdeFile(sessionId: string, messageId: unknown, chip: ContentBlockView): void {
+    if (typeof messageId !== 'string' || messageId.length === 0) {
+      log(`${LOG_PREFIX}: IDE context block without a messageId (dropped)`);
+      return;
+    }
+    this.ideFilesByMessage.set(ideKey(sessionId, messageId), chip);
+    // 只留最近 20 条：若用户只是"打开了个文件"而没有下文，这条就永远没人来取。
+    while (this.ideFilesByMessage.size > 20) {
+      const oldest = this.ideFilesByMessage.keys().next().value;
+      if (oldest === undefined) { break; }
+      this.ideFilesByMessage.delete(oldest);
+    }
+  }
+
+  /** [CUSTOM-20261008-205] 取走这条消息的 IDE 上下文（取过即删，不会挂到第二条消息上）。 */
+  private takeIdeFile(sessionId: string, messageId: unknown): ContentBlockView | undefined {
+    if (typeof messageId !== 'string' || messageId.length === 0) { return undefined; }
+    const key = ideKey(sessionId, messageId);
+    const chip = this.ideFilesByMessage.get(key);
+    if (chip) { this.ideFilesByMessage.delete(key); }
+    return chip;
   }
 
   /** Real epoch ms for a replay chunk's message, or undefined when the agent gave none. */
@@ -1888,14 +2042,22 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
         if (newest) {
           this.sessionManager.focusSession(newest);
         } else {
-          // [CUSTOM-20260930-131] No session yet: CREATE one, and do it before reporting
-          // the phase. A draft page can never be "the same as a normal session" — images
-          // need a session to attach to, and the mode/model pickers come from the
-          // `session/new` response, so without a session there is nothing to show. The
-          // cost is a session left in the agent's history if the user connects and walks
-          // away; `session/close` does not remove it from history (058), and that is the
-          // trade the user chose over a half-usable composer.
-          await this.sessionManager.createSession(agent, { focus: true });
+          // [CUSTOM-20261009-209] 有可恢复的会话就先别建新的：面板停在空态卡片上问一句
+          // 「要不要恢复上次那几个」。用户选「开始新的」时会再发一次 connectAgent
+          // （那时快照已被丢弃），于是照旧走到下面 createSession —— 也就是"保持现在的逻辑"。
+          const recoverable = this.recoverableSessions();
+          if (recoverable.length > 0) {
+            log(`${LOG_PREFIX}: ${recoverable.length} session(s) are restorable — asking before creating a new one`);
+          } else {
+            // [CUSTOM-20260930-131] No session yet: CREATE one, and do it before reporting
+            // the phase. A draft page can never be "the same as a normal session" — images
+            // need a session to attach to, and the mode/model pickers come from the
+            // `session/new` response, so without a session there is nothing to show. The
+            // cost is a session left in the agent's history if the user connects and walks
+            // away; `session/close` does not remove it from history (058), and that is the
+            // trade the user chose over a half-usable composer.
+            await this.sessionManager.createSession(agent, { focus: true });
+          }
         }
         // [CUSTOM-20260930-124] 'connected' goes out AFTER the focus/creation above, and the
         // order is load-bearing: the client opens a draft on 'connected' only when no
@@ -1951,6 +2113,17 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
   }
 
   /** [CUSTOM-20260930-125] Tell every surface what the setting currently says. */
+  /** [CUSTOM-20261009-209] 卡片上那个「记住我的选择」写回来的值（走 prefs 注入缝，同 autoConnect）。 */
+  private async handleSetRestorePref(value: unknown): Promise<void> {
+    const choice = resolveRestoreChoice(value);
+    try {
+      await this.prefs.setRestore(choice);
+    } catch (e) {
+      log(`${LOG_PREFIX}: could not write ${RESTORE_KEY}: ${String(e)}`);
+    }
+    this.postRestorePref();
+  }
+
   private postAutoConnectPref(): void {
     this.post({ type: 'autoConnectPref', value: this.prefs.getAutoConnect() });
   }
@@ -2150,6 +2323,9 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
     cwd?: string,
     title?: string,
     fromDraft = false,
+    // [CUSTOM-20261009-209] 恢复上次的会话：**保留**其它已打开的会话（099 的"替换语义"是给历史
+    // 选择器用的 —— 那是导航，不该越点越多；恢复则相反，它就是要多开）。
+    keepOthers = false,
   ): Promise<void> {
     const agent = this.panelAgent(agentName);
     if (!agent || !sessionId) { return; }
@@ -2171,7 +2347,7 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       // other session). The client discards its draft itself.
       const alreadyLive = !!this.sessionManager.getSession(sessionId);
       const current = this.focused.sessionId ? this.sessionManager.getSession(this.focused.sessionId) : undefined;
-      if (!alreadyLive && !fromDraft && current && current.sessionId !== sessionId) {
+      if (!alreadyLive && !fromDraft && !keepOthers && current && current.sessionId !== sessionId) {
         try {
           await this.sessionManager.closeSession(current.agentName, current.sessionId);
         } catch (e) {
@@ -2604,11 +2780,116 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
   }
   // [CUSTOM-END] CUSTOM-20260924-019
 
+  /**
+   * [CUSTOM-20261008-206] 编辑器里「当前打开的文件」（含多行选区的行区间）→ 输入框的引用栏。
+   *
+   * 它让「把正在看的这个文件加进这条消息」从「找文件 + Attach File」变成点一下 `+`（与官方插件同一件事）。
+   * 只在**签名变化**时推：`onDidChangeTextEditorSelection` 每次光标移动都会回调，而区间叠成「行号」之后，
+   * 同一行里移动是不该发的（否则光标一动就是一条消息）。
+   * `force` 用于面刚挂上来的那一刻 —— 签名是全局的，第二个面挂上来时不该因为「另一个面拿过了」而拿不到。
+   */
+  private pushActiveFile(force = false): void {
+    if (this.attachedCount === 0) { return; }
+    const info = readActiveFileFrom(vscode.window.activeTextEditor as ActiveEditorLike | undefined);
+    const signature = info
+      ? info.path + '|' + (info.lineStart ?? '') + '|' + (info.lineEnd ?? '')
+      : '';
+    if (!force && signature === this.activeFileSignature) { return; }
+    this.activeFileSignature = signature;
+    this.post({ type: 'activeFile', file: info });
+  }
+
+  /**
+   * [CUSTOM-20261009-209] 记下「此刻开着哪些会话、聚焦哪一个」，供下次重开面板时恢复。
+   *
+   * - **顺序按 uiPrefs.tabOrder**：那正是客户端的手工顺序，恢复出来的 tab 才会回到原位。
+   * - **只有本生命周期出现过会话之后，才允许写空表** —— 否则重载后刚启动、一个会话都还没有的
+   *   那一瞬间就会把上一次的快照抹掉（而那正是要读它的时刻）。
+   * - **防抖**：它挂在 created / closed / focus 三个事件上，而 focus 会因为"切标签"频繁发生。
+   */
+  private saveOpenSessions(): void {
+    if (this.snapshotTimer) { clearTimeout(this.snapshotTimer); }
+    this.snapshotTimer = setTimeout(() => {
+      this.snapshotTimer = null;
+      const live = this.liveSessionsInTabOrder();
+      if (live.length === 0 && !this.sawLiveSession) { return; }
+      const snapshot: OpenSessionsSnapshot = { sessions: live, focused: this.focused.sessionId };
+      this.openSessions = snapshot;
+      const write = this.globalState?.update(OPEN_SESSIONS_KEY, snapshot);
+      if (write) { void Promise.resolve(write).catch(() => undefined); }
+    }, SNAPSHOT_DEBOUNCE_MS);
+  }
+
+  /**
+   * [CUSTOM-20261009-209] 恢复时把一条快照会话真正加载回来。
+   *
+   * 与历史选择器走**同一个决策点**（`openExistingSession`：load 优先、否则 resume），差别只有两点：
+   *   · 它**不动**其它已打开的会话（历史选择器有"替换语义"，恢复是"多开"）；
+   *   · 失败（会话在 agent 侧已经没了/转录被删）时把这一条从快照里摘掉，别下次再拿它问用户。
+   */
+  private async openSnapshotSession(entry: RecoverableSession): Promise<void> {
+    const agent = this.panelAgent(entry.agentName);
+    if (!agent) { return; }
+    try {
+      await this.preloadTranscriptTimes(agent, entry.sessionId, entry.cwd);
+      await this.sessionManager.openExistingSession(agent, entry.sessionId, { cwd: entry.cwd, title: entry.title });
+    } catch (e) {
+      log(`${LOG_PREFIX}: could not restore ${entry.sessionId}: ${(e as Error)?.message ?? String(e)}`);
+      this.openSessions = {
+        sessions: (this.openSessions?.sessions ?? []).filter(s => s.sessionId !== entry.sessionId),
+        focused: this.openSessions?.focused ?? null,
+      };
+      this.globalState?.update(OPEN_SESSIONS_KEY, this.openSessions);
+      this.reportError(null, e);
+    }
+  }
+
+  /** 活着的 modern 会话，按客户端那份手工顺序排（不在表里的按 SessionManager 的顺序接在后面）。 */
+  private liveSessionsInTabOrder(): RecoverableSession[] {
+    const out: RecoverableSession[] = [];
+    for (const agentName of MODERN_AGENTS) {
+      for (const sessionId of this.sessionManager.getSessionIdsForAgent(agentName)) {
+        const session = this.sessionManager.getSession(sessionId);
+        out.push({
+          agentName,
+          sessionId,
+          ...(session?.cwd ? { cwd: session.cwd } : {}),
+          ...(session?.title ? { title: session.title } : {}),
+        });
+      }
+    }
+    const rank = new Map<string, number>();
+    (this.uiPrefs?.tabOrder ?? []).forEach((id, index) => rank.set(id, index));
+    const known = out.filter(s => rank.has(s.sessionId));
+    const unknown = out.filter(s => !rank.has(s.sessionId));
+    known.sort((a, b) => (rank.get(a.sessionId) ?? 0) - (rank.get(b.sessionId) ?? 0));
+    return known.concat(unknown);
+  }
+
+  /**
+   * [CUSTOM-20261009-209] 可以恢复的会话：快照里**现在不活的**那些（活着的已经是 tab 了）。
+   *
+   * 已被答复（选过"开始新的"）或设置是 `never` 时返回空 —— 上层据此决定"问不问"，
+   * `handleConnectAgent` 也据此决定"要不要当场建一个新会话"。
+   */
+  private recoverableSessions(): RecoverableSession[] {
+    if (this.restoreDismissed) { return []; }
+    if (this.prefs.getRestore() === 'never') { return []; }
+    const snapshot = this.openSessions;
+    if (!snapshot || snapshot.sessions.length === 0) { return []; }
+    return snapshot.sessions.filter(s => !this.sessionManager.getSession(s.sessionId));
+  }
+
+  private postRestorePref(): void {
+    this.post({ type: 'restorePref', value: this.prefs.getRestore() });
+  }
+
   private pushBoot(to?: SurfaceKey): void {
     if (this.attachedCount === 0) { return; }
     // INV-E: the snapshot must not overtake anything still sitting in the queue.
     this.outbox.flush();
     this.refreshLiveSessionIds();
+    const recoverable = this.recoverableSessions();
     const sessions = this.buildSummaries();
     const focused = this.focused.sessionId ? this.buildSummary(this.focused.sessionId) : null;
     this.post({
@@ -2625,6 +2906,10 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       // 面板就是"已连接、还没有会话"，那时地址栏空着会看着像坏了（090 当初把这一格整个隐藏）。
       // 与草稿页显示的是**同一份**语义（下次会话建在这里），所以也复用宿主这一个解析器。
       defaultCwd: this.sessionManager.resolveDefaultCwd(),
+      // [CUSTOM-20261009-209] 上次退出时开着的会话（现在都不活）→ 空态卡片据此问一句要不要恢复。
+      // 只给 modern agent 的（legacy 交给旧面板会换文档）；一条都没有时不带这个字段。
+      ...(recoverable.length > 0 ? { recoverable } : {}),
+      restorePref: this.prefs.getRestore(),
     }, to);
     // [CUSTOM-20260926-077] Bring the outline pin/width prefs along with the boot,
     // so a recreated webview (editor panel reopen / window reload) restores them.
@@ -2792,12 +3077,31 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
 // --- helpers ---------------------------------------------------------------
 
 /**
+ * [CUSTOM-20261009-209] globalState 里的「上次打开过的会话」：条目的顺序就是 tab 的顺序。
+ */
+interface OpenSessionsSnapshot {
+  sessions: RecoverableSession[];
+  focused: string | null;
+}
+
+/**
+ * [CUSTOM-20261009-209] 设置值的消毒：手改过的 settings.json 不该把客户端的相位机带进未知状态
+ * （同 `resolveAutoConnect` 的理由）。抽成**导出的纯函数**是为了可测。
+ */
+export function resolveRestoreChoice(value: unknown): RestoreChoice {
+  return value === 'always' || value === 'never' ? value : 'ask';
+}
+
+/**
  * [CUSTOM-20260930-125] The one settings interaction this host has, behind an interface
  * so tests can hand it a stub instead of writing the developer's settings.json.
  */
 export interface PanelPrefsIO {
   getAutoConnect(): boolean;
   setAutoConnect(value: boolean): Promise<void>;
+  // [CUSTOM-20261009-209] 「重开面板要不要恢复上次的会话」：ask / always / never。
+  getRestore(): RestoreChoice;
+  setRestore(value: RestoreChoice): Promise<void>;
 }
 
 /** [CUSTOM-20260930-125] Default implementation: the real VS Code configuration. */
@@ -2809,6 +3113,10 @@ export function vscodePanelPrefs(): PanelPrefsIO {
     getAutoConnect: () => resolveAutoConnect(config().get<unknown>('autoConnectOnOpen')),
     setAutoConnect: async value => {
       await config().update('autoConnectOnOpen', value, vscode.ConfigurationTarget.Global);
+    },
+    getRestore: () => resolveRestoreChoice(config().get<unknown>('restoreSessionsOnOpen')),
+    setRestore: async value => {
+      await config().update('restoreSessionsOnOpen', value, vscode.ConfigurationTarget.Global);
     },
   };
 }
@@ -2951,15 +3259,18 @@ function sanitizeTabOrder(value: unknown): string[] {
 }
 
 /**
- * [CUSTOM-20261008-200] Times 的按会话表：`{ 会话 id → 开/关 }`。
+ * [CUSTOM-20261008-200] 「会话 id → 开/关」这张表的消毒器（Times 与大纲侧栏的开/关共用）。
  *
  * 来源是 webview，所以只信它的**形状**：键必须是非空短字符串（会话 id 的实际字符集，防手改过的
- * state 塞进来一整篇文本）、值只收布尔、条数有上限（同 `sanitizeTabOrder`：这张表随用户拨开关增长，
- * 客户端已经在写之前裁到"当前已知会话"，上限是第二道闸）。非对象 = 什么都没留下 ⇒ 空表 ——
- * 与 `sanitizeTabOrder` 对"不是数组"的处理**同形**（那个也是回空表）。"这一轮没改它"是
- * 另一件事，由调用方按"字段缺不缺"判断，不靠这里的返回值。
+ * state 塞进来一整篇文本）、值只收布尔、条数有上限（同 `sanitizeTabOrder`：这两张表都随用户动作
+ * 增长，客户端已经在写之前裁过，上限是第二道闸）。非对象 = 什么都没留下 ⇒ 空表 —— 与
+ * `sanitizeTabOrder` 对"不是数组"的处理**同形**。"这一轮没改它"是另一件事，由调用方按
+ * "字段缺不缺"判断，不靠这里的返回值。
+ *
+ * [CUSTOM-20261008-204] 从 `sanitizeTimesMap` 改名而来：大纲侧栏的按会话开关与它**同一形状**，
+ * 共用一份比抄第二份强（两份迟早漂移 —— pitfalls #19）。
  */
-function sanitizeTimesMap(value: unknown): Record<string, boolean> {
+function sanitizeSessionFlags(value: unknown): Record<string, boolean> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) { return {}; }
   const out: Record<string, boolean> = {};
   let count = 0;
@@ -3015,7 +3326,91 @@ function textOf(content: unknown): string {
 // [CUSTOM-20260928-109] 注入块（<task-notification> 等）不是用户输入，却走同一个
 // user chunk 通道 —— 渲染成蓝色用户气泡会把"agent 的回报"误读成"我说过这句话"。
 // 判据是前缀（与 diskSessions.ts:66 的 <local-command 先例同一类）。
-const INJECTED_PREFIXES = ['<task-notification', '<system-reminder', '<local-command', '<command-name', '<command-message'];
+const INJECTED_PREFIXES = [
+  '<task-notification', '<system-reminder', '<local-command', '<command-name', '<command-message',
+  // [CUSTOM-20261008-205] 其它 IDE 上下文块（`<ide_selection>` / `<ide_diagnostics>` …）也不是
+  // 用户说过的话：认不出形状时至少别渲染成蓝色气泡。认得出来的那个（`<ide_opened_file>`）走下面
+  // 的专用通道，变成消息上的文件 chip。
+  '<ide_',
+];
+
+// [CUSTOM-20261008-205] IDE 注入的"当前打开的文件"上下文。
+const IDE_OPENED_FILE_BLOCK = /^\s*<ide_opened_file>([\s\S]*?)<\/ide_opened_file>\s*$/;
+
+/**
+ * [CUSTOM-20261008-205] 从 IDE 上下文块里取出文件路径；不是这个块就返回 null。
+ *
+ * 它是**上下文**，不是用户说过的话 —— 用户报的"附加的文件被拆成了两条对话"就是它：这个块以前按
+ * 普通 user chunk 走，于是同一条消息渲染成**两个**蓝色气泡（一个只有 `<ide_opened_file>…` 的原文，
+ * 一个才是正文）。官方插件把它渲染成消息上的一个**文件 chip**（同一气泡里、正文在下），这里照做 ——
+ * 块本身不建记录，文件挂到同一条消息的用户气泡上（见 user_message_chunk 分支）。
+ */
+function ideOpenedFilePath(text: string): string | null {
+  const m = IDE_OPENED_FILE_BLOCK.exec(text);
+  if (!m) { return null; }
+  const named = /opened the file\s+(.+?)\s+in the IDE/i.exec(m[1]);
+  if (named) { return named[1].trim(); }
+  // 措辞若变了也不能把它变回蓝色气泡：退一步找第一个像路径的片段（盘符，或以 / 开头）。
+  const guess = /([A-Za-z]:[\\/][^\s<>"']+|\/[^\s<>"']+)/.exec(m[1]);
+  return guess ? guess[1].trim() : null;
+}
+
+/** [CUSTOM-20261008-205] 路径 → 用户气泡上那个文件 chip 的视图（点它走 openFile，见 039）。 */
+function ideFileChip(filePath: string): ContentBlockView {
+  const name = filePath.split(/[\\/]/).filter(Boolean).pop() ?? filePath;
+  return { type: 'resource_link', uri: filePath, name, title: name, path: filePath };
+}
+
+/**
+ * [CUSTOM-20261008-206] `readActiveFileFrom` 要的那几样（**结构子集**，不是 vscode.TextEditor 全量）
+ * —— 抽出来是为了**可测**：真 `vscode.window.activeTextEditor` 在测试宿主里造不出来，而"1 基行号 /
+ * 停在下一行行首不算"这类判据值得钉住（同 `pickDefaultCwd` 的既有做法：把 vscode 外壳与纯函数分开）。
+ */
+export interface ActiveEditorLike {
+  document: { uri: { scheme: string; fsPath: string } };
+  selection: {
+    isEmpty: boolean;
+    start: { line: number; character: number };
+    end: { line: number; character: number };
+  };
+}
+
+/**
+ * [CUSTOM-20261008-206] 编辑器里当前打开的文件 + 多行选区的行区间（1 基、含两端），喂给输入框的引用栏。
+ *
+ * **行号是 0 基、界面上是 1 基**：这里统一换成 1 基。选区若停在下一行的行首（character 0），那一行
+ * 不算选中 —— 与编辑器自己的显示一致（否则从第 3 行拖到第 5 行开头会显示成 3-5，而编辑器显示 3-4）。
+ * 单行选区不带区间（引用整个文件）；没有可见编辑器、或不是本地文件（`untitled:` / 虚拟文档）时返回 null。
+ */
+export function readActiveFileFrom(
+  editor: ActiveEditorLike | undefined,
+): { path: string; name: string; lineStart?: number; lineEnd?: number } | null {
+  if (!editor || editor.document.uri.scheme !== 'file') { return null; }
+  const path = editor.document.uri.fsPath;
+  const name = path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+  const sel = editor.selection;
+  if (!sel || sel.isEmpty) { return { path, name }; }
+  let endLine = sel.end.line;
+  if (sel.end.character === 0 && endLine > sel.start.line) { endLine -= 1; }
+  if (endLine <= sel.start.line) { return { path, name }; }
+  return { path, name, lineStart: sel.start.line + 1, lineEnd: endLine + 1 };
+}
+
+/** [CUSTOM-20261008-205] IDE 上下文的暂存键：会话 + messageId（回放里同一消息的两条 chunk 靠它配对）。 */
+function ideKey(sessionId: string, messageId: string): string {
+  return `${sessionId}::${messageId}`;
+}
+
+/**
+ * [CUSTOM-20261008-207] 两条引用是不是**同一条**：路径 + 行区间。
+ *
+ * 同一个文件的不同段是**不同的引用**（用户可以引用 foo.cs 的 12-40 行和 5-9 行两次，207 的要求）；
+ * 没有区间的（拖拽/粘贴进来的文件、图片）按路径比 —— 与它们原来的行为一致。
+ */
+function sameReference(a: Attachment, b: Attachment): boolean {
+  if (a.path !== b.path) { return false; }
+  return (a.lineStart ?? 0) === (b.lineStart ?? 0) && (a.lineEnd ?? 0) === (b.lineEnd ?? 0);
+}
 
 function isInjectedChunk(text: string): boolean {
   const t = text.trimStart();

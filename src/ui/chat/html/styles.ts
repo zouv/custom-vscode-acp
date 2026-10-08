@@ -96,6 +96,23 @@ export function styles(): string {
     font-size: inherit;
   }
 
+  /* [CUSTOM-20261009-209] 待恢复的 tab（本地页，宿主里还没有它）：与草稿同族但**不是**新会话 ——
+     用虚一点的名字色 + 一个空心点区分，tooltip 写明 click to open；不可拖拽（顺序由 tabOrder 决定）。 */
+  .tab-restore .tab-label { color: var(--vscode-descriptionForeground); font-style: italic; }
+  .tab-dot.restore {
+    width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto;
+    background: transparent; border: 1px dashed var(--vscode-descriptionForeground);
+  }
+  /* [CUSTOM-20261009-209] 恢复卡片上的第二个按钮（次要动作）：比主按钮安静一档。 */
+  .state-fresh {
+    font-family: inherit; font-size: inherit; cursor: pointer;
+    margin-left: 8px; padding: 3px 10px; border-radius: 3px;
+    background: var(--vscode-button-secondaryBackground, transparent);
+    color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+    border: 1px solid var(--vscode-panel-border);
+  }
+  .state-fresh:hover { background: var(--vscode-button-secondaryHoverBackground, var(--vscode-list-hoverBackground)); }
+
   /* --- Tabs ------------------------------------------------------------ */
   .tab-strip {
     display: flex;
@@ -720,14 +737,29 @@ export function styles(): string {
      第一行，正文（.bubble-body）用 flex-basis:100% 撑到第二行。
      **注意**：无图片时 bubble-body 是 block（自然另起一行），不能给所有 summary 都套 flex
      —— block 在 flex 容器里不会换行，会把正文挤到与图标同一行。 */
-  .entry-user .user-fold > summary:has(.content-image-chip) {
+  /* [CUSTOM-20261008-206] 文件 chip（'.chip-row' 里那个 .chip）与图片 chip **同栏**：
+     以前 summary 只在 ':has(.content-image-chip)' 时才变 flex 行，而文件 chip 外面那层 '.chip-row'
+     是个块级 div ⇒ 它自己占一行（用户报的第 1 条：文件 tag 掉到了第二行）。
+     两条一起收：summary 变 flex 行 + 那层包装不占盒（'display: contents'），chip 自己成为 flex 项。 */
+  .entry-user .user-fold > summary:has(.content-image-chip),
+  .entry-user .user-fold > summary:has(.chip-row) {
     display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px;
   }
+  .entry-user .user-fold > summary .chip-row { display: contents; }
+  /* [CUSTOM-20261008-206] 用户气泡里的文件 tag 加高一点：'.chip' 默认 'padding: 0 5px'（零纵向内边距），
+     文件名被上下描边紧压着（用户报的第 2 条）。**只加在气泡内**，工具卡那套 chip 的几何不动
+     （122 的"两侧正文同起于 x=71"是量过的）。 */
+  .entry-user .user-fold > summary .chip { padding: 2px 6px; }
+  /* [CUSTOM-20261008-206] chip 里的 '</>' 图标（见 toolCallView 的 resource_link 分支）。 */
+  .chip-icon { display: inline-flex; align-items: center; }
+  .chip-icon svg { display: block; width: 12px; height: 12px; opacity: 0.85; }
   /* [CUSTOM-20260928-113] 折叠时 bubble-body 也是 flex 项（不占满一行），与图标/caret 同行。 */
-  .entry-user .user-fold:not([open]) > summary:has(.content-image-chip) .bubble-body {
+  .entry-user .user-fold:not([open]) > summary:has(.content-image-chip) .bubble-body,
+  .entry-user .user-fold:not([open]) > summary:has(.chip-row) .bubble-body {
     flex-basis: auto;
   }
-  .entry-user .user-fold > summary:has(.content-image-chip) .bubble-body {
+  .entry-user .user-fold > summary:has(.content-image-chip) .bubble-body,
+  .entry-user .user-fold > summary:has(.chip-row) .bubble-body {
     flex-basis: 100%;
   }
   .entry-user .content-image-chip {
@@ -1468,6 +1500,41 @@ export function styles(): string {
      textarea + 卡外一行按钮"，中间隔一条缝，看着像两个孤立控件）。
      这一层**绝不能写 overflow**：.picker-menu 与 .slash-popup 都向上弹出、会被裁掉；而且
      column flex 容器上的 overflow 会压缩子项而不是让容器滚动（pitfalls #17）。 */
+  /* [CUSTOM-20261008-206] 引用栏里的「编辑器当前文件」那一格：'+'/'x' 开关 + 文件 tag。
+     与普通附件 chip 的区别是"**它还没被加进来**"这个状态：未引用时描边虚一点、标签暗一点，
+     一眼能看出"点 + 就能加"。两个面（侧边栏/编辑区）都有输入框，所以样式挂在 .ref-chip 上。 */
+  /* [CUSTOM-20261008-206 / 208] 一整格**一个 chip**：外壳描边 + 底色，里面 tag 与开关平级。
+     两态用底色分开（用户要求"加一些按钮背景色区分预选与已引用"）：
+       · **预选**（还没引用）：强调色底 + 虚线描边 —— "点 + 就加进来"；
+       · **已引用**：与其它附件 chip 同观感（代码块底色 + 实线）—— "它已经在引用里了"。
+     颜色一律走主题 token（不写死色值）。 */
+  .ref-chip {
+    display: inline-flex; align-items: center; gap: 2px;
+    padding: 1px 4px 1px 2px; border-radius: 3px; max-width: 100%;
+    border: 1px dashed var(--vscode-focusBorder, var(--vscode-panel-border));
+    /* 预选态的底色 = 中性的 chip 底色**混入**主题强调色：两态必然看得出不同，又不写死任何色值
+       （直接拿 badge 底色会在有些主题里与代码块底色撞成同一个灰 —— 预览里就撞过一次）。 */
+    background: color-mix(in srgb, var(--vscode-focusBorder, var(--vscode-panel-border)) 30%,
+      var(--vscode-textCodeBlock-background));
+    color: var(--vscode-badge-foreground, var(--vscode-foreground));
+    font-family: var(--vscode-editor-font-family); font-size: 0.88em;
+  }
+  .ref-chip.ref-on {
+    border-style: solid; border-color: var(--vscode-panel-border);
+    background: var(--vscode-textCodeBlock-background);
+    color: var(--vscode-foreground);
+  }
+  /* 里层的两个都是真按钮，但外观交给外壳：自己不要描边/底色。 */
+  .ref-tag, .ref-toggle {
+    display: inline-flex; align-items: center; gap: 4px;
+    border: none; background: transparent; color: inherit;
+    font-family: inherit; font-size: inherit; cursor: pointer; padding: 1px 2px;
+  }
+  .ref-tag:hover, .ref-toggle:hover { background: var(--vscode-list-hoverBackground); border-radius: 2px; }
+  .ref-toggle { justify-content: center; min-width: 12px; opacity: 0.85; }
+  .ref-toggle:hover { opacity: 1; }
+  .ref-label { max-width: 40ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
   .composer-card {
     display: flex; flex-direction: column;
     background: var(--vscode-input-background);

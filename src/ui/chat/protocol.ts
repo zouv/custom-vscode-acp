@@ -78,8 +78,25 @@ export interface Attachment {
   kind?: 'file' | 'image';
   mimeType?: string;
   // [CUSTOM-END] CUSTOM-20260928-096
+  // [CUSTOM-20261008-206] 引用一个**正在编辑器里看着的文件**时带上选区行区间（1 基、含两端）——
+  // 它进 `name`（人看的 tag 上写出来）与资源链接的 `#L12-40` 片段（agent 也看得到）。
+  lineStart?: number;
+  lineEnd?: number;
 }
 
+/**
+ * [CUSTOM-20261009-209] 一条「上次打开过的会话」：够恢复它（agent + id + cwd），也够在 tab 上写出名字。
+ * `cwd` 决定 agent 侧从哪个目录找它（057/083 —— 不传就会当成当前工作区的会话）。
+ */
+export interface RecoverableSession {
+  agentName: string;
+  sessionId: string;
+  cwd?: string;
+  title?: string;
+}
+
+/** [CUSTOM-20261009-209] 重开面板时的策略：每次问 / 直接恢复 / 不问也不恢复。 */
+export type RestoreChoice = 'ask' | 'always' | 'never';
 /** Webview UI prefs that must survive webview disposal (window reload / editor-panel
  *  recreation). Persisted in the extension host's `globalState`. */
 export interface UiPrefs {
@@ -96,6 +113,11 @@ export interface UiPrefs {
   // 重载窗口之后它还该在（vscode.setState 会随文档一起没），两个面也该看到同一条。
   timesBySession?: Record<string, boolean>;
   timesDefault?: boolean;
+  // [CUSTOM-20261008-204] 右侧大纲栏的**开/关**：同样"按会话记 + 一个默认值"（与 Times 同一形态）。
+  // `outlineMode` 仍是"要不要允许出现侧栏"这个**布局**偏好；这里记的是"这个会话里它开着吗"——
+  // 侧栏里是**这个会话**的对话大纲，A 开着不代表 B 要开着（用户明确要求）。空表 = 还没有任何记录。
+  outlineOpenBySession?: Record<string, boolean>;
+  outlineOpenDefault?: boolean;
 }
 
 /**
@@ -144,13 +166,17 @@ export type ExtToChat =
   // （宿主 `resolveDefaultCwd()`：下次会话将建在这里）。随 boot 走而不是客户端自己猜：
   // 默认目录的三级回退（配置 → 第一个工作区文件夹 → cwd）只有宿主知道，且 058 的草稿页
   // 展示的是**同一份**值（pitfalls #19：同一份知识不要存两份）。
-  | { type: 'boot'; focused: SessionSummary | null; sessions: SessionSummary[]; snapshot: TranscriptSnapshotWire | null; meta: SessionMeta | null; agentConnected?: boolean; autoConnect?: boolean; defaultCwd?: string }
+  | { type: 'boot'; focused: SessionSummary | null; sessions: SessionSummary[]; snapshot: TranscriptSnapshotWire | null; meta: SessionMeta | null; agentConnected?: boolean; autoConnect?: boolean; defaultCwd?: string; recoverable?: RecoverableSession[]; restorePref?: RestoreChoice }
   | { type: 'focus'; summary: SessionSummary | null; snapshot: TranscriptSnapshotWire | null; meta: SessionMeta | null; agentConnected?: boolean }
   | { type: 'sessionsChanged'; sessions: SessionSummary[]; agentConnected?: boolean }
+  // [CUSTOM-20261008-206] 编辑器里**当前打开的文件**（含多行选区的行区间），喂给输入框的引用栏：
+  // 那条 chip 上有个 `+`（还没引用）/`x`（已引用），点一下就把路径加进这条消息的引用。
+  // **非会话作用域**（面板空着时也要显示），而且两个面都要（各自有自己的输入框）。
+  | { type: 'activeFile'; file: { path: string; name: string; lineStart?: number; lineEnd?: number } | null }
   // [CUSTOM-20260926-077] 大纲钉住/宽度偏好，随 boot 一起带回（跨窗口重载存活）。
   // [CUSTOM-20261007-198] 外加 tab 栏的手工顺序（同一条记录）。
   // [CUSTOM-20261008-200] 外加 Times 的按会话记录 + 默认值（同一条记录）。
-  | { type: 'uiPrefs'; outlineMode: 'popup' | 'sidebar'; outlineWidth: number; tabOrder?: string[]; timesBySession?: Record<string, boolean>; timesDefault?: boolean }
+  | { type: 'uiPrefs'; outlineMode: 'popup' | 'sidebar'; outlineWidth: number; tabOrder?: string[]; timesBySession?: Record<string, boolean>; timesDefault?: boolean; outlineOpenBySession?: Record<string, boolean>; outlineOpenDefault?: boolean }
   // [CUSTOM-BEGIN] CUSTOM-20260925-033 - 历史会话列表（回复 `listHistory`）。
   // `source` 说明这份列表从哪来：agent 侧 `session/list`，还是本地 workspaceState 缓存
   // （未连接时不去 spawn agent，见 ChatPanelHost.handleListHistory）。
@@ -210,6 +236,8 @@ export type ExtToChat =
   // 同时成立才布防自动连接，拆成两条消息就会出现半状态窗口），
   // 这条消息则负责**运行期**的变更（另一个面改了 / 用户在 Settings 里改了）。
   | { type: 'autoConnectPref'; value: boolean }
+  // [CUSTOM-20261009-209] 「重开面板要不要恢复上次的会话」的当前设置值（设置面板改了它也要跟上）。
+  | { type: 'restorePref'; value: RestoreChoice }
   // [CUSTOM-END] CUSTOM-20260930-125
   | { type: 'error'; sessionId?: string; message: string };
 
@@ -228,10 +256,18 @@ export type ChatToExt =
   // 由宿主**合并**（重建会把对方那一半抹掉）。缺的字段 = 这一轮没改它。
   // [CUSTOM-20261008-200] Times 同样走这条（第三个写者）：timesBySession 整份发上来
   // （与 tabOrder 同一形态 —— 顺序与开关都是"一整张表"，逐条 delta 反而要宿主维护版本）。
-  | { type: 'setUiPref'; outlineMode?: 'popup' | 'sidebar'; outlineWidth?: number; tabOrder?: string[]; timesBySession?: Record<string, boolean>; timesDefault?: boolean }
+  | { type: 'setUiPref'; outlineMode?: 'popup' | 'sidebar'; outlineWidth?: number; tabOrder?: string[]; timesBySession?: Record<string, boolean>; timesDefault?: boolean; outlineOpenBySession?: Record<string, boolean>; outlineOpenDefault?: boolean }
   // [CUSTOM-20260930-125] 状态卡上的自动连接开关。**非会话作用域**（正是没有会话时
   // 才需要它），所以必须放在 verifySession 守卫**之前**处理，与 setUiPref 同一位置。
   | { type: 'setAutoConnect'; value: boolean }
+  // [CUSTOM-20261009-209] 会话恢复（重载/关闭后重开面板时问一句：要不要恢复上次那几个 tab）。
+  // 三条都**非会话作用域** —— 快照里的会话此刻都还没活（那正是要恢复它们的意义），
+  // 所以必须放在 verifySession 守卫**之前**（§5.4 规则二）。
+  // 「开始恢复」：快照留着（下一次重载还要用），但**这一次**别再问了 —— 客户端已经在建本地 tab 了。
+  | { type: 'startRestore' }
+  | { type: 'dismissSessions' }
+  | { type: 'forgetRestorable'; sessionId: string }
+  | { type: 'setRestorePref'; value: RestoreChoice }
   | { type: 'sendPrompt'; sessionId: string; text: string }
   | { type: 'cancelTurn'; sessionId: string }
   | { type: 'newSession'; agentName: string }
@@ -252,7 +288,7 @@ export type ChatToExt =
   // immediately; `fromDraft` says the CLIENT was on a draft page (the host's
   // `focused` then names some other session, and it is the draft that must step
   // aside — a draft is client-local, 058).
-  | { type: 'openHistorySession'; agentName: string; sessionId: string; cwd?: string; title?: string; fromDraft?: boolean }
+  | { type: 'openHistorySession'; agentName: string; sessionId: string; cwd?: string; title?: string; fromDraft?: boolean; keepOthers?: boolean }
   // [CUSTOM-END] CUSTOM-20260925-032/033
   // [CUSTOM-BEGIN] CUSTOM-20260925-058 - 草稿页与目录选择。
   // 三条都**不是**会话作用域：草稿按定义还没有 sessionId（那正是它存在的意义），
@@ -288,10 +324,13 @@ export type ChatToExt =
   | { type: 'closeSession'; sessionId: string }
   | { type: 'focusSession'; sessionId: string }
   | { type: 'focusAgent'; agentName: string }
-  | { type: 'detachFile'; sessionId: string; path: string }
+  // [CUSTOM-20261008-207] 带上行区间 = 只摘那一段（同一个文件可以引用多段）；不带 = 整个路径全摘。
+  | { type: 'detachFile'; sessionId: string; path: string; lineStart?: number; lineEnd?: number }
   // [CUSTOM-20260925-049] Files dropped onto / pasted into the panel. Session
   // scoped, so it MUST be handled after the `verifySession` guard (§5.4 rule 1).
-  | { type: 'attachPath'; sessionId: string; paths: string[] }
+  // [CUSTOM-20261008-206] `meta` 与 `paths` **按下标平行**：只有"从编辑器当前文件加进来的"那一条
+  // 需要它（显示名带行区间）。拖拽/粘贴那条路照旧只发 paths（缺 = 用 basename）。
+  | { type: 'attachPath'; sessionId: string; paths: string[]; meta?: Array<{ name?: string; lineStart?: number; lineEnd?: number }> }
   // [CUSTOM-BEGIN] CUSTOM-20260928-096 - 输入框图片：粘贴/拖入的位图无路径，只能把
   // base64 带上。会话作用域（verifySession 守卫之后，同 attachPath）。`id` 由客户端
   // 生成（合成附件 id），宿主用它作附件 `path` 并把字节存进 imageData。

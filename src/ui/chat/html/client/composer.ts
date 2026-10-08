@@ -20,6 +20,9 @@ export const composerClient = `
   var steerHintEl = null;
   var slashPopup = null;
   var attachmentsEl = null;
+  // [CUSTOM-20261008-206] 编辑器里**当前打开的文件**（宿主推来的，见 ChatPanelHost.pushActiveFile）。
+  // 它是一格「候选引用」：'+' 还没引用、'x' 已引用；点一下就把路径加进/移出这条消息。
+  var activeFile = null;
   var pickersEl = null;
   var contextMeter = null;
   // [CUSTOM-20260930-129] The last usage we were given. The ring's "a turn is running"
@@ -659,11 +662,14 @@ export const composerClient = `
 
   function renderAttachments() {
     NS.dom.clear(attachmentsEl);
-    if (state.attachments.length === 0) {
+    // [CUSTOM-20261008-206] 引用栏里除了已加的附件，还有**编辑器当前文件**那一格 —— 即使一条附件
+    // 都没有也要显示（那就是「给它一个 + 就能加进来」的入口）。
+    if (state.attachments.length === 0 && !activeFile) {
       attachmentsEl.hidden = true;
       return;
     }
     attachmentsEl.hidden = false;
+    if (activeFile) { attachmentsEl.appendChild(activeFileChip(activeFile)); }
     for (var i = 0; i < state.attachments.length; i++) {
       (function (attachment) {
         var chip = NS.dom.el('span', 'attachment');
@@ -702,6 +708,95 @@ export const composerClient = `
     }
   }
 
+  // [CUSTOM-20261008-206] 「编辑器当前文件」那一格。
+  //
+  // 与官方插件同一件事：不用先去别处找文件、Attach File —— 正在看的那个文件就在引用栏里，
+  // 点 '+' 加进来（'+' 变 'x'），点 'x' 移出去。已引用与否**从附件列表现算**（不另存一份状态，
+  // 否则两条真相迟早对不上 —— pitfalls #19）；宿主的 'attachments' 回复一到，'+' 自己就变 'x'。
+  function refLabel(file) {
+    var range = '';
+    if (file.lineStart) {
+      range = ':' + file.lineStart
+        + (file.lineEnd && file.lineEnd > file.lineStart ? '-' + file.lineEnd : '');
+    }
+    return (file.name || file.path) + range;
+  }
+
+  // [CUSTOM-20261008-207] 引用的**同一性 = 路径 + 行区间**：同一个文件的不同段是两条引用
+  // （用户要求"当前框选的行与已添加引用的不同，则显示 +"）。没有区间的（拖拽/粘贴进来的文件）
+  // 按路径比 —— 与它们本来的行为一致。
+  function sameRef(a, b) {
+    if (a.path !== b.path) { return false; }
+    return (a.lineStart || 0) === (b.lineStart || 0) && (a.lineEnd || 0) === (b.lineEnd || 0);
+  }
+
+  function isReferenced(file) {
+    var list = state.attachments || [];
+    for (var i = 0; i < list.length; i++) { if (sameRef(list[i], file)) { return true; } }
+    return false;
+  }
+
+  function activeFileChip(file) {
+    var referenced = isReferenced(file);
+    // [CUSTOM-20261008-208] 一整格**一个 chip**：外壳负责描边/底色（区分预选与已引用），
+    // 里面是 tag（图标 + 文件名，点了 openFile）+ 开关（'+'/'×'）。两个都是真按钮、**平级**
+    // 而不是嵌套（button 里不能放 button），键盘各自可达；开关不再露在 chip 外面（用户嫌突兀）。
+    var wrap = NS.dom.el('span', 'ref-chip' + (referenced ? ' ref-on' : ''));
+
+    var tag = NS.dom.el('button', 'ref-tag');
+    tag.type = 'button';
+    tag.setAttribute('data-path', file.path);
+    tag.title = file.path + (file.lineStart
+      ? ' (lines ' + file.lineStart + '-' + (file.lineEnd || file.lineStart) + ')' : '');
+    var icon = NS.icons.icon('file', 'chip-icon');
+    if (icon) { tag.appendChild(icon); }
+    tag.appendChild(NS.dom.el('span', 'ref-label', refLabel(file)));
+    wrap.appendChild(tag);
+
+    var toggle = NS.dom.el('button', 'ref-toggle', referenced ? '\u00d7' : '+');
+    toggle.type = 'button';
+    toggle.title = referenced ? 'Remove this file from the message' : 'Add this file to the message';
+    toggle.setAttribute('aria-label', toggle.title);
+    toggle.addEventListener('click', function (event) {
+      event.preventDefault();
+      if (referenced) { detachReference(file); } else { attachReference(file); }
+    });
+    wrap.appendChild(toggle);
+    return wrap;
+  }
+
+  /** 把当前文件加进这条消息的引用：会话页发 attachPath，草稿页先本地攒着（193）。 */
+  function attachReference(file) {
+    var meta = { name: refLabel(file) };
+    if (file.lineStart) { meta.lineStart = file.lineStart; meta.lineEnd = file.lineEnd || file.lineStart; }
+    if (state.draft) { addDraftPaths([file.path], [meta]); return; }
+    if (!state.sessionId) { return; }
+    NS.bridge.post({ type: 'attachPath', sessionId: state.sessionId, paths: [file.path], meta: [meta] });
+  }
+
+  function detachReference(file) {
+    if (state.draft) {
+      var list = draftFiles[state.draft.draftId] || [];
+      for (var k = 0; k < list.length; k++) {
+        if (sameRef(list[k], file)) { list.splice(k, 1); break; }
+      }
+      syncDraftAttachments();
+      refreshControls();
+      return;
+    }
+    // [CUSTOM-20261008-207] 带上区间：只摘这一段（同一个文件可以有别的段还留着）。
+    NS.bridge.post({
+      type: 'detachFile', sessionId: state.sessionId, path: file.path,
+      lineStart: file.lineStart, lineEnd: file.lineEnd,
+    });
+  }
+
+  /** 宿主推来的「编辑器当前文件」变了（含选区行区间；null = 没有打开的文件）。 */
+  function setActiveFile(file) {
+    activeFile = file && file.path ? file : null;
+    renderAttachments();
+  }
+
   // --- Draft mode (CUSTOM-20260925-058) ------------------------------------
 
   // [CUSTOM-20261005-193] 草稿页攒下的附件：draftId -> [{ id, kind, name, path, mimeType, dataUrl }]。
@@ -720,7 +815,12 @@ export const composerClient = `
     var out = [];
     if (!list) { return out; }
     for (var i = 0; i < list.length; i++) {
-      out.push({ id: list[i].id, kind: list[i].kind, name: list[i].name, path: list[i].path });
+      out.push({
+        id: list[i].id, kind: list[i].kind, name: list[i].name, path: list[i].path,
+        // [CUSTOM-20261008-207] 区间也要带过来：引用的同一性（路径 + 区间）靠它判断（见 sameRef）——
+        // 漏了它，"同一段加过没有"永远答"没有"，同一段会被攒下两次。
+        lineStart: list[i].lineStart, lineEnd: list[i].lineEnd,
+      });
     }
     return out;
   }
@@ -747,14 +847,22 @@ export const composerClient = `
   }
 
   /** 草稿页收到拖入/粘贴的文件路径（同上）。 */
-  function addDraftPaths(paths) {
+  function addDraftPaths(paths, meta) {
     if (!state.draft || !paths || paths.length === 0) { return false; }
     var draftId = state.draft.draftId;
     var list = draftFiles[draftId] || (draftFiles[draftId] = []);
+    var labels = meta && meta.length ? meta : [];
     for (var i = 0; i < paths.length; i++) {
       var p = String(paths[i] || '');
       if (!p) { continue; }
-      list.push({ id: 'file-' + Date.now() + '-' + i, kind: 'file', name: basenameOf(p), path: p });
+      // [CUSTOM-20261008-206] 显示名优先用调用方给的（编辑器那条带行区间），否则 basename。
+      var m = labels[i] || {};
+      var label = typeof m.name === 'string' && m.name ? m.name : basenameOf(p);
+      // [CUSTOM-20261008-207] 行区间也存下来：同一性（路径 + 区间）要用它判断"这一段加过没有"。
+      list.push({
+        id: 'file-' + Date.now() + '-' + i, kind: 'file', name: label, path: p,
+        lineStart: m.lineStart, lineEnd: m.lineEnd,
+      });
     }
     syncDraftAttachments();
     refreshControls();
@@ -1015,6 +1123,8 @@ export const composerClient = `
   function isComposable() { return canCompose(); }
 
   NS.composer = {
+    // [CUSTOM-20261008-206] 编辑器当前文件（宿主推来）→ 引用栏那一格。
+    setActiveFile: setActiveFile,
     init: init,
     setFocus: setFocus,
     setRunning: setRunning,

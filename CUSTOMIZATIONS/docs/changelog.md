@@ -17,6 +17,113 @@
 
 ---
 
+### 2026-10-09 - CUSTOM-20261009-209
+- **功能**：**会话恢复** —— 重载/关闭编辑器后再打开 ACP Client，问一句「要不要恢复上次开着的几个会话 tab」（是 ⇒ 按原顺序恢复；否 ⇒ 保持现在的逻辑）。参考浏览器的标签页恢复
+- **改动文件**：`src/ui/chat/protocol.ts`、`src/ui/chat/ChatPanelHost.ts`、`package.json`、`src/ui/chat/html/body.ts`、`src/ui/chat/html/styles.ts`、`src/ui/chat/html/client/stateCard.ts`、`src/ui/chat/html/client/boot.ts`、`src/ui/chat/html/client/tabs.ts`、`src/test/chat-client.test.ts`、`src/test/chat-panel.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（文档：`chat-panel-sessions.md` §5.48、`pitfalls.md` #60、`dev-workflow.md` 验收 221-222、`registry.md` 总览）
+- **来源**：用户「再继续迭代一个会话恢复功能（参考浏览器页面 tab 恢复）：1. 在有多个会话 tab 开启时关闭编辑器（包括 reload）2. 重新打开 ACP Client 后恢复之前的会话（先询问是否恢复，是-恢复之前的会话 tab，否-保持现在的逻辑）」，并选择了：**面板空态卡片**里问、**懒恢复**（点开才加载）、带**「不再询问」+ 设置项**
+- **详细说明**：
+  - **现状与难点**：重载会让扩展宿主重启（agent 进程被杀、`SessionManager` 内存态全清），而此前**没有任何"上次开着哪些会话"的持久化** ⇒ 重开面板只能走 131 那条"当场建一个新的空会话"，用户的多个 tab 全丢。
+  - **快照**：globalState 新增 `acpc.openSessions.v1`（`{sessions[{agentName,sessionId,cwd,title}], focused}`），**按 `uiPrefs.tabOrder` 的顺序存**（恢复出来才回原位）；写点在 created/closed/focus 三个事件上 + 300ms 防抖；**只有"本生命周期出现过会话"后才允许写空表**（否则重载启动那一瞬间会把它抹掉）。
+  - **问**：`pushBoot` 加 `recoverable`（只含**当前不活**的 modern 会话 —— legacy 交给旧面板会换文档）与 `restorePref`；客户端在**空态卡片**上多一个 `restore` 相位（**压过 ready**）：标题「Restore N sessions from your last window?」+ 列几条标题 + 【Restore N sessions】【Start fresh】+ 一行「Remember my choice」。设置项 `acpc.restoreSessionsOnOpen`（ask/always/never，默认 ask）走 125 的 `PanelPrefsIO` 注入缝。
+  - **让位**：提问待决期间 ①宿主 `handleConnectAgent` 跳过 createSession ②客户端 `connection==='connected'` 也不开草稿（否则草稿页把提问顶掉）；按 `+` 例外（那是用户明确要一张新草稿）。
+  - **懒恢复**：点【Restore】= 宿主把**上次聚焦的那条**立刻 `openExistingSession`（面板马上有内容）+ 客户端把 N 条变成**待恢复的本地 tab**（`tabs.ts` 的 `restoring`，与草稿同族；与真会话**共用 tabOrder 排名** ⇒ 顺序回到原位）；其余**点开才 load**（`openHistorySession … keepOthers: true` —— 099 的替换语义只属于历史选择器，恢复是"多开"）。之所以必须懒：大会话的 replay 是秒级到十几秒，8 个 tab eager 恢复要等一两分钟。
+  - **收尾**：关掉未加载的 tab ⇒ 丢本地 + `forgetRestorable`（会话活了则相反：真 tab 顶替本地那条）；【Start fresh】⇒ `dismissSessions` + `connectAgent`（= 保持现在的逻辑）；勾选 + 按钮 ⇒ 记住 `always`/`never`；加载失败的那条从快照里摘掉并报错。
+- **验证方式**：客户端 `npx mocha --ui tdd out/test/chat-client.test.js` → **212 passing**（新增 5 条：卡片提问态与退场规则 / 两个按钮 + 勾选把回答交给 boot / 待恢复 tab 的 tabOrder 排序·点击发 `keepOthers`·关闭发 `forgetRestorable` / 会话活了就让位）；宿主 `npm test` → **414 passing**（新增 6 条：设置消毒、快照写盘并端给下一个窗口、`keepOthers` 不关别的会话、有快照时不自动建会话而 `never` 时照建、三条消息落地、`startRestore` 只加载聚焦那条）；真 Chromium `#restorecard` 档（卡片截图：标题 + 三条标题预览 + 两个按钮 + 勾选）与 `#restorecardprobe`（相位/文案/点一下之后发出去的是 `startRestore`、tab 栏里 3 条待恢复 tab）；`check-registry.mjs` 六节全绿、`npm run lint` 0 warning。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-08 - CUSTOM-20261008-208
+- **功能（观感两条）**：①引用栏那一格的 `+`/`×` **收进 chip 里面**（原来露在外面显得突兀）；②**用底色 + 描边区分「预选」与「已引用」**
+- **改动文件**：`src/ui/chat/html/client/composer.ts`、`src/ui/chat/html/styles.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（文档：`chat-panel.md` §5.47、`pitfalls.md` #59、`dev-workflow.md` 验收 220、`registry.md` 总览）
+- **来源**：用户（附截图）：「`x` 应该也放到文件 tag 里面，放在外面有点突兀，可以加一些按钮背景色区分下预选和已引用的文件」
+- **详细说明**：
+  - **一整格 chip**：外层 `.ref-chip` 负责描边 + 底色 + 内边距，里面是 **两个平级的真按钮** —— `.ref-tag`（`</>` + 文件名 + 区间，点了走 `openFile`）与 `.ref-toggle`（`+`/`×`）。平级而不是嵌套是硬要求：**button 里不能放 button**（嵌套既非法、点击语义也会打结），而两者都是真按钮才各自键盘可达（047 的规矩）。
+  - **两态区分（两条通道）**：预选（还没引用）= 中性 chip 底色**混入**主题强调色
+    （`color-mix(in srgb, var(--vscode-focusBorder, …) 30%, var(--vscode-textCodeBlock-background))`）+ **虚线**描边；
+    已引用 = 与其它附件 chip 同观感（`--vscode-textCodeBlock-background` + 实线）。
+    **第一版挑的 `--vscode-badge-background` 在预览主题里恰好等于代码块底色**（两态实测同一个 rgb）——
+    所以改成"从主题色**派生**出差值"，而不是指望两个 token 恰好不同（见 pitfalls #59）。
+  - **探针跟着升级**：`#refchip` 档现在**把两态各读一遍**（读当前态 → 用 `setAttachments` 翻一次 → 再读），
+    并把 `toggleInside` 一起读出来 —— 一次就能看见"两态是不是真的不同"。
+    （第一次翻转忘了带上区间，被 207 的同一性挡下 —— 探针自己也得满足业务语义。）
+- **验证方式**：真 Chromium `#refchip` 读数：`toggleInside: true`、`toggleAfterTag: true`、
+  `styleOff {bg: color(srgb 0.118 0.259 0.367), border: dashed}` vs `styleOn {bg: rgb(43,43,43), border: solid}`
+  （两态确实不同）+ 截图肉眼核对；客户端 `npx mocha --ui tdd out/test/chat-client.test.js` → **207 passing**（结构断言不变：外壳 → tag → 开关的顺序、tag 内图标在最前）；宿主 `npm test` → **408 passing**；`check-registry.mjs` 六节全绿、`npm run lint` 0 warning。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-08 - CUSTOM-20261008-207
+- **功能（三条修正）**：①气泡里文件 tag 的 `</>` 图标**移到文件名前**；②引用栏的 `+` **移到 tag 之后**（与 `×` 一致）；③**同一个文件支持引用多段**（框选的行与已引用的不同 ⇒ `+`、相同 ⇒ `×`）
+- **改动文件**：`src/ui/chat/html/client/toolCallView.ts`、`src/ui/chat/html/client/composer.ts`、`src/ui/chat/protocol.ts`、`src/ui/chat/ChatPanelHost.ts`、`src/test/chat-client.test.ts`、`src/test/chat-panel.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（文档：`chat-panel.md` §5.47、`pitfalls.md` #58、`dev-workflow.md` 验收 219、`registry.md` 总览）
+- **来源**：用户三条（附截图）：「1. 消息面板里的用户消息卡片，文件 Tag 的图标反了，应该放在前面；2. 把 `+` 也移到文件 Tag 后面（改为与 `x` 一致）；3. 需支持针对同一个文件，添加多个引用段（当前框选的行与已添加引用的不同，则显示 `+`，相同则不显示）」
+- **详细说明**：
+  - **① 图标反了**：`el('button', 'chip', 文件名)` 已经把名字写进按钮了，用 `appendChild` 加图标就落在**名字后面**。改成 `insertBefore(icon, firstChild)` ✓。
+  - **② 开关位置**：`+`/`×` 都排在 tag **之后**（附件 chip 的 `.attachment-x` 本来就是这么排的），两态一致。
+  - **③ 多段引用**：同一性从「路径」改成「**路径 + 行区间**」，收敛到一个 `sameRef(a, b)`（宿主去重与客户端"加过没有"共用）。**这条要求牵出宿主两处按路径写的判断**：`addAttachments` 的去重 `some(a => a.path === b.path)` 会让同一个文件的**第二段根本入不了列**（界面上"点了 `+` 没反应"）；`detachFile` 的 `filter(a => a.path !== path)` 会把这个文件的**所有**段一起摘掉。现在 `detachFile` 带可选区间（带 = 只摘那一段、不带 = 整条路径全摘，拖拽/粘贴的旧行为不变），发送时每一段各是一个带自己 `#L` 片段的 `resource_link`。
+  - **顺带修的同类缺陷**：草稿页把附件投影给 `state.attachments` 的 `draftFilesOf` 只手抄了 `{id,kind,name,path}` ⇒ 区间在投影时掉了，"这一段加过没有"永远答"没有"（同一段会被攒下两次）—— 已补上并写进 pitfalls #58（投影函数是漏字段的温床）。
+- **验证方式**：客户端 `npx mocha --ui tdd out/test/chat-client.test.js` → **207 passing**（新增 5 条：开关在 tag 之后且图标在最前 / 框选不同 ⇒ 仍是 `+` 且 `meta` 带新区间 / 框选相同 ⇒ `×` 且 `detachFile` 带区间 / 整文件与某一段是两条不同引用 / 草稿页按区间攒两条）；宿主 `npm test` → **408 passing**（新增 3 条：同文件两段都在列且同段不重复、拖拽那条仍按路径去重 / `detachFile` 带区间只摘那段、不带全摘 / 发送时两个 `resource_link` 各带 `#L12-40` 与 `#L5-9`）；真 Chromium：`#filechip*` 的 `iconFirst: true`、`#refchip*` 的 `toggleAfterTag: true`，并各截一张图核对；`check-registry.mjs` 六节全绿、`npm run lint` 0 warning。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-08 - CUSTOM-20261008-206
+- **功能**：文件引用的三处形状 —— ①用户气泡里的文件 tag 与折叠按钮**同栏**、加高、带 `</>` 图标；②输入框引用栏新增「**编辑器当前文件**」格（`+`/`×` 开关 + 行区间）；③agent 也拿得到行区间
+- **改动文件**：`src/ui/chat/html/client/icons.ts`（新增 `file` 形状）、`src/ui/chat/html/client/toolCallView.ts`、`src/ui/chat/html/styles.ts`、`src/ui/chat/html/client/composer.ts`、`src/ui/chat/html/client/boot.ts`、`src/ui/chat/protocol.ts`、`src/ui/chat/ChatPanelHost.ts`、`src/test/chat-client.test.ts`、`src/test/chat-panel.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（文档：`chat-panel.md` §5.47、`pitfalls.md` #57、`dev-workflow.md` 验收 217-218、`registry.md` 总览）
+- **来源**：用户三条（附官方插件对比截图）：①「引用的文件 Tag 应该放在折叠按钮同栏（与引用图片一致）」②「文件 tag 的高度稍微加大一些…文件名前需要加个图标（可参考 claude 官方插件）」③「对话输入栏再扩展个功能：自动识别编辑区当前打开的文件（将文件 Tab 显示在输入框的引用栏），如果该文件尚未添加引用则在文件 Tag 前显示个 `+`，点击 `+` 之后将文件路径添加进引用（同时将 `+` 改为 `x`），如果当前文件在编辑区框选了多行，则在文件 Tag 末尾加上行区间」
+- **详细说明**：
+  - **① 同栏 + 加高 + 图标（气泡内）**：112 那条"图标/caret/chip 同在第一行"的 CSS 判据是 `summary:has(.content-image-chip)` —— 它按**图片 chip 的类名**认"这个气泡有 chip"，而文件 chip 走 `resource_link` 分支、外面还套一层 `div.chip-row`（块级）⇒ 判据不成立、那层壳自己占一行。修法：判据补 `:has(.chip-row)` + 那层壳 `display: contents`（它是纯包装，不该占盒，chip 自己成为 flex 项）；`.chip` 默认是零纵向内边距（文件名被描边紧压），用户气泡里的 tag 补 `padding: 2px 6px`（**只加气泡内** —— 工具卡那套 chip 的几何是量过的，不动）；`NS.icons` 新增 `file`（`</>`）形状，`resource_link` chip 有 `path` 时前置它（真链接不加，代码图标会误导）。
+  - **② 输入框引用栏的当前文件格**：宿主订阅 `onDidChangeActiveTextEditor` / `onDidChangeTextEditorSelection`，推新消息 `activeFile`（**非会话作用域**，两个面都发；按"路径 + 行区间"签名去重 —— 选区回调每次光标移动都来，叠成行号之后同一行里动就不发；面挂上来时 `force` 推一次）。客户端在 `#attachments` 那一行渲染：圆形 `+`/`×` 开关 + 文件 tag（`</>` 图标 + 文件名 + `:12-40`）。**已引用与否从附件列表现算**（不另存状态），所以宿主的 `attachments` 回复一到 `+` 自己变 `×`；点 `+` 会话页走 `attachPath`（新增与 `paths` **下标平行**的 `meta`：显示名 + 行区间）、草稿页走 193 的本地列表（`addDraftPaths(paths, meta)`）；点 `×` 走 `detachFile` 或就地删本地那份；tag 本体可点（`data-path` → 既有 `openFile` 通道）。
+  - **③ 行区间**：`readActiveFileFrom(editor)` 把 0 基行号换成 1 基，并处理"拖到下一行行首不算那一行"（与编辑器显示一致；单行选区不带区间）。它是**导出的纯函数、收一个结构子集**而不是直接读 `vscode.window` —— 真 `activeTextEditor` 在测试宿主里造不出来（同 `pickDefaultCwd` 的既有做法）。发送时把区间挂进资源链接的 uri 片段（`file:///….cs#L12-40`），`name` 里保留给人看的 `文件名:12-40`。
+- **验证方式**：客户端 `npx mocha --ui tdd out/test/chat-client.test.js` → **202 passing**（新增 4 条：出现 `+` / 行区间进 `meta` / 宿主回复后变 `×` 再点走 `detachFile` / 草稿页攒本地且不发会话作用域消息）；宿主 `npm test` → **400 passing**（新增 4 条：无编辑器与非本地文件 ⇒ null、整文件、1 基行区间与"下一行行首"边界、`attachPath` 的 meta → 附件显示名 + 发送时 uri 的 `#L12-40` 片段）；真 Chromium：`#filechip*` 档（`caretTop 85 / chipTop 86` 同栏、`chipH 23`、`hasIcon true`）与 `#refchip*` 档（`toggle:'+'`、`label:'PianoGameplayDefine.cs:12-40'`、`href` 为真实路径、`barHidden false`），并各截一张图肉眼核对；`check-registry.mjs` 六节全绿、`npm run lint` 0 warning。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-08 - CUSTOM-20261008-205
+- **功能（bug 修复）**：修「用户对话里附加的文件没有合并到一个对话里（预期是跟图片附件一样显示），现在是分成了两条对话」
+- **改动文件**：`src/ui/chat/ChatPanelHost.ts`、`src/test/chat-panel.test.ts`（文档：`chat-panel-records.md` 注入块分流表、`pitfalls.md` #56、`dev-workflow.md` 验收 216、`registry.md` 总览）
+- **来源**：用户报（附两张对比截图：图 1 = 我们面板「两个气泡」，图 2 = 官方插件「chip + 正文同一个气泡」）
+- **详细说明**：
+  - **先用数据定案**：读那次的转录（`~/.claude/projects/F--Developer-AI-vibe-aki-workspace-aki-work/0edad308-….jsonl`）—— 那条消息的 `content` 就是**两个 text 块**：`<ide_opened_file>The user opened the file …/PianoGameplayDefine.cs in the IDE…</ide_opened_file>` 与 `两边都提交git`，**没有任何附件块**（`entrypoint: claude-vscode`，是官方扩展发起的会话）。所以"两条对话"不是附件被拆开，而是**IDE 注入的上下文块被当成了用户说过的话**（109 那类注入块的新成员，前缀表里没有它）。先用一条临时 host 测试把它钉死：喂这两条 chunk → 产出**两条 `user` 记录、零附件**。
+  - **修法（照官方插件的形状）**：`<ide_opened_file>` 块**不建记录**，抠出的路径变成**这条消息上的文件 chip**：`resource_link` 视图（`path` → 点它走 `openFile`，见 039；`name/title` = 文件名），作为 `attachments` 与图片一起进同一个用户气泡（chip 在上、正文在下 —— 108/112 早就把这种气泡画好了，图 1 的第二个气泡正是它）。配对用**数据里的键**：按「会话::messageId」暂存、正文 chunk 到达时取走（回放里两条 chunk 同 `messageId`，而代码顺序不保证）；取过即删、上限 20 条（用户只开了个文件、没有下文时那条永远没人来取）、会话关闭即清。
+  - **顺带**：其它 `<ide_*>` 块（`<ide_selection>` / `<ide_diagnostics>` …）进 109 的前缀表 ⇒ 变成 meta 提示条，而不是"我说过的话"。**判据顺序是硬要求**：`ideOpenedFilePath()` 必须在 `isInjectedChunk()` **之前**（它同样以 `<ide_` 开头）。
+  - **没做的**：不把注入块的内容渲染出来（官方插件也不显示那行"may or may not be related"）；不做"正文先到"的反向配对（当前可达路径都是上下文在前，而暂存的键保证了它不会挂到别的消息上）。
+- **验证方式**：宿主 `npm test` → **392 passing**（新增 3 条：ide 块 + 正文 → **一个**气泡、且 chip 的 `path`/`name` 正确、零提示条；只有 ide 块 → **一条记录都没有**；`<ide_selection>` → 提示条而非用户气泡）；客户端 `npx mocha --ui tdd out/test/chat-client.test.js` → 198 passing（未受影响 —— chip 走的正是 108/112 已有的渲染路径，图 1 本身就证明了它能画）；`check-registry.mjs` 六节全绿、`npm run lint` 0 warning。**真机验收**：dev-workflow 216。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-08 - CUSTOM-20261008-204
+- **功能（bug 修复）**：修「点一下地址栏的 `Times`，右侧大纲栏自己打开了」+「关掉右侧栏、重启编辑器再打开面板，它又开着」（用户要求：**按会话**保存开/关）
+- **改动文件**：`src/ui/chat/html/client/outline.ts`、`src/ui/chat/html/client/boot.ts`、`src/ui/chat/protocol.ts`、`src/ui/chat/ChatPanelHost.ts`、`src/test/chat-client.test.ts`、`src/test/chat-panel.test.ts`（文档：`chat-panel.md` §5.9、`pitfalls.md` #55、`dev-workflow.md` 验收 214-215、`registry.md` 总览）
+- **来源**：用户报「1. 发现点击地址栏的 times，会把右侧边栏给打开（点击之前是关闭的）；2. 关闭了右侧边栏，重启编辑器后再打开对话面板，右侧边栏又会恢复打开状态（预期是按会话保存开/关的状态）」
+- **详细说明**：
+  - **两条是同一个根因：偏好里混了"此刻是否可见"**。`applyPrefs` 里写着 `isOpen = (mode === 'sidebar')` —— 于是**每一次偏好回话都等价于"把侧栏重新打开"**；而 `uiPrefs` 是**广播**的（宿主在**任何** `setUiPref` 之后都会回一次，好让另一个面跟上）⇒ **任何**触发一次偏好写的动作都能把刚关掉的侧栏弹回来：点 `Times`（200 起它会写偏好）、拖 tab（198）、拖大纲栏宽度。用户撞上的正是 `Times`。而"关"只改了瞬态 `isOpen`、没落盘（☰ 与 Escape 走 `hide()`，只有 ✕ 走 `unpin()` 才改 `mode`）⇒ 重启后 `applyPrefs` 按 `mode` 重算成"开着"。
+  - **修法**：把"开/关"变成**按会话持久的状态**（与 Times 200 同一套语义）：`outlineOpenBySession` + `outlineOpenDefault`，有效值 = 表里的记录 ?? 默认值；拨一次两处都写。`isOpen` 一律由它推出来，**回话只让两端收敛**；关闭（☰ / Escape / ✕）都落盘并记到当前会话名下。焦点咽喉点同步（`boot.applyFocus` → `NS.outline.setSession`，与 `stickyUser.setSession` 同形）。`mode` 仍是**布局**偏好（"允不允许出现侧栏"），与"这个会话里它开着吗"分开。旧记录（还没有这两项）按老行为补一次 `openDefault = true`，避免升级后侧栏无声消失。
+  - **宿主侧**：`sanitizeTimesMap` 改名 **`sanitizeSessionFlags`** —— 两张"会话 id → 布尔"表（Times、侧栏开/关）**共用同一份消毒器**（抄第二份迟早漂移，pitfalls #19）；`setUiPref` 的合并语义按老规矩扩展（缺字段 = 这一轮没改它）。
+  - **没做的**：不改"下拉形态"的语义（它是瞬态的，不受这套状态影响）；不给侧栏加"全局强制开/关"的开关。
+- **验证方式**：客户端 `npx mocha --ui tdd out/test/chat-client.test.js` → **198 passing**（新增 4 条：①回话只是收敛、不许把刚关掉的侧栏打开 ②每个会话各自记着、没记录的跟默认值 ③关掉要落盘且重启后仍是关的 ④旧记录迁移一次）；宿主 `npm test` → **389 passing**（新增 1 条：侧栏开/关与 Times 同一条记录、四个写者互不覆盖）；`check-registry.mjs` 六节全绿、`npm run lint` 0 warning。**真机验收**：dev-workflow 214（关掉侧栏后点 Times / 拖 tab，它不该回来）与 215（按会话 + 重启后仍关）。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-08 - CUSTOM-20261008-203
+- **功能（bug 修复）**：修「刚通过 Browse 选择的目录（并且发起了对话），但最近使用里没有这个记录」
+- **改动文件**：`src/ui/chat/html/client/directoryMenu.ts`、`src/test/chat-client.test.ts`（文档：`chat-panel-sessions.md` §5.15、`pitfalls.md` #54、`dev-workflow.md` 验收 213、`registry.md` 总览）
+- **来源**：用户报「Recently used 功能有问题，我刚通过 Browse 选择的目录（并且发起了对话），但最近使用里没有这个记录」
+- **详细说明**：
+  - **先分离两侧**：从真机日志核对"宿主到底记了没有" —— 最近一次 `session/new` 的 `cwd` 是 `d:\Git\zgithub\custom-marktext`（不是本工作区）⇒ 那次会话确实建在 Browse 选的目录里，宿主的"最近用过"（`SessionHistoryStore.recentDirectories` ← `createSession` 里的 `upsertNew`）**有**它。问题在客户端这一侧。
+  - **根因**：目录抽屉的候选（工作区文件夹 / **最近用过** / 默认）来自一次 `listDirectoryChoices`，客户端存进 `choices` 之后**再也不重新请求** —— `reset()` 也不清。而这份列表**会变**（Browse 选的目录、刚用过的目录都要等宿主把它们算进最近列表）⇒ 一份当天的快照用一整天，新目录永远不出现。
+  - **修法**：**每次打开抽屉都回头问一次**（stale-while-revalidate）：先用手上那份渲染（列表永远瞬间出来），回复到了再就地重渲染；`pending` 只表示"一条候选都没有"，所以不会每开一次都闪 `Loading…`。**只在"还没数据"与"打开时"问**：同一个 `refresh` 也被 boot 在切草稿/切会话时调用（那时抽屉是关的），不能每次都付一次宿主往返（回复里可能带一次 `session/list`）。058 的两条老规矩一条没动：数据更新不门控于 `open`（否则对话框回来时抽屉恰好关着就把选择丢了）、宿主回复时无条件采用默认目录。
+  - **没做的**：不给抽屉加"手动刷新"按钮（打开即刷新已经覆盖），也不在 `draftResolved` 上主动预取（下一次打开自然会问到）。
+- **验证方式**：客户端 `npx mocha --ui tdd out/test/chat-client.test.js` → **194 passing**（新增 2 条：打开抽屉必回问一次且手上那份立刻可读、回复后新目录出现；boot 那条关着抽屉的路径只在首次问一次）；宿主 `npm test` → **384 passing**；`check-registry.mjs` 六节全绿、`npm run lint` 0 warning。**真机验收**：dev-workflow 213（Browse 选新目录 → 发消息 → 再开抽屉看它在不在 Recently used）。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-08 - CUSTOM-20261008-202
+- **功能（bug 修复）**：修「在 New Session 打开历史会话时，loading 的过程中没法切换到其他会话 tab」
+- **改动文件**：`src/ui/chat/html/client/scroll.ts`、`src/ui/chat/html/client/transcriptView.ts`、`src/ui/chat/html/client/perf.ts`（**新增**）、`src/ui/chat/html/client/index.ts`、`src/ui/chat/html/client/boot.ts`、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（文档：`chat-panel.md` §5.46、`pitfalls.md` #53、`dev-workflow.md` 验收 211-212、`registry.md` 总览）
+- **来源**：用户报「发现在 New Session 打开历史会话时，在 loading 的过程中没法切换到其他会话 tab」
+- **详细说明**：
+  - **先定案，再动手**：真机日志（`~/.claude/acp-client-custom.log`，08:55）给出三条判据 —— 客户端**连续 50 秒一行日志都没有**；恢复后的**第一刻**打出来的正是那次 `press@outside`（点击被压后了约 50 秒）；紧接着是攒了一路的 4 条 `markdownRendered` **一次性涌出**。同一时间宿主的 `session/load` 响应早就到了（08:55:36）⇒ 卡的是**客户端主线程**，不是宿主、也不是焦点/守卫逻辑。宿主侧也量过：整份转录（3.9MB 文本）的 markdown 渲染只要 **0.6 秒**，所以不是它。
+  - **根因**：一个批次 **139 条**回填在**一个任务**里跑完 —— 每条都要按白名单消毒、插进 DOM，并且读一次几何（`patch` 收尾的 `follow()` 读 `scrollHeight`、`refreshPreview` 读 `textContent`）。那条会话的转录有 581 条记录、2428 个工具卡、17000px 高 ⇒ 几百次"写一段又读一次几何"交错 = 几百次**强制整页重排**，合成一个几十秒的长任务；而**长任务期间浏览器把输入事件压后甚至丢掉**，症状于是与"处理器没接上"完全同形。
+  - **修法①（砍掉浪费的读）**：`scroll.follow()` 在"用户没贴底"那一格里**只为诊断**读 `scrollHeight`，而诊断自己有节流/配额、绝大多数调用根本不会记 —— 抽一个 `diagAllows(force)`（与 `logScrollState` 同一判据）并在读之前问一句。真机日志里 `skip-unpinned` / `grew-unpinned` 就是这条链，回放期间几十次每秒。
+  - **修法②（把长任务切成片）**：回填应用搬进记录层（`transcriptView.queueMarkdown`，boot 只转发），按 **≤8ms 的时间片**落地、剩下的排到下一帧 ⇒ 单任务不超过一帧。每片只做两个便宜收尾（`reassert()` / `stickyUser.schedule()`，都排到下一帧），`rail.reflow()` **只在整批结束时点一次** —— 逐片点名时那趟全量量测自己就成 50ms+ 的长任务（`#mdsliceprobe` 量到过；rail 本来就有 ResizeObserver 盯着每个节点）。一条回填抛错**先推游标再干活**，只跳过它自己并记一行 —— 否则它会被每帧重试一次（死循环 + 刷屏）。
+  - **常驻诊断**：新增 `html/client/perf.ts` —— `PerformanceObserver('longtask')`，>300ms 记一行 `[acpc] longtask NNNNms during=<阶段>`（阶段由 `NS.perf.phase()` 标，粘性），自带 1s 节流（173 的配额规矩）。下次再"点了没反应"，日志里直接有数字，不必再靠"日志突然断了"反推。
+  - **必须写明的限度**：`#mdsliceprobe` 档在同一份 DOM 上对照"整批一次 vs 分帧"，但**它复现不出真机那 50 秒**（合成条目整批 20ms、分帧 165ms，而真机约 **360ms/条**，差两个数量级）⇒ 它只能证明"一个批次不再落在单个任务里"，**不能**证明真机修好。真机判据是下一次的 `longtask` 行（dev-workflow 验收 211），这也是给用户的唯一一次复验请求。
+  - **顺带**：`chat-client.test.ts` 里两条用例原本用"往全局 `console.warn` 打补丁"来断言客户端日志 —— 在扩展宿主里抓不到（宿主与裸 node 未必是同一个 console 对象，本仓白掉过一次）。改成断言行为 + 纯函数判据（`NS.perf.shouldReport`），并把这条教训写进 pitfalls #53。
+- **验证方式**：客户端 `npx mocha --ui tdd out/test/chat-client.test.js` → **192 passing**（新增 5 条：一批按顺序逐片落地 / 跨多条回填不丢 / 一条坏的不拖住整批 / 不贴底时 50 次 `follow()` 最多读一两次几何 / 看门狗只装一次且阈值判据纯函数化）；宿主 `npm test` → **382 passing**；真 Chromium 的 `#mdsliceprobe` 档给出了整批 vs 分帧的对照数字（结论见"限度"）；`check-registry.mjs` 六节全绿、`npm run lint` 0 warning。⚠ **真机尚未复验**：需要用户按验收 211 打开一次那条大会话并点一下别的 tab。
+- **基于上游版本**：0.2.0（commit e7371659）
+
 ### 2026-10-08 - CUSTOM-20261008-199/200/201
 - **功能**：三条用户回报 —— ①空态（已连接、还没有会话）**地址栏没内容 + Times 被挤到左边**；②`Times` 开关**按会话记住**、新会话沿用最后一次的值；③tab 拖拽**松手后复位**（落点根本不接）
 - **改动文件**：`src/ui/chat/protocol.ts`、`src/ui/chat/ChatPanelHost.ts`、`src/ui/chat/html/client/tabs.ts`、`src/ui/chat/html/client/boot.ts`、`src/ui/chat/html/client/times.ts`（**新增**）、`src/ui/chat/html/client/index.ts`、`src/ui/chat/html/styles.ts`、`src/test/chat-client.test.ts`、`src/test/chat-panel.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（文档：`architecture.md` §1/§2.5、`chat-panel.md` §5.45、`dev-workflow.md` 验收 208-210、`pitfalls.md` #52、`registry.md` 总览）
