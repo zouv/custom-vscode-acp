@@ -652,6 +652,11 @@ export const bootClient = `
         NS.sessionMenu.applySupplement(message);
         break;
 
+      // [CUSTOM-20261009-212] 归档/改名做完了（宿主是执行方）—— 列表就地更新。
+      case 'sessionAction':
+        NS.sessionMenu.applyAction(message);
+        break;
+
       // [CUSTOM-20260925-058] Draft page: directory candidates, the native
       // picker's result, and the outcome of "create the session and send".
       // All four are TARGETED at this document (the draft is this document's).

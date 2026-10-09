@@ -895,6 +895,107 @@ function driver() {
     if (document.readyState === 'complete') { historyDefaultMode(); }
     else { window.addEventListener('load', historyDefaultMode); }
   }
+  // [CUSTOM-20261009-212] 历史列表行的悬停动作（Archive / Rename）。桩 DOM 测的是逻辑；
+  // 这一档在真 Chromium 里量**布局与接线**：默认隐藏（计算值）、按钮落在行内、图标画出来了、
+  // 点击真的发出 archiveSession、回执后列表就地更新。
+  // ⚠️ :hover 在无头里没法程序触发 —— "默认隐藏"读计算值，"显示态"用内联样式把悬停后的
+  // 最终值摆出来（图给人看观感，数字看右侧布局）。
+  function historyRowMode() {
+    var rowSent = [];
+    var nativeRowPost = NS.bridge.post;
+    NS.bridge.post = function (m) { rowSent.push(m); if (nativeRowPost) { nativeRowPost(m); } };
+    document.getElementById('historyBtn').click();
+    NS.sessionMenu.setHistory({
+      type: 'history', agentName: 'Claude Code', source: 'agent',
+      sessions: [
+        { sessionId: 'a1', title: 'alpha one', cwd: 'D:/Git/alpha', dirKey: 'd:/git/alpha', updatedAt: '2026-09-20T00:00:00Z' },
+        { sessionId: 'a2', title: 'alpha two', cwd: 'D:/Git/alpha', dirKey: 'd:/git/alpha', updatedAt: '2026-09-19T00:00:00Z' },
+        { sessionId: 'b1', title: 'beta one', cwd: 'D:/Git/beta', dirKey: 'd:/git/beta', updatedAt: '2026-09-18T00:00:00Z' }
+      ],
+      directories: [
+        { key: 'd:/git/alpha', cwd: 'D:/Git/alpha', name: 'alpha', label: 'alpha', count: 2, current: true },
+        { key: 'd:/git/beta', cwd: 'D:/Git/beta', name: 'beta', label: 'beta', count: 1, current: false }
+      ]
+    });
+    var rows = document.querySelectorAll('#history .session-row');
+    var firstActions = rows.length ? rows[0].querySelector('.row-actions') : null;
+    var defaultOpacity = firstActions ? getComputedStyle(firstActions).opacity : null;
+    var defaultPE = firstActions ? getComputedStyle(firstActions).pointerEvents : null;
+    // 点一次 Archive（元素 .click() 走真事件路径），再喂回执，看列表就地更新。
+    var firstArchive = rows.length ? rows[0].querySelector('[data-session-action="archive"]') : null;
+    if (firstArchive) { firstArchive.click(); }
+    var sentArchive = rowSent.filter(function (m) { return m.type === 'archiveSession'; }).length;
+    NS.sessionMenu.applyAction({ action: 'archive', sessionId: 'a1' });
+    var afterArchive = document.querySelectorAll('#history .session-row').length;
+    // 把剩下第一行的悬停动作摆出来并量几何（右缘在行内、纵向近似居中、按钮尺寸与图标）。
+    var reveal = document.querySelectorAll('#history .session-row')[0];
+    var revealActions = reveal ? reveal.querySelector('.row-actions') : null;
+    var rect = null; var btnSizes = [];
+    if (revealActions) {
+      revealActions.style.opacity = '1';
+      revealActions.style.pointerEvents = 'auto';
+      var rowRect = reveal.getBoundingClientRect();
+      var actRect = revealActions.getBoundingClientRect();
+      rect = {
+        insideRow: actRect.right <= rowRect.right + 0.5 && actRect.left >= rowRect.left,
+        centred: Math.abs((actRect.top + actRect.bottom) / 2 - (rowRect.top + rowRect.bottom) / 2) <= 3
+      };
+      var btns = revealActions.querySelectorAll('.row-action');
+      for (var bi = 0; bi < btns.length; bi++) {
+        var br = btns[bi].getBoundingClientRect();
+        btnSizes.push(Math.round(br.width) + 'x' + Math.round(br.height)
+          + (btns[bi].firstChild && btns[bi].firstChild.childNodes && btns[bi].firstChild.childNodes.length ? '+icon' : ''));
+      }
+    }
+    var rowPre = document.createElement('pre');
+    rowPre.id = 'history-row-probe';
+    rowPre.textContent = JSON.stringify({
+      kind: 'history-row-actions',
+      rowCount: rows.length,
+      actionsPerRow: rows.length ? rows[0].querySelectorAll('[data-session-action]').length : null,
+      // 动作**不能**嵌在行按钮里（button 嵌套 button 是无效 HTML）——这个选择器应当查不到。
+      actionsInsideRowButton: !!document.querySelector('#history .outline-item .row-actions'),
+      defaultOpacity: defaultOpacity, defaultPointerEvents: defaultPE,
+      sentArchive: sentArchive, rowsAfterArchive: afterArchive, rect: rect, btnSizes: btnSizes
+    });
+    document.body.appendChild(rowPre);
+  }
+  // [CUSTOM-20261009-213 补] 用户气泡展开态"正文第一行可框选"的读数：第一行在 summary 里，
+  // 而 summary 是 user-select: none 的切换区 —— 展开态必须给它解禁（userSelect=text）。
+  // 只量不推（pitfall #31）：CSS 的 user-select 是否真的被覆盖，读 getComputedStyle 才算数。
+  function userFoldSelectMode() {
+    var out = {};
+    var openBody = document.querySelector('.entry-user details.user-fold[open] .bubble-body');
+    if (openBody) {
+      var cs = getComputedStyle(openBody);
+      out.openBody = { userSelect: cs.userSelect, cursor: cs.cursor };
+      // 展开态：正文里划选一下（Range API，不需要真鼠标），看能不能选出文字。
+      if (document.createRange && window.getSelection) {
+        try {
+          var range = document.createRange();
+          range.selectNodeContents(openBody);
+          var sel = window.getSelection();
+          sel.removeAllRanges();
+          sel.addRange(range);
+          out.selectedChars = String(sel.toString() || '').length;
+        } catch (e) { out.selectError = String(e && e.message); }
+      }
+    }
+    var openSummary = document.querySelector('.entry-user details.user-fold[open] > summary');
+    if (openSummary) { out.summaryUserSelect = getComputedStyle(openSummary).userSelect; }
+    var pre = document.createElement('pre');
+    pre.id = 'userfold-select-probe';
+    pre.textContent = JSON.stringify({ kind: 'userfold-select', ...out });
+    document.body.appendChild(pre);
+  }
+  if (location.hash.indexOf('userfold') >= 0) {
+    if (document.readyState === 'complete') { userFoldSelectMode(); }
+    else { window.addEventListener('load', userFoldSelectMode); }
+  }
+  if (location.hash.indexOf('historyrow') >= 0) {
+    if (document.readyState === 'complete') { historyRowMode(); }
+    else { window.addEventListener('load', historyRowMode); }
+  }
   // [CUSTOM-20260930-143] 未连接（disconnected / connecting）时底栏应当**整块消失** —— 那时
   // 输入框本来就用不了，露着一个"看得见却打不了字"的框只会让人以为它坏了。相位是 stateCard
   // 写在 body[data-phase] 上的，这里直接设属性来摆出那个状态。
@@ -915,6 +1016,35 @@ function driver() {
     // scroll 事件是**异步派发**的，而探针在同一个同步块里读数 —— 手动派发一次，让 scroll.ts
     // 的 onScroll（pinned 判定与 pin-bottom 类）先跑完。
     messages.dispatchEvent(new Event('scroll'));
+  }
+  // [CUSTOM-20261009-210] 「到底了、尾巴还被输入卡压住」的**自愈**复现。把 --acpc-composer-h
+  // 人为踩回 0px（模拟观测器在"文档没渲染"时段哑火后变量停在 0 的形态——真机截图里就是它），
+  // 再滚到底派发 scroll：recompute 的按结果判据（末条底边 vs 卡片顶边）应当发现，并让
+  // composer 重测、重写变量、跟到底。读三样：varAfter（应回到真实高度）、covered（应假）、
+  // lastGap（应 ≥ 卡片高，即尾巴在卡片上方）。
+  if (location.hash.indexOf('composerbottomtail') >= 0) {
+    var tailMessages = document.getElementById('messages');
+    var tailComposer = document.getElementById('composer');
+    var tailLast = tailMessages.lastElementChild;
+    document.body.style.setProperty('--acpc-composer-h', '0px');
+    // 变量一变留白立刻回落 —— 这正是真机里"变量停在 0"的形态：内容末尾会被卡片压住。
+    tailMessages.scrollTop = tailMessages.scrollHeight;
+    tailMessages.dispatchEvent(new Event('scroll'));
+    var tailComposerRect = tailComposer.getBoundingClientRect();
+    var tailLastRect = tailLast ? tailLast.getBoundingClientRect() : null;
+    var tailLine = JSON.stringify({
+      kind: 'tail-covered-heal',
+      varAfter: (document.body.style.getPropertyValue('--acpc-composer-h') || '').trim(),
+      composerH: Math.round(tailComposerRect.height),
+      padBottom: getComputedStyle(tailMessages).paddingBottom,
+      covered: tailLastRect ? tailLastRect.bottom > tailComposerRect.top : null,
+      lastGap: tailLastRect
+        ? Math.round(tailMessages.getBoundingClientRect().bottom - tailLastRect.bottom) : null
+    });
+    var tailPre = document.createElement('pre');
+    tailPre.id = 'tail-covered-probe';
+    tailPre.textContent = tailLine;
+    document.body.appendChild(tailPre);
   }
   // [CUSTOM-20260930-147] 端到端：boot 自己初始化（真机就是这么走的），再由本档**模拟宿主**
   // 把 renderMarkdown 渲染成 html 回填进来。这是"最后一条不渲染"唯一能在本地复现的姿势 ——
@@ -1629,23 +1759,27 @@ function driver() {
       out.push(JSON.stringify({
         kind: 'refchip',
         present: !!refChip,
-        on: !!(refChip && String(refChip.className).indexOf('ref-on') >= 0),
+        // [CUSTOM-20261009-214] 原 on=（两态里的"已引用"）随那一态退役 —— 引用栏只剩预选态，
+        // 已引用时这格整个不渲染（下面的 refChipAfterAttach 读的就是它）。
         toggle: refToggle ? String(refToggle.textContent) : null,
         label: refTag ? String(refTag.textContent).trim() : null,
         href: refTag ? refTag.getAttribute('data-path') : null,
         barHidden: (function () { var b = document.getElementById('attachments'); return b ? b.hidden === true : null; })(),
         // [CUSTOM-20261008-207] 开关排在 tag **之后**（用户要求 + 与 × 一致）。
         toggleAfterTag: !!(refChip && refChip.lastChild && String(refChip.lastChild.className || '').indexOf('ref-toggle') >= 0),
-        // [CUSTOM-20261008-208] 开关要在 **chip 里面**，且"预选 / 已引用"两态的底色+描边必须一眼不同。
-        // 探针自己翻一次状态（把这一格标成已引用）再读第二遍 —— 两态各一次读数。
+        // [CUSTOM-20261008-208] 开关要在 **chip 里面**（预选态的强调色底 + 虚线由 styleOff 读）。
         toggleInside: !!(refChip && refToggle && refChip.contains && refChip.contains(refToggle)),
         styleOff: readRefStyle(refChip),
-        styleOn: (function () {
+        // [CUSTOM-20261009-214] 探针自己翻一次状态（把这一段标成已引用）再读第二遍：
+        // 引用栏那一格应当**整个消失**（重复 tag 的修法 —— 已引用的在附件行里有自己的 chip），
+        // 且附件行里那条要带上 </> 图标。两态各一次读数，一次就把整条链看到底。
+        refChipAfterAttach: (function () {
           if (!refChip || !NS.composer.setAttachments) { return null; }
           // 区间必须与当前选区一致 —— 同一性 = 路径 + 区间（207），不然这里翻不过去。
           NS.composer.setAttachments([{ path: 'f:/P4/x/PianoGameplayDefine.cs', name: 'x', kind: 'file', lineStart: 12, lineEnd: 40 }]);
-          return readRefStyle(document.querySelector('.ref-chip'));
+          return !!document.querySelector('.ref-chip');
         })(),
+        attachmentIconAfterAttach: !!document.querySelector('#attachments .attachment .chip-icon'),
       }));
       function readRefStyle(node) {
         if (!node || !window.getComputedStyle) { return null; }
@@ -2118,6 +2252,9 @@ const SHOTS = [
   // 一直截不到（既有现象，与 183 无关），借这个相位才能看到确认条的观感。
   ['#composerdraftstopconfirm', 'stop-confirm-connected', '1440,1000'],
   ['#composerbottom', 'composer-wide-bottom', '1440,1000'],
+  // [CUSTOM-20261009-210] 「到底了、尾巴还被卡片压住」的自愈：变量被踩回 0px 后，滚到底
+  // 派发 scroll 应当自己修复（varAfter 回真实高度、covered=false、lastGap ≥ 卡片高）。
+  ['#composerbottomtailprobe', 'tail-covered', '1440,900'],
   // [CUSTOM-20260930-144] 中途（不在底部）：不该有那段让位留白，消息应当铺到面板底。
   ['#composermid', 'composer-mid', '1440,900'],
   // 贴底后上滚 40px（用户截图里的位置）：留白必须撤掉。
@@ -2135,6 +2272,9 @@ const SHOTS = [
   // [CUSTOM-20261001-155] 默认筛选（地址栏有目录 ⇒ 列表只出该目录）：截图看列表本身，
   // 探针（同 hash 带 probe）读 askedCwd / rows / chip —— 数字比肉眼可靠。
   ['#historydefaultprobe', 'history-default', '1440,900'],
+  // [CUSTOM-20261009-212] 历史列表行的悬停动作：布局（默认隐藏 / 落在行内）+ 接线
+  // （点击发出 archiveSession、回执后列表就地更新）。图里第一行是"悬停后"的摆法。
+  ['#historyrowprobe', 'history-row-actions', '1440,900'],
   // [CUSTOM-20261001-158] 权限抽屉：记录一行 + 输入框上方的浮层（与表单抽屉同形）。
   // `both` 档把表单与权限**同时**摆出来 —— 两个抽屉上下堆叠，探针量 gapToElic / overlapsElic。
   ['#permdrawerprobe', 'perm-drawer', '1440,900'],

@@ -191,6 +191,12 @@ export type ExtToChat =
   // 重置回 current 目录）。只回发起过滤的那个目录的磁盘会话。
   | { type: 'historySupplement'; agentName: string; cwd: string; sessions: HistorySessionSummary[] }
   // [CUSTOM-END] CUSTOM-20260928-095
+  // [CUSTOM-BEGIN] CUSTOM-20261009-212 - 归档/改名**做完**的回执（宿主是执行方）。
+  // 客户端据此**就地**更新历史列表（改标题 / 摘掉行），不重发整份 history —— 那会把用户
+  // 手选的目录过滤重置回默认（setHistory 用 askedCwd 重派生 filterKey）。广播：两个面
+  // 都可能开着这份列表，谁开着谁更新（没开的 applyAction 会按 lastMessage 为空短路）。
+  | { type: 'sessionAction'; action: 'rename' | 'archive'; sessionId: string; title?: string }
+  // [CUSTOM-END] CUSTOM-20261009-212
   // [CUSTOM-BEGIN] CUSTOM-20260925-058 - 草稿页与目录选择的应答。
   // 四条都**定向**发给发起请求的那个面（`post(msg, to)` 会绕开合帧队列），
   // 因为它们是"某个文档正在编辑的东西"，广播会让另一个面也长出同一个草稿。
@@ -322,6 +328,13 @@ export type ChatToExt =
   // 建的是 B 的会话"——而那种错配在应用阶段会被逐项校验静默丢掉。
   // [CUSTOM-END] CUSTOM-20260930-151
   | { type: 'closeSession'; sessionId: string }
+  // [CUSTOM-BEGIN] CUSTOM-20261009-212 - 历史列表 / 会话 tab 的**改名**。**要在守卫之前处理**：
+  // 历史列表里的行大多不是活会话（verifySession 只认 live 的）——会话 tab 那条是活的，但走同
+  // 一条路更省心（见 ChatPanelHost 的分支注释）。`currentTitle` 只是给输入框的初值（客户端
+  // 行/标签上有它就带上）。归档（历史行的另一个动作）见下行 `archiveSession`。
+  | { type: 'archiveSession'; sessionId: string }
+  | { type: 'renameSession'; sessionId: string; currentTitle?: string }
+  // [CUSTOM-END] CUSTOM-20261009-212
   | { type: 'focusSession'; sessionId: string }
   | { type: 'focusAgent'; agentName: string }
   // [CUSTOM-20261008-207] 带上行区间 = 只摘那一段（同一个文件可以引用多段）；不带 = 整个路径全摘。

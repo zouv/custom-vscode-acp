@@ -329,6 +329,37 @@ export function styles(): string {
   }
   .outline-item.active .outline-time { color: inherit; opacity: 0.85; }
   .outline-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* [CUSTOM-BEGIN] CUSTOM-20261009-212 - 历史列表行的悬停动作（Archive / Rename）。
+     图标层是行的**兄弟**（button 不能嵌 button，见 sessionMenu.buildRowActions），
+     绝对定位浮在行的右端：默认透明且不接事件，悬停/键盘聚焦整行时才现身 ——
+     "仅鼠标悬停时显示"是用户点名要的形态。背景取行自己的悬停色，使这条贴合在行上
+     （行被指到时底色就是它）；覆盖在最右的目录 chip 上是有意的（官方插件同形）。 */
+  .session-row { position: relative; }
+  .session-row:hover .outline-item { background: var(--vscode-list-hoverBackground); }
+  .row-actions {
+    position: absolute; top: 0; right: 6px; bottom: 0;
+    display: flex; align-items: center; gap: 2px;
+    opacity: 0; pointer-events: none;
+    background: var(--vscode-list-hoverBackground);
+    transition: opacity 80ms ease-out;
+  }
+  .session-row:hover .row-actions,
+  .session-row:focus-within .row-actions { opacity: 1; pointer-events: auto; }
+  .row-action {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 20px; height: 20px; padding: 0;
+    border: none; border-radius: 4px; cursor: pointer;
+    background: transparent; color: var(--vscode-icon-foreground, var(--vscode-foreground));
+  }
+  .row-action:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2)); }
+  .row-action-icon { display: inline-flex; }
+  /* [CUSTOM-20261009-212 修] 历史行：标题不再吃满整行。.outline-text 的 flex: 1 会把右端推满，
+     目录名于是被挤到最右侧、与悬停的 Archive/Rename 重叠（用户 2026-10-09 报，图里就是"图标压在
+     aki_work 上"）。改 0 1 auto：标题按内容占位、过长才收缩出省略号，目录名紧跟其后（"(aki_work)"），
+     右端空档留给 .row-actions。**只限历史行**（.session-row 前缀）——大纲行的 .outline-text 仍是
+     flex: 1，那条行的时刻要贴右缘。 */
+  .session-row .outline-text { flex: 0 1 auto; }
+  /* [CUSTOM-END] CUSTOM-20261009-212 */
   /* [CUSTOM-20261005-191] 「这一行是谁说的」要一眼看得出来。用户报"右侧边栏用户消息区分度不明显" ——
      在此之前两类行只有**一小格图标**在区分（076/077），文字颜色/字重/缩进完全一样，整排读起来是
      一片同质的列表。做法是把两个方向拉开：
@@ -719,6 +750,13 @@ export function styles(): string {
     cursor: pointer; user-select: none; list-style: none;
     background: transparent; padding: 0; border-radius: 0; color: inherit;
   }
+  /* [CUSTOM-20261009-213 补] 展开态的**正文第一行**必须可框选。它落在 summary 里，而上面那条
+     user-select: none（summary 整体当"切换区"的历史写法）连同 cursor: pointer 一起把它按住了 ——
+     鼠标变成手、还选不中（用户 2026-10-09 报："展开情况下正文第一行还是无法框选，鼠标变手，
+     点了又没反应"；第一行之外的各行在 fold-body 里，本来就能选）。展开态给 .bubble-body 解禁
+     （文字恢复文本光标 + 可选中；点击不再折叠由 213 的 click 拦截负责）；**折叠态刻意不解禁** ——
+     那一行预览按用户要求就是"点它就展开"的切换区。 */
+  .entry-user .user-fold[open] > summary .bubble-body { user-select: text; cursor: text; }
   /* [CUSTOM-20260928-108] 正文从第二行开始（图标与折叠三角留在第一行）。
      .bubble-body 是 block，所以 summary 里的文字永远另起一行；折叠态的截断
      作用在它自己身上（不再是整个 summary，否则图片 chip 也会被截掉）。 */
@@ -1504,9 +1542,9 @@ export function styles(): string {
      与普通附件 chip 的区别是"**它还没被加进来**"这个状态：未引用时描边虚一点、标签暗一点，
      一眼能看出"点 + 就能加"。两个面（侧边栏/编辑区）都有输入框，所以样式挂在 .ref-chip 上。 */
   /* [CUSTOM-20261008-206 / 208] 一整格**一个 chip**：外壳描边 + 底色，里面 tag 与开关平级。
-     两态用底色分开（用户要求"加一些按钮背景色区分预选与已引用"）：
-       · **预选**（还没引用）：强调色底 + 虚线描边 —— "点 + 就加进来"；
-       · **已引用**：与其它附件 chip 同观感（代码块底色 + 实线）—— "它已经在引用里了"。
+     [CUSTOM-20261009-214] 只剩**预选**一态（还没引用）：强调色底 + 虚线描边 —— "点 + 就加进来"；
+     已引用时这一格**根本不渲染**（附件行里有它自己的 chip，两处都显示就是重复 tag），
+     所以 208 那条 .ref-on（实线 + 代码块底色）随之删除 —— 别留没有写者的死 CSS（pitfall #20）。
      颜色一律走主题 token（不写死色值）。 */
   .ref-chip {
     display: inline-flex; align-items: center; gap: 2px;
@@ -1518,11 +1556,6 @@ export function styles(): string {
       var(--vscode-textCodeBlock-background));
     color: var(--vscode-badge-foreground, var(--vscode-foreground));
     font-family: var(--vscode-editor-font-family); font-size: 0.88em;
-  }
-  .ref-chip.ref-on {
-    border-style: solid; border-color: var(--vscode-panel-border);
-    background: var(--vscode-textCodeBlock-background);
-    color: var(--vscode-foreground);
   }
   /* 里层的两个都是真按钮，但外观交给外壳：自己不要描边/底色。 */
   .ref-tag, .ref-toggle {

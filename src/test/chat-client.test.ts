@@ -383,7 +383,7 @@ function loadClient(
   for (const source of [domClient, iconsClient, linksClient, toolCallViewClient, transcriptViewClient, permissionViewClient, permissionDrawerClient, outlineClient, sessionMenuClient, directoryMenuClient, composerClient, tabsClient, timesClient, perfClient, stickyUserClient, elicitationViewClient, stateCardClient, contextMenuClient]) {
     new Function('window', 'document', source)(win, doc);
   }
-  return { NS, metrics, doc, docListeners, jumps, timers };
+  return { NS, metrics, doc, docListeners, jumps, timers, win };
 }
 
 /**
@@ -594,6 +594,51 @@ suite('chat client logic: record DOM shape (stub DOM)', () => {
     assert.ok(details, 're-decided: one line, folded to it');
     assert.strictEqual(record.getAttribute('data-fold'), 'done', 'and the answer is final now');
     assert.strictEqual(details.querySelector('.fold-body'), null, 'nothing is left hidden behind the caret');
+  });
+
+  // [CUSTOM-20261009-213] 正文不触发折叠（用户 2026-10-09 报："点击任意位置都折叠，
+  // 没法框选文字内容"）。理由与助手气泡（114，"正文不在 summary 里"）同源，但用户气泡的
+  // 折叠态要求"首行预览"留在 summary 里，所以只能在这一层把**正文那一片**从切换区摘出去。
+  function foldFixture(NS: Record<string, any>, text: string): {
+    details: StubNode; summary: StubNode; bodyEl: StubNode; caret: StubNode;
+  } {
+    const { node: details, summary } = shapeOf(NS, { id: 'u9', kind: 'user', at: Date.now(), text });
+    assert.ok(details && summary, 'the fixture must fold');
+    const bodyEl = summary!.querySelector('.bubble-body') as StubNode;
+    const caret = summary!.querySelector('.fold-caret') as StubNode;
+    assert.ok(bodyEl && caret, 'fixture: both zones exist');
+    return { details: details!, summary: summary!, bodyEl, caret };
+  }
+
+  function clickOn(host: StubNode, target: StubNode): boolean {
+    let prevented = false;
+    host.dispatch('click', { target, preventDefault: () => { prevented = true; } });
+    return prevented;
+  }
+
+  test('展开态：点在正文上不折叠（可框选）；点 caret 照常切换（213）', () => {
+    const { NS } = loadClient();
+    const { details, summary, bodyEl, caret } = foldFixture(NS, '第一行\n第二行\n第三行');
+    details.open = true;
+    assert.strictEqual(clickOn(summary, bodyEl), true,
+      '正文里的点击必须被拦下 —— 原生 <details> 里点 summary 就切换，划选==点它');
+    assert.strictEqual(clickOn(summary, caret), false, 'caret（标题行）仍是切换区');
+  });
+
+  test('折叠态：整行（含一行预览）仍然可点开（213）', () => {
+    const { NS } = loadClient();
+    const { details, summary, bodyEl } = foldFixture(NS, '第一行\n第二行\n第三行');
+    details.open = false;
+    assert.strictEqual(clickOn(summary, bodyEl), false,
+      '折叠态"第一行就是全部"，整行都该能点（用户要求"点击第一行就触发折叠"）');
+  });
+
+  test('手里已有选区时不折叠 —— 从正文拖到行尾空白松手也不算点（213）', () => {
+    const { NS, win } = loadClient();
+    win.getSelection = () => ({ toString: () => '选中的一段' });
+    const { details, summary, caret } = foldFixture(NS, '第一行\n第二行\n第三行');
+    details.open = true;
+    assert.strictEqual(clickOn(summary, caret), true, '选到一半的内容不许被折起来');
   });
 
   test('INV-J: the fold caret comes AFTER the type icon, and both survive finalize', () => {
@@ -1905,6 +1950,75 @@ suite('chat client logic: history picker filter (stub DOM)', () => {
     }, { tabCwd: '/git/beta' });
     assert.deepStrictEqual(posted.filter(m => m.type === 'supplementHistory'),
       [{ type: 'supplementHistory', cwd: '/git/beta' }]);
+  });
+
+  // [CUSTOM-20261009-212] 行右端的悬停动作（Archive / Rename，仅悬停显示）。
+  // 两个要点：①图标按钮是行按钮的**兄弟**（button 不能嵌 button，见 buildRowActions）；
+  // ②点击只发消息，等宿主的 `sessionAction` 回执再改列表 —— 不做乐观更新。
+  // ⚠️ 桩 DOM 的选择器只支持 [attr]（存在性），不支持 [attr=value] —— 找按钮要取回来自己比。
+  function actionBtnOf(wrap: StubNode, kind: string): StubNode {
+    const hit = wrap.querySelectorAll('[data-session-action]')
+      .find(b => b.getAttribute('data-session-action') === kind);
+    assert.ok(hit, `expected a ${kind} action button`);
+    return hit!;
+  }
+
+  test('每行都带一对动作，且动作按钮是行按钮的兄弟（不嵌套）', () => {
+    const { tree } = openedPicker();
+    const rows = tree.list.querySelectorAll('.outline-item');
+    assert.strictEqual(rows.length, 3);
+    for (const row of rows) {
+      const wrap = row.parentNode!;
+      assert.ok(wrap.className.includes('session-row'), '行外面是 .session-row');
+      const actions = wrap.querySelectorAll('[data-session-action]');
+      assert.strictEqual(actions.length, 2, 'Archive + Rename');
+      assert.strictEqual(
+        actions.map(a => a.getAttribute('data-session-action')).join(','),
+        'archive,rename');
+      // 动作层是行的**兄弟**：按钮的父级不是行按钮，而动作层自身挂在 .session-row 下。
+      assert.notStrictEqual(actions[0].parentNode, row, '动作不在行按钮里');
+      assert.strictEqual((actions[0].parentNode as StubNode).parentNode, wrap, '动作层挂在行容器下');
+    }
+  });
+
+  test('点 Archive 只发消息，列表等回执才动', () => {
+    const { docListeners, tree, posted } = openedPicker();
+    const row = tree.list.querySelectorAll('.outline-item')[0];
+    dispatchClick(actionBtnOf(row.parentNode as StubNode, 'archive'), docListeners);
+    assert.deepStrictEqual(posted.filter(m => m.type === 'archiveSession'),
+      [{ type: 'archiveSession', sessionId: 'a1' }]);
+    assert.strictEqual(tree.list.querySelectorAll('.outline-item').length, 3,
+      '回执之前列表不动（不做乐观更新）');
+    assert.strictEqual(tree.drawer.hidden, false, '列表就地更新，抽屉不关');
+  });
+
+  test('点 Rename 带上行上的当前标题（进输入框当初值）', () => {
+    const { docListeners, tree, posted } = openedPicker();
+    const row = tree.list.querySelectorAll('.outline-item')[1];
+    dispatchClick(actionBtnOf(row.parentNode as StubNode, 'rename'), docListeners);
+    assert.deepStrictEqual(posted.filter(m => m.type === 'renameSession'),
+      [{ type: 'renameSession', sessionId: 'a2', currentTitle: 'alpha two' }]);
+  });
+
+  test('applyAction：归档摘行、改名换标签，计数跟着重算，过滤不被重置', () => {
+    const { NS, docListeners, tree } = openedPicker({}, { tabCwd: '/git/alpha' });
+    // 先手动过滤到 alpha（2 条）——回执路径**不能**把这个选择冲掉（那正是"重发整份
+    // history"会干的事：setHistory 会用 askedCwd 重派生 filterKey）。
+    dispatchClick(tree.chip, docListeners);
+    const alpha = filterRows(tree.menu).find(r => r.getAttribute('data-filter-key') === '/git/alpha');
+    dispatchClick(alpha!, docListeners);
+    assert.strictEqual(tree.list.querySelectorAll('.outline-item').length, 2, '过滤在 alpha');
+
+    NS.sessionMenu.applyAction({ action: 'archive', sessionId: 'a1' });
+    assert.strictEqual(tree.list.querySelectorAll('.outline-item').length, 1, '归档的行被摘掉');
+    assert.ok(!tree.drawer.hidden, '列表就地更新，抽屉不关');
+
+    NS.sessionMenu.applyAction({ action: 'rename', sessionId: 'a2', title: '新的名字' });
+    const first = tree.list.querySelectorAll('.outline-item')[0];
+    assert.ok(first.querySelector('.outline-text')!.textContent.includes('新的名字'),
+      '改名的行换标签');
+    assert.ok(tree.chip.querySelector('.picker-label')!.textContent.includes('alpha'),
+      '手动选的目录过滤不被回执重置');
   });
 });
 
@@ -4451,6 +4565,64 @@ suite('scroll: 几何（内容 / 留白）变化后视口判定要重算 (CUSTOM
       `50 次 follow() 最多读一两次（诊断节流窗口），实际读了 ${reads} 次 ——`
       + ' 旧实现这里每次都读，那正是几百次强制重排的来源');
   });
+
+  // [CUSTOM-20261009-210] 「到底了、尾巴却还压在输入卡后面」的**按结果自愈**。
+  // 判据是"末条记录的底边 vs 输入卡的顶边"（用户看得见的量，pitfalls #25/#26），
+  // 修复动作是让 composer 重测高度（唯一写者）。前置有两条：**真在滚动范围末尾**（st ≥ max−1）
+  // ＋ 贴底态（distance < 阈值）——少了 at-max 那条，从底部上滚一格就会被误判成"被压住"、
+  // 视口被拉回底部（2026-10-09 用户报的"滚轮滚不上去"，这里有回归用例钉住）。
+  // 这里只验**逻辑接线**（什么时候调 refreshHeight / 什么时候不调）——被压住之后的真实布局
+  // 照旧归真 Chromium 的预览档。
+  function mountHeal(opts: {
+    pad: string; scrollTop: number; lastBottom: number; composerTop: number; composerH: number;
+  }): { healed: () => number } {
+    const { NS, el } = mountScroll(opts.pad);
+    let healed = 0;
+    NS.composer = { refreshHeight: () => { healed++; } };
+    NS.dom = { qs: () => ({ getBoundingClientRect: () => ({ top: opts.composerTop, height: opts.composerH }) }) };
+    Object.defineProperty(el, 'lastElementChild', {
+      configurable: true,
+      get: () => ({
+        getBoundingClientRect: () => ({ bottom: opts.lastBottom }),
+        // logScrollState 的 kind= 那一格要读 data-kind（诊断字段），桩里给个空值即可。
+        getAttribute: () => null,
+      }),
+    });
+    el.scrollTop = opts.scrollTop;
+    el.fire('scroll');
+    return { healed: () => healed };
+  }
+
+  test('触底且尾巴压进输入卡 ⇒ 调 refreshHeight 自愈（CUSTOM-20261009-210）', () => {
+    // max = 1000 − 400 = 600；st=600（真在末尾）；distance = 1000 − 24 − 600 − 400 = −24 ⇒ 贴底；
+    // 末条底边 990 > 卡片顶边 900 ⇒ 被压住。
+    const m = mountHeal({ pad: '24px', scrollTop: 600, lastBottom: 990, composerTop: 900, composerH: 100 });
+    assert.strictEqual(m.healed(), 1, '被压住必须重测一次');
+  });
+
+  test('从底部上滚一格（还在阈值内）⇒ 绝不自愈 —— 滚轮被吃光的回归（2026-10-09）', () => {
+    // 上滚一格后 st=500（< max=600）：distance = 1000 − 104 − 500 − 400 = −4，仍在阈值内；
+    // 而尾巴此刻"离开卡片上方"（990 > 900）**是上滚的正常中间态**，不是被压住。
+    // 少了 at-max 门槛的版本会在这里自愈 → reflow 把视口拉回底部 → 滚轮一格都推不上去。
+    const m = mountHeal({ pad: '104px', scrollTop: 500, lastBottom: 990, composerTop: 900, composerH: 100 });
+    assert.strictEqual(m.healed(), 0, '不在滚动范围末尾就不许动视口');
+  });
+
+  test('尾巴在卡片上方（健康的触底）⇒ 一次都不重测', () => {
+    // st=600=max；distance = 1000 − 128 − 600 − 400 = −128 ⇒ 贴底且留白完整：末条底边 890 ≤ 卡片顶边 900。
+    const m = mountHeal({ pad: '128px', scrollTop: 600, lastBottom: 890, composerTop: 900, composerH: 100 });
+    assert.strictEqual(m.healed(), 0);
+  });
+
+  test('上翻看历史时内容从卡片下面穿过是常态 ⇒ 绝不重测', () => {
+    const m = mountHeal({ pad: '24px', scrollTop: 100, lastBottom: 990, composerTop: 900, composerH: 100 });
+    assert.strictEqual(m.healed(), 0, 'distance=476 ⇒ 提前返回（判据只在贴底态生效）');
+  });
+
+  test('卡片没显示（相位断开，rect 全 0）⇒ 此刻没有可压的内容，不关它的事', () => {
+    const m = mountHeal({ pad: '24px', scrollTop: 600, lastBottom: 990, composerTop: 0, composerH: 0 });
+    assert.strictEqual(m.healed(), 0);
+  });
 });
 
 // [CUSTOM-20261004-180] rail.measure() 的**读写分离**。
@@ -4669,6 +4841,77 @@ suite('chat client logic: context menu items (stub DOM, CUSTOM-20261007-197)', (
     assert.ok(!items.some(i => i.label === 'Copy message'),
       `an unknown id must not offer a copy that would copy nothing: ${labels(items)}`);
   });
+
+  // [CUSTOM-20261009-211/212] 四个上下文专属格（用户报的"有个 Copy 但点不动"就出在前两处：
+  // 右键时通常没有选区，通用的 Copy 只会灰着）。
+  test('大纲行：Copy 拷这一条的正文（不是选区，也不需要选区）', () => {
+    const { NS, posted } = withEntry();
+    const row = new StubNode('button');
+    row.className = 'outline-item kind-user';
+    row.setAttribute('data-jump-id', 'u1');
+    const label = new StubNode('span');
+    label.className = 'outline-text';
+    label.textContent = '截断的标题…';
+    row.appendChild(label);
+
+    const items = NS.contextMenu.itemsFor(label) as Array<{ label: string; disabled?: boolean; run: () => void }>;
+    assert.strictEqual(labels(items), 'Copy', '这一格只有 Copy');
+    assert.ok(!items[0].disabled, '没有选区也必须可点');
+    items[0].run();
+    assert.deepStrictEqual(posted, [{ type: 'copy', text }], '拷的是整条正文');
+  });
+
+  test('地址栏：Copy 拷它正显示的目录路径', () => {
+    const { NS, posted } = withEntry();
+    const addr = new StubNode('button');
+    addr.className = 'session-title';                 // body.ts 的 #cwdBtn
+    addr.textContent = 'F:\\\\dev\\\\aki';
+
+    const items = NS.contextMenu.itemsFor(addr) as Array<{ label: string; run: () => void }>;
+    assert.strictEqual(labels(items), 'Copy');
+    items[0].run();
+    assert.deepStrictEqual(posted, [{ type: 'copy', text: 'F:\\\\dev\\\\aki' }]);
+  });
+
+  test('会话 tab：Close 与 Rename（初值取行上看得见的标签）；草稿 tab 只给 Close', () => {
+    const { NS, posted } = withEntry();
+    const tab = new StubNode('button');
+    tab.className = 'tab';
+    tab.setAttribute('data-session-id', 's1');
+    const tabLabel = new StubNode('span');
+    tabLabel.className = 'tab-label';
+    tabLabel.textContent = 'alpha one';
+    tab.appendChild(tabLabel);
+
+    const items = NS.contextMenu.itemsFor(tabLabel) as Array<{ label: string; run: () => void }>;
+    assert.strictEqual(labels(items), 'Close / Rename');
+    items[1].run();
+    assert.deepStrictEqual(posted, [{ type: 'renameSession', sessionId: 's1', currentTitle: 'alpha one' }],
+      '改名的初值就是标签上看得见的标题（与用户看到的一致）');
+
+    const draft = new StubNode('button');
+    draft.className = 'tab tab-draft';
+    draft.setAttribute('data-draft-id', 'd1');
+    const draftItems = NS.contextMenu.itemsFor(draft) as Array<{ label: string }>;
+    assert.strictEqual(labels(draftItems), 'Close', '草稿没有会话可改名');
+  });
+
+  test('历史列表行：右键也给 Archive / Rename（键盘用户的入口）', () => {
+    const { NS, posted } = withEntry();
+    const row = new StubNode('button');
+    row.className = 'outline-item';
+    row.setAttribute('data-open-session', 'a1');
+    row.setAttribute('data-open-title', 'alpha one');
+
+    const items = NS.contextMenu.itemsFor(row) as Array<{ label: string; run: () => void }>;
+    assert.strictEqual(labels(items), 'Archive / Rename');
+    items[0].run();
+    items[1].run();
+    assert.deepStrictEqual(posted, [
+      { type: 'archiveSession', sessionId: 'a1' },
+      { type: 'renameSession', sessionId: 'a1', currentTitle: 'alpha one' },
+    ]);
+  });
 });
 
 // [CUSTOM-20261008-204] 右侧大纲栏的**开/关**按会话记（+ 一个默认值），而且"关"必须落盘。
@@ -4833,24 +5076,30 @@ suite('chat client logic: 引用栏的当前文件格（stub DOM, CUSTOM-2026100
       [{ name: 'PianoGameplayDefine.cs:12-40', lineStart: 12, lineEnd: 40 }]);
   });
 
-  test('宿主回了附件列表 ⇒ `+` 变 `×`；再点就移出去', () => {
+  test('宿主回了附件列表 ⇒ 引用栏那格消失（不在两处显示同一条），移除走附件 chip 的 ×', () => {
     const h = refBar();
     h.NS.composer.setActiveFile(FILE);
+    assert.ok(chipOf(h.attachments), '先有预选格');
     h.NS.composer.setAttachments([{ path: FILE.path, name: FILE.name, kind: 'file' }]);
-    assert.strictEqual(String(toggleOf(h.attachments).textContent), '\u00d7', '已引用 ⇒ ×');
+    assert.strictEqual(chipOf(h.attachments), null,
+      '已引用 ⇒ 引用栏那格整个消失（214：两处都摆就是用户报的"重复 tag"）');
+    const chip = h.attachments.querySelector('.attachment')!;
+    assert.ok(chip.querySelector('.chip-icon'), '附件 chip 左侧也带 `</>` 图标（214）');
     h.sent.length = 0;
-    dispatchClick(toggleOf(h.attachments), {});
-    assert.strictEqual((h.sent.find(m => m.type === 'detachFile') as Record<string, unknown>).path, FILE.path);
+    dispatchClick(chip.querySelector('.attachment-x')!, {});
+    const post = h.sent.find(m => m.type === 'detachFile') as Record<string, any>;
+    assert.strictEqual(post.path, FILE.path);
   });
 
   test('草稿页：`+` 先攒在本地（草稿没有会话，attachPath 会被宿主丢掉）', () => {
     const h = refBar();
     h.NS.composer.setDraft({ draftId: 'd1', cwd: '/tmp' });
     h.NS.composer.setActiveFile(FILE);
+    assert.ok(chipOf(h.attachments), '预选格在');
     dispatchClick(toggleOf(h.attachments), {});
     assert.strictEqual(h.sent.filter(m => m.type === 'attachPath').length, 0, '草稿不发会话作用域的消息');
     assert.ok(h.attachments.querySelectorAll('.attachment').length >= 1, '本地附件列里有了它');
-    assert.strictEqual(String(toggleOf(h.attachments).textContent), '\u00d7', '本地也算已引用 ⇒ ×');
+    assert.strictEqual(chipOf(h.attachments), null, '本地也算已引用 ⇒ 预选格消失（214）');
   });
 });
 
@@ -4887,6 +5136,15 @@ suite('chat client logic: 同一文件可引用多段（stub DOM, CUSTOM-2026100
     ({ path: PATH, name: NAME, ...(lineStart ? { lineStart, lineEnd } : {}) });
   const toggleOf = (att: StubNode) => att.querySelector('.ref-toggle')!;
   const childrenOf = (att: StubNode) => ((att.querySelector('.ref-chip') as any).childNodes as StubNode[]);
+  const attachmentXOf = (att: StubNode, name: string): StubNode => {
+    const chips = att.querySelectorAll('.attachment');
+    const hit = chips.find(c => {
+      const n = c.querySelector('.attachment-name');
+      return !!n && String(n.textContent) === name;
+    });
+    assert.ok(hit, `expected an attachment chip named ${name}`);
+    return hit!.querySelector('.attachment-x')!;
+  };
 
   test('开关排在文件 tag **之后**（与附件 chip 的 × 一致），tag 里的图标在最前面', () => {
     const h = refBar();
@@ -4908,16 +5166,17 @@ suite('chat client logic: 同一文件可引用多段（stub DOM, CUSTOM-2026100
     assert.deepStrictEqual(post.meta, [{ name: NAME + ':5-9', lineStart: 5, lineEnd: 9 }], '加的是这一段的区间');
   });
 
-  test('框选的行与已引用的**相同** ⇒ 显示 `×`，点它只摘这一段', () => {
+  test('框选的行与已引用的**相同** ⇒ 预选格不出现；附件 chip 的 × 按同一性只摘这一段（214）', () => {
     const h = refBar();
     h.NS.composer.setAttachments([
       { path: PATH, name: NAME + ':12-40', kind: 'file', lineStart: 12, lineEnd: 40 },
       { path: PATH, name: NAME + ':5-9', kind: 'file', lineStart: 5, lineEnd: 9 },
     ]);
     h.NS.composer.setActiveFile(ref(12, 40));
-    assert.strictEqual(String(toggleOf(h.attachments).textContent), '\u00d7', '这一段已经在引用里');
+    assert.strictEqual(h.attachments.querySelector('.ref-chip'), null,
+      '这一段已经在引用里 ⇒ 不重复显示预选格（214）');
     h.sent.length = 0;
-    dispatchClick(toggleOf(h.attachments), {});
+    dispatchClick(attachmentXOf(h.attachments, NAME + ':12-40'), {});
     const post = h.sent.find(m => m.type === 'detachFile') as Record<string, any>;
     assert.strictEqual(post.path, PATH);
     assert.strictEqual(post.lineStart, 12, '带区间 ⇒ 宿主只摘这一段（5-9 那条留着）');
@@ -4936,8 +5195,9 @@ suite('chat client logic: 同一文件可引用多段（stub DOM, CUSTOM-2026100
     h.NS.composer.setDraft({ draftId: 'd1', cwd: '/tmp' });
     h.NS.composer.setActiveFile(ref(12, 40));
     dispatchClick(toggleOf(h.attachments), {});
-    assert.strictEqual(String(toggleOf(h.attachments).textContent), '\u00d7', '这一段已攒下');
+    assert.strictEqual(h.attachments.querySelector('.ref-chip'), null, '这一段已攒下 ⇒ 预选格消失');
     h.NS.composer.setActiveFile(ref(5, 9));            // 换了选区
+    assert.ok(h.attachments.querySelector('.ref-chip'), '新的一段还没攒 ⇒ 预选格又出现');
     assert.strictEqual(String(toggleOf(h.attachments).textContent), '+', '新的一段还没攒');
     dispatchClick(toggleOf(h.attachments), {});
     assert.strictEqual(h.attachments.querySelectorAll('.attachment').length, 2, '本地攒下两条');

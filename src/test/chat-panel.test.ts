@@ -2003,6 +2003,38 @@ suite('chat panel: image attachments (CUSTOM-20260928-096)', () => {
     assert.strictEqual(users[0].attachments![0].name, 'shot.png', 'the attachment name survives');
   });
 
+  // [CUSTOM-20261009-215] 文件引用也要进气泡（用户报："引用了文件的消息发出去后，消息面板里
+  // 这条用户消息卡片里看不到引用的文件"——它此前只进了发给 agent 的 blocks）。两处一份构造：
+  // 气泡视图的 uri 必须与发出去那条**逐字相同**（含 #L 片段）。
+  test('带文件引用的发送把 chip 记进用户气泡，且与 blocks 同一条 uri（215）', async () => {
+    const { harness, manager } = imageHarness();
+    harness.host.onMessage({
+      // 盘符绝对路径（真实场景的形状）：POSIX 风格 /tmp/... 在 Windows 测试宿主上会经 Uri.file
+      // 变成 file:///tmp/... —— fileURLToPath 解不出盘符（ERR_INVALID_FILE_URL_PATH）⇒ path 为空。
+      type: 'attachPath', sessionId: 'image-session', paths: ['F:/P4/x/notes.txt'],
+      meta: [{ name: 'notes.txt:12-40', lineStart: 12, lineEnd: 40 }],
+    });
+    harness.host.onMessage({ type: 'sendPrompt', sessionId: 'image-session', text: '看下这个引用' });
+    await waitFor(() => manager.sent.length > 0, 'the prompt to be sent');
+
+    const snap = (harness.host as any).transcripts.snapshot('image-session');
+    const users = snap.entries.filter((e: any) => e.kind === 'user');
+    const contents = snap.entries.filter((e: any) => e.kind === 'content');
+    assert.strictEqual(users.length, 1, 'one user entry');
+    assert.strictEqual(contents.length, 0, 'the chip lives in the bubble, not a separate entry');
+    const att = users[0].attachments;
+    assert.ok(att && att.length === 1, 'the file reference rides in the bubble');
+    assert.strictEqual(att[0].type, 'resource_link');
+    assert.strictEqual(att[0].name, 'notes.txt:12-40', '显示名（含行区间）同源');
+    assert.ok(String(att[0].uri).indexOf('#L12-40') >= 0, 'uri 带 #L 片段');
+    assert.ok(att[0].path, 'toContentView 认出本地文件 ⇒ 气泡里的 chip 点击走 openFile: ' + JSON.stringify(att[0]));
+
+    const blocks = manager.sent[0].prompt as Array<Record<string, any>>;
+    const link = blocks.find(b => b.type === 'resource_link');
+    assert.ok(link, 'the sent blocks carry the resource_link');
+    assert.strictEqual(link.uri, att[0].uri, '两个出口一份构造（pitfall #19）');
+  });
+
   test('an image-only send records a content entry and no empty user bubble', async () => {
     const { harness, manager } = imageHarness();
     harness.host.onMessage({

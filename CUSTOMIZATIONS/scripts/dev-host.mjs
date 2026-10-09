@@ -5,6 +5,8 @@
 //   npm run dev:host              # 先编译，再启动宿主窗口
 //   npm run dev:host -- --no-build
 //   npm run dev:host -- <别的目录>   # 用别的目录当工作区（默认是本仓库）
+//   npm run dev:host -- <x.code-workspace>   # 也可以是多根工作区文件：位置参数原样交给 code CLI
+//                                            # （对着真实项目验收时用这条；宿主用日常配置与已装扩展启动）
 //
 // 为什么用 Node 而不是把命令直接写进 package.json 的 scripts：
 //   npm 在 Windows 上默认用 cmd.exe、在 macOS/Linux 上用 sh，`%CD%` 与 `$PWD`

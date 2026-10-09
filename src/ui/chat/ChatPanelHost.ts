@@ -142,6 +142,19 @@ const RESTORE_KEY = 'acpc.restoreSessionsOnOpen';
 /** [CUSTOM-20261009-209] 快照写入的防抖：它挂在 created/closed/focus 三个事件上。 */
 const SNAPSHOT_DEBOUNCE_MS = 300;
 
+// [CUSTOM-BEGIN] CUSTOM-20261009-212 - 历史列表的本地覆盖（改名 / 归档）。
+// 一份按 sessionId 记的账（globalState）：**任何来源**的行都能被改 —— agent 列的 / 本地
+// 缓存的 / 转录目录补出来的。不写进 SessionHistoryStore 有两个理由：它只覆盖本地那一段
+// （agent / disk 行不在里面），而且它的 memento key 是冻结的（architecture §4 铁律 2）。
+// 归档 = 历史列表里不再出现；改名 = 列表 / tab / 树上的标题换成这个名字（覆盖优先于
+// agent 的 session_info_update）。
+const SESSION_LABELS_KEY = 'acpc.sessionLabels.v1';
+interface SessionLabelOverride {
+  title?: string;
+  archived?: boolean;
+}
+// [CUSTOM-END] CUSTOM-20261009-212
+
 export class ChatPanelHost implements IChatPanel, PermissionPresenter, ElicitationPresenter {
   readonly id = 'modern' as const;
 
@@ -688,6 +701,27 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
         }
         return;
       }
+      // [CUSTOM-BEGIN] CUSTOM-20261009-212 - 历史列表的归档 / 改名（会话 tab 右键菜单的 Rename
+      // 走同一条 `renameSession`）。两条都**必须**在会话守卫之前：列表里的行大多不是活会话，
+      // verifySession 只认 live 的，放在守卫后会整条丢掉。
+      // 动作由宿主做（改名走原生输入框 —— webview 里没有等价控件），做完回一条 `sessionAction`
+      // 让客户端**就地**更新列表；不重发整份 history，因为那会重置用户选的目录过滤。
+      case 'archiveSession': {
+        const id = (msg as { sessionId?: unknown }).sessionId;
+        if (typeof id !== 'string' || !id) { return; }
+        void this.updateSessionLabel(id, { archived: true }).then(() => {
+          this.post({ type: 'sessionAction', action: 'archive', sessionId: id });
+        });
+        return;
+      }
+      case 'renameSession': {
+        const id = (msg as { sessionId?: unknown }).sessionId;
+        if (typeof id !== 'string' || !id) { return; }
+        const current = (msg as { currentTitle?: unknown }).currentTitle;
+        void this.handleRenameSession(id, typeof current === 'string' ? current : '');
+        return;
+      }
+      // [CUSTOM-END] CUSTOM-20261009-212
       case 'setRestorePref':
         void this.handleSetRestorePref((msg as { value?: unknown }).value);
         return;
@@ -1032,33 +1066,13 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
     this.finalizeEntries(sessionId, { only: 'assistant' });
     // [CUSTOM-20260928-108] 图片附件进用户气泡（不再独立成行）——它们是这次提问的
     // 一部分，不是另一条记录。
-    const imageViews: ContentBlockView[] = [];
-    for (const a of attachments) {
-      if (a.kind !== 'image') { continue; }
-      const img = images.get(a.path);
-      if (!img) { continue; }
-      const view = toContentView({ type: 'image', data: img.data, mimeType: img.mimeType });
-      if (view && view.type === 'image') {
-        if (a.name) { view.name = a.name; }
-        imageViews.push(view);
-      }
-    }
-    // [CUSTOM-20260928-096] 空文字 + 图片附件时跳过空的气泡。
-    // [CUSTOM-20260928-109] 注入块已在上面作为 meta notice 落账，这里不再产生用户气泡。
-    if (!isInjectedChunk(text) && text.trim().length > 0) {
-      const userEntry = this.transcripts.appendUser(sessionId, text, imageViews);
-      if (userEntry) { this.post({ type: 'append', sessionId, entries: [userEntry] }); }
-    } else if (imageViews.length > 0) {
-      const entry = this.transcripts.appendContent(sessionId, imageViews);
-      if (entry) { this.post({ type: 'append', sessionId, entries: [entry] }); }
-    }
-
-    this.sessionManager.recordFirstPrompt(sessionId, text);
-    this.attachments.set(sessionId, []);
-    this.imageData.delete(sessionId);
-    this.post({ type: 'attachments', sessionId, attachments: [] });
-
+    // [CUSTOM-20261009-215] **文件引用**同样要进气泡（用户报："引用了文件的消息发出去后，
+    // 消息面板里这条用户消息卡片里看不到引用的文件"——它只进了发给 agent 的 blocks，
+    // 气泡里没有对应视图）。两处产出一遍算：气泡视图与 blocks 在**同一个循环**里砌出来，
+    // uri / `#L` 片段 / name 各只有一个来源（pitfall #19），不会出现"发出去带区间、
+    // 气泡里不带"这类两边漂移。
     const blocks: ContentBlock[] = [];
+    const attachmentViews: ContentBlockView[] = [];
     if (text.trim().length > 0) { blocks.push({ type: 'text', text }); }
     for (const a of attachments) {
       if (a.kind === 'image') {
@@ -1068,14 +1082,39 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
           continue;
         }
         blocks.push({ type: 'image', data: img.data, mimeType: img.mimeType });
+        const view = toContentView({ type: 'image', data: img.data, mimeType: img.mimeType });
+        if (view && view.type === 'image') {
+          if (a.name) { view.name = a.name; }
+          attachmentViews.push(view);
+        }
       } else {
         // ACP `ResourceLink.uri` is a plain string (file:// URI per convention).
         // [CUSTOM-20261008-206] 带选区行区间时挂一个 `#L12-40` 片段：`name` 里已经有它是给人看的，
         // 片段则是让 agent 也能看到"引用的是哪几行"（不认识片段的实现会照旧忽略它）。
         const range = a.lineStart ? `#L${a.lineStart}-${a.lineEnd ?? a.lineStart}` : '';
-        blocks.push({ type: 'resource_link', uri: fileUri(a.path).toString() + range, name: a.name });
+        const uri = fileUri(a.path).toString() + range;
+        blocks.push({ type: 'resource_link', uri, name: a.name });
+        // 视图走同一条 uri（toContentView 会认出本地文件并给出 `path`）⇒ 气泡里的 chip
+        // 点击走 openFile 通道（039/205 的既有约定）。
+        const view = toContentView({ type: 'resource_link', uri, name: a.name });
+        if (view && view.type === 'resource_link') { attachmentViews.push(view); }
       }
     }
+    // [CUSTOM-20260928-096] 空文字 + 附件时跳过空的气泡。
+    // [CUSTOM-20260928-109] 注入块已在上面作为 meta notice 落账，这里不再产生用户气泡。
+    if (!isInjectedChunk(text) && text.trim().length > 0) {
+      const userEntry = this.transcripts.appendUser(
+        sessionId, text, attachmentViews.length > 0 ? attachmentViews : undefined);
+      if (userEntry) { this.post({ type: 'append', sessionId, entries: [userEntry] }); }
+    } else if (attachmentViews.length > 0) {
+      const entry = this.transcripts.appendContent(sessionId, attachmentViews);
+      if (entry) { this.post({ type: 'append', sessionId, entries: [entry] }); }
+    }
+
+    this.sessionManager.recordFirstPrompt(sessionId, text);
+    this.attachments.set(sessionId, []);
+    this.imageData.delete(sessionId);
+    this.post({ type: 'attachments', sessionId, attachments: [] });
 
     // [CUSTOM-BEGIN] CUSTOM-20261004-187 - 轮次进行中：把这条消息**注入**正在跑的那一轮
     // （Claude Code 的 steering），而不是当第二个 `session/prompt` 发出去。
@@ -2255,12 +2294,60 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
     if (!agent || !cwd) { return; }
     const rows = await this.readDiskHistory(agent, cwd);
     if (rows.length === 0) { return; }
-    const sessions: HistorySessionSummary[] = rows.map(s => {
-      const dirKey = directoryKey(s.cwd);
-      return dirKey ? { ...s, dirKey } : s;
-    });
+    // [CUSTOM-20261009-212] 补扫也会带回归档过的行（磁盘转录不认我们的账）——同一个出口
+    // 同一套过滤/覆盖，别让归档在"补扫"这条路上漏回来。
+    const supplementLabels = this.sessionLabels();
+    const sessions: HistorySessionSummary[] = rows
+      .filter(s => !supplementLabels[s.sessionId]?.archived)
+      .map(s => {
+        const dirKey = directoryKey(s.cwd);
+        const titled = supplementLabels[s.sessionId]?.title
+          ? { ...s, title: supplementLabels[s.sessionId].title } : s;
+        return dirKey ? { ...titled, dirKey } : titled;
+      });
     this.post({ type: 'historySupplement', agentName: agent, cwd, sessions });
   }
+
+  // [CUSTOM-BEGIN] CUSTOM-20261009-212 - 会话的本地覆盖（改名 / 归档）——读、写、改名流程。
+  private sessionLabels(): Record<string, SessionLabelOverride> {
+    return this.globalState?.get<Record<string, SessionLabelOverride>>(SESSION_LABELS_KEY) ?? {};
+  }
+
+  /** 覆盖标题；没有覆盖时返回 undefined，调用方继续走原来的回退链。 */
+  private sessionLabelTitle(sessionId: string): string | undefined {
+    const t = this.sessionLabels()[sessionId]?.title;
+    return t ? t : undefined;
+  }
+
+  private async updateSessionLabel(sessionId: string, patch: SessionLabelOverride): Promise<void> {
+    if (!this.globalState) { return; }
+    const all = this.sessionLabels();
+    await this.globalState.update(SESSION_LABELS_KEY, {
+      ...all,
+      [sessionId]: { ...(all[sessionId] ?? {}), ...patch },
+    });
+  }
+
+  /**
+   * 改名：原生输入框（webview 里没有等价控件），做完回一条 `sessionAction`。
+   * 清空 / 取消都当"没改"——清空意味着"回到原始标题"，而那需要知道这条行的底层标题
+   * （agent 的 / 缓存的 / 磁盘的都可能），列表这边拿不到它。宁可不动，也不猜。
+   */
+  private async handleRenameSession(sessionId: string, currentTitle: string): Promise<void> {
+    const title = await vscode.window.showInputBox({
+      title: 'Rename Session',
+      prompt: 'New name for this session',
+      value: currentTitle,
+    });
+    if (title === undefined || title.trim() === '') { return; }
+    const clean = title.trim();
+    await this.updateSessionLabel(sessionId, { title: clean });
+    this.post({ type: 'sessionAction', action: 'rename', sessionId, title: clean });
+    // 开着这条会话的 tab / 树也要换名字：toSummary 的 title 链已插了覆盖，推一把让
+    // 客户端拿到新的 sessionsChanged（签名里含 title，所以不会被去重掉）。
+    this.refreshSessions();
+  }
+  // [CUSTOM-END] CUSTOM-20261009-212
 
   /**
    * [CUSTOM-20260926-079] The ONE place a `history` reply is assembled.
@@ -2278,10 +2365,16 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
     currentCwd?: string,
     error?: string,
   ): void {
-    const rows: HistorySessionSummary[] = sessions.map(s => {
-      const dirKey = directoryKey(s.cwd);
-      return dirKey ? { ...s, dirKey } : s;
-    });
+    // [CUSTOM-20261009-212] 本地覆盖在**唯一装配点**落地：归档的整行滤掉，改过名的换标题
+    // （覆盖优先于任何来源的标题）。
+    const labels = this.sessionLabels();
+    const rows: HistorySessionSummary[] = sessions
+      .filter(s => !labels[s.sessionId]?.archived)
+      .map(s => {
+        const dirKey = directoryKey(s.cwd);
+        const titled = labels[s.sessionId]?.title ? { ...s, title: labels[s.sessionId].title } : s;
+        return dirKey ? { ...titled, dirKey } : titled;
+      });
     this.post({
       type: 'history',
       agentName: agent,
@@ -2987,7 +3080,9 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       // [CUSTOM-20260928-097] Title first, then the cached title, then the first
       // prompt — matching the history picker's fallback chain (078), not just
       // firstPrompt (which left a reopened session showing its id prefix).
-      title: session.title ?? stored?.title ?? stored?.firstPrompt ?? null,
+      // [CUSTOM-20261009-212] 本地改名排在最前：覆盖就是覆盖（tab / 树跟着换名字靠这条）。
+      title: this.sessionLabelTitle(session.sessionId)
+        ?? session.title ?? stored?.title ?? stored?.firstPrompt ?? null,
       cwd: session.cwd,
       createdAt: session.createdAt,
       loading: this.sessionManager.isLoading(session.sessionId),
