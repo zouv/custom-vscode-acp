@@ -324,6 +324,11 @@ export const sessionMenuClient = `
     }
     for (var i = 0; i < items.length; i++) {
       var item = items[i];
+      // [CUSTOM-20261009-212] 行外面套一层 .session-row：悬停时的 Archive / Rename 图标
+      // **不能放进行按钮里**（button 嵌套 button 是无效 HTML，浏览器解析时会把里层弹出去；
+      // 而且行的点击语义会被搅乱）。图标层是行的**兄弟**，绝对定位浮在行的右端，
+      // 默认透明且不接事件（CSS 见 styles.ts 的 .row-actions）。
+      var wrap = NS.dom.el('div', 'session-row');
       // [CUSTOM-20260925-047] A real <button> — see outline.ts.
       var row = NS.dom.el('button', 'outline-item');
       row.type = 'button';
@@ -342,8 +347,12 @@ export const sessionMenuClient = `
       // This list spans directories (it is the agent's, not this workspace's),
       // and until now the only way to tell was the row tooltip — 245 rows with
       // no visible directory is exactly how you open the wrong one.
+      // [CUSTOM-20261009-212 修] 2026-10-09 用户报：它原来落在行的最右端，被悬停的
+      // Archive/Rename 图标盖住（图里就是"图标压在 aki_work 上"）。改成**会话名后面的括号
+      // 后缀**（"(aki_work)"，跟着标题靠左）——右端从此留给悬停动作；配合 styles.ts 里
+      // .session-row .outline-text 的 flex 调整（标题不再吃满整行）。
       var dirName = folderName(item.cwd);
-      if (dirName) { row.appendChild(NS.dom.el('span', 'outline-cwd', dirName)); }
+      if (dirName) { row.appendChild(NS.dom.el('span', 'outline-cwd', '(' + dirName + ')')); }
       var tooltip = (item.cwd ? item.cwd + '\\n' : '') + item.sessionId;
       // [CUSTOM-20260927-092] A row only the local cache knows about may no longer exist
       // agent-side. Saying so in the tooltip keeps the picker honest without adding noise
@@ -356,9 +365,68 @@ export const sessionMenuClient = `
       // (same class of trap as the regex rule in chat-panel.md 5.2).
       if (item.fromDisk) { tooltip += '\\n(read from the transcript folder — the agent did not list it)'; }
       row.title = tooltip;
-      listEl.appendChild(row);
+      wrap.appendChild(row);
+      wrap.appendChild(buildRowActions(item));
+      listEl.appendChild(wrap);
     }
   }
+
+  // [CUSTOM-BEGIN] CUSTOM-20261009-212 - 行右端的悬停动作（Archive / Rename）。
+  // 两个都是真 <button>（047 的规矩），但**不进 tab 序**（tabIndex -1）：这一格是悬停才现的
+  // 冗余入口，键盘用户走右键菜单（contextMenu.itemsFor 的同名两项，Shift+F10 可达），
+  // 与 tab 上 × 出 tab 序是同一条先例（089）。
+  // 动作本身只发消息，等宿主做完再回 sessionAction 来找齐（见 applyAction）—— 不做乐观更新，
+  // 免得"宿主没做成、界面却变了"（pitfall #29 的那类不一致）。
+  function buildRowActions(item) {
+    var actions = NS.dom.el('span', 'row-actions');
+    var specs = [
+      { action: 'archive', icon: 'archive', label: 'Archive' },
+      { action: 'rename', icon: 'rename', label: 'Rename' }
+    ];
+    for (var i = 0; i < specs.length; i++) {
+      (function (spec) {
+        var btn = NS.dom.el('button', 'row-action');
+        btn.type = 'button';
+        btn.tabIndex = -1;
+        btn.setAttribute('data-session-action', spec.action);
+        btn.setAttribute('data-action-id', item.sessionId);
+        btn.title = spec.label;
+        btn.setAttribute('aria-label', spec.label);
+        var icon = NS.icons && NS.icons.icon ? NS.icons.icon(spec.icon, 'row-action-icon') : null;
+        if (icon) { btn.appendChild(icon); } else { btn.textContent = spec.label; }
+        actions.appendChild(btn);
+      })(specs[i]);
+    }
+    return actions;
+  }
+
+  /**
+   * [CUSTOM-20261009-212] 宿主做完归档/改名后的对账（boot 转发的 sessionAction 消息）。
+   * 就地改 lastMessage.sessions 再走一遍 renderList —— 计数行/过滤都跟着重算，而且
+   * **不重置用户手动选的目录过滤**（重发一次 listHistory 会重置它：setHistory 用 askedCwd
+   * 重派生 filterKey）。
+   */
+  function applyAction(message) {
+    if (!message || !lastMessage || !lastMessage.sessions) { return; }
+    var id = message.sessionId;
+    var sessions = lastMessage.sessions;
+    if (message.action === 'archive') {
+      var kept = [];
+      for (var i = 0; i < sessions.length; i++) {
+        if (sessions[i].sessionId !== id) { kept.push(sessions[i]); }
+      }
+      lastMessage.sessions = kept;
+      renderList(lastMessage);
+      return;
+    }
+    if (message.action === 'rename' && typeof message.title === 'string') {
+      for (var j = 0; j < sessions.length; j++) {
+        if (sessions[j].sessionId === id) { sessions[j].title = message.title; }
+      }
+      renderList(lastMessage);
+    }
+  }
+  // [CUSTOM-END] CUSTOM-20261009-212
 
   function show() {
     open = true;
@@ -432,6 +500,30 @@ export const sessionMenuClient = `
       menuOpen = false;
       renderMenu();
       renderChip();
+    }
+    // [CUSTOM-20261009-212] 行右端的悬停动作（Archive / Rename）在这里处理：按钮是行按钮的
+    // **兄弟**（见 buildRowActions），下面那圈上行查找从它出发找不到 data-open-session，
+    // 点击会落空。动作只发消息，等宿主的 sessionAction 回来再改列表（不做乐观更新）。
+    var actionBtn = event.target && event.target.closest
+      ? event.target.closest('[data-session-action]') : null;
+    if (actionBtn) {
+      event.preventDefault();
+      var actionKind = actionBtn.getAttribute('data-session-action');
+      var actionId = actionBtn.getAttribute('data-action-id');
+      if (actionKind && actionId) {
+        if (actionKind === 'rename') {
+          var rowWrap = actionBtn.closest ? actionBtn.closest('.session-row') : null;
+          var rowBtn = rowWrap && rowWrap.querySelector ? rowWrap.querySelector('[data-open-title]') : null;
+          NS.bridge.post({
+            type: 'renameSession',
+            sessionId: actionId,
+            currentTitle: rowBtn ? (rowBtn.getAttribute('data-open-title') || '') : ''
+          });
+        } else if (actionKind === 'archive') {
+          NS.bridge.post({ type: 'archiveSession', sessionId: actionId });
+        }
+      }
+      return;
     }
     var row = event.target;
     while (row && row !== drawer) {
@@ -558,7 +650,9 @@ export const sessionMenuClient = `
     init: init,
     reset: reset,
     setHistory: setHistory,
-    applySupplement: applySupplement
+    applySupplement: applySupplement,
+    // [CUSTOM-20261009-212] 宿主做完归档/改名后的对账（boot 转发 sessionAction）。
+    applyAction: applyAction
   };
 })(window.__acpc = window.__acpc || {});
 `;

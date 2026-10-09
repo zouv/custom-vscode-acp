@@ -37,12 +37,16 @@
 | **注入块分流（109）** | `<task-notification>`、`<system-reminder>` 等注入块走 `user_message_chunk` 通道，被无条件渲染成蓝色用户气泡。改为**前缀判据**（`isInjectedChunk`），两条入口（replay 分支、`handleSendPrompt`）共用同一个判据，分流成 `notice` 的 `meta` 级别（居中、灰色、小字、无气泡、无图标）。发送路径仍然真的发出去（agent 期待收到），只是不再产生用户气泡 |
 | **IDE 上下文 → 文件 chip（205）** | `<ide_opened_file>…</ide_opened_file>` 是 IDE（官方 Claude Code 扩展）注入的"当前打开的文件"**上下文**，它跟 109 那批一样走 user chunk 通道 ⇒ 同一条消息渲染成**两个**蓝色气泡（用户报："附加的文件没有合并到一个对话里，分成了两条对话"）。**它的正确形状不是提示条而是 chip**（官方插件就是这么画的：同一个气泡里，chip 在上、正文在下）：`ideOpenedFilePath()` 抠出路径，按「会话::messageId」暂存（回放里两条 chunk 同 messageId、顺序不保证），正文 chunk 到的时候作为 `attachments` 进同一个气泡（chip 是 `resource_link` 视图 → 点它走 openFile，见 039）；块本身**不建记录**。⚠️ **判据要放在 `isInjectedChunk` 之前**（它也以 `<ide_` 开头）；其它 `<ide_*>` 块（`<ide_selection>` / `<ide_diagnostics>`）归 109 那条路（`<ide_` 进了前缀表），认不出形状也不会变成"用户说过的话"。暂存表只留最近 20 条（用户只开了个文件、没有下文时那条永远没人来取），会话关闭即清 |
 
+| **点击切换区（213）** | 用户气泡的折叠由 `<summary>` 的原生点击触发，而正文（`.bubble-body`）**在** summary 里（折叠态"首行预览"的要求）⇒ 在正文里划选 == 点它，读者刚要选的内容反被折起来（用户 2026-10-09 报："点击任意位置都折叠，没法框选文字内容"）。修法是在 summary 的 click 上 `preventDefault` 拦掉原生的开合，**按状态分格**：展开态 —— 正文区一切点击都不折叠（可自由框选），切换区 = 标题行（caret/图标/chip）；折叠态 —— 整行（含那一行预览）仍是切换区（"第一行就是全部"，用户要求它能点）；另加一条通用闸门：**手里已有选区**（从正文拖到行尾空白再松手也算划选）一律不折叠。助手气泡（114）不需要这条 —— 它的正文本来就在 summary 外。**同日补**：展开态**第一行本身**仍选不中 —— 它落在 summary 里，而 summary 是 `cursor:pointer; user-select:none` 的切换区（用户报"鼠标变手、选了没反应"）。加一条 `.user-fold[open] > summary .bubble-body { user-select:text; cursor:text }` 解禁（**折叠态刻意不解禁**：那一行预览就是"点它展开"的切换区）；真 Chromium 读数钉住：`userSelect:text / cursor:text / 选中 3 字符`（修前 none/pointer/0） |
+
+| **文件引用进气泡（215）** | 用户报："引用了文件的消息发出去后，消息面板里这条用户消息卡片里看不到引用的文件"——发送路径只给**图片**建了气泡视图，文件引用只进了发给 agent 的 blocks。修法：气泡视图与 blocks 在**同一个循环**里砌出来（uri / `#L` 片段 / name 各只有一个来源，pitfall #19）——图片进 `imageViews`、文件转成 `resource_link` 视图（`toContentView` 会认出本地文件给出 `path`，气泡里的 chip 点击走 openFile）。空文字 + 只有文件引用时同样落成 `content` 条目，不产生空气泡 |
+
 **INV-J（破了不会有自动检查报错；`src/test/chat-client.test.ts` 是它的守卫）**：
 ①三角在图标**之后**；②summary 重写后**图标与三角都还在**；③用户消息折叠**不重复全文**、
 默认展开、**每条消息都有控件**（113）——单行时 body 为空且**不生成 `.fold-body`**（那个元素
 就是"后面还有东西"的标记，置顶条的收缩按钮按它判断）；④**触发判据是"屏幕上几行"**——
 两个方向都要测：只折行无换行的消息**必须切分**（有 `.fold-body`），
-一行放得下的长文本**必须不切分**（无 `.fold-body`）；只测前者说明不了它是测量而不是"更宽的阈值"。
+一行放得下的长文本**必须不切分**（无 `.fold-body`）；只测前者说明不了它是测量而不是"更宽的阈值"；⑤**点击分格（213）**——展开态点正文必须被拦下、点 caret 放行；折叠态整行放行；手里有选区一律拦下（三条用例在 `chat-client.test.ts`）；⑥**展开态的第一行可框选**（`.bubble-body` 的 user-select 必须是 text —— `#userfoldprobe` 读计算值 + 实选字数）。
 
 ### 5.16.1 助手消息的折叠（114；折叠态一行 115→116）
 

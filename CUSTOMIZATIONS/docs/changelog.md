@@ -17,6 +17,71 @@
 
 ---
 
+### 2026-10-09 - CUSTOM-20261009-215
+- **功能**：修「引用了文件的消息发出去后，用户消息卡片里看不到引用的文件」
+- **改动文件**：`src/ui/chat/ChatPanelHost.ts`、`src/test/chat-panel.test.ts`（文档：`chat-panel-records.md` §5.16 表格行、`dev-workflow.md` 验收 230）
+- **来源**：用户（附图）「引用了文件的消息发出去后，消息面板里这条"用户消息卡片"里看不到引用的文件」
+- **详细说明**：`handleSendPrompt` 里气泡视图只组了**图片**（`imageViews`，108 的产物），文件引用只进了发给 agent 的 `blocks` —— 于是气泡里没有对应 chip。修法：把 blocks 的构建**提前**并与气泡视图合成**同一个循环**（两处产出一遍算：`uri`/`#L` 片段/`name` 各只有一个来源，pitfall #19，不会出现"发出去带区间、气泡里不带"的漂移）；文件附件经 `toContentView` 转成 `resource_link` 视图挂到用户记录上（`path` 由本地文件识别给出 ⇒ 气泡里的 chip 点击走 `openFile`，039/205 的既有约定）。空文字 + 只有文件引用时走 `content` 条目（与图片同形）。
+- **验证方式**：宿主测试 1 条（气泡记录里出现 resource_link 视图、name 含行区间、uri 带 `#L` 片段且与发给 agent 的 blocks **逐字相同**、`path` 存在）；`npm test` 全绿（436 passing）
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-09 - CUSTOM-20261009-214
+- **功能**：修「引用文件 tag 重复」与「已引用文件 tag 没有图标」：已引用的不再重复显示预选格；附件 chip 补 `</>` 图标；附件 `×` 改为按"路径 + 区间"的同一性摘
+- **改动文件**：`src/ui/chat/html/client/composer.ts`、`src/ui/chat/html/styles.ts`、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（文档：`chat-panel.md` §5.47 ②d、`dev-workflow.md` 验收 218/229）
+- **来源**：用户（附图）「1. 已经添加了引用（同文件、同文件+同行区），编辑区重复选择时，不再显示预选的 tag（否则会出现重复的 tag）；2. 已添加引用的文件 tag，左侧没有图标，需要加上」
+- **详细说明**：
+  - **重复 tag**：编辑器里重复选择一条**已引用**的内容时，引用栏那格（`.ref-chip`）与附件行里的 chip 显示同一条。修法：`renderAttachments` 只在这条**还没引用**时才渲染引用格 —— "已引用"那一态连同 `.ref-on` 配色、`.ref-toggle` 的 `×` 分支与 `detachReference` 一起退役（死 CSS 不留，pitfall #20）。
+  - **附件 chip 的图标**：非图片附件补上 `NS.icons.icon('file', 'chip-icon')`（与引用格同一枚 `</>`）。
+  - **顺带的必要修复**：附件 chip 的 `×` 此前**按整路径摘**（会话页 `detachFile` 不带区间 = 宿主把该路径**所有段**一起摘；草稿页按 path 命中第一条）——引用格的 `×` 退役后它是唯一摘除口，不修就会"点 5-9 那段的 × 把 12-40 一起带走"。改成按 `sameRef`（路径 + 区间）摘。
+- **验证方式**：客户端桩（引用格消失 + 附件 chip 带图标 + 点 `×` 走带区间的 `detachFile` + 草稿按同一性摘 + 多段各摘各的）；真 Chromium `#refchip` 档新增 `refChipAfterAttach:false` / `attachmentIconAfterAttach:true` 两读数；`npm test` 全绿
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-09 - CUSTOM-20261009-213
+- **功能**：修「用户消息卡片点任意位置都折叠、没法框选文字」——折叠切换区收窄为**标题行（caret/图标）+ 折叠态那一行预览**
+- **改动文件**：`src/ui/chat/html/client/transcriptView.ts`、`src/test/chat-client.test.ts`（文档：`chat-panel-records.md` §5.16 表格行 + INV-J ⑤、`dev-workflow.md` 验收 228）
+- **来源**：用户「用户消息卡片，应该是点击第一行（图标和折叠按钮那一行）或者点击[这个]按钮时才触发折叠（现在是点击任意位置都折叠，导致没法框选文字内容）」
+- **详细说明**：用户气泡的正文（`.bubble-body`）在 `<summary>` 里 —— 这是折叠态"首行预览"的要求（064/108）—— 而原生 `<details>` 的规矩是"点 summary 就切换"，于是在正文里划选 == 点它，读者刚要选的内容反被折起来。助手气泡（114）靠"正文不在 summary 里"绕开过同一件事；用户气泡的预览必须留在 summary 里，所以在 `buildUserBubble` 里对 summary 的 click 做 `preventDefault`（能拦掉原生开合）并按状态分格：**展开态** —— 正文区一切点击都不折叠（可自由框选），切换区 = 标题行；**折叠态** —— 整行（含一行预览）仍是切换区（"第一行就是全部"，用户要求它能点）；另加通用闸门：**手里已有选区**（从正文拖到行尾空白再松手也算划选）一律不折叠。
+- **同日补**（用户报告"展开情况下正文第一行还是无法框选，鼠标变手、点了没反应"）：第一行落在 summary 里，而 summary 是 `cursor:pointer; user-select:none` 的切换区 —— 加 `.user-fold[open] > summary .bubble-body { user-select:text; cursor:text }` 解禁（折叠态刻意不解禁）。真 Chromium `#userfoldprobe`：修前 `none/pointer/0 字`，修后 `text/text/3 字`
+- **验证方式**：桩 DOM 3 条（展开态点正文被拦/caret 放行、折叠态整行放行、有选区时不折叠 —— `chat-client.test.ts` 的 record DOM shape 套件）+ 真 Chromium `#userfoldprobe`；`npm test` 全绿
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-09 - CUSTOM-20261009-212
+- **功能**：历史记录的弹出列表：会话行加**悬停动作图标**（Archive 归档 / Rename 改名，仅鼠标悬停显示，参考 VS Code 官方插件）；同时给右键菜单补上**四个上下文格** —— 大纲行 Copy 正文、地址栏 Copy 目录、会话 tab、历史行（Archive/Rename）
+- **修（同日实测反馈）**：目录名从"行最右端"改成**会话名后的括号后缀**（`(aki_work)`，靠左）——原来与悬停图标重叠（`.session-row .outline-text` 改 flex: 0 1 auto，右端空档留给图标）；本链路的 `renameSession` 同时被会话 tab 的右键 Rename 复用（见 211）
+- **改动文件**：`src/ui/chat/html/client/sessionMenu.ts`、`contextMenu.ts`、`icons.ts`、`boot.ts`、`src/ui/chat/html/styles.ts`、`src/ui/chat/protocol.ts`、`src/ui/chat/ChatPanelHost.ts`、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（文档：`chat-panel.md` §5.50、`architecture.md` §2.5）
+- **来源**：用户「1. 右侧大纲加上右键菜单的拷贝功能（点击后拷贝文本内容，现在有个 Copy 但无法点击）… 4. 历史记录的弹出列表给会话功能图标（仅悬停显示）：Archive / Rename（参考 vscode 官方插件）」
+- **详细说明**：
+  - **为什么 Copy 点不动**：右键时通常没有选区，而通用那条 `Copy` 复制的就是**选区**（无选区禁用是 067 故意的）——这几处要的拷贝内容（大纲那一条的正文 / 地址栏的目录）与选区根本不是一回事，所以给它们各自的**上下文专属项**（在 `itemsFor` 里**排通用清单之前**）。
+  - **.session-row 包裹**：悬停动作层不能放进行按钮里（button 不能嵌 button）—— 行仍是真 `<button>`，`.row-actions` 是它的**兄弟**、绝对定位浮在右端，默认 `opacity:0; pointer-events:none`，`.session-row:hover / :focus-within` 才现身；两个动作是真 button 但 `tabIndex=-1`（与 tab 的 × 出 tab 序同一先例）；键盘用户走右键菜单（Shift+F10）同一对动作。
+  - **不做乐观更新**：点击只发 `archiveSession` / `renameSession {currentTitle}`；宿主做完回 `sessionAction`，客户端 `applyAction` **就地**改 `lastMessage.sessions` 再重渲染（归档摘行 / 改名换标签、计数跟着算）——**不重发整份 history**（那会经 setHistory 重派生 filterKey，把手选的目录过滤重置掉）。
+  - **宿主**：两条动作**必须在 verifySession 守卫之前**（列表行大多不是活会话）；覆盖存 globalState 的 `acpc.sessionLabels.v1`（按 sessionId 记、与来源无关）；生效点 = `postHistory` + `handleSupplementHistory`（唯一装配点：归档滤行、改名换标题）+ `toSummary` 标题链最前（tab / 树跟着换名）。改名走原生 `showInputBox`（清空/取消当"没改"）。
+  - **图标**：`icons.ts` 新增 12×12 直线图形 `archive`（箱盖+箱体+提手缝）与 `rename`（斜铅笔）。
+- **验证方式**：客户端桩 —— contextMenu 4 条（大纲行 Copy 正文 / 地址栏 Copy 目录 / tab（草稿只给 Close）/ 历史行 Archive+Rename）+ history picker 4 条（每行一对动作且不嵌套 / 点 Archive 只发消息 / 点 Rename 带 currentTitle / applyAction 摘行换标签且不重置过滤）；真 Chromium `#historyrowprobe`：`defaultOpacity:"0"`、`actionsInsideRowButton:false`、`rect.insideRow/centred:true`、`btnSizes:["20x20+icon","20x20+icon"]`、`sentArchive:1`、`rowsAfterArchive:2`；`npm test` 全绿（431 passing）
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-09 - CUSTOM-20261009-211
+- **功能**：会话 tab 的右键菜单：`Close`（关掉 tab，会话留在列表）与 `Rename`（给这条会话改名）
+- **修（同日更正）**：首版按用户早先口述做了 `Remove`（归档 + 忘掉本地缓存 + 关闭），用户随后更正"**要的是 Rename 不是 Remove**" —— 已整条删除（含 `removeSession` 消息与宿主分支），改为 Rename：复用 212 的 `renameSession` 链路（原生输入框 + globalState 覆盖 + `sessionAction` 回执），改完 tab 自己也会换名（`refreshSessions` 把新标题推回来）
+- **改动文件**：`src/ui/chat/html/client/contextMenu.ts`、`tabs.ts`、`src/ui/chat/protocol.ts`、`src/ui/chat/ChatPanelHost.ts`、`src/test/chat-client.test.ts`
+- **来源**：用户「会话 tab 的右键菜单需要加上'Remove'功能（上次提过的，目前还是没看到），另外再补一个 Close 菜单项」（此前口头提过一次，账本无记录）
+- **详细说明**：`Close` 复用 tab 上的 × 同一条路（`NS.tabs.closeTabNode` → `closeModel` 按 kind 分派：草稿=丢弃 / 待恢复=本地忘掉 / 真会话=closeSession）。`Remove` 只对真会话 tab 出现：宿主收到 `removeSession`（会话作用域、守卫之后）先 `historyStore.forget`（与树里 Forget Session 同一出口，onDidChange 让树自刷新）再 `closeSession`；agent 侧的转录删不掉——若 agent 仍列出它，刷新后会回来（与 Forget 的既有语义一致，与"能删除"划清界限）。
+- **验证方式**：contextMenu 桩测试（Close/Remove 两项、草稿只给 Close、Remove 发出 `removeSession`）
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-09 - CUSTOM-20261009-210
+- **功能**：修「滚动条已触底、消息却没拉到底部」（第三次复发）：**按结果自愈**的底部留白 + 可见性/尺寸变化时重判 + 日志截断改**轮转**
+- **改动文件**：`src/ui/chat/html/client/scroll.ts`、`composer.ts`、`src/utils/Logger.ts`、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（文档：`pitfalls.md` #61/#62、`chat-panel.md` §5.49）
+- **来源**：用户报「刚又出现了消息没拉到底部，但滚动条已触底的问题（见图）… 你能通过日志进一步排查吗」
+- **详细说明**：
+  - **排查结论**：截图像素量化出底部留白只剩 ~24px（变量缺省值）而卡片实高 80–104px ⇒ `--acpc-composer-h` 停在 0 而卡片可见。根因：该变量的唯一写者是 composer.ts 的 ResizeObserver，而**真 Chromium 实验**里 display:none 循环（hide→show）只收到初始那一次回调 —— "变量=0 而卡片可见"可达，此刻贴底 = 尾巴被压住 + 滚无可滚。11:15 的原始诊断日志被 Logger 的 5MB **清零**毁掉（旁证：view 面 diagSeq 在清零后从 #225 续起 —— 前面 224 条全在被清的那段里，见 pitfalls #61）。
+  - **①按结果自愈**：`scroll.healIfTailCovered`（recompute 收尾调用；前置两条：**真在滚动范围末尾**（st ≥ max−1）＋贴底态）：比较**末条记录底边 vs 输入卡顶边**（同坐标系两个 rect），被压住 ⇒ 记 `tail-covered-heal` + 调 `NS.composer.refreshHeight()`（唯一写者重测重写 + reflow）；`healing` 闸门防打转。
+    ⚠️ **首版当天即被用户实测反噬**：门槛只写 distance<32 ⇒ 从底部上滚一格被误判成"被压住" ⇒ 自愈把视口拉回底部（"滚轮滚不上去"）。已加 at-max 门槛 + 回归用例（见 pitfalls #62 的教训 2）。
+  - **②写者重取**：composer.ts 在 `visibilitychange`（回 visible）/`window resize` 上重跑 `apply()`，并把它以 `refreshHeight` 暴露。
+  - **③pin 重判**：scroll.ts 同两个钩子跑 `reflow()`（贴底者带回新底部、没贴底者只刷 pin/Jump）——日志里抓到 `pin=1` 却停在 st=418/6781 卡了五分钟。顺带 reflow 的裸 `scrollTop =` 改走 `writeTop()`（192 的规矩：程序写同一出口，否则事件被误标成 user-scroll）。
+  - **日志轮转**：超限时改名成 `.log.1` 而不是清零 —— 清零发生在"下一次激活"，正是要查现场的时刻。
+- **验证方式**：桩 DOM 5 条（被压住重测 / **从底部上滚一格绝不自愈（回归）** / 健康不打扰 / 上翻不重测 / 卡片隐藏不关它的事）；真 Chromium `#composerbottomtailprobe`：`varAfter:"85px"`、`composerH:85`、`padBottom:"109px"`、`covered:false`、`lastGap:112`；`npm test` 全绿
+- **基于上游版本**：0.2.0（commit e7371659）
+
 ### 2026-10-09 - CUSTOM-20261009-209
 - **功能**：**会话恢复** —— 重载/关闭编辑器后再打开 ACP Client，问一句「要不要恢复上次开着的几个会话 tab」（是 ⇒ 按原顺序恢复；否 ⇒ 保持现在的逻辑）。参考浏览器的标签页恢复
 - **改动文件**：`src/ui/chat/protocol.ts`、`src/ui/chat/ChatPanelHost.ts`、`package.json`、`src/ui/chat/html/body.ts`、`src/ui/chat/html/styles.ts`、`src/ui/chat/html/client/stateCard.ts`、`src/ui/chat/html/client/boot.ts`、`src/ui/chat/html/client/tabs.ts`、`src/test/chat-client.test.ts`、`src/test/chat-panel.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（文档：`chat-panel-sessions.md` §5.48、`pitfalls.md` #60、`dev-workflow.md` 验收 221-222、`registry.md` 总览）

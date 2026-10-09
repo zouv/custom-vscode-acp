@@ -85,8 +85,21 @@ export const iconsClient = `
       ['path', { d: 'M2.5 3.2h7v5.6h-7Z' }],
       ['circle', { cx: 4.6, cy: 5.1, r: 0.8 }],
       ['path', { d: 'M3.2 8.2 5.4 6l1.6 1.6L9 5.4' }]
-    ]
+    ],
     // [CUSTOM-END] CUSTOM-20260928-096
+    // [CUSTOM-BEGIN] CUSTOM-20261009-212 - 历史列表行的悬停动作图标（归档 / 改名）。
+    // 与官方插件的语义对齐；形状照本文件的规矩只用直线：归档 = 箱盖 + 箱体 + 提手缝，
+    // 改名 = 一支斜放的铅笔（笔身四边形 + 笔头线），12×12、stroke=currentColor。
+    archive: [
+      ['path', { d: 'M1.6 2.4h8.8v2H1.6Z' }],
+      ['path', { d: 'M2.4 5.2h7.2v4.4H2.4Z' }],
+      ['path', { d: 'M4.8 6.6h2.4' }]
+    ],
+    rename: [
+      ['path', { d: 'M8.2 2.2 9.8 3.8 4.6 9 2.4 9.6 3 7.4Z' }],
+      ['path', { d: 'M7.2 3.2 8.8 4.8' }]
+    ]
+    // [CUSTOM-END] CUSTOM-20261009-212
   };
 
   /** Build the SVG element for a record kind, or null when there is no icon. */

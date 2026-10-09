@@ -48,6 +48,18 @@ export const scrollClient = `
         logScrollState('press@' + label, false);
       }
     }, true); }
+    // [CUSTOM-20261009-210] 文档不渲染的时段既没有 scroll 事件、观测器也可能哑火（见 composer.ts
+    // watchHeight 的 210 段），pin 与留白会烂在旧值上：2026-10-09 的日志里 view 面就抓到
+    // pin=1 却停在 st=418/6781 卡了五分钟（192 那句"某个量在说谎"的现场）。重新可见 /
+    // 尺寸变化时自己重算一遍 —— reflow() 在贴底时顺手把视口带回（含新长出来的留白），
+    // 没贴底时只刷新 pin/Jump，绝不抢视口。
+    if (document.addEventListener) {
+      document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState && document.visibilityState !== 'visible') { return; }
+        reflow();
+      });
+    }
+    if (window.addEventListener) { window.addEventListener('resize', reflow); }
     jumpBtn.addEventListener('click', function () {
       pinned = true;
       hideJump();
@@ -247,6 +259,48 @@ export const scrollClient = `
     // [CUSTOM-20261005-192] 贴底状态翻转 = 一次"视口归属"的交接，正是这个 bug 唯一会留下痕迹的地方。
     if (wasPinned !== pinned) { logScrollState(pinned ? 'pinned' : 'unpinned'); }
     if (pinned) { hideJump(); } else { showJump(); }
+    healIfTailCovered(distance);
+  }
+
+  // [CUSTOM-20261009-210] 「到底了、尾巴却还压在输入卡后面」的**按结果自愈**（pitfalls #25/#26：
+  // 判据用用户看得见的量，别信代理量）。
+  //
+  // 代理量是 --acpc-composer-h：唯一写者是 composer.ts 的 ResizeObserver，而观测器在「文档没在
+  // 渲染」的时段不可靠 —— 2026-10-09 的真机实验里，display:none 循环只收到过初始回调，hide 与
+  // 恢复都不报（pitfalls #62）。变量停在 0 时留白只剩 24px：内容末尾停在离面板底 24px 处，
+  // 被 ~80px 高的输入卡压住，而且**滚无可滚**（滚动条已触底）—— 用户 2026-10-09 截图报的就是它。
+  //
+  // 判据取"末条记录的底边 vs 输入卡的顶边"（同一坐标系的两个 rect）：这是"尾巴是否被压住"的
+  // 直接观测量，与留白变量为什么失真无关 —— 失真的原因（观测器哑火 / 相位切换 / 隐藏时段）
+  // 全部涵盖。两个前置（缺一不可，别放宽）：
+  //   · **真在滚动范围末尾**（st ≥ max−1）：只有这里才是"触底了却还看不全"的病态格。
+  //     ⚠️ 2026-10-09 用户报的"滚轮滚不上去、被自动拉回去"就是这条判据放宽到 distance<32 的
+  //     后果 —— 从底部上滚一格时尾巴刚离开卡片上方，而 st 还在阈值内 ⇒ 误判成被压住 ⇒
+  //     自愈 reflow 又把视口拉回底部，滚轮被吃光。at-max 门槛把修复面收窄到真正的病灶
+  //     （当初的截图正是 st=max 且被压住）。
+  //   · 贴底态（distance < PIN_THRESHOLD）：上翻看历史时内容从输入卡下面穿过是常态。
+  var healing = false;
+  function healIfTailCovered(distance) {
+    if (healing || distance >= PIN_THRESHOLD) { return; }
+    if (!container || !container.lastElementChild) { return; }
+    var max = container.scrollHeight - container.clientHeight;
+    if (container.scrollTop < max - 1) { return; }
+    if (!NS.dom || !NS.dom.qs || !NS.composer || !NS.composer.refreshHeight) { return; }
+    var composer = NS.dom.qs('composer');
+    if (!composer || !composer.getBoundingClientRect) { return; }
+    var last = container.lastElementChild;
+    if (!last.getBoundingClientRect) { return; }
+    var compRect = composer.getBoundingClientRect();
+    // 卡片没显示（相位断开时 display:none ⇒ rect 全 0）：此刻没有可压的内容，不关它的事。
+    if (compRect.height <= 0) { return; }
+    var lastRect = last.getBoundingClientRect();
+    if (lastRect.bottom <= compRect.top + 1) { return; }
+    // 被压住：先记一笔（记的是**修复前**的现场），再让唯一的写者重测+重写。
+    // 重写会触发 reflowNow → reflow → recompute —— healing 闸门保证这条链只尝试一次，
+    // 不会"判据不满足 → 修复 → 仍不满足 → 再修复"地打转。
+    logScrollState('tail-covered-heal', true);
+    healing = true;
+    try { NS.composer.refreshHeight(); } finally { healing = false; }
   }
 
   /**
@@ -269,7 +323,10 @@ export const scrollClient = `
     var keepBottom = pinned;
     recompute();
     if (keepBottom) {
-      container.scrollTop = container.scrollHeight;
+      // [CUSTOM-20261009-210] 原来这里直写 scrollTop（绕过 writeTop）⇒ 它引发的 scroll 事件会被
+      // **误标**成 user-scroll —— 读日志时会把"我们跟到底"看成"用户自己滚到底"（192 立的规矩：
+      // 程序写必须走同一个出口）。这里只是换出口，行为不变。
+      writeTop(container.scrollHeight);
       recompute();
       // [CUSTOM-20261005-192] 刚"跟到底"却又判成没到底 ⇒ 这次跟随**没到位**：要么 scrollTop
       // 被夹在一个更小的 max 上（内容还没落地就写），要么留白在写入之后又长了一截。

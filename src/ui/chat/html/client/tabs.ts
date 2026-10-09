@@ -120,6 +120,27 @@ export const tabsClient = `
     NS.bridge.post({ type: 'closeSession', sessionId: model.id });
   }
 
+  // [CUSTOM-BEGIN] CUSTOM-20261009-211 - 会话 tab 右键菜单的入口（见 contextMenu.itemsFor）。
+  // 模型解析留在本模块：菜单只拿得到 DOM 元素，而"这个元素是哪一条、关掉它意味着什么"
+  // （草稿=丢弃 / 待恢复=本地忘掉 / 真会话=closeSession）是这里独有的知识。
+  /** The model behind a tab element, by whichever id attribute its kind carries. */
+  function modelOfNode(node) {
+    if (!node || !node.getAttribute) { return null; }
+    var id = node.getAttribute('data-session-id') || node.getAttribute('data-draft-id')
+      || node.getAttribute('data-restore-id');
+    if (!id) { return null; }
+    var models = tabModels();
+    for (var i = 0; i < models.length; i++) { if (models[i].id === id) { return models[i]; } }
+    return null;
+  }
+
+  /** 菜单 Close：与 tab 上的 × 同一条路（closeModel 按 kind 分派）。 */
+  function closeTabNode(node) {
+    var model = modelOfNode(node);
+    if (model) { closeModel(model); }
+  }
+  // [CUSTOM-END] CUSTOM-20261009-211
+
   function init() {
     tabsEl = NS.dom.qs('tabs');
     // [CUSTOM-20261008-201] 整条标签栏（含最后一个 tab 右边的空白）才是落点容器，见 installDrag。
@@ -680,7 +701,9 @@ export const tabsClient = `
     // [CUSTOM-20261008-199] 空态地址栏显示的那份默认目录（随 boot 消息到达）。
     setDefaultCwd: setDefaultCwd,
     // [CUSTOM-20261009-209] 待恢复的会话（本地 tab）：由 boot 的 restoreChoice 喂。
-    setRestoring: setRestoring
+    setRestoring: setRestoring,
+    // [CUSTOM-20261009-211] 会话 tab 右键菜单的 Close 入口（见 contextMenu.itemsFor）。
+    closeTabNode: closeTabNode
   };
 })(window.__acpc = window.__acpc || {});
 `;

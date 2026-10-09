@@ -478,6 +478,23 @@ export const transcriptViewClient = `
     var body = NS.dom.el('span', 'bubble-body');
     body.appendChild(document.createTextNode(entry.text || ''));
     summary.appendChild(body);
+    // [CUSTOM-20261009-213] 正文不触发折叠（用户 2026-10-09 报："点击任意位置都折叠，
+    // 没法框选文字内容"）。正文（.bubble-body）在 <summary> 里 —— 这是折叠态"首行预览"的
+    // 要求（064/108：折叠后 summary 占恰好一行并省略号截断）—— 而原生 <details> 的规矩是
+    // "点 summary 就切换"，于是在正文里划选 == 点它，读者刚要选的内容反被折起来。
+    // 助手气泡（114）靠"正文不在 summary 里"绕开了这件事；用户气泡的预览必须留在 summary
+    // 里，就在这层把**正文那一片**从切换区里摘出去（对 summary 的 click 做 preventDefault
+    // 能拦掉原生的开合）：
+    //   · 展开态：正文区一切点击都不折叠 —— 可自由框选；
+    //   · 折叠态：整行（含那一行预览）仍是切换区 —— "第一行就是全部"的形态，用户要求它能点；
+    //   · 手里已有选区（从正文一路拖到行尾空白再松手，同样算划选）：一律不折叠。
+    summary.addEventListener('click', function (event) {
+      var target = event.target;
+      var inBody = !!(target && target.closest && target.closest('.bubble-body'));
+      var selection = window.getSelection ? window.getSelection() : null;
+      var hasSelection = !!(selection && String(selection.toString() || '').length > 0);
+      if ((inBody && details.open) || hasSelection) { event.preventDefault(); }
+    });
     details.appendChild(summary);
     return details;
   }

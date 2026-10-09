@@ -74,6 +74,78 @@ export const contextMenuClient = `
    * ever a no-op (that was the whole complaint about the native menu).
    */
   function itemsFor(target) {
+    // [CUSTOM-BEGIN] CUSTOM-20261009-211 - 三个上下文专属格。它们**必须**排在通用清单之前：
+    // 这几处右键时通常没有选区，通用那条 Copy 只会灰着（"有个 Copy 但点不动"——用户报的
+    // 就是它），而用户要的拷贝内容与"选区"根本不是一回事：
+    //   1) 大纲行（含下拉抽屉）：Copy = 这条消息的**正文**（整条记录，不是截断的标题）；
+    //   2) 地址栏（#cwdBtn）：Copy = 它正显示的目录路径；
+    //   3) 会话 tab：Close（关掉这个 tab，会话留在列表里）/ Rename（给这条会话改名）。
+    // 选择器都带各自的 data-*，"是不是这一类"不靠猜（表格里都是真 button，不冲突）。
+    var outlineRow = target && target.closest ? target.closest('.outline-item[data-jump-id]') : null;
+    if (outlineRow) {
+      var jumpId = outlineRow.getAttribute('data-jump-id');
+      var entry = jumpId && NS.transcriptView && NS.transcriptView.entry
+        ? NS.transcriptView.entry(jumpId) : null;
+      var text = entry && typeof entry.text === 'string' ? entry.text : '';
+      if (!text) {
+        // 记录已经不在（会话被换掉之类）：退回行上可见的文本，绝不复制空串。
+        var labelEl = outlineRow.querySelector ? outlineRow.querySelector('.outline-text') : null;
+        text = labelEl ? String(labelEl.textContent || '') : '';
+      }
+      return [{ label: 'Copy', run: function () { copy(text); } }];
+    }
+    var addr = target && target.closest ? target.closest('.session-title') : null;
+    if (addr) {
+      // .session-title 就是 body.ts 的 #cwdBtn（地址栏按钮）——用类选择器是为了桩 DOM 也
+      // 认（它只支持标签 / .class / [attr]，见 chat-client.test.ts 的 matchesOne）。
+      // currentCwd() 是"地址栏此刻显示的是什么"的同源读口（155）；草稿页它的文案可能不是
+      // 路径（如 "Default directory"），拿不到 cwd 时退回可见文本 —— 复制它自己显示的东西，
+      // 与菜单项的语义一致。
+      var path = NS.tabs && NS.tabs.currentCwd ? NS.tabs.currentCwd() : '';
+      if (!path) { path = String(addr.textContent || ''); }
+      return [{ label: 'Copy', run: function () { copy(path); } }];
+    }
+    var tab = target && target.closest ? target.closest('.tab') : null;
+    if (tab) {
+      var tabItems = [{
+        label: 'Close',
+        run: function () { if (NS.tabs && NS.tabs.closeTabNode) { NS.tabs.closeTabNode(tab); } }
+      }];
+      // Rename 只对**真会话** tab 有意义（草稿/待恢复的还没有会话可改名，× 已是它们的语义）。
+      // 初值取行上**看得见**的标签（与用户看到的一致，155 的同源原则）；宿主弹原生输入框。
+      if (tab.getAttribute('data-session-id')) {
+        tabItems.push({
+          label: 'Rename',
+          run: function () {
+            var tabLabelEl = tab.querySelector ? tab.querySelector('.tab-label') : null;
+            NS.bridge.post({
+              type: 'renameSession',
+              sessionId: tab.getAttribute('data-session-id'),
+              currentTitle: tabLabelEl ? String(tabLabelEl.textContent || '') : ''
+            });
+          }
+        });
+      }
+      return tabItems;
+    }
+    // [CUSTOM-20261009-212] 历史列表的行（sessionMenu 的行也带 data-open-session）：悬停图标
+    // 够不着的键盘用户（Shift+F10）走这里一样能归档/改名 —— 同一对动作、同一个出口。
+    var historyRow = target && target.closest ? target.closest('.outline-item[data-open-session]') : null;
+    if (historyRow) {
+      var historyId = historyRow.getAttribute('data-open-session');
+      var historyTitle = historyRow.getAttribute('data-open-title') || '';
+      return [
+        { label: 'Archive', run: function () { NS.bridge.post({ type: 'archiveSession', sessionId: historyId }); } },
+        {
+          label: 'Rename',
+          run: function () {
+            NS.bridge.post({ type: 'renameSession', sessionId: historyId, currentTitle: historyTitle });
+          }
+        }
+      ];
+    }
+    // [CUSTOM-END] CUSTOM-20261009-211
+
     var items = [];
     var selected = selectionText();
     items.push({

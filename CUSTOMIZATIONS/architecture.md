@@ -190,9 +190,12 @@ webview→扩展消息类型（**按"要不要带 sessionId"分组——这正�
   `connectAgent` / `listHistory` / `openHistorySession`(032/033)、`clientLog`(029)、
   `listDirectoryChoices` / `pickDirectory` / `createDraftAndSend`(058)、`listDraftOptions`(151)、
   `supplementHistory`(095)。
+  **例外形态**：`archiveSession` / `renameSession`(212) **带** sessionId 却在守卫之前 ——
+  历史列表里的行大多不是活会话，`verifySession` 只认 live 的，放守卫后会整条丢掉
+  （会话 tab 右键菜单的 Rename 是活会话，仍走同一条 `renameSession`）。
 
 扩展→webview 消息类型：`boot`/`focus`/`sessionsChanged`/`sessionClosed`/`append`/`revise`/`toolUpdate`/
-`markdownRendered`/`meta`/`attachments`/`error`/`history`(033)/`historySupplement`(095)/`directoryChoices`/`directoryPicked`/
+`markdownRendered`/`meta`/`attachments`/`error`/`history`(033)/`historySupplement`(095)/`sessionAction`(212)/`directoryChoices`/`directoryPicked`/
 `draftResolved`/`draftFailed`(058)/`draftOptions`(151)。**定向 vs 广播**：`boot` 与 058/151 那几条**定向**（只回发起请求的那个面，
 058 的是"某个文档正在编辑的草稿"），其余广播——见 §5.7。
 

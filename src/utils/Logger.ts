@@ -4,13 +4,19 @@
 import * as vscode from 'vscode';
 // [CUSTOM-BEGIN] CUSTOM-20260928-095 - 日志落盘：log() 除写输出通道外，异步追加写到
 // ~/.claude/acp-client-custom.log，让 AI 排查时能直接读文件而不必用户手动贴日志。
-import { appendFile, statSync, truncateSync } from 'node:fs';
+import { appendFile, statSync, renameSync, rmSync } from 'node:fs';
 // [CUSTOM-END] CUSTOM-20260928-095
 
 let _outputChannel: vscode.OutputChannel | undefined;
 let _trafficChannel: vscode.OutputChannel | undefined;
 
-// [CUSTOM-BEGIN] CUSTOM-20260928-095 - 落盘文件缓存（惰性求值 + 首次使用时截断超 5MB 的文件）。
+// [CUSTOM-BEGIN] CUSTOM-20260928-095 - 落盘文件缓存（惰性求值 + 首次使用时处置超 5MB 的文件）。
+// [CUSTOM-20261009-210] 原来的处置是 **truncate 到 0** —— 2026-10-09 就是这么把 11:15–11:40 的
+// 全部现场（含用户截图那一刻的滚动诊断）清掉的：文件超限后，**下一次激活的首条日志**把它清零，
+// 而被清掉的那段恰好是"刚出过问题、正要排查"的窗口（pitfalls #61）。改成**轮转**：
+// 超限时把旧文件改名成 `.log.1`（只留一份备份，覆盖更旧的），新日志从空文件开始 ——
+// 代价是多占一份磁盘，换来的是"上一次会话的现场永远在"。
+const LOG_FILE_MAX_BYTES = 5 * 1024 * 1024;
 let _logFile: string | undefined;
 let _logFileReady = false;
 
@@ -22,8 +28,12 @@ function persistLog(line: string): void {
     if (home) {
       const file = `${home}/.claude/acp-client-custom.log`;
       try {
-        if (statSync(file).size > 5 * 1024 * 1024) { truncateSync(file, 0); }
-      } catch { /* 文件不存在，忽略 */ }
+        if (statSync(file).size > LOG_FILE_MAX_BYTES) {
+          const backup = `${file}.1`;
+          try { rmSync(backup, { force: true }); } catch { /* 备份删不掉也要继续尝试改名 */ }
+          renameSync(file, backup);
+        }
+      } catch { /* 文件不存在 / 改名失败：忽略，宁可变大也别丢日志 */ }
       _logFile = file;
     }
   }

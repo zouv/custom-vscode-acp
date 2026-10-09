@@ -1033,7 +1033,7 @@ SDK 侧走 `ClientSideConnection.extMethod(method, params)`（就是普通 JSON-
 要重排），而真机是 **~360ms/条**（50s/139）—— 差两个数量级。所以它只能说明"分帧之后一个批次绝不落在
 单个任务里"，**不能**证明真机修好；真机判据是下一次的 `longtask` 日志行（dev-workflow 验收 211）。
 
-### 5.47 文件引用的三种呈现（CUSTOM-20261008-206）
+### 5.47 文件引用的三种呈现（CUSTOM-20261008-206..208、20261009-214）
 
 用户提的三条，其实是"文件引用"在三个位置上的形状问题：
 
@@ -1048,7 +1048,8 @@ chip 加 —— 真链接给代码图标会误导）。实测：`caretTop 85 / c
 **② 输入框引用栏里的「编辑器当前文件」格**：宿主订阅 `onDidChangeActiveTextEditor` /
 `onDidChangeTextEditorSelection`，把当前文件 + 多行选区的行区间推给客户端（`activeFile` 消息，
 **非会话作用域**、两个面都发）；客户端在 `#attachments` 那一行渲染一格：
-`+`（还没引用）/ `×`（已引用）的圆形开关 + 文件 tag（图标 + 文件名 + `:12-40`）。
+`+` 开关 + 文件 tag（图标 + 文件名 + `:12-40`）—— **214 起只剩"还没引用"这一态**（已引用时
+整格不出现，见下 ②d；206 时的 `×` 与 208 的两态配色已退役）。
 
 - **已引用与否从附件列表现算**（`state.attachments` 里有没有同 `path` 的一条），不另存一份状态：
   宿主的 `attachments` 回复一到，`+` 自己变 `×`（pitfall #19 的老规矩）。
@@ -1082,8 +1083,108 @@ chip 加 —— 真链接给代码图标会误导）。实测：`caretTop 85 / c
 **预选**（还没引用）= 中性 chip 底色**混入**主题强调色（`color-mix`，见 pitfalls #59）+ **虚线**；
 **已引用** = 与其它附件 chip 同观感（`--vscode-textCodeBlock-background` + 实线）。
 
-**验收**：客户端桩 4 条（出现 `+` / 行区间进 `meta` / 宿主回复后变 `×` 再点走 `detachFile` /
-草稿页攒本地）；宿主 4 条（无编辑器与非本地文件 ⇒ 不显示、整文件、1 基行区间与"下一行行首"边界、
-`attachPath` 的 meta → 附件与发送时的 uri 片段）；真 Chromium 的 `#refchip` 档
-（`toggle:'+'`、`label:'PianoGameplayDefine.cs:12-40'`、`href` 为真实路径）+ `#filechip` 档
+**②d 已引用不再重复显示 + 附件 chip 补图标 + × 按同一性摘（214）**：用户报两条 ——
+①编辑器里重复选择已引用的（同文件、或同文件 + 同行区间）时，引用栏那格与附件行里的 chip
+**同一条显示两遍**（截图里两枚一模一样的 tag）；②已添加引用的文件 tag 左侧**没有图标**。
+修法：`renderAttachments` 只在这条**还没引用**时才渲染引用格（`!isReferenced(activeFile)`）——
+于是"已引用"那一态连同 `.ref-on` 配色、`.ref-toggle` 的 `×` 分支与 `detachReference` 一起退役
+（别留没有写者的死 CSS，pitfall #20）；文件附件 chip 补上与引用格同一枚 `</>` 图标；
+**附件 chip 的 `×` 顺势改成按"路径 + 区间"同一性摘**（`sameRef`）——它此前是唯一按整路径摘的
+出口（宿主 `detachFile` 不带区间 = 该路径**全摘**），引用格的 `×` 退役后它就是唯一摘除口，
+不修的话"点 5-9 那段的 × 会把 12-40 一起带走"。
+
+**验收**：客户端桩（出现 `+` / 行区间进 `meta` / 宿主回复后**引用格消失**且附件 chip 带图标、
+点附件 `×` 走带区间的 `detachFile` / 草稿页攒本地并同样按同一性摘）；宿主 4 条（无编辑器与
+非本地文件 ⇒ 不显示、整文件、1 基行区间与"下一行行首"边界、`attachPath` 的 meta → 附件与发送时的
+uri 片段）；真 Chromium 的 `#refchip` 档（`toggle:'+'`、`label`、`href` 为真实路径、
+**翻转后 `refChipAfterAttach:false` + `attachmentIconAfterAttach:true`**）+ `#filechip` 档
 （气泡里的文件 chip：`caretTop/chipTop` 同栏、`chipH`、`hasIcon`）。
+
+### 5.49 「尾巴被输入卡压住」的按结果自愈、可见性重判与日志轮转（CUSTOM-20261009-210）
+
+**症状**（用户 2026-10-09 第三次报，截图在 aki_work 会话）：滚动条已触底、消息却没拉到底部 ——
+到底时最后一条记录被悬浮输入卡压住，而且**滚无可滚**。像素量化：截图刻底部留白只剩 ~24px
+（变量的缺省值），而卡片实高 ~80–104px ⇒ `--acpc-composer-h` 停在 0 而卡片可见。
+
+**根因**：见 pitfalls #62 —— 该变量的唯一写者是 `composer.ts` 的 ResizeObserver，
+而 display:none 循环（相位切换 / 文档不渲染的时段）里真 Chromium 的 RO 只回调初始一次，
+hide 与恢复都不报。"变量=0 而卡片可见"于是可达。
+
+**三层修法（都在 `html/client/` 里）**：
+- **①按结果自愈**：`scroll.ts` 新增 `healIfTailCovered(distance)`，由 `recompute()` 收尾调用
+  （每次 scroll 均跑）。前置**两条**（缺一不可）：**真在滚动范围末尾**（`st ≥ max − 1`）＋
+  **贴底态**（`distance < PIN_THRESHOLD`）；然后在末条记录与 `#composer` 两个 `getBoundingClientRect`
+  上判 `last.bottom > composer.top + 1` 且卡片可见（height > 0）⇒ 记一行 `tail-covered-heal`
+  （强制、记的是**修复前**的现场）并调 `NS.composer.refreshHeight()`。
+  ⚠️ **at-max 门槛是 2026-10-09 用户实测倒逼出来的**：首版只在 `distance<32` 判，于是从底部
+  上滚一格（尾巴刚离开卡片上方、st 还在阈值内）被误判成"被压住"⇒ 自愈 reflow 把视口拉回底部
+  ⇒ **滚轮一格都推不上去**（用户报"滚动滚不上去了，会被自动拉回去"）。修复面必须收窄到病灶格。
+  `healing` 闸门保证一条 recompute 链只尝试一次（重写变量 → reflow → 再次 recompute 不会打转）。
+  桩 DOM 的判空链（`NS.dom.qs` / `NS.composer` 缺席）先短路，别把客户端逻辑测试打红。
+- **②写者自己重取**：`composer.ts` 的 `watchHeight` 在 `visibilitychange`（回到 visible）与
+  `window resize` 上再跑一次 `apply()`；并把 `apply` 以 `NS.composer.refreshHeight` 暴露出去
+  （判据在滚动侧、写口在这里，唯一写者不变）。`apply` 幂等：值没变时 `noteGeometry` 去重、
+  `setProperty` 同值、`reflowNow` 只在贴底时写一次 scrollTop。
+- **③pin 重判**：`scroll.ts` 的 `init` 在同样的两个钩子上跑 `reflow()` —— 贴底者被带回新底部，
+  没贴底者只刷新 pin/Jump（不抢视口）。日志里另有一条：`pin=1` 却停在 `st=418/6781` 卡了五分钟
+  （192 的"某个量在说谎"现场），同一根因（文档不渲染的时段没有 scroll 事件）。顺带把 `reflow()`
+  里的裸 `container.scrollTop =` 换成 `writeTop()`（192 的规矩：程序写走同一个出口，
+  否则它引发的 scroll 事件会被误标成 user-scroll）。
+
+**日志轮转**：`Logger.ts` 的超限处置从 **truncate 到 0** 改成**轮转**（超限时改名成 `.log.1`，
+只留一份备份）—— 2026-10-09 那次清零恰好毁掉了要查的现场（pitfalls #61 有完整推理链）。
+
+**验收**：桩 DOM 4 条（`mountHeal`：被压住重测 / 健康不打扰 / 上翻不重测 / 卡片隐藏不关它的事，
+`src/test/chat-client.test.ts` 的 176 套件内）＋ 真 Chromium 的 `#composerbottomtailprobe`
+（把 `--acpc-composer-h` 人为踩回 0px → 滚到底派发 scroll → 读 `varAfter` 回到真实高度、
+`covered=false`、`lastGap ≥ 卡片高`；截图档 `tail-covered.png`）。
+
+### 5.50 右键菜单的四个上下文格 与 历史列表行的悬停动作（CUSTOM-20261009-211/212）
+
+**右键菜单**（`contextMenu.ts` 的 `itemsFor`，四个专属分支**排在通用清单之前** —— 通用那条
+`Copy` 复制的是**选区**、无选区时禁用，而用户报的"有个 Copy 但点不动"正是这几处）：
+- **大纲行**（`.outline-item[data-jump-id]`）：`Copy` = 这一条的**正文**（`transcriptView.entry(id).text`，
+  取不到时退回行上可见文本）——不是选区，也不需要选区；
+- **地址栏**（`.session-title`，即 body.ts 的 `#cwdBtn`；用类选择器是为了桩 DOM 也认）：
+  `Copy` = `NS.tabs.currentCwd()`（拿不到退回按钮文本 —— 草稿页它可能是 "Default directory"）；
+- **会话 tab**（`.tab`）：`Close`（= tab 上的 × 同一条路，`NS.tabs.closeTabNode` 按 kind 分派
+  草稿=丢弃 / 待恢复=本地忘掉 / 真会话=closeSession）＋ `Rename`（仅真会话 tab，改名见下）；
+- **历史列表行**（`.outline-item[data-open-session]`）：`Archive` / `Rename` —— 悬停图标够不着的
+  键盘用户（Shift+F10）走这里同一对动作、同一个出口。
+
+**会话 tab 的两个菜单项（211）**：`Close` = `NS.tabs.closeTabNode`（按 kind 分派：草稿=丢弃 /
+待恢复=本地忘掉 / 真会话=closeSession，与 tab 上的 × 同一条路）；`Rename` = 发 212 的
+`renameSession {sessionId, currentTitle}`（初值取 `.tab-label` 上**看得见**的标题，同源原则），
+改名由宿主弹原生输入框，回执后 `refreshSessions` 把新标题经 `sessionsChanged` 推回来 —— tab
+自己也就换了名字。**首版曾按用户早先口述做了 `Remove`（归档+忘掉+关闭），用户随后更正
+"要的是 Rename 不是 Remove"，已整条删除**（包含 `removeSession` 消息）。
+
+**历史行的悬停动作（212，仅悬停显示）**：`sessionMenu.renderList` 把每行包进
+`.session-row`（`position: relative`），动作层 `.row-actions` 是**行的兄弟**（button 不能嵌
+button；行仍是真 `<button>`）绝对定位浮在右端，默认 `opacity:0; pointer-events:none`，
+`.session-row:hover / :focus-within` 才现身；两个动作是真 button 但 `tabIndex=-1`（与 tab 的 ×
+出 tab 序同一先例，089）。点击**只发消息**（`archiveSession` / `renameSession {currentTitle}`），
+等宿主做完回 `sessionAction` 再 `applyAction` **就地**改 `lastMessage.sessions` 重渲染
+（归档摘行 / 改名换标签，计数与过滤都跟着走）——**不重发整份 history**：那会经 `setHistory`
+按 askedCwd 重派生 filterKey，把手选的目录过滤重置掉；也不做乐观更新（#29 那类"界面变了、
+宿主没做成"的不一致）。
+
+**宿主侧（212）**：`renameSession` / `archiveSession` 两条**必须在 verifySession 守卫之前**
+（列表里的行大多不是活会话）。覆盖存在 `globalState` 的 `acpc.sessionLabels.v1`
+（`{sessionId: {title?, archived?}}` —— 按 id 记、与来源无关；不写 SessionHistoryStore：
+它只覆盖本地那一段且 memento key 冻结）。生效点两处：`postHistory` 与
+`handleSupplementHistory`（唯一装配点：归档滤行、改名换标题，补扫也不能把归档的行漏回来）；
+`toSummary` 的标题链最前插覆盖（tab / 树跟着换名字，`refreshSessions` 推一把）。
+改名走原生 `showInputBox`（清空 / 取消都当"没改"——清空意味着"回到原始标题"，
+而底层标题（agent/缓存/磁盘）列表这边拿不到，不猜）。
+
+**行内布局（212 修）**：目录名从"行最右端"改成**会话名后的括号后缀**（`(aki_work)`，靠左）——
+2026-10-09 用户报：原来它与右端的悬停图标重叠（图里就是"图标压在 aki_work 上"）。
+CSS 上 `.session-row .outline-text { flex: 0 1 auto }`（标题按内容占位、过长才省略，右端空档
+留给 `.row-actions`）；**只限历史行**——大纲行的 `.outline-text` 仍是 `flex: 1`（时刻贴右缘）。
+
+**验收**：客户端桩 —— contextMenu 4 条（大纲行 / 地址栏 / tab（草稿只给 Close）/ 历史行）＋
+history picker 4 条（每行一对动作且不嵌套 / 点 Archive 只发消息 / 点 Rename 带 currentTitle /
+applyAction 摘行换标签且不重置过滤）；真 Chromium 的 `#historyrowprobe`（默认 opacity=0、
+动作落在行内且纵向居中、图标画出来、点击发出 `archiveSession`、回执后行数 -1；
+截图档 `history-row-actions.png` 第一行是"悬停后"的摆法 —— 无头里触发不了真 :hover）。

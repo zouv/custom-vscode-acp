@@ -374,16 +374,32 @@ export const composerClient = `
       // [CUSTOM-20261003-176] 留白变了 ⇒ 视口判定要跟着重算（scroll 事件不会来，见 scroll.ts 的 reflow）。
       if (NS.scroll && NS.scroll.reflowNow) { NS.scroll.reflowNow(); }
     }
+    applyHeight = apply;
     apply();
     if (typeof window.ResizeObserver === 'function') {
       var observer = new window.ResizeObserver(apply);
       observer.observe(composerEl);
     } else {
       // 与 rail.ts 的 onResize 同一个态度：没有 ResizeObserver 时说一声，而不是静默错位。
-      window.addEventListener('resize', apply);
+      // （resize 兜底由下面那条统一的监听负责，这里只出声。）
       console.warn('[acpc] ResizeObserver unavailable: the composer will not make room when it grows');
     }
+    // [CUSTOM-20261009-210] 观测器在「文档没在渲染」的时段不可靠：2026-10-09 的真机实验里，
+    // display:none 循环（hide → show）只收到过初始那一次回调 —— hide 和恢复都不报（pitfalls #62）。
+    // 而这段留白是**承重**的（变量停在 0 时，贴底 = 内容末尾被输入卡压住、还滚不动），
+    // 不能押在回调上：文档重新可见 / 窗口尺寸变化时自己再量一次。apply 幂等（值没变时
+    // noteGeometry 去重、setProperty 同值、reflowNow 只在贴底时写一次 scrollTop）。
+    if (document.addEventListener) {
+      document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState && document.visibilityState !== 'visible') { return; }
+        apply();
+      });
+    }
+    if (window.addEventListener) { window.addEventListener('resize', apply); }
   }
+  // [CUSTOM-20261009-210] 给 scroll.ts 的「尾巴被输入卡压住」自愈用的重测出口（见那里的
+  // healIfTailCovered）—— 判据在滚动侧（用户看得见的结果），重新落地的动作在这里（唯一写者）。
+  var applyHeight = null;
 
   // --- Slash commands ------------------------------------------------------
 
@@ -664,12 +680,15 @@ export const composerClient = `
     NS.dom.clear(attachmentsEl);
     // [CUSTOM-20261008-206] 引用栏里除了已加的附件，还有**编辑器当前文件**那一格 —— 即使一条附件
     // 都没有也要显示（那就是「给它一个 + 就能加进来」的入口）。
+    // [CUSTOM-20261009-214] 但它只在**还没引用**时出现：已引用的那一条在附件行里本来就有自己的
+    // chip，两个都摆出来就是重复 tag（用户 2026-10-09 报"编辑区重复选择时出现重复的 tag"，见图）。
+    // 去引用改走附件 chip 自己的 ×（那个 × 按"路径 + 区间"的同一性摘，只摘这一段）。
     if (state.attachments.length === 0 && !activeFile) {
       attachmentsEl.hidden = true;
       return;
     }
     attachmentsEl.hidden = false;
-    if (activeFile) { attachmentsEl.appendChild(activeFileChip(activeFile)); }
+    if (activeFile && !isReferenced(activeFile)) { attachmentsEl.appendChild(activeFileChip(activeFile)); }
     for (var i = 0; i < state.attachments.length; i++) {
       (function (attachment) {
         var chip = NS.dom.el('span', 'attachment');
@@ -684,6 +703,11 @@ export const composerClient = `
           } else {
             chip.appendChild(NS.icons.icon('image', 'attachment-thumb-icon'));
           }
+        } else {
+          // [CUSTOM-20261009-214] 文件附件也带图标（与引用栏那一格同一枚 </> 图形）——
+          // 用户 2026-10-09 报"已添加引用的文件 tag 左侧没有图标，需要加上"。
+          var fileIcon = NS.icons.icon('file', 'chip-icon');
+          if (fileIcon) { chip.appendChild(fileIcon); }
         }
         chip.appendChild(NS.dom.el('span', 'attachment-name', attachment.name));
         var remove = NS.dom.el('button', 'attachment-x', '\\u00d7');
@@ -694,13 +718,20 @@ export const composerClient = `
           if (state.draft) {
             var list = draftFiles[state.draft.draftId] || [];
             for (var k = 0; k < list.length; k++) {
-              if (list[k].path === attachment.path) { list.splice(k, 1); break; }
+              // [CUSTOM-20261009-214] 按**同一性**（路径 + 区间）摘：同一文件的多段各有自己的 ×。
+              // 引用栏那格的 × 退役后这里是唯一的摘除口 —— 按路径全摘会把别的段一起带走。
+              if (sameRef(list[k], attachment)) { list.splice(k, 1); break; }
             }
             syncDraftAttachments();
             refreshControls();
             return;
           }
-          NS.bridge.post({ type: 'detachFile', sessionId: state.sessionId, path: attachment.path });
+          // [CUSTOM-20261009-214] 同样带上区间：宿主的 detachFile **不带区间 = 该路径全摘**（207），
+          // 那会把同一个文件别的段一起摘掉。
+          NS.bridge.post({
+            type: 'detachFile', sessionId: state.sessionId, path: attachment.path,
+            lineStart: attachment.lineStart, lineEnd: attachment.lineEnd,
+          });
         });
         chip.appendChild(remove);
         attachmentsEl.appendChild(chip);
@@ -711,8 +742,9 @@ export const composerClient = `
   // [CUSTOM-20261008-206] 「编辑器当前文件」那一格。
   //
   // 与官方插件同一件事：不用先去别处找文件、Attach File —— 正在看的那个文件就在引用栏里，
-  // 点 '+' 加进来（'+' 变 'x'），点 'x' 移出去。已引用与否**从附件列表现算**（不另存一份状态，
-  // 否则两条真相迟早对不上 —— pitfalls #19）；宿主的 'attachments' 回复一到，'+' 自己就变 'x'。
+  // 点 '+' 加进来。已引用与否**从附件列表现算**（不另存一份状态，否则两条真相迟早对不上 ——
+  // pitfalls #19）；宿主的 'attachments' 回复一到，这一格自己就**消失**（214：已引用的那条
+  // 在附件行里有自己的 chip，两处都显示就是重复 tag）。
   function refLabel(file) {
     var range = '';
     if (file.lineStart) {
@@ -737,11 +769,13 @@ export const composerClient = `
   }
 
   function activeFileChip(file) {
-    var referenced = isReferenced(file);
-    // [CUSTOM-20261008-208] 一整格**一个 chip**：外壳负责描边/底色（区分预选与已引用），
-    // 里面是 tag（图标 + 文件名，点了 openFile）+ 开关（'+'/'×'）。两个都是真按钮、**平级**
+    // [CUSTOM-20261008-208] 一整格**一个 chip**：外壳负责描边/底色（预选态：强调色底 + 虚线），
+    // 里面是 tag（图标 + 文件名，点了 openFile）+ 开关（'+'）。两个都是真按钮、**平级**
     // 而不是嵌套（button 里不能放 button），键盘各自可达；开关不再露在 chip 外面（用户嫌突兀）。
-    var wrap = NS.dom.el('span', 'ref-chip' + (referenced ? ' ref-on' : ''));
+    // [CUSTOM-20261009-214] "已引用"那一态连同外壳的 × 一起退役：已引用时这一格**根本不出现**
+    // （见 renderAttachments 里那道 !isReferenced 门槛；去引用走附件 chip 的 ×，它按
+    // "路径 + 区间"的同一性摘）——两个都摆出来正是用户报的"重复 tag"。
+    var wrap = NS.dom.el('span', 'ref-chip');
 
     var tag = NS.dom.el('button', 'ref-tag');
     tag.type = 'button';
@@ -753,13 +787,13 @@ export const composerClient = `
     tag.appendChild(NS.dom.el('span', 'ref-label', refLabel(file)));
     wrap.appendChild(tag);
 
-    var toggle = NS.dom.el('button', 'ref-toggle', referenced ? '\u00d7' : '+');
+    var toggle = NS.dom.el('button', 'ref-toggle', '+');
     toggle.type = 'button';
-    toggle.title = referenced ? 'Remove this file from the message' : 'Add this file to the message';
+    toggle.title = 'Add this file to the message';
     toggle.setAttribute('aria-label', toggle.title);
     toggle.addEventListener('click', function (event) {
       event.preventDefault();
-      if (referenced) { detachReference(file); } else { attachReference(file); }
+      attachReference(file);
     });
     wrap.appendChild(toggle);
     return wrap;
@@ -772,23 +806,6 @@ export const composerClient = `
     if (state.draft) { addDraftPaths([file.path], [meta]); return; }
     if (!state.sessionId) { return; }
     NS.bridge.post({ type: 'attachPath', sessionId: state.sessionId, paths: [file.path], meta: [meta] });
-  }
-
-  function detachReference(file) {
-    if (state.draft) {
-      var list = draftFiles[state.draft.draftId] || [];
-      for (var k = 0; k < list.length; k++) {
-        if (sameRef(list[k], file)) { list.splice(k, 1); break; }
-      }
-      syncDraftAttachments();
-      refreshControls();
-      return;
-    }
-    // [CUSTOM-20261008-207] 带上区间：只摘这一段（同一个文件可以有别的段还留着）。
-    NS.bridge.post({
-      type: 'detachFile', sessionId: state.sessionId, path: file.path,
-      lineStart: file.lineStart, lineEnd: file.lineEnd,
-    });
   }
 
   /** 宿主推来的「编辑器当前文件」变了（含选区行区间；null = 没有打开的文件）。 */
@@ -1142,7 +1159,11 @@ export const composerClient = `
     failDraft: failDraft,
     // [CUSTOM-20261005-193] 草稿页的附件（boot 在没有会话时转到这里，见 attachImage/attachPaths）。
     addDraftImage: addDraftImage,
-    addDraftPaths: addDraftPaths
+    addDraftPaths: addDraftPaths,
+    // [CUSTOM-20261009-210] 重测底栏高度并重写 --acpc-composer-h（观测器可能哑火，见
+    // watchHeight 里的说明）。滚动侧的「尾巴被压住」自愈会调它 —— 判据在那边（用户看得见的
+    // 结果），唯一的写者仍然是这里。
+    refreshHeight: function () { if (applyHeight) { applyHeight(); } }
   };
 })(window.__acpc = window.__acpc || {});
 `;
