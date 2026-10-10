@@ -37,6 +37,15 @@ export const iconsClient = `
       ['path', { d: 'M7.6 2.6 10.6 6l-3 3.4' }],
       ['path', { d: 'M8.6 1.9 3.4 10.1' }]
     ],
+    // [CUSTOM-20261010-232] 额外根目录（additionalDirectories）的目录 chip 图标。
+    folder: [
+      ['path', { d: 'M1.5 3h3.2l1 1.2h4.8v6H1.5Z' }]
+    ],
+    // [CUSTOM-20261010-232] 通用「文档」图标（'Files or folders' 菜单项用，区别于 '</>' 代码文件）。
+    document: [
+      ['path', { d: 'M3 1.5h4.5L10 4v6.5H3Z' }],
+      ['path', { d: 'M7.5 1.5V4H10' }]
+    ],
     assistant: [
       ['path', { d: 'M2.4 3.2h7.2v4.4H5.8L3.6 9.6V7.6H2.4Z' }]
     ],

@@ -211,6 +211,8 @@ export function body(surface: SurfaceKey = 'view'): string {
              同样必须在 .composer-inner 里面（理由见上面 #stopConfirm）。 -->
         <div id="steerHint" class="steer-hint" hidden>This agent can't take messages mid-turn — send it when this turn finishes.</div>
         <div id="attachments" class="attachments" hidden></div>
+        <!-- [CUSTOM-20261010-232] 额外根目录（additionalDirectories）的 chips 行，形态同附件行。 -->
+        <div id="additionalDirectories" class="attachments" hidden></div>
         <!-- [CUSTOM-BEGIN] CUSTOM-20260930-133 - 一体式输入卡：textarea 与按钮栏合进同一个描边
              容器（原来是"带边框的 textarea + 卡外一行按钮"，中间隔一条缝，看着像两个孤立的
              控件）。焦点环也从 textarea 移到卡片上（:focus-within），见 styles.ts。
@@ -223,6 +225,14 @@ export function body(surface: SurfaceKey = 'view'): string {
                下方，Send 改为图标按钮，二者与上下文进度条合并成一条置底按钮栏（pickers 靠左、
                Send 靠右）。133 起这一条整块移进 .composer-card 内（一体式卡片）。 -->
           <div class="composer-bar">
+            <!-- [CUSTOM-20261010-232] 输入栏左下角通用 '+' 入口：弹出一级菜单（工作区目录 / 文件或文件夹）。
+                 注意菜单**不能**带 hidden —— [hidden]{display:none!important} 会压过 .open，菜单永远不显示。 -->
+            <div class="picker" id="addPicker">
+              <button id="addBtn" class="picker-btn" type="button" title="Add to session">
+                <span class="picker-icon">+</span>
+              </button>
+              <div id="addMenu" class="picker-menu"></div>
+            </div>
             <div id="configPickers" class="config-pickers"></div>
             <div id="contextMeter" class="context-meter" hidden title="Context usage"></div>
             <button id="sendStopBtn" class="send-stop send" disabled title="Send" aria-label="Send"></button>
