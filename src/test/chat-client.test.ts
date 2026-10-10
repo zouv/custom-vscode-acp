@@ -2440,6 +2440,8 @@ suite('chat client logic: draft composer options (stub DOM)', () => {
       // [CUSTOM-20261005-193] 附件也随这条消息走（草稿上没有会话，宿主收不了会话作用域的
       // attachPath/attachImage）。这里没有附件 ⇒ 两个空数组，字段本身必须在。
       images: [], paths: [],
+      // [CUSTOM-20261010-232] 额外根目录（additionalDirectories）默认空。
+      additionalDirectories: [],
     }]);
   });
 
@@ -4674,6 +4676,12 @@ suite('scroll: 几何（内容 / 留白）变化后视口判定要重算 (CUSTOM
     // 末条底边 990 > 卡片顶边 900 ⇒ 被压住。
     const m = mountHeal({ pad: '24px', scrollTop: 600, lastBottom: 990, composerTop: 900, composerH: 100 });
     assert.strictEqual(m.healed(), 1, '被压住必须重测一次');
+  });
+
+  test('滚轮落在 max 附近（差一格）⇒ 仍自愈 —— 2026-10-10 底部对齐回归', () => {
+    // max=600；st=580（差 20px，在 32px 容差内）⇒ 自愈该出手：滚轮到底常落在 max−N 而非精确 max。
+    const m = mountHeal({ pad: '24px', scrollTop: 580, lastBottom: 990, composerTop: 900, composerH: 100 });
+    assert.strictEqual(m.healed(), 1, '滚轮差一格（max−20）也要触发自愈');
   });
 
   test('从底部上滚一格（还在阈值内）⇒ 绝不自愈 —— 滚轮被吃光的回归（2026-10-09）', () => {

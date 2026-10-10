@@ -695,6 +695,33 @@ function driver() {
       });
     }
   }
+  // [CUSTOM-20261010-232] '+' 菜单的**事件**探针（真 Chromium）：点 '+' 开一级菜单，再点
+  // Workspace directories 切二级。关键读数 level2StillOpen —— DOM 重建后菜单若被「点外面」检查
+  // 关掉（pitfalls #28 的重演，即用户报的"点了没反应"），它就是 false。
+  if (location.hash.indexOf('addmenuprobe') >= 0) {
+    NS.composer.init();
+    NS.composer.setDraft({ draftId: 'draft-1', cwd: null, additionalDirectories: [] });
+    NS.composer.setDirectoryChoices({ workspaceFolders: ['/ws/a', '/ws/b'], recent: [], defaultCwd: '/ws/a' });
+    var addMenuPre = document.getElementById('probe') || (function () {
+      var el = document.createElement('pre'); el.id = 'probe'; document.body.appendChild(el); return el;
+    })();
+    var addOut = { kind: 'addmenu' };
+    var addBtnEl = document.getElementById('addBtn');
+    var addMenuEl = document.getElementById('addMenu');
+    if (addBtnEl && addMenuEl) {
+      addBtnEl.click();
+      addOut.level1Open = addMenuEl.className.indexOf('open') !== -1;
+      addOut.level1Items = addMenuEl.children.length;
+      var dirsEl = addMenuEl.querySelector('[data-add-action="directories"]');
+      addOut.dirsDisabled = dirsEl ? !!dirsEl.disabled : null;
+      if (dirsEl) { dirsEl.click(); }
+      addOut.level2StillOpen = addMenuEl.className.indexOf('open') !== -1;
+      addOut.level2HasBack = !!addMenuEl.querySelector('[data-add-dir="__back__"]');
+      addOut.level2HasBrowse = !!addMenuEl.querySelector('[data-add-dir="__browse__"]');
+      addOut.level2DirCount = addMenuEl.querySelectorAll('[data-add-dir]').length;
+    }
+    addMenuPre.textContent = JSON.stringify(addOut);
+  }
   // [CUSTOM-20260930-152] 表单抽屉（ACP elicitation / AskUserQuestion）：记录里只留一行
   // "待回答"条，表单本体在悬浮抽屉里 —— 多题按 tab 分页、单选用下拉（选项 = 名称 + 介绍）、
   // 可收起成一行。载荷形状照 adapter 的产物（'askUserQuestionsToCreateRequest'）：每题一个

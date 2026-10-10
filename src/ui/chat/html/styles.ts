@@ -1653,6 +1653,10 @@ export function styles(): string {
   .picker-item { padding: 3px 8px; cursor: pointer; white-space: nowrap; }
   .picker-item:hover { background: var(--vscode-list-hoverBackground); }
   .picker-item.active { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
+  /* [CUSTOM-20261010-232] '+' 菜单里灰置的项（已有会话的 Workspace directories）。 */
+  .picker-item:disabled { opacity: 0.45; cursor: default; }
+  /* [CUSTOM-20261010-232] '+' 菜单项：图标与文字之间留一点间距（图标是 .chip-icon 12px inline-flex）。 */
+  .picker-item .add-menu-label { margin-left: 6px; }
   /* [CUSTOM-20260926-079] 历史列表的目录过滤 chip + 菜单：**复用** composer 那套
      .picker-btn / .picker-menu / .picker-item（同一个"选一个值"的控件，观感应当一致），
      只补三件它没有的东西：

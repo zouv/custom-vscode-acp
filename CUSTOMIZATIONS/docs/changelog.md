@@ -17,6 +17,30 @@
 
 ---
 
+### 2026-10-10 - CUSTOM-20261010-232
+- **功能**：多根工作区 additionalDirectories 改显式 UI——输入栏 `+` 按钮选择额外根目录（回退 231 的自动全量）
+- **改动文件**：`src/ui/chat/protocol.ts`、`src/core/SessionManager.ts`、`src/ui/chat/ChatPanelHost.ts`、`src/ui/chat/html/client/boot.ts`、`src/ui/chat/html/client/composer.ts`、`src/ui/chat/html/client/icons.ts`、`src/ui/chat/html/body.ts`、`src/test/chat-client.test.ts`
+- **来源**：用户 2026-10-10「这样处理不太好，太隐含了。应该放到输入栏，显性提供给用户来操作：输入栏左下角 + 按钮 → 菜单 → additionalDirectories（快捷选工作区目录 + 自定义）」
+- **详细说明**：231 那版「自动把除 cwd 外的全部工作区根塞进 additionalDirectories」被用户否掉。改为：草稿页输入栏左下角一个 `+` 按钮，点开菜单勾选工作区根（排除 cwd）或 Browse 自定义目录，已选目录以 chip 展示（可摘除），随 `createDraftAndSend` 显式下发；已有会话只读展示（`SessionInfo.additionalDirectories` → `metaOf` → 客户端）。链路：`createDraftAndSend.additionalDirectories`（protocol）→ `handleCreateDraftAndSend` → `createSession({additionalDirectories})` → `createAcpSession`（能力位 gate + 校验绝对路径）→ `newSession`。`pickDirectory`/`directoryPicked` 加 `purpose` 区分「选 cwd」还是「选 additionalDirectories」。删掉了 231 的 `additionalDirectoriesFor`/`pathKey`（自动全量不再需要）。
+- **验证方式**：`npm run compile` / `lint` / `check-webview-client` / `check-registry` 全绿；`npm test` 449 passing（`createDraftAndSend` 载荷断言补 `additionalDirectories: []`）；`preview-records.mjs` 新增 `#addmenuprobe` 真 Chromium 探针自验「点 `+` 开一级菜单 → 点 Workspace directories 切二级菜单且菜单仍开着」（`level2StillOpen: true`，钉住 pitfalls #28 的 DOM 重建关菜单 bug）；手工：多根 workspace 草稿页勾选额外根目录后发首条消息，观察 agent 是否读到非主根目录的 AGENTS.md/skills
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-10 - CUSTOM-20261010-231
+- **功能**：多根工作区支持——建会话时把「除 cwd 外的其它工作区根目录」作为 `additionalDirectories` 下发
+- **改动文件**：`src/core/SessionManager.ts`、`src/test/chat-panel.test.ts`
+- **来源**：用户 2026-10-10「vscode 多目录 workspace 下，新建会话默认定位第一个目录，会话识别不到其他目录（那些目录也配了 AGENTS/skills）——现在有处理吗，有什么好办法？」
+- **详细说明**：此前 `resolveDefaultCwd()` 只取 `workspaceFolders[0]`，`createAcpSession` 的 `session/new` 只传 `cwd`+`mcpServers`，agent 因此只感知一个根目录。ACP 原生支持多根：`NewSessionRequest.additionalDirectories?: string[]`（"Additional workspace roots to activate"），Claude Code 适配器已声明能力位 `sessionCapabilities.additionalDirectories`。现在：①新增纯函数 `additionalDirectoriesFor(workspaceFolders, cwd)`（返回除 cwd 外的根，路径同一性对齐 `historyDirs.directoryKey` 口径）；②`summarizeCapabilities` 解析 `additionalDirectories` 能力位；③`createAcpSession` 在 agent 声明该能力且有多余根目录时，把 `additionalDirectories` 随 `session/new` 下发（两处：正常 + 认证重试）。`loadSession`/`resumeSession` 本次未动（重开既有会话时 agent 已从 `SessionInfo.additionalDirectories` 知道根列表）。「智能默认 cwd」留作后续。
+- **验证方式**：`npm run compile` / `npm run lint` 通过；`chat-panel.test.ts` 新增 `additionalDirectoriesFor` 纯函数 4 条用例（多根去 cwd / cwd 不在根里全量返回 / 单根为空 / 大小写平台规则）；手工：多根 workspace 新建会话，观察 agent 是否读得到非主根目录的 AGENTS.md/skills
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-10 - CUSTOM-20261010-230
+- **功能**：修「滚动条到底了、底部没显示完，Jump 能恢复、滚轮又坏」
+- **改动文件**：`src/ui/chat/html/client/scroll.ts`、`src/test/chat-client.test.ts`
+- **来源**：用户 2026-10-10「又出现了消息面板底部对齐的问题（底部有一部分没显示完，但滚动条已经拖到底了，点击 Jump to latest 能恢复正常，但滑动滚轮后就不对了）」
+- **详细说明**：触底自愈 `healIfTailCovered` 的 at-max 门槛是 `st ≥ max−1`（1px 容差）。滚轮滚到底时浏览器常落在 `max−N` 而非精确 `max`，1px 容差太紧、自愈根本不触发，尾巴就一直压在输入卡后面；而「Jump to latest」用 `writeTop(scrollHeight)` 精确落底，于是能触发。放宽到 `st ≥ max−PIN_THRESHOLD`（32px）：覆盖"滚轮差一格"（~30px 内），同时仍挡住"往上翻一大段"——#210 教训 2 的"滚轮被吃光"是 160px 宽窗（`distance<32` 覆盖 `pad+32`），32px 远窄于它。
+- **验证方式**：`npm run compile` / `check-webview-client.mjs` 通过；`npx mocha out/test/chat-client.test.js` 236 passing（新增「滚轮落在 max 附近（差一格）⇒ 仍自愈」回归用例，既有「上滚一格绝不自愈」不破）
+- **基于上游版本**：0.2.0（commit e7371659）
+
 ### 2026-10-10 - CUSTOM-20261010-229
 - **功能**：修「渲染含 diff 的工具卡抛 ReferenceError，hydrate 循环被打断 → 拉不到底」
 - **改动文件**：`src/ui/chat/html/client/toolCallView.ts`、`src/test/chat-client.test.ts`

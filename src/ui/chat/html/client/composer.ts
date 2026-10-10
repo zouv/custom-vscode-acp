@@ -25,6 +25,14 @@ export const composerClient = `
   var activeFile = null;
   var pickersEl = null;
   var contextMeter = null;
+  // [CUSTOM-20261010-232] '+' 菜单的 DOM：'#additionalDirectories' 是 chips 行，'#addBtn' 是
+  // 入口按钮，'#addMenu' 是一级/二级共用的弹出菜单。
+  var additionalDirectoriesEl = null;
+  var addPicker = null;
+  var addBtn = null;
+  var addMenu = null;
+  // 菜单层级：0 = 一级（工作区目录 / 文件或文件夹），1 = 二级（目录列表 + 返回 + Browse）。
+  var addMenuLevel = 0;
   // [CUSTOM-20260930-129] The last usage we were given. The ring's "a turn is running"
   // outer arc is driven by setRunning, and that path never sees 'meta' — so the numbers
   // are kept here and redrawn from them.
@@ -52,7 +60,12 @@ export const composerClient = `
     draftPending: false,
     // [CUSTOM-20261004-187] 当前 agent 是否吃"轮次进行中的补充消息"（steering，来自 meta）。
     // 它决定 running 时回车是**发出去**还是**原样待着并提示**（见 send / refreshSteerHint）。
-    steering: false
+    steering: false,
+    // [CUSTOM-20261010-232] 额外根目录（additionalDirectories，多根工作区）。草稿页可编辑、
+    // 已有会话只读；workspaceFolders 是菜单候选（来自 directoryChoices）。
+    additionalDirectories: [],
+    addDirectoriesReadonly: false,
+    workspaceFolders: []
   };
 
   // [CUSTOM-20260925-050] Per-session drafts. Switching sessions used to clear
@@ -113,6 +126,11 @@ export const composerClient = `
     attachmentsEl = NS.dom.qs('attachments');
     pickersEl = NS.dom.qs('configPickers');
     contextMeter = NS.dom.qs('contextMeter');
+    // [CUSTOM-20261010-232] 额外根目录（additionalDirectories）的 DOM。
+    additionalDirectoriesEl = NS.dom.qs('additionalDirectories');
+    addPicker = NS.dom.qs('addPicker');
+    addBtn = NS.dom.qs('addBtn');
+    addMenu = NS.dom.qs('addMenu');
 
     input.addEventListener('keydown', onKeyDown);
     input.addEventListener('input', function () {
@@ -142,7 +160,47 @@ export const composerClient = `
     }
     document.addEventListener('click', function (event) {
       if (!pickersEl.contains(event.target)) { closeMenus(); }
+      // [CUSTOM-20261010-232] '+' 菜单也随点外部收起。
+      if (!addMenu || !addMenu.contains(event.target)) { closeAddMenu(); }
     });
+    // [CUSTOM-20261010-232] '+' 入口：按钮开一级菜单；菜单里点一级项切层级、二级项切换目录/Browse/返回。
+    if (addBtn) {
+      addBtn.addEventListener('click', function (event) {
+        event.stopPropagation();
+        var wasOpen = addMenu && addMenu.className.indexOf('open') !== -1;
+        closeAddMenu();
+        if (!wasOpen && addMenu) {
+          addMenuLevel = 0;
+          renderAddMenu();
+          addMenu.className = 'picker-menu open';
+        }
+      });
+    }
+    if (addMenu) {
+      addMenu.addEventListener('click', function (event) {
+        // [CUSTOM-20261010-232] 点菜单里的东西**必须**停在这里：下面 renderAddMenu() 会重建 DOM、
+        // 把被点的那个元素摘掉，冒泡到 document 时 contains(event.target) 就变 false、菜单被
+        // 「点外面」检查关掉（pitfalls #28 的重演）。stopPropagation 让 document 那条永远收不到。
+        event.stopPropagation();
+        var item = event.target && event.target.closest ? event.target.closest('[data-add-action],[data-add-dir]') : null;
+        if (!item) { return; }
+        var action = item.getAttribute('data-add-action');
+        if (action === 'directories') { addMenuLevel = 1; renderAddMenu(); return; }
+        if (action === 'files') {
+          closeAddMenu();
+          NS.bridge.post({ type: 'pickFiles' });
+          return;
+        }
+        var path = item.getAttribute('data-add-dir');
+        if (path === '__back__') { addMenuLevel = 0; renderAddMenu(); return; }
+        if (path === '__browse__') {
+          closeAddMenu();
+          NS.bridge.post({ type: 'pickDirectory', purpose: 'additionalDirectories' });
+          return;
+        }
+        toggleAdditionalDirectory(path);
+      });
+    }
     // [CUSTOM-20260930-140] 底栏浮起来了，消息区要靠这个高度才知道该留多少底部空间。
     watchHeight();
   }
@@ -256,7 +314,9 @@ export const composerClient = `
         // retry must carry the selection as it is then, not as it was.
         configSelections: draftSelections(),
         images: draftImages,
-        paths: draftPaths
+        paths: draftPaths,
+        // [CUSTOM-20261010-232] 草稿页显式勾选的额外根目录（additionalDirectories）。
+        additionalDirectories: state.additionalDirectories
       });
       refreshControls();
       return;
@@ -400,6 +460,127 @@ export const composerClient = `
   // [CUSTOM-20261009-210] 给 scroll.ts 的「尾巴被输入卡压住」自愈用的重测出口（见那里的
   // healIfTailCovered）—— 判据在滚动侧（用户看得见的结果），重新落地的动作在这里（唯一写者）。
   var applyHeight = null;
+
+  // --- Add menu (CUSTOM-20261010-232) ----------------------------------------
+  // 输入栏 '+' 菜单：一级「工作区目录 / 文件或文件夹」，二级「返回 + 目录列表 + Browse」。
+  // 额外根目录（additionalDirectories）草稿页可编辑、已有会话只读；真相在 boot 的 draft 对象上。
+
+  function closeAddMenu() {
+    if (addMenu) { addMenu.className = 'picker-menu'; }
+    addMenuLevel = 0;
+  }
+
+  function setDirectoryChoices(message) {
+    state.workspaceFolders = (message && message.workspaceFolders) || [];
+  }
+
+  function toggleAdditionalDirectory(path) {
+    var list = state.additionalDirectories.slice();
+    var idx = list.indexOf(path);
+    if (idx >= 0) { list.splice(idx, 1); } else { list.push(path); }
+    if (state.draft) { NS.draft.setAdditionalDirectories(state.draft.draftId, list); }
+  }
+
+  function setPickedDirectory(path) {
+    if (!path) { return; }
+    var list = state.additionalDirectories.slice();
+    if (list.indexOf(path) < 0) { list.push(path); }
+    if (state.draft) { NS.draft.setAdditionalDirectories(state.draft.draftId, list); }
+  }
+
+  // [CUSTOM-20261010-232] 'Files or folders' 的文件选择器结果：草稿页本地攒、会话页走 attachPath。
+  function setPickedFiles(paths) {
+    if (!paths || paths.length === 0) { return; }
+    if (state.draft) { addDraftPaths(paths); }
+    else if (state.sessionId) { NS.bridge.post({ type: 'attachPath', sessionId: state.sessionId, paths: paths }); }
+  }
+
+  function setAdditionalDirectories(list) {
+    state.additionalDirectories = list || [];
+    renderAdditionalDirectories();
+    if (addMenu && addMenu.className.indexOf('open') !== -1 && addMenuLevel === 1) { renderAddMenu(); }
+  }
+
+  function renderAdditionalDirectories() {
+    if (!additionalDirectoriesEl) { return; }
+    NS.dom.clear(additionalDirectoriesEl);
+    var list = state.additionalDirectories || [];
+    for (var i = 0; i < list.length; i++) {
+      (function (path) {
+        var chip = NS.dom.el('span', 'attachment');
+        var icon = NS.icons.icon('folder', 'chip-icon');
+        if (icon) { chip.appendChild(icon); }
+        chip.appendChild(NS.dom.el('span', 'attachment-name', basenameOf(path)));
+        chip.title = path;
+        if (!state.addDirectoriesReadonly) {
+          var remove = NS.dom.el('button', 'attachment-x', '\\u00d7');
+          remove.title = 'Remove directory';
+          remove.addEventListener('click', function () { toggleAdditionalDirectory(path); });
+          chip.appendChild(remove);
+        }
+        additionalDirectoriesEl.appendChild(chip);
+      })(list[i]);
+    }
+    additionalDirectoriesEl.hidden = list.length === 0;
+    // [CUSTOM-20261010-232] '+' 现在是复合入口（还有 Files or folders），所以**不再**按会话隐藏；
+    // 「Workspace directories」在已有会话里灰置（见 renderAddMenu），Files or folders 照常可用。
+  }
+
+  /** 一级菜单项：图标 + 文字。 */
+  function addMenuItem(action, iconKind, label) {
+    var item = NS.dom.el('button', 'picker-item');
+    item.type = 'button';
+    item.setAttribute('data-add-action', action);
+    var icon = NS.icons.icon(iconKind, 'chip-icon');
+    if (icon) { item.appendChild(icon); }
+    item.appendChild(NS.dom.el('span', 'add-menu-label', label));
+    return item;
+  }
+
+  function renderAddMenu() {
+    if (!addMenu) { return; }
+    NS.dom.clear(addMenu);
+    if (addMenuLevel === 0) {
+      // [CUSTOM-20261010-232] 已有会话里 additionalDirectories 已锁死不可改 ⇒ 灰置该项；
+      // Files or folders（文件引用）任何阶段都能用，照常。
+      var dirsItem = addMenuItem('directories', 'folder', 'Workspace directories');
+      if (state.addDirectoriesReadonly) { dirsItem.disabled = true; }
+      addMenu.appendChild(dirsItem);
+      addMenu.appendChild(addMenuItem('files', 'document', 'Files or folders'));
+      return;
+    }
+    // 二级：返回 + 目录列表 + Browse。
+    var back = NS.dom.el('button', 'picker-item');
+    back.type = 'button';
+    back.setAttribute('data-add-dir', '__back__');
+    back.appendChild(NS.dom.el('span', 'add-menu-label', '← Back'));
+    addMenu.appendChild(back);
+    var folders = state.workspaceFolders || [];
+    var cwd = state.draft ? state.draft.cwd : null;
+    var shown = 0;
+    for (var i = 0; i < folders.length; i++) {
+      if (cwd && folders[i] === cwd) { continue; }
+      var item = NS.dom.el('button', 'picker-item' + (state.additionalDirectories.indexOf(folders[i]) >= 0 ? ' active' : ''));
+      item.type = 'button';
+      item.setAttribute('data-add-dir', folders[i]);
+      var dirIcon = NS.icons.icon('folder', 'chip-icon');
+      if (dirIcon) { item.appendChild(dirIcon); }
+      item.appendChild(NS.dom.el('span', 'add-menu-label', basenameOf(folders[i])));
+      item.title = folders[i];
+      addMenu.appendChild(item);
+      shown++;
+    }
+    if (shown === 0) {
+      addMenu.appendChild(NS.dom.el('div', 'picker-group', 'No workspace folders'));
+    }
+    var browse = NS.dom.el('button', 'picker-item');
+    browse.type = 'button';
+    browse.setAttribute('data-add-dir', '__browse__');
+    var browseIcon = NS.icons.icon('folder', 'chip-icon');
+    if (browseIcon) { browse.appendChild(browseIcon); }
+    browse.appendChild(NS.dom.el('span', 'add-menu-label', 'Browse…'));
+    addMenu.appendChild(browse);
+  }
 
   // --- Slash commands ------------------------------------------------------
 
@@ -914,6 +1095,10 @@ export const composerClient = `
     state.draftPending = false;
     // [CUSTOM-20261005-193] 附件也按草稿记（切走再切回不该串，同文本草稿的道理）。
     state.attachments = draftFilesOf(state.draft ? state.draft.draftId : null);
+    // [CUSTOM-20261010-232] 草稿页可编辑额外根目录（additionalDirectories）；真相在 draft 对象上。
+    state.additionalDirectories = draft ? (draft.additionalDirectories || []) : [];
+    state.addDirectoriesReadonly = false;
+    renderAdditionalDirectories();
     // No session ⇒ no 'meta' yet: mode/model/commands only arrive once the agent
     // has created the session. That is inherent to a draft, not an oversight.
     // [CUSTOM-20260930-151] …but the panel no longer leaves it at that: the HOST keeps a
@@ -1092,12 +1277,18 @@ export const composerClient = `
       // [CUSTOM-20261004-187] 只有"宿主明确说了"才改这个能力位：meta 缺失时保持原值，
       // 免得一次 meta 丢失就把支持 steering 的会话降级成发不出去。
       if (typeof meta.steering === 'boolean') { state.steering = meta.steering; }
+      // [CUSTOM-20261010-232] 会话的额外根目录（只读展示，来自宿主 meta）。
+      state.additionalDirectories = meta.additionalDirectories || [];
     } else {
       state.commands = [];
       state.configOptions = [];
+      state.additionalDirectories = [];
     }
+    // [CUSTOM-20261010-232] 已有会话：额外根目录只读（创建后锁死不可改）。
+    state.addDirectoriesReadonly = true;
     renderPickers();
     renderAttachments();
+    renderAdditionalDirectories();
     renderContext(meta && meta.usage);
     refreshControls();
     autoGrow();
@@ -1162,6 +1353,13 @@ export const composerClient = `
     updateDraftCwd: updateDraftCwd,
     resolveDraft: resolveDraft,
     failDraft: failDraft,
+    // [CUSTOM-20261010-232] 额外根目录（additionalDirectories）：boot 的 setter 回写、目录候选、
+    // Browse 结果都走这三个。
+    setAdditionalDirectories: setAdditionalDirectories,
+    setDirectoryChoices: setDirectoryChoices,
+    setPickedDirectory: setPickedDirectory,
+    // [CUSTOM-20261010-232] 'Files or folders' 文件选择器结果。
+    setPickedFiles: setPickedFiles,
     // [CUSTOM-20261005-193] 草稿页的附件（boot 在没有会话时转到这里，见 attachImage/attachPaths）。
     addDraftImage: addDraftImage,
     addDraftPaths: addDraftPaths,

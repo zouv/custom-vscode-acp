@@ -284,7 +284,11 @@ export const scrollClient = `
     if (healing || distance >= PIN_THRESHOLD) { return; }
     if (!container || !container.lastElementChild) { return; }
     var max = container.scrollHeight - container.clientHeight;
-    if (container.scrollTop < max - 1) { return; }
+    // [CUSTOM-20261010-230] at-max 门槛 1px → 32px（PIN_THRESHOLD）：滚轮滚到底时浏览器常落在
+    // max−N 而非精确 max，1px 容差太紧、自愈根本不触发，尾巴就一直压着（用户 2026-10-10：
+    // "滚动条到底了、Jump 能恢复、滚轮又坏"）。32px 覆盖"滚轮差一格"，仍挡住"往上翻一大段"——
+    // #210 教训 2 的"滚轮被吃光"是 160px 宽窗（distance<32 覆盖 pad+32），32px 远窄于它。
+    if (container.scrollTop < max - PIN_THRESHOLD) { return; }
     if (!NS.dom || !NS.dom.qs || !NS.composer || !NS.composer.refreshHeight) { return; }
     var composer = NS.dom.qs('composer');
     if (!composer || !composer.getBoundingClientRect) { return; }

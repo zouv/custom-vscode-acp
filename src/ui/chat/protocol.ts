@@ -74,6 +74,11 @@ export interface SessionMeta {
    * would send a message into a hole.
    */
   steering?: boolean;
+  /**
+   * [CUSTOM-20261010-232] 会话的额外根目录（多根工作区）。随 meta/focus/boot 下发，客户端只读
+   * 展示 —— additionalDirectories 创建后锁死不可改。缺省 = 没有额外根。
+   */
+  additionalDirectories?: string[];
 }
 
 /** Incremental patch for an existing transcript entry (streaming text, status). */
@@ -211,7 +216,9 @@ export type ExtToChat =
   // 四条都**定向**发给发起请求的那个面（`post(msg, to)` 会绕开合帧队列），
   // 因为它们是"某个文档正在编辑的东西"，广播会让另一个面也长出同一个草稿。
   | { type: 'directoryChoices'; agentName: string | null; workspaceFolders: string[]; recent: string[]; defaultCwd: string }
-  | { type: 'directoryPicked'; path: string | null }
+  | { type: 'directoryPicked'; path: string | null; purpose?: 'cwd' | 'additionalDirectories' }
+  // [CUSTOM-20261010-232] 'Files or folders' 文件选择器结果（多选文件）。
+  | { type: 'filesPicked'; paths: string[] }
   // `draftId` 是**相关性 id，不能省**：`createSession` 会连带触发
   // `session-created → sessionsChanged → focus`，靠"收到一个新 focus 就删草稿"
   // 在慢路径/失败路径上会留下孤儿草稿或误删。
@@ -310,7 +317,9 @@ export type ChatToExt =
   // 三条都**不是**会话作用域：草稿按定义还没有 sessionId（那正是它存在的意义），
   // 所以它们必须和其他非会话作用域消息一样，在 `verifySession` 守卫**之前**处理（§5.4 规则二）。
   | { type: 'listDirectoryChoices'; agentName?: string }
-  | { type: 'pickDirectory' }
+  | { type: 'pickDirectory'; purpose?: 'cwd' | 'additionalDirectories' }
+  // [CUSTOM-20261010-232] 'Files or folders'：打开文件选择器（多选文件）。
+  | { type: 'pickFiles' }
   /**
    * [CUSTOM-20261005-193] 草稿页也可能带附件。
    *
@@ -325,6 +334,8 @@ export type ChatToExt =
     configSelections?: Array<{ configId: string; value: string }>;
     images?: Array<{ id: string; name: string; mimeType: string; dataUrl: string }>;
     paths?: string[];
+    // [CUSTOM-20261010-232] 草稿页显式勾选的额外根目录（additionalDirectories，多根工作区）。
+    additionalDirectories?: string[];
   }
   // [CUSTOM-END] CUSTOM-20260925-058
   // [CUSTOM-BEGIN] CUSTOM-20260930-151 - 草稿页要"显示完整"：问宿主有没有该 agent 上一次会话

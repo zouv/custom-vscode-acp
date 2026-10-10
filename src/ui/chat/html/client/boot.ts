@@ -314,7 +314,7 @@ export const bootClient = `
 
   /** Open a new draft and focus it. 'initialCwd' pre-fills the directory. */
   function startDraft(initialCwd) {
-    var draft = { draftId: 'draft-' + (++draftSeq), cwd: initialCwd || null };
+    var draft = { draftId: 'draft-' + (++draftSeq), cwd: initialCwd || null, additionalDirectories: [] };
     drafts.push(draft);
     focusDraft(draft.draftId);
     return draft;
@@ -349,6 +349,18 @@ export const bootClient = `
     if (focusedDraftId === draftId) {
       NS.tabs.setDraftFocus(draft);
       NS.composer.updateDraftCwd(draftId, draft.cwd);
+    }
+    renderDrafts();
+  }
+
+  // [CUSTOM-20261010-232] 草稿页显式勾选的额外根目录（additionalDirectories）。与 cwd 同一条路：
+  // 真相在 draft 对象上，setter 改完再通知 composer 重渲染 chips。
+  function setDraftAdditionalDirectories(draftId, dirs) {
+    var draft = draftById(draftId);
+    if (!draft) { return; }
+    draft.additionalDirectories = dirs || [];
+    if (focusedDraftId === draftId) {
+      NS.composer.setAdditionalDirectories(draft.additionalDirectories);
     }
     renderDrafts();
   }
@@ -420,6 +432,8 @@ export const bootClient = `
     // 本行的原位置在 NS.draft 里（drop: dropDraft 那一节），挪错过一次，症状是"点了没反应"。
     drop: dropDraft,
     setCwd: setDraftCwd,
+    // [CUSTOM-20261010-232] 草稿页显式勾选的额外根目录（additionalDirectories）。
+    setAdditionalDirectories: setDraftAdditionalDirectories,
     // [CUSTOM-20260925-058] Read-only accessor for the directory drawer: it
     // keeps only the draft id and reads the cwd from here, so there is exactly
     // one copy of "which directory will this draft use" (pitfalls #19).
@@ -662,10 +676,22 @@ export const bootClient = `
       // All four are TARGETED at this document (the draft is this document's).
       case 'directoryChoices':
         NS.directoryMenu.setChoices(message);
+        // [CUSTOM-20261010-232] additionalDirectories 菜单也要工作区根候选 —— 同一份数据喂两处。
+        if (NS.composer && NS.composer.setDirectoryChoices) { NS.composer.setDirectoryChoices(message); }
         break;
 
       case 'directoryPicked':
-        NS.directoryMenu.setPicked(message.path || null);
+        // [CUSTOM-20261010-232] purpose 区分「选 cwd」还是「选 additionalDirectories」。
+        if (message.purpose === 'additionalDirectories' && NS.composer && NS.composer.setPickedDirectory) {
+          NS.composer.setPickedDirectory(message.path || null);
+        } else {
+          NS.directoryMenu.setPicked(message.path || null);
+        }
+        break;
+
+      case 'filesPicked':
+        // [CUSTOM-20261010-232] 'Files or folders' 的文件选择器结果。
+        if (NS.composer && NS.composer.setPickedFiles) { NS.composer.setPickedFiles(message.paths || []); }
         break;
 
       case 'draftResolved':

@@ -755,7 +755,12 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
         void this.handleListDirectoryChoices((msg as { agentName?: string }).agentName, from);
         return;
       case 'pickDirectory':
-        void this.handlePickDirectory(from);
+        // [CUSTOM-20261010-232] purpose 区分「选 cwd」还是「选 additionalDirectories」，随应答回传。
+        void this.handlePickDirectory(from, (msg as { purpose?: 'cwd' | 'additionalDirectories' }).purpose);
+        return;
+      case 'pickFiles':
+        // [CUSTOM-20261010-232] 'Files or folders'：打开文件选择器（多选文件）。
+        void this.handlePickFiles(from);
         return;
       case 'createDraftAndSend':
         void this.handleCreateDraftAndSend(
@@ -767,6 +772,8 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
           // [CUSTOM-20261005-193] 草稿页攒下的附件（草稿还没有会话，客户端先本地拿着）。
           (msg as { images?: Array<{ id: string; name: string; mimeType: string; dataUrl: string }> }).images ?? [],
           (msg as { paths?: string[] }).paths ?? [],
+          // [CUSTOM-20261010-232] 草稿页显式勾选的额外根目录（多根工作区）。
+          (msg as { additionalDirectories?: string[] }).additionalDirectories ?? [],
           from,
         );
         return;
@@ -2715,7 +2722,7 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
   }
 
   /** Native folder picker — the webview cannot open one itself. */
-  private async handlePickDirectory(to: SurfaceKey): Promise<void> {
+  private async handlePickDirectory(to: SurfaceKey, purpose?: 'cwd' | 'additionalDirectories'): Promise<void> {
     const picked = await vscode.window.showOpenDialog({
       canSelectFiles: false,
       canSelectFolders: true,
@@ -2723,7 +2730,19 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       openLabel: 'Use this directory',
       defaultUri: vscode.Uri.file(this.sessionManager.resolveDefaultCwd()),
     });
-    this.post({ type: 'directoryPicked', path: picked?.[0]?.fsPath ?? null }, to);
+    this.post({ type: 'directoryPicked', path: picked?.[0]?.fsPath ?? null, purpose }, to);
+  }
+
+  /** [CUSTOM-20261010-232] Native file picker — 'Files or folders' 菜单项（多选文件）。 */
+  private async handlePickFiles(to: SurfaceKey): Promise<void> {
+    const picked = await vscode.window.showOpenDialog({
+      canSelectFiles: true,
+      canSelectFolders: false,
+      canSelectMany: true,
+      openLabel: 'Add files',
+      defaultUri: vscode.Uri.file(this.sessionManager.resolveDefaultCwd()),
+    });
+    this.post({ type: 'filesPicked', paths: (picked ?? []).map(uri => uri.fsPath) }, to);
   }
 
   /**
@@ -2748,6 +2767,8 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
     // [CUSTOM-20261005-193] 草稿页攒的附件：客户端本地拿着（草稿没有会话），随这条消息一起交上来。
     images: Array<{ id: string; name: string; mimeType: string; dataUrl: string }> = [],
     paths: string[] = [],
+    // [CUSTOM-20261010-232] 草稿页显式勾选的额外根目录（多根工作区）。
+    additionalDirectories: string[] = [],
     to: SurfaceKey = 'view',
   ): Promise<void> {
     const agent = this.panelAgent(agentName);
@@ -2764,7 +2785,7 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
     log(`${LOG_PREFIX}: draft ${draftId}: creating a session for ${agent} in ${target}`);
 
     try {
-      const session = await this.sessionManager.createSession(agent, { cwd: target, focus: true });
+      const session = await this.sessionManager.createSession(agent, { cwd: target, focus: true, additionalDirectories });
       // Resolve the draft BEFORE starting the turn: `handleSendPrompt` awaits the
       // whole turn (it is what carries the stop reason back), and the client must
       // be able to swap its draft tab for the real one immediately.
@@ -3181,6 +3202,8 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       // Attachments live here so they survive a focus/boot round-trip; the
       // standalone `attachments` message is only for immediate feedback.
       attachments: this.attachments.get(sessionId) ?? [],
+      // [CUSTOM-20261010-232] 额外根目录（多根工作区）——只读展示，随 focus/boot 下发。
+      additionalDirectories: session?.additionalDirectories ?? [],
     };
   }
 

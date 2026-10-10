@@ -58,6 +58,8 @@ export interface SessionInfo {
   agentName: string;
   agentDisplayName: string;
   cwd: string;
+  /** [CUSTOM-20261010-232] 额外根目录（多根工作区），创建会话时由用户显式勾选。 */
+  additionalDirectories?: string[];
   createdAt: string;
   initResponse: InitializeResponse;
   modes: SessionModeState | null;
@@ -89,6 +91,11 @@ export interface AgentCapabilitySummary {
   close: boolean;
   /** [CUSTOM-20260923-010] `session/fork` — advertised the same way. */
   fork: boolean;
+  /**
+   * [CUSTOM-20261010-231] `sessionCapabilities.additionalDirectories` — the agent
+   * can activate extra workspace roots beyond `cwd` (multi-root workspaces).
+   */
+  additionalDirectories: boolean;
 }
 
 /**
@@ -374,6 +381,8 @@ export class SessionManager extends EventEmitter {
       // multi-session teardown needs to shut a session down honestly.
       close: !!sc?.close,
       fork: !!sc?.fork,
+      // [CUSTOM-20261010-231] 多根工作区：agent 是否支持 additionalDirectories。
+      additionalDirectories: !!sc?.additionalDirectories,
     };
   }
 
@@ -534,9 +543,9 @@ export class SessionManager extends EventEmitter {
    */
   async createSession(
     agentName: string,
-    opts: { focus?: boolean; cwd?: string } = {},
+    opts: { focus?: boolean; cwd?: string; additionalDirectories?: string[] } = {},
   ): Promise<SessionInfo> {
-    const { focus = true, cwd: requestedCwd } = opts;
+    const { focus = true, cwd: requestedCwd, additionalDirectories = [] } = opts;
     const cwd = requestedCwd || this.resolveDefaultCwd();
 
     const configs = getAgentConfigs();
@@ -561,7 +570,7 @@ export class SessionManager extends EventEmitter {
       // persisted rather than dropped.
       const sessionInfo = await this.enqueueControl(
         agentId,
-        () => this.createAcpSession(agentName, agentId, connInfo, cwd),
+        () => this.createAcpSession(agentName, agentId, connInfo, cwd, additionalDirectories),
       );
 
       this.addSessionToAgent(agentName, sessionInfo.sessionId);
@@ -680,12 +689,22 @@ export class SessionManager extends EventEmitter {
     agentId: string,
     connInfo: ConnectionInfo,
     cwd: string,
+    additionalDirectories: string[] = [],
   ): Promise<SessionInfo> {
+    // [CUSTOM-20261010-232] 多根工作区：additionalDirectories 由调用方**显式**传入（草稿页用户
+    // 勾选的额外根目录），这里只做两道闸门 —— agent 声明了该能力 + 校验为绝对路径。不再自动把
+    // 全部工作区根塞进去（231 那版"太隐含"，已回退）。
+    const extra = this.capabilities.get(agentName)?.additionalDirectories
+      ? (additionalDirectories ?? [])
+        .filter(p => typeof p === 'string' && p.trim().length > 0 && isAbsolute(p.trim()))
+        .map(p => p.trim())
+      : [];
     let sessionResponse: NewSessionResponse;
     try {
       sessionResponse = await connInfo.connection.newSession({
         cwd,
         mcpServers: [],
+        ...(extra.length ? { additionalDirectories: extra } : {}),
       });
     } catch (e: any) {
       if (!this.isAuthRequiredError(e)) {
@@ -699,6 +718,7 @@ export class SessionManager extends EventEmitter {
         sessionResponse = await connInfo.connection.newSession({
           cwd,
           mcpServers: [],
+          ...(extra.length ? { additionalDirectories: extra } : {}),
         });
       } catch (retryErr) {
         logError('Failed to create session after authentication', retryErr);
@@ -715,6 +735,8 @@ export class SessionManager extends EventEmitter {
         connInfo.initResponse.agentInfo?.name ||
         agentName,
       cwd,
+      // [CUSTOM-20261010-232] 会话的额外根目录，供只读展示（extra 已按能力位 + 绝对路径过滤）。
+      additionalDirectories: extra.length ? extra : undefined,
       createdAt: new Date().toISOString(),
       initResponse: connInfo.initResponse,
       modes: sessionResponse.modes ?? null,
