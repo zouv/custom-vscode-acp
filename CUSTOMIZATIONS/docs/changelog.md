@@ -17,6 +17,122 @@
 
 ---
 
+### 2026-10-10 - CUSTOM-20261010-229
+- **功能**：修「渲染含 diff 的工具卡抛 ReferenceError，hydrate 循环被打断 → 拉不到底」
+- **改动文件**：`src/ui/chat/html/client/toolCallView.ts`、`src/test/chat-client.test.ts`
+- **来源**：用户 2026-10-10「还是一样拉不到底，昨天白天还是好的」
+- **详细说明**：223 给 `renderDiff` 加"diff 默认展开"（Edit/Write/Delete/Move 卡的 diff 默认展开）时，在函数体里用了 `tool.kind` 判 kind，却**忘了把 `tool` 传进 `renderDiff`/`renderContentItem`** —— 于是每渲染一张含 diff 的工具卡都抛 `ReferenceError: tool is not defined`（真机日志 `client(error): uncaught ... @line 2481`，会话加载时连刷 8+ 次），hydrate 循环当场断掉、该卡及之后的所有条目都渲染不出来。这正是「有一部分内容看不到 + 拉不到底 + 大纲还有很多条目」的机制（大纲与 DOM 同源，但渲染在错误点中断）。修法是给 `renderContentItem(item, key, entryId, tool)` / `renderDiff(item, key, tool)` 补上 `tool` 参数。**教训**：模板串里的注释禁反引号（pitfall #11），本次第一版修复就在注释里写了反引号、把模板串提前终结。
+- **验证方式**：`npm run compile` 通过；`check-webview-client.mjs` 22 模块可解析；`npx mocha out/test/chat-client.test.js` 235 passing（新增「edit 卡的 diff 能渲染且默认展开」回归用例）
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-10 - CUSTOM-20261010-228
+- **功能**：修「触底自愈在矮视口里死循环」
+- **改动文件**：`src/ui/chat/html/client/scroll.ts`、`src/test/chat-client.test.ts`（文档：`docs/pitfalls.md` #62）
+- **来源**：用户 2026-10-10（附图）「消息面板触底的异常又出现了——往下滑到底没法再往下滑，实际下面还有内容，右侧大纲显示还有很多消息条目」
+- **详细说明**：210 加的 `healIfTailCovered` 自愈，判据只问「末条记录底边是否被输入卡压住」，而**视口极矮**（composer 几乎占满视图区，真机日志 `ch=152 / cv=120px`）时这条恒为真、自愈重测却改不了任何东西（`--acpc-composer-h` 本来就对）⇒ 反复触发（104 次 `tail-covered-heal`）并伴随 composer 高度 1px 震荡。修法是给自愈加一道门槛：**只有变量真的失真**（composer 实高比 `--acpc-composer-h` 高出 ≥2px，容差吸收亚像素取整）才重测——「被盖是变量失真」还是「被盖是视口矮」由此分开。
+- **验证方式**：`npm run compile` 通过；`node CUSTOMIZATIONS/scripts/check-webview-client.mjs` 22 模块可解析；`npx mocha --ui tdd out/test/chat-client.test.js` 234 passing（新增「变量已是正确值 ⇒ 绝不重测」回归用例）
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-09 - CUSTOM-20261009-227
+- **功能**：修「目录缩写取了整条路径（DGAD）而不是最底层目录名（SMP）」+「4 个字母没有 2x2 换行」
+- **改动文件**：`src/ui/chat/html/client/tabs.ts`、`src/ui/chat/html/styles.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（文档：`chat-panel.md` §5.51、`dev-workflow.md` 验收 241）
+- **来源**：用户 2026-10-09（附图：图标显示 DGAD，4 个字母一行）「目录图标的名称缩写不对，应该取最底部的目录名的缩写，并且使用2x2两行布局（现在没有剔除父目录等前缀，而且4个字母没有换行）」
+- **详细说明**：两个独立 bug。①**反斜杠在模板串里被吃了一层**：`cwd.split(/[\\/]/)` 在模板串里求值后客户端拿到 `/[\/]/`（只匹配正斜杠），Windows 路径（`D:\Git\…`）整条不拆 ⇒ 整条路径进拆词 ⇒ 取前 4 个词首字母 = DGAD。修法：模板串里写**四个**反斜杠（`/[\\\\/]/`），客户端拿到 `/[\\/]/`（同时匹配两种分隔符）。实测验证：编译产物 eval 后 split 正确拆出 ['D:','Git','zgame_ai_coding','ai-vibe-creator'] → AVC。②**2x2 布局没生效**：`NS.dom.el(tag, cls, text)` 把缩写当一个文本节点，一行排不下才换行 ⇒ 4 个字母挤一行。修法：每个字母一个 `<span class="dir-letter">`（宽度 50%），4 字母自然排成 2x2 两行。
+- **验证方式**：真 Chromium 读数（`#tabsprobe` 档：ABGD 排 2 行、SMP/ADF 各 3 行、T 1 行；尺寸 16×16）；`npm test` 446 passing
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-09 - CUSTOM-20261009-226
+- **功能**：修「目录图标完成态看不见」与「图标是矩形不是方形、偏大」
+- **改动文件**：`src/ui/chat/html/styles.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（文档：`chat-panel.md` §5.51、`dev-workflow.md` 验收 241）
+- **来源**：用户 2026-10-09（附图：完成态的 tab 左侧图标几乎看不见）「目录图标可以稍微小一些，并且使用方形；没有看到目录缩写的文字；会话处于完成状态时就看不到目录图标了（看着是颜色原因）」
+- **详细说明**：根因是 225 把状态色写在 `color:` 上，而 `background: currentColor` 会把 color 当背景用 —— 完成态（无状态类）时 color 是 `descriptionForeground`（灰）、背景灰、文字近黑 ⇒ 看不见。修法：**状态色只给 background-color，文字色固定在 color 上**（不再吃状态类）；外圈单独读 `--tab-dot-state` 自定义属性（background-color 不能给 currentColor 用）。方形化：宽高都 16px（从 18 缩到 16）。**探针发现的隐藏 bug**：预览主题里没有 `--vscode-charts-orange/yellow/blue` 三个 token ⇒ waiting/loading/attention 三态的 background-color 算出来是透明（`rgba(0,0,0,0)`）—— 补齐后五态全是对比色。
+- **验证方式**：真 Chromium 读数（`#tabsprobe` 档：五态 bg/fg 全是对比色，尺寸 16×16：空闲 rgb(157,157,157)/rgb(31,31,31)、运行 rgb(14,112,192)、等待 rgb(231,138,78)、载入 rgb(229,192,123)、后台 rgb(77,170,252)）；`npm test` 446 passing
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-09 - CUSTOM-20261009-225
+- **功能**：会话 tab 左侧加**目录标识**（文字组合图标，两色设计）
+- **改动文件**：`src/ui/chat/html/client/tabs.ts`、`src/ui/chat/html/styles.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（文档：`chat-panel.md` §5.16、`dev-workflow.md` 验收 241）
+- **来源**：用户 2026-10-09「像个会话tab加一个所在目录的标识，有什么好的设计建议？先讨论」→「采用方案D：左侧加目录图标（使用文字组合图标）；将左侧状态圆点改造下，圆点放大并替换为目录图标；目录图标采用两色设计：文字+文字色对应不同目录，背景色保留原"圆点"的状态色设计；目录图标的文字规则：取目录名单词的头几个字母（最多4个，2x2布局）」
+- **详细说明**：状态圆点（7px 圆点）改造成 18px 圆角方块，里面写目录缩写（最多 4 个字母，按非字母数字 + 驼峰边界拆词取首字母，大写）。背景色保留原"圆点"的状态色（currentColor 的 background），文字用对比色（var(--vscode-editor-background)）。缩写规则：'story-myriad-pavilion' → 'SMP'，'AbcDeFg' → 'ADF'，'abc-de-fg' → 'ADF'。**踩坑**：拆词不用正则 lookbehind（本文件要走 check-webview-client.mjs 的 new Function 解析，lookbehind 在它的目标解析里会报 Unexpected token）—— 用两轮拆分（先按非字母数字切，再按驼峰边界切）。
+- **验证方式**：真 Chromium 读数（`#tabs` 档下 8 个 tab 的 dot 文本：T/T/T/T/T/SMP/ADF/ADF）；`npm test` 446 passing
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-09 - CUSTOM-20261009-224
+- **功能**：上下文圆环的 tooltip 里显示**思考 token 数**（`usage_update.thoughtTokens`），有就显示、没有就不显示
+- **改动文件**：`src/ui/chat/protocol.ts`、`src/ui/chat/ChatPanelHost.ts`、`src/ui/chat/html/client/composer.ts`、`src/test/chat-panel.test.ts`（文档：`chat-panel-records.md` §5.16、`dev-workflow.md` 验收 239）
+- **来源**：用户 2026-10-09「claude 官方 vscode 插件，thinking 卡片，在进行状态时会动态显示一个动态token统计，这个是从哪里读的，能加上吗」
+- **详细说明**：ACP 的 `Usage` 类型里有 `thoughtTokens` 字段，但实测当前适配器发过来的 `usage_update` 只有 `used` / `size` / `_meta._claude/model` —— 没有 `thoughtTokens`。所以是**兜底显示**：有就加在 tooltip 里（`· Nk thinking`），没有就不显示。不猜、不编一个数。
+- **验证方式**：宿主用例 1 条（`thoughtTokens: undefined` 时 tooltip 不含 thinking 字样）；`npm test` 446 passing
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-09 - CUSTOM-20261009-223
+- **功能**：Edit/Write 卡的正文（diff）默认展开（外层卡片折叠时，里面的 diff 不再折叠）
+- **改动文件**：`src/ui/chat/html/client/toolCallView.ts`（文档：`chat-panel-records.md` §5.26、`dev-workflow.md` 验收 240）
+- **来源**：用户 2026-10-09（附图：Edit 卡的 diff 折叠着）「Edit 类型卡片（Editor和Write），因为外层卡片默认是折叠的，里面文件的折叠希望默认展开」
+- **详细说明**：Edit/Write/Delete/Move 的 diff 默认展开（`body.hidden = false`），Bash 的输出照旧默认收起（118 定案：长会话会变成一堵命令输出墙）。`aria-expanded` 与 caret 字形同步（▾ 展开 / ▸ 收起）。`captureExpansion`/`applyExpansion` 仍然保住用户手动收起的态（040 的既有机制）。
+- **验证方式**：`npm test` 446 passing（无新增用例 —— 默认态的改动，既有 040 的展开保持用例已覆盖）
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-09 - CUSTOM-20261009-222
+- **功能**：子 agent chip 的 tooltip 带上**主 agent 派给它的指令**（`rawInput.prompt`，截断到 ~200 字）
+- **改动文件**：`src/ui/chat/transcript/types.ts`、`src/ui/chat/transcript/ToolInvocationStore.ts`、`src/ui/chat/html/client/toolCallView.ts`（文档：`chat-panel-records.md` §5.26、`dev-workflow.md` 验收 238）
+- **来源**：用户 2026-10-09「rawInput.prompt（Agent 的完整指令），可以先截断只显示一部分，后续再看怎么迭代优化」
+- **详细说明**：`rawInput.prompt` 在首帧 `tool_call` 上就有（与 `subagent_type` 同帧），截断后进 tooltip。完整版本来就在卡片的正文里（Agent 调用的第一个内容块就是 prompt 本身），这里只是让 tooltip 能回答"我让它去干什么"。
+- **验证方式**：`npm test` 446 passing（无新增用例 —— 字段只是从已有数据源透传，219 的用例已覆盖 latch 链路）
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-09 - CUSTOM-20261009-221
+- **功能**：工具卡显示**工具自己报的耗时**（`toolResponse.elapsedTimeSeconds`），比 host 算的 `elapsedMs` 更准（不含传输与渲染开销）；子 agent 卡的正文限高同步放大 340→510px
+- **改动文件**：`src/ui/chat/transcript/types.ts`、`src/ui/chat/transcript/ToolInvocationStore.ts`、`src/ui/chat/content/toolCalls.ts`、`src/ui/chat/html/client/toolCallView.ts`、`src/ui/chat/html/styles.ts`（文档：`chat-panel-records.md` §5.26、`dev-workflow.md` 验收 237）
+- **来源**：用户 2026-10-09「子 agent 卡展开后高度再放大 1/2」+「其他kind类型的卡片的显示有优化空间吗，还有没有前天有价值的信息可以显示出来？比如之前 subagent 的 toolResponse.agentType 就没有渲染出来，其实这是很有用的信息」
+- **详细说明**：`toolResponse.elapsedTimeSeconds` 只在**完成的那一条** update 里出现一次（与 `subagent_type` 同形），所以 latch 而不是按需读。卡头的耗时显示优先用它，没有才回退到 `elapsedMs`（`endedAt - startedAt`）；tooltip 标注来源（'Reported by the tool' vs 'This tool call took'）。子 agent 卡的正文限高同步放大 340→510px（用户同一句"子 agent 卡展开后高度再放大 1/2"）。
+- **验证方式**：真 Chromium 读数（`#tools` 档下 `max-height: 510px`、`tool-time` 的 title 区分两种来源）；`npm test` 446 passing
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-09 - CUSTOM-20261009-220
+- **功能**：修「工具输出里那张真表格看着怪」——md 块之间的换行被 `white-space: pre-wrap` 又渲染了一遍（每行多一行空白、单元格内按原文折行）
+- **改动文件**：`src/ui/chat/html/client/toolCallView.ts`、`src/ui/chat/html/styles.ts`、`src/test/chat-client.test.ts`（文档：`chat-panel-records.md` §5.26、`dev-workflow.md` 验收 236、`pitfalls.md` #11 复发记录 2）
+- **来源**：用户 2026-10-09（附图：图1，表格有渲染但间距异常）「表格确实有渲染了，但看着有点怪」
+- **详细说明**：218 拆围栏之后，内容进了 `div.tool-text` —— 它的规则是 `white-space: pre-wrap; word-break: break-word`（工具正文一直是字面文本，从没拿到过 markdown）。拿到 markdown 的宿主走 `setSanitizedHtml`（元素化），pre-wrap 把 marked 输出的块间换行**再渲染一遍** ⇒ 表格每行下多一行空白、`约**十二万九千六百年**` 被折成两行两截。修法两条：①两处 `tool-text` 宿主都补 `.md` 类（与 `.thought-body.md` 同一套排版，pitfall #19——"修一侧漏一侧"的温床）；②`.md th/.md td` 补 `white-space: normal; word-break: keep-all; overflow-wrap: anywhere`（长中文词不在词中断开，窄列里仍能折行）。**当日就踩了同一条地雷**：注释里写裸反引号，`check-webview-client.mjs` 拦下 —— pitfalls #11 的复发记录 2 把它记上了。
+- **验证方式**：客户端 1 条（拿到 markdown 的宿主带 `.md` 类）；真 Chromium 读数（`#tools` 档下 DOM 里出现 `class="tool-text md"`、`word-break: keep-all` 在样式表里）；`npm test` 446 passing
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-09 - CUSTOM-20261009-219（修订：判据已按实测改正）
+- **功能**：把「子 agent 的产出」标出来（用户问："有的消息是主 agent 输出，有的是子 agent 输出，能区分吗"）
+- **改动文件**：`src/ui/chat/transcript/types.ts`、`src/ui/chat/transcript/ToolInvocationStore.ts`、`src/ui/chat/content/toolCalls.ts`、`src/ui/chat/html/client/toolCallView.ts`、`src/ui/chat/html/styles.ts`、`src/test/chat-panel.test.ts`、`src/test/chat-client.test.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（文档：`chat-panel-records.md` §5.26、`dev-workflow.md` 验收 234）
+- **来源**：用户 2026-10-09（附图：一条"读起来像子 agent 报告"的正文气泡）「消息类内容，有的是主agent输出，有的是子agent输出，这个能区分吗？」；**当日追问**："子 agent 加了标识吗，没看出有什么差异，是不是没改到"
+- **详细说明（修订）**：首版只认 `_meta.claudeCode.toolResponse.agentType`，而**当前适配器发出来的 `toolResponse` 根本没有 `agentType`**（三个日志里 `agentType` 出现 0 次；`toolResponse` 的实测形状只有 `{elapsedTimeSeconds}` 与 Bash 的 `{stdout,stderr,interrupted,backgroundTaskId,…}`）——那是更早一次**已轮转**日志里的另一种载荷，我引的那句"实测抓包"基于它。**真正稳定的信号是 `rawInput.subagent_type`**（委派调用的**输入**里就写着派给谁，首帧 `tool_call` 上就有）：实测 `Explore` / `Plan` / `story_editor`，三个日志里每次 Agent 调用都有。`agentType` 形状保留作兜底。渲染路径不变：`ToolInvocation.subagent` latch → `ToolCallView.subagent` 直通 → 客户端 `applySubagent`（卡头 chip `subagent · <type>` + tooltip；无命令行的卡正文段标 'Sub-agent report'）。`bodySignature` 补 `sub:`（INV-H）。**教训**：先拿真载荷再写断言；首次引用某个字段前必须在**当前**日志里 `grep` 到它（pitfalls #19 的同族）。
+- **验证方式**：客户端 3 条 + 宿主 3 条（判据改为 `rawInput.subagent_type` 优先、`toolResponse.agentType` 兜底、都没有就不算委派）；真 Chromium `#subagentprobe` 不变（chip 文本 / tooltip / 正文段标 / 背景色）；`npm test` 446 passing
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-09 - CUSTOM-20261009-218
+- **功能**：工具输出里**真的是** markdown 表格时，渲染成真表格
+- **改动文件**：`src/ui/chat/html/client/toolCallView.ts`、`src/test/chat-client.test.ts`（文档：`chat-panel-records.md` §5.26、`dev-workflow.md` 验收 233）
+- **来源**：用户 2026-10-09（附图：Bash 卡的 OUT 里一张 md 表格按字面显示）「bash执行输出的文本没有格式化渲染（是一段md文本，应该按md渲染）」
+- **详细说明**：根因**不是**"没渲染 markdown"——渲染了：Claude Code 把 stdout 包在一条三反引号围栏（语言标 `console`）里发过来（抓包原文：`content:[{type:'text',text:'```console\n=== 14.1 表 ===\n|…\n```'}]`），而 066 建立、121 又细化过的规则把围栏渲染成**代码块**（等宽 + Copy），围栏里的 md 语法因此是字面量。判据由用户 2026-10-09 选定为**刻意窄的一条**：**整段恰好是一条围栏 且 围栏内容里真有一行 GFM 表格分隔行**时才拆（`toolMarkdownSource`）⇒ "脚本自己打印 markdown"变真表格，而 `ls -la` / `git diff` / 代码片段照旧是代码块（一律拆的代价：`#` 开头变标题、`-` 开头变列表、4 空格缩进变代码块）。**两个来源同一判据**：内容块文本与 `rawOutput` 兜底（含表格才走 markdown 往返）。助手正文里的围栏不动（那是引用，不是产出）。
+- **验证方式**：客户端 2 条（含表格 ⇒ 交给 markdown 的是**无围栏**内容；不含 ⇒ 围栏保留）+ `npm test` 446 passing
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-09 - CUSTOM-20261009-217
+- **功能**：Thought 展开态的正文高度上限 300px → 600px
+- **改动文件**：`src/ui/chat/html/styles.ts`、`CUSTOMIZATIONS/scripts/preview-records.mjs`（文档：`chat-panel-records.md` §5.16、`dev-workflow.md` 验收 235）
+- **来源**：用户 2026-10-09「Thought 卡片展开后显示的内容高度有点低，加大一倍」
+- **详细说明**：`.thought-body` 是**滚动视口**（超出才滚），它的 `max-height` 从 300px 翻倍到 600px —— 长推理一次能看到更多。顺带把预览主题缺的两个 token（`--vscode-badge-background` / `--vscode-badge-foreground`）补上：真主题一定有它们，缺了会让 219 的子 agent chip 与 `.tool-name` 撞成同色，"看截图"这条验收就白搭。
+- **验证方式**：真 Chromium 读数（`#subagentprobe` 的 `thoughtMaxHeight: "600px"`）
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-09 - CUSTOM-20261009-216
+- **功能**：修「引用了文件的消息 reload 后变回原文 `[@名](file:///…)`」
+- **改动文件**：`src/ui/chat/markdown.ts`、`src/ui/chat/diskSessions.ts`、`src/ui/chat/ChatPanelHost.ts`、`src/ui/chat/transcript/types.ts`、`src/test/chat-panel.test.ts`（文档：`chat-panel-records.md` §5.16、`dev-workflow.md` 验收 231/232、`pitfalls.md` #63）
+- **来源**：用户（附图）「引用了文件的消息发出去后，消息面板里这条"用户消息卡片"能看到引用的文件，但是会话重新 reload 后，就变成图片的样子」
+- **详细说明**：
+  - **根因（全部实测）**：面板把引用按 ACP `resource_link` 块发出去，Claude Code 却把它**序列化成一段文本**存进自己的转录（`[{text: 正文}, {text: '[@名](file:///…)'}]`），`session/load` 回放时把这两块**各发一条 `user_message_chunk`**（共用同一个 messageId；`acp-client-custom.log` 有原文，转录 `87179583-*.jsonl` 三条用户记录都是这个形状）。宿主原先只认**块**，于是那段文本被当正文又建一条用户气泡 —— 而用户气泡正文是**纯文本节点**（`transcriptView.buildUserBubble`，不跑 markdown）⇒ markdown 原样露出来。图片没这问题：111 早就做了「replay 前读转录 → 按 messageId 并回同一气泡 → 丢掉附件 chunk」。
+  - **修法**：把文件引用接进 111 那条既有链路。①`markdown.fileMentionViews(text)`：整段（trim 后）每一段都是 `[@名](本地路径)` 时产出 `resource_link` 视图（`path` 复用 184 的 `fileLinkTarget`，`name` 把 `#L437-440` 归一成 live chip 的 `:437-440`）。②`diskSessions.readTranscriptUserAttachments` **取代** `readTranscriptUserImages`（图片与文件引用本来就是同一条记录的同一批块，一次扫描收齐，顺带把 open 会话时的三遍扫文件收成两遍），每 uuid 返回 `{images, files, hasProse}`。
+  - **丢弃的判据是"这条记录**有没有正文**"，不是"转录里知道这条 messageId"**：用户完全可以只引用文件、不打字（215 支持：空文字 + 附件落成 `content` 条目），那种消息回放时**只有**附件 chunk —— 按后者处理它会连记录一起消失（**比现在的原文更糟**）。有正文 ⇒ 附件随正文 chunk 进气泡、附件 chunk 丢弃；没有正文 ⇒ 附件 chunk 自己渲染。同一判据顺带修掉 111 留下的同类洞（只有图片没有正文的消息此前也被丢掉）。
+  - 读不到转录 / 非 Claude Code agent：mention chunk 落成 `content` 条目（与发送路径同形），**绝不显示原文，也不静默丢信息**（已知残留：那种情况下正文气泡与 chip 会是两条记录）。
+- **验证方式**：宿主测试 2 条（①有正文：气泡**一条**、`attachments` 含 `resource_link`、`path`/`name` 逐字正确、mention chunk 不另建记录；②只有引用：落成一条 `content`、全文里不出现 `](file:///`）；`npm test` 全绿（438 passing）
+- **基于上游版本**：0.2.0（commit e7371659）
+
 ### 2026-10-09 - CUSTOM-20261009-215
 - **功能**：修「引用了文件的消息发出去后，用户消息卡片里看不到引用的文件」
 - **改动文件**：`src/ui/chat/ChatPanelHost.ts`、`src/test/chat-panel.test.ts`（文档：`chat-panel-records.md` §5.16 表格行、`dev-workflow.md` 验收 230）

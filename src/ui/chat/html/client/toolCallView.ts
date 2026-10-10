@@ -31,6 +31,50 @@ export const toolCallViewClient = `
   // render as a clickable chip.
   var OPENABLE_SCHEME = /^(https?:|mailto:)/i;
 
+  // [CUSTOM-BEGIN] CUSTOM-20261009-218 - 工具输出里**真的是** markdown 表格时要变成真表格。
+  //
+  // 现象（用户报）：Bash 卡片的 OUT 里明明是一张 markdown 表格，却按字面显示（竖线、
+  // '|---|---|' 全都看得见）。根因**不是**"没渲染 markdown" —— 渲染了：Claude Code 把 stdout
+  // 包在一条三反引号围栏（语言标 console）里发过来（抓包原文的 text 字段就是以三反引号 +
+  // console 开头、以三反引号结尾，里面是 '=== 14.1 表 ===' 与那张表格），而 066 建立的规则把
+  // 围栏渲染成**代码块**（等宽 + Copy，那是刻意的：不要露出字面围栏），围栏里的 md 语法因此
+  // 就是字面量。
+  //
+  // 判据刻意窄（用户 2026-10-09 选定）：**整段恰好就是一个围栏**、且围栏内容里真有一行 GFM
+  // 表格分隔行（'|---|---|' 那种只由竖线/短横/冒号组成的行）时，才拆掉围栏、把内容按 markdown
+  // 渲染。于是
+  //   · 'node scripts/xxx.mjs' 这类"脚本自己打印 markdown"的输出 → 真表格；
+  //   · 'ls -la' / 'git diff' / 代码片段 → 照旧是代码块（'#' 开头的注释不会变成标题、
+  //     '-' 开头的行不会变成列表 —— 那些正是"一律拆"的代价）。
+  // 只在**工具卡片 / content 记录**这条渲染路上生效：助手正文里的围栏不动（那是引用，不是产出）。
+  //
+  // ⚠️ 本文件嵌在模板字符串里：注释与代码里都**不要出现裸反引号**（它会直接结束模板串，
+  // pitfall #11），所以下面的围栏字面量用 String.fromCharCode 拼出来。
+  // [CUSTOM-END] CUSTOM-20261009-218
+  var FENCE = String.fromCharCode(96, 96, 96);
+  var TABLE_SEPARATOR = /^[ \\t]*\\|[\\s:|-]+\\|[ \\t]*$/m;
+
+  /** True when this text carries a GFM table (a separator row of pipes and dashes). */
+  function hasTableRow(text) {
+    return TABLE_SEPARATOR.test(String(text === null || text === undefined ? '' : text));
+  }
+
+  /**
+   * [CUSTOM-20261009-218] The markdown source for one tool-output text: the text
+   * itself, or the inside of its fence when the whole text is a single fence whose
+   * content is a markdown table. See the block comment above.
+   */
+  function toolMarkdownSource(text) {
+    var value = String(text === null || text === undefined ? '' : text);
+    var lines = value.trim().split('\\n');
+    if (lines.length < 3) { return value; }
+    // First line opens a fence, last line is exactly the closing fence.
+    if (lines[0].indexOf(FENCE) !== 0) { return value; }
+    if (lines[lines.length - 1].trim() !== FENCE) { return value; }
+    var inner = lines.slice(1, lines.length - 1).join('\\n');
+    return hasTableRow(inner) ? inner : value;
+  }
+
   function splitLines(text) {
     if (text === null || text === undefined) { return []; }
     var value = String(text);
@@ -111,7 +155,11 @@ export const toolCallViewClient = `
     return out;
   }
 
-  function renderDiff(item, key) {
+  // [CUSTOM-20261010-229] 'tool' 是 223 落下的病：renderDiff 里用 tool.kind 判默认展开，
+  // 却没把 tool 传进来 —— 于是每渲染一张 Edit/Write/Delete/Move 卡的 diff 都抛
+  // ReferenceError（tool is not defined），hydrate 循环当场断掉、后面的条目全渲染不出来
+  // （用户报的"有一部分内容看不到 + 拉不到底"）。补齐参数。
+  function renderDiff(item, key, tool) {
     var el = NS.dom.el;
     var wrap = el('div', 'diff');
     // [CUSTOM-20260925-040] Identity used to carry the user's expansion state
@@ -127,8 +175,11 @@ export const toolCallViewClient = `
     var head = el('button', 'diff-head');
     head.type = 'button';
     head.setAttribute('data-diff-toggle', '1');
-    head.setAttribute('aria-expanded', 'false');
-    var caret = el('span', 'tool-caret', '\\u25b8');
+    // [CUSTOM-20261009-223] aria-expanded 必须与 body.hidden 同步：默认展开时它是 'true'。
+    var defaultOpen = tool.kind === 'edit' || tool.kind === 'delete' || tool.kind === 'move';
+    head.setAttribute('aria-expanded', defaultOpen ? 'true' : 'false');
+    // [CUSTOM-20261009-223] caret 必须与 body.hidden 同步：默认展开时它是 ▾。
+    var caret = el('span', 'tool-caret', defaultOpen ? '\\u25be' : '\\u25b8');
     head.appendChild(caret);
     var path = el('span', 'diff-path', item.path || '(new file)');
     path.title = item.path || '';
@@ -142,7 +193,12 @@ export const toolCallViewClient = `
     wrap.appendChild(head);
 
     var body = el('div', 'diff-body');
-    body.hidden = true;
+    // [CUSTOM-20261009-223] Edit/Write 卡的正文默认展开（用户 2026-10-09：外层卡片折叠时，
+    // 里面的 diff 也折叠，要看到改动必须点两次）。正文默认展开后，外层卡片一点开就能看到 diff。
+    // 只改 Edit/Write（kind 是 edit / delete / move 的调用），Bash 的输出照旧默认收起（118 定案：
+    // 长会话会变成一堵命令输出墙）。
+    var defaultOpen = tool.kind === 'edit' || tool.kind === 'delete' || tool.kind === 'move';
+    body.hidden = !defaultOpen;
     if (result.rows.length > MAX_RENDER_LINES) {
       body.appendChild(el('div', 'diff-note', 'Diff too large to render (' + result.rows.length + ' lines). Open the file to inspect it.'));
     } else {
@@ -310,9 +366,9 @@ export const toolCallViewClient = `
     mdPending = {};
   }
 
-  function renderContentItem(item, key, entryId) {
+  function renderContentItem(item, key, entryId, tool) {
     var el = NS.dom.el;
-    if (item.type === 'diff') { return renderDiff(item, key); }
+    if (item.type === 'diff') { return renderDiff(item, key, tool); }
 
     if (item.type === 'terminal') {
       // [CUSTOM-20260925-047] A real <button> -> keyboard reachable.
@@ -332,9 +388,15 @@ export const toolCallViewClient = `
     // Cosmetic only, so an empty inline span is enough — no need to hide nodes.
     if (block.type === 'text') {
       if (isBlank(block.text)) { return el('span', ''); }
-      var textHost = el('div', 'tool-text');
+      // [CUSTOM-20261009-220] 'md' 类必须一起给：.tool-text 是 white-space: pre-wrap，而拿到
+      // markdown 的宿主走 setSanitizedHtml（元素化）。pre-wrap 会把 marked 输出的块间换行
+      // 再渲染一遍（表格每行下多一行空白、单元格内按原文换行），那是"看起来怪"的真因。
+      var textHost = el('div', 'tool-text md');
       // [CUSTOM-20260925-066] Markdown, not raw text - see markdownText above.
-      markdownText(textHost, (entryId || '') + '#' + (key || ''), entryId || '', block.text);
+      // [CUSTOM-20261009-218] …and a console fence that holds a markdown table is unwrapped
+      // first, so the table renders as a table instead of as literal pipes in a code block.
+      markdownText(textHost, (entryId || '') + '#' + (key || ''), entryId || '',
+        toolMarkdownSource(block.text));
       return textHost;
     }
     if (block.type === 'image') {
@@ -500,14 +562,22 @@ export const toolCallViewClient = `
       var item = items[j];
       if (item.type === 'content' && item.block && item.block.type === 'text' && isBlank(item.block.text)) { continue; }
       // Positional key so a rebuilt diff keeps the user's expansion state.
-      outputs.push(renderContentItem(item, 'i' + j + ':' + (item.path || ''), entryId));
+      outputs.push(renderContentItem(item, 'i' + j + ':' + (item.path || ''), entryId, tool));
     }
     var commandLine = '' + (tool.command || '');
     // [CUSTOM-20260929-118] Nothing renderable, but the agent did report output text:
     // show it. Without this the OUT section can be an empty box on a call whose output
     // the agent sent in a shape we do not render (see ToolCallView.output).
+    // [CUSTOM-20261009-218] 含 GFM 表格时走同一条 markdown 往返（否则原样等宽）——同一个判据，
+    // 两个来源（内容块 / 原始输出）不能各判各的。
     if (!hasVisibleItem(items) && tool.output) {
-      outputs.push(el('pre', 'tool-raw', tool.output));
+      if (hasTableRow(tool.output)) {
+        var rawHost = el('div', 'tool-text md');
+        markdownText(rawHost, (entryId || '') + '#raw', entryId || '', tool.output);
+        outputs.push(rawHost);
+      } else {
+        outputs.push(el('pre', 'tool-raw', tool.output));
+      }
     }
     if (!commandLine && outputs.length === 0) {
       body.appendChild(el('div', 'diff-note', 'No detail reported for this tool call.'));
@@ -524,6 +594,13 @@ export const toolCallViewClient = `
     if (tool.command) {
       body.appendChild(toolSection('in', 'IN', [el('div', 'tool-command', tool.command)]));
       if (outputs.length > 0) { body.appendChild(toolSection('out', 'OUT', outputs)); }
+      return body;
+    }
+    // [CUSTOM-20261009-219] A delegating call has no command line, so its body is the
+    // sub-agent's report — name it. Without a label the report reads exactly like prose
+    // the main agent wrote itself, which is the confusion the marker exists to remove.
+    if (tool.subagent && tool.subagent.type && outputs.length > 0) {
+      body.appendChild(toolSection('out', 'Sub-agent report', outputs));
       return body;
     }
     for (var k = 0; k < outputs.length; k++) { body.appendChild(outputs[k]); }
@@ -618,6 +695,9 @@ export const toolCallViewClient = `
     var outputFp = fingerprintText(tool.output);
     if (outputFp === null) { return null; }
     parts.push('out:' + outputFp);
+    // [CUSTOM-20261009-219] 正文那一段的标签取决于它（子 agent 的报告要标出来）—— INV-H：
+    // 正文渲染读到的每个字段都得在这儿，漏一个就是"卡片永久停在旧样子"。
+    parts.push('sub:' + ((tool.subagent && tool.subagent.type) || ''));
     var locations = tool.locations || [];
     for (var i = 0; i < locations.length; i++) {
       parts.push('loc:' + locations[i].path + ':' + (locations[i].line || 0));
@@ -675,6 +755,8 @@ export const toolCallViewClient = `
     head.appendChild(el('span', 'tool-kind', KIND_LABEL[tool.kind] || 'Tool'));
     // [CUSTOM-20260926-074] The agent's own tool name, when it reported one.
     applyToolName(head, tool);
+    // [CUSTOM-20261009-219] …and the sub-agent marker, when this call delegated.
+    applySubagent(head, tool);
     var title = el('span', 'tool-title', headLabel(tool) || tool.toolCallId);
     title.title = tool.title || '';
     head.appendChild(title);
@@ -723,6 +805,52 @@ export const toolCallViewClient = `
   }
 
   /**
+   * [CUSTOM-20261009-219] Mark a card whose call delegated to a **sub-agent**.
+   *
+   * The user's question ("有的消息是主 agent 输出，有的是子 agent 输出，能区分吗？") has a
+   * partial answer in the data: ACP has no "who said this" field, but Claude Code returns a
+   * sub-agent's report as the RESULT of the delegating call and names the sub-agent there.
+   * So the card gets a chip — the head is visible even when the card is collapsed, which is
+   * exactly where "whose words are these?" is asked. The tooltip carries the rest of what
+   * the same payload reported (id / model / tokens / wall time).
+   *
+   * Same add/remove/patch shape as 'applyToolName': the head is never rebuilt, so the chip
+   * has to be creatable, removable AND patchable.
+   */
+  function applySubagent(head, tool) {
+    var sub = tool.subagent;
+    var node = head.querySelector('.tool-subagent');
+    if (!sub || !sub.type) {
+      if (node && node.parentNode) { node.parentNode.removeChild(node); }
+      return;
+    }
+    var label = 'subagent \\u00b7 ' + sub.type;
+    if (node) { node.textContent = label; }
+    else {
+      node = NS.dom.el('span', 'tool-subagent', label);
+      var title = head.querySelector('.tool-title');
+      if (title) { head.insertBefore(node, title); } else { head.appendChild(node); }
+    }
+    var details = ['Sub-agent ' + sub.type];
+    if (sub.model) { details.push(sub.model); }
+    if (typeof sub.tokens === 'number') { details.push(sub.tokens + ' tokens'); }
+    if (typeof sub.durationMs === 'number' && NS.dom && NS.dom.duration) {
+      var took = NS.dom.duration(sub.durationMs);
+      if (took) { details.push(took); }
+    }
+    if (sub.agentId) { details.push(sub.agentId); }
+    // [CUSTOM-20261009-222] The instruction the main agent gave it (rawInput.prompt),
+    // truncated so the tooltip stays scannable. The full text is in the card body
+    // (the first content item of an Agent call is the prompt itself).
+    if (sub.prompt) {
+      var snippet = String(sub.prompt).replace(/\s+/g, ' ').trim();
+      if (snippet.length > 200) { snippet = snippet.slice(0, 197) + '…'; }
+      details.push('Prompt: ' + snippet);
+    }
+    node.title = details.join(' \\u00b7 ');
+  }
+
+  /**
    * [CUSTOM-20260925-065] Put the call's duration in the card head, once it has
    * finished. A still-running call shows nothing: the pulsing status glyph already
    * says "in progress", and a live counter would mean a ticking re-render.
@@ -732,7 +860,12 @@ export const toolCallViewClient = `
    * same gap that made 027's shell permanent).
    */
   function applyDuration(head, tool) {
-    var label = NS.dom.duration(tool.elapsedMs);
+    // [CUSTOM-20261009-221] 工具自己报的耗时（秒）优先于 host 算的 elapsedMs
+    // （后者含传输与渲染开销）。两者都在时显示工具的版本。
+    var ms = tool.toolElapsedSeconds !== undefined
+      ? tool.toolElapsedSeconds * 1000
+      : tool.elapsedMs;
+    var label = NS.dom.duration(ms);
     var node = head.querySelector('.tool-time');
     if (!label) {
       if (node && node.parentNode) { node.parentNode.removeChild(node); }
@@ -743,7 +876,9 @@ export const toolCallViewClient = `
       head.appendChild(node);
     }
     node.textContent = label;
-    node.title = 'This tool call took ' + label;
+    node.title = tool.toolElapsedSeconds !== undefined
+      ? 'Reported by the tool: ' + label
+      : 'This tool call took ' + label;
   }
 
   function inferredMarker() {
@@ -785,7 +920,7 @@ export const toolCallViewClient = `
     // [CUSTOM-20260926-074] Same reason as the kind label above: a card built from
     // a placeholder starts without a tool name and must pick it up on the update
     // that finally carries the view model.
-    if (head) { applyToolName(head, tool); }
+    if (head) { applyToolName(head, tool); applySubagent(head, tool); }
     // [CUSTOM-20260929-117] ...and the description, which arrives on a later update
     // than the first paint (see headLabel). The old inline version overwrote the
     // label with tool.title only, which would have reverted a described card to the

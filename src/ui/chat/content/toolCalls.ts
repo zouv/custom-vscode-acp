@@ -7,7 +7,7 @@
 import type { ToolCallStatus, ToolKind } from '@agentclientprotocol/sdk';
 
 import { toContentView, type ContentBlockView } from './contentBlocks';
-import type { ToolInvocation } from '../transcript/types';
+import type { ToolInvocation, SubagentInfo } from '../transcript/types';
 
 /** One entry of a tool call's `content` collection. */
 export type ToolContentItem =
@@ -52,6 +52,13 @@ export interface ToolCallView {
   // "Edit"), when it publishes one in `_meta`. `kind` is ACP's coarse vocabulary
   // ("Run" / "Read"), so this is what tells two "Run" cards apart at a glance.
   toolName?: string;
+  /**
+   * [CUSTOM-20261009-219] Set when this call delegated to a **sub-agent** and its result
+   * reported who that was (`_meta.claudeCode.toolResponse.agentType` …). The card marks
+   * itself with it, so the reader can tell a sub-agent's report from the main agent's own
+   * words — the two look identical otherwise (see SubagentInfo in transcript/types.ts).
+   */
+  subagent?: SubagentInfo;
   locations: ToolLocationView[];
   items: ToolContentItem[];
   /**
@@ -63,6 +70,13 @@ export interface ToolCallView {
    * says "in progress".
    */
   elapsedMs?: number;
+  /**
+   * [CUSTOM-20261009-221] The tool's OWN reported duration in seconds
+   * (`_meta.claudeCode.toolResponse.elapsedTimeSeconds`). More accurate than
+   * `elapsedMs` (which includes transport and rendering overhead). Latched by
+   * the store because it only arrives on the completion update.
+   */
+  toolElapsedSeconds?: number;
   /** Nesting parent, when a NestingStrategy inferred one (Phase 4). */
   parentId?: string;
   inferredParent?: boolean;
@@ -87,10 +101,15 @@ export function toToolCallView(inv: ToolInvocation): ToolCallView {
     items: toToolContentItems(inv.content),
   };
   if (inv.endedAt !== undefined) { view.elapsedMs = Math.max(0, inv.endedAt - inv.startedAt); }
+  // [CUSTOM-20261009-221] 工具自己报的耗时（`toolResponse.elapsedTimeSeconds`）优先于
+  // `endedAt - startedAt`（后者含传输与渲染开销）。两者都在时显示工具的版本。
+  if (inv.toolElapsedSeconds !== undefined) { view.toolElapsedSeconds = inv.toolElapsedSeconds; }
   if (inv.description) { view.description = inv.description; }
   if (typeof inv.rawOutput === 'string' && inv.rawOutput.trim().length > 0) { view.output = inv.rawOutput; }
   const toolName = extractToolName(inv.meta);
   if (toolName) { view.toolName = toolName; }
+  // [CUSTOM-20261009-219] 委派给子 agent 的调用：身份由 store 锁存（见 latchSubagent）。
+  if (inv.subagent) { view.subagent = inv.subagent; }
   if (inv.parentId) {
     view.parentId = inv.parentId;
     view.inferredParent = inv.inferredParent;

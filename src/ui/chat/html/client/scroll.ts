@@ -293,6 +293,13 @@ export const scrollClient = `
     var compRect = composer.getBoundingClientRect();
     // 卡片没显示（相位断开时 display:none ⇒ rect 全 0）：此刻没有可压的内容，不关它的事。
     if (compRect.height <= 0) { return; }
+    // [CUSTOM-20261010-228] 变量已是正确值（composer 实高 ≈ --acpc-composer-h）⇒ 尾巴被盖不是
+    // 「变量失真」，而是视口本身太矮（composer 几乎占满整个视图区）。这时自愈重测毫无用处，只会
+    // 反复触发：2026-10-10 日志里 104 次 tail-covered-heal 全在这类状态里打转，还伴随 composer
+    // 高度 1px 的震荡。只有变量真的失真（实高比变量高出 ≥2px；2px 容差吸收亚像素取整）才值得
+    // 重测 —— 那才是 210 要修的病灶格。
+    var composerVar = parseFloat(bodyVar('--acpc-composer-h')) || 0;
+    if (Math.abs(compRect.height - composerVar) < 2) { return; }
     var lastRect = last.getBoundingClientRect();
     if (lastRect.bottom <= compRect.top + 1) { return; }
     // 被压住：先记一笔（记的是**修复前**的现场），再让唯一的写者重测+重写。

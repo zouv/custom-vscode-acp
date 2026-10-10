@@ -20,6 +20,8 @@ import type { SessionUpdateHandler, SessionUpdateListener } from '../../handlers
 import { log } from '../../utils/Logger';
 import { renderChatHtml, createNonce } from './html';
 import { SafeMarkdown } from './markdown';
+// [CUSTOM-20261009-216] 回放里文件引用是一段文本（`[@名](file:///…)`），得先认出来。
+import { fileMentionViews } from './markdown';
 import { Outbox } from './Outbox';
 import type {
   Attachment,
@@ -71,7 +73,8 @@ import {
 // `basename` (same "last path segment" idea the client's folderName implements, and
 // two copies of it here is exactly how they drift — pitfalls #19).
 import { directoryKey, directoryOptions, folderName as basename } from './historyDirs';
-import { CLAUDE_CODE_AGENT, claudeTranscriptDir, readDiskSessions, readTranscriptTimes, readTranscriptUserImages } from './diskSessions';
+import { CLAUDE_CODE_AGENT, claudeTranscriptDir, readDiskSessions, readTranscriptTimes, readTranscriptUserAttachments } from './diskSessions';
+import type { TranscriptUserParts } from './diskSessions';
 import type { HistorySessionSummary } from './protocol';
 
 /** Prefix of the output channel used for panel-level diagnostics. */
@@ -220,7 +223,9 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
   private readonly replayTimes: Map<string, Map<string, number>> = new Map();
   // [CUSTOM-20260928-111] sessionId → (messageId → 图片视图)。replay 把图片并回用户气泡
   // （100 的教训：文本与非文本块分成两条 chunk 到达，气泡里没有可合并的东西）。
-  private readonly replayUserImages: Map<string, Map<string, ContentBlockView[]>> = new Map();
+  // [CUSTOM-20261009-216] 文件引用一并收在这里（它们连到同一批块），外加"这条消息有没有正文"
+  // ——附件 chunk 该丢还是该自己渲染，判据是它（见 diskSessions.TranscriptUserParts）。
+  private readonly replayUserParts: Map<string, Map<string, TranscriptUserParts>> = new Map();
   /**
    * [CUSTOM-20261008-205] IDE 上下文块（`<ide_opened_file>`）按「会话::messageId」暂存，
    * 等**同一条消息**的正文 chunk 到了再挂到那个气泡上（回放里两条 chunk 同 messageId，
@@ -378,7 +383,7 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       this.attachments.delete(sessionId);
       this.imageData.delete(sessionId);
       this.replayTimes.delete(sessionId);
-      this.replayUserImages.delete(sessionId);
+      this.replayUserParts.delete(sessionId);
       for (const key of Array.from(this.ideFilesByMessage.keys())) {
         if (key.startsWith(`${sessionId}::`)) { this.ideFilesByMessage.delete(key); }
       }
@@ -1368,18 +1373,38 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
           this.rememberIdeFile(sessionId, data.messageId, ideFileChip(idePath));
           return;
         }
-        // [CUSTOM-20260928-111] Images of this user message were read from the
-        // transcript BEFORE replay started (preloadTranscriptTimes); merge them
-        // into the bubble. The separate image chunk that follows (100) is dropped
-        // below so it does not become a second row.
-        const images = this.replayImagesFor(sessionId, data.messageId);
+        // [CUSTOM-20260928-111] Images of this user message (and, since 216, its FILE
+        // REFERENCES) were read from the transcript BEFORE replay started
+        // (preloadTranscriptTimes); merge them into the bubble. The separate chunks that
+        // follow (100) are dropped below so they do not become second rows.
+        const parts = this.replayPartsFor(sessionId, data.messageId);
+        // [CUSTOM-20261009-216] 文件引用：agent 把 `resource_link` 块序列化成一段文本回放回来。
+        // 这里必须**先于**注入块与正文判据认出它（它也长得像普通文本），否则它会变成一条
+        // 蓝色气泡、把 `[@名](file:///…)` 原样显示出来（用户报的正是这个）。
+        const mentions = fileMentionViews(text);
+        if (mentions) {
+          // 这条记录有正文 ⇒ 引用已经（或马上会）随正文 chunk 并进那个气泡，这条只丢不建。
+          if (parts?.hasProse) { return; }
+          // 没有正文的记录（只引用文件就发送）自己渲染 —— 与发送路径同形（215：落成 content 条目）。
+          // 读不到转录时也走这里：无论如何都不把这段 markdown 当正文显示。
+          const mentionEntry = this.transcripts.appendContent(sessionId, mentions);
+          if (mentionEntry) { this.post({ type: 'append', sessionId, entries: [mentionEntry] }); }
+          return;
+        }
         if (text.length === 0) {
           // [CUSTOM-20260928-100] Non-text blocks of a USER message were dropped here
           // (a pasted image, a resource link), so a reopened conversation showed the
           // prompt without the picture it carried. Same treatment as the thought chunk
           // below (075): it becomes a content record like any other.
-          // [CUSTOM-20260928-111] …unless the image already rode in on the text chunk.
-          if (images && images.length > 0) { return; }
+          // [CUSTOM-20261009-216] 丢弃的判据是"这条记录**有正文**"（那它已经随正文 chunk 进气泡了），
+          // 不再是"转录里知道这条消息"：只有附件、没有正文的消息（111 起就存在）此前被无条件丢掉，
+          // 于是重开后连图片一起消失。没有正文时这里就是它唯一的承载者，自己渲染。
+          if (parts?.hasProse) { return; }
+          if (parts && (parts.images.length > 0 || parts.files.length > 0)) {
+            const ownEntry = this.transcripts.appendContent(sessionId, [...parts.images, ...parts.files]);
+            if (ownEntry) { this.post({ type: 'append', sessionId, entries: [ownEntry] }); }
+            return;
+          }
           this.postContentNotice(sessionId, data.content);
           return;
         }
@@ -1405,9 +1430,10 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
         // turn here too ("finalizes pending assistant turn", its
         // user_message_chunk branch).
         this.finalizeEntries(sessionId, { only: 'assistant' });
-        // [CUSTOM-20261008-205] 同一条消息的 IDE 上下文（若到过）与图片一起进气泡：chip 在前、正文在下。
+        // [CUSTOM-20261008-205] 同一条消息的 IDE 上下文（若到过）与附件一起进气泡：chip 在前、正文在下。
+        // [CUSTOM-20261009-216] 附件 = IDE 上下文 + 图片 + 文件引用（三者各只有一个来源）。
         const ideChip = this.takeIdeFile(sessionId, data.messageId);
-        const views = (ideChip ? [ideChip] : []).concat(images ?? []);
+        const views = (ideChip ? [ideChip] : []).concat(parts?.images ?? [], parts?.files ?? []);
         const entry = this.transcripts.appendUser(sessionId, text, views.length > 0 ? views : undefined);
         if (entry) {
           this.stampReplayTime(sessionId, entry, data.messageId);
@@ -1476,6 +1502,11 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
           size: Number(data.size ?? 0),
           costAmount: data.cost?.amount,
           costCurrency: data.cost?.currency,
+          // [CUSTOM-20261009-224] 思考 token：ACP 的 Usage 里有这个字段，但实测当前适配器没发过来
+          // （`used`/`size`/`_meta._claude/model` 之外什么都没有）。有就带上，没有就是 undefined。
+          thoughtTokens: typeof (data as { thoughtTokens?: unknown }).thoughtTokens === 'number'
+            ? (data as { thoughtTokens?: number }).thoughtTokens
+            : undefined,
         });
         this.pushMeta(sessionId);
         return;
@@ -1548,21 +1579,26 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
     // [CUSTOM-20260928-111] Images of user messages too: the replay delivers them as
     // separate chunks (100), so the bubble has nothing to merge with unless we read
     // the transcript. Any failure is "no images", never an error.
+    // [CUSTOM-20261009-216] …and the message's FILE REFERENCES ride the same way (the agent
+    // serialises a `resource_link` block as a `[@name](file:///…)` text block). One scan now
+    // serves both, and it also reports whether each record has prose of its own — the
+    // discriminator that tells an attachment chunk "this already rode on the text chunk"
+    // from "you are the only carrier this message has".
     try {
-      const images = await readTranscriptUserImages(dir, sessionId);
-      if (images.size > 0) {
-        this.replayUserImages.set(sessionId, images);
-        log(`${LOG_PREFIX}: replayed images available for ${sessionId} (${images.size} messages)`);
+      const parts = await readTranscriptUserAttachments(dir, sessionId);
+      if (parts.size > 0) {
+        this.replayUserParts.set(sessionId, parts);
+        log(`${LOG_PREFIX}: replayed user attachments available for ${sessionId} (${parts.size} messages)`);
       }
     } catch (e) {
-      log(`${LOG_PREFIX}: transcript images unavailable (${(e as Error)?.message ?? e})`);
+      log(`${LOG_PREFIX}: transcript user attachments unavailable (${(e as Error)?.message ?? e})`);
     }
   }
 
-  /** Real image views for a replayed user chunk, or undefined when there are none. */
-  private replayImagesFor(sessionId: string, messageId: unknown): ContentBlockView[] | undefined {
+  /** Real parts (images / file references / prose) of a replayed user message, or undefined. */
+  private replayPartsFor(sessionId: string, messageId: unknown): TranscriptUserParts | undefined {
     if (typeof messageId !== 'string' || messageId.length === 0) { return undefined; }
-    return this.replayUserImages.get(sessionId)?.get(messageId);
+    return this.replayUserParts.get(sessionId)?.get(messageId);
   }
 
   /**

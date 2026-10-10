@@ -18,7 +18,11 @@ import { existsSync } from 'node:fs';
 import { createReadStream, readdirSync, statSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { join } from 'node:path';
+import type { ContentBlock } from '@agentclientprotocol/sdk';
+import { toContentView, isBlankText } from './content/contentBlocks';
 import type { ContentBlockView } from './content/contentBlocks';
+// [CUSTOM-20261009-216] 同一段文本形状的判定（回放里引用是一段文本而不是块）。
+import { fileMentionViews } from './markdown';
 
 /**
  * The agent whose transcripts these are. A SEPARATE constant from
@@ -191,18 +195,47 @@ export async function readTranscriptTimes(dir: string, sessionId: string): Promi
   return times;
 }
 
+// [CUSTOM-BEGIN] CUSTOM-20261009-216 - 一条用户消息带的附件，以及"它有没有正文"。
+//
+// 为什么要有 `hasProse`（**不是**可有可无的补充字段）：回放时一条消息的正文、图片、文件引用
+// 是**各一条 chunk**（100/111 的教训），而"引用已经并进气泡了"这件事**不能**用"转录里知道这条
+// messageId"来判断 —— 用户完全可以**只引用文件、不打字**（215 的发送路径支持：空文字 + 附件落成
+// `content` 条目）。那种消息回放时**只有**那条引用 chunk，若按"知道 messageId 就丢弃"处理，
+// 它会连记录一起消失（比现在显示成原文更糟）。真正的判据是**这条记录有没有正文**：
+// 有正文 ⇒ 附件由正文那条 chunk 承载；没有 ⇒ 附件 chunk 自己渲染。
+//
+// 顺带把 111 留下的同类洞一起修了（同一个判据）：只有图片、没有正文的消息，图片 chunk 原先也
+// 被无条件丢弃 ⇒ 重开后什么都不剩。
+//
+// 【为什么一个函数收两遍】这个文件 5–13MB、上限 20 万行，open 会话时原先被扫三遍
+// （times / images / 本函数）。图片与附件本来就是同一条记录的同一批块，一次扫描收齐更实在。
+//
+// 边界与代价与 094/100/111 完全同源：厂商私有格式、只对 Claude Code、任何失败都只是
+// "没有附件"而绝不抛错（转录读不到时回放分支退化为把附件 chunk 自己渲染出来）。
+// [CUSTOM-END] CUSTOM-20261009-216
+export interface TranscriptUserParts {
+  /** 图片附件视图（111 的既有形状）。 */
+  images: ContentBlockView[];
+  /** 文件引用视图 —— mention 文本块与真正的 `resource_link` 块都在这里。 */
+  files: ContentBlockView[];
+  /** 这条消息除引用之外还有可见正文 ⇒ 回放会另发一条正文 chunk 承载这些附件。 */
+  hasProse: boolean;
+}
+
 /**
- * [CUSTOM-20260928-111] `messageId` → the image views of every user record in the
- * transcript. The replay path delivers a message's text and its images as SEPARATE
- * chunks (100), so the bubble has nothing to merge with unless we read the transcript.
+ * `messageId` → the images and file references of every user record in the transcript,
+ * plus whether the record has prose of its own.
  *
  * Never throws: a missing file, an unreadable line or a lost race all degrade to
- * "no images" and the caller renders the bubble without them.
+ * "no attachments" and the caller renders the message without them.
  */
-export async function readTranscriptUserImages(dir: string, sessionId: string): Promise<Map<string, ContentBlockView[]>> {
-  const images = new Map<string, ContentBlockView[]>();
+export async function readTranscriptUserAttachments(
+  dir: string,
+  sessionId: string,
+): Promise<Map<string, TranscriptUserParts>> {
+  const parts = new Map<string, TranscriptUserParts>();
   const file = join(dir, `${sessionId}.jsonl`);
-  if (!existsSync(file)) { return images; }
+  if (!existsSync(file)) { return parts; }
 
   let lines = 0;
   const input = createReadStream(file, { encoding: 'utf8' });
@@ -219,27 +252,50 @@ export async function readTranscriptUserImages(dir: string, sessionId: string): 
       const message = record.message as { content?: unknown } | undefined;
       const content = message?.content;
       if (!Array.isArray(content)) { continue; }
-      const views: ContentBlockView[] = [];
+
+      const images: ContentBlockView[] = [];
+      const files: ContentBlockView[] = [];
+      let hasProse = false;
       for (const block of content) {
-        const b = block as { type?: string; source?: { type?: string; media_type?: unknown; data?: unknown }; name?: unknown };
-        if (b?.type !== 'image') { continue; }
-        // Claude Code 的转录格式：{ type:'image', source:{ type:'base64', media_type, data } }
-        const src = b.source;
-        const data = src?.data;
-        const mimeType = src?.media_type;
-        if (src?.type !== 'base64' || typeof data !== 'string' || typeof mimeType !== 'string') { continue; }
-        views.push({
-          type: 'image',
-          mimeType,
-          dataUri: `data:${mimeType};base64,${data}`,
-          name: typeof b.name === 'string' && b.name ? b.name : 'image',
-        });
+        const b = block as {
+          type?: string;
+          text?: unknown;
+          source?: { type?: string; media_type?: unknown; data?: unknown };
+          name?: unknown;
+        };
+        if (b?.type === 'image') {
+          // Claude Code 的转录格式：{ type:'image', source:{ type:'base64', media_type, data } }
+          const src = b.source;
+          const data = src?.data;
+          const mimeType = src?.media_type;
+          if (src?.type !== 'base64' || typeof data !== 'string' || typeof mimeType !== 'string') { continue; }
+          images.push({
+            type: 'image',
+            mimeType,
+            dataUri: `data:${mimeType};base64,${data}`,
+            name: typeof b.name === 'string' && b.name ? b.name : 'image',
+          });
+          continue;
+        }
+        // 真正的内容块形状（未来 Claude Code 直接存 `resource_link` 时不必再来改这里）。
+        if (b?.type === 'resource_link') {
+          const view = toContentView(block as ContentBlock);
+          if (view && view.type === 'resource_link') { files.push(view); }
+          continue;
+        }
+        if (b?.type === 'text') {
+          const text = typeof b.text === 'string' ? b.text : '';
+          // 这条文本块本身就是一串文件引用（`[@名](file:///…)`，见 markdown.fileMentionViews）。
+          const mentions = fileMentionViews(text);
+          if (mentions) { files.push(...mentions); continue; }
+          if (!isBlankText(text)) { hasProse = true; }
+        }
       }
-      if (views.length > 0) { images.set(uuid, views); }
+      parts.set(uuid, { images, files, hasProse });
     }
-  } catch { /* unreadable transcript: no images, the caller renders without them */ } finally {
+  } catch { /* unreadable transcript: no attachments, the caller renders without them */ } finally {
     reader.close();
     input.destroy();
   }
-  return images;
+  return parts;
 }

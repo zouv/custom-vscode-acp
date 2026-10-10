@@ -46,7 +46,17 @@ export interface SessionMeta {
   models: LegacySessionModelState | null;
   configOptions: SessionConfigOption[] | null;
   availableCommands: Array<{ name: string; description: string; inputHint?: string | null }>;
-  usage: { used: number; size: number; costAmount?: number; costCurrency?: string } | null;
+  usage: {
+    used: number;
+    size: number;
+    costAmount?: number;
+    costCurrency?: string;
+    /**
+     * [CUSTOM-20261009-224] 思考/推理 token 数（`usage_update.thoughtTokens`）。
+     * ACP 的 Usage 类型里有这个字段，但实测当前适配器没发过来 —— 有就显示，没有就不显示。
+     */
+    thoughtTokens?: number;
+  } | null;
   /**
    * Pending attachments for this session. Carried on `meta` (and therefore on
    * `boot`/`focus`) so the chips survive a session switch rather than being
