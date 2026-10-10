@@ -1559,6 +1559,76 @@ suite('chat client logic: tool-card markdown round trip (stub DOM)', () => {
       'the update path must be able to patch the label');
   });
 
+  // [CUSTOM-20261010-229] renderDiff 里用了 tool.kind 判默认展开，却没人把 tool 传进来 ⇒
+  // 每渲染一张 Edit/Write/Delete/Move 卡的 diff 都抛 ReferenceError（tool is not defined），
+  // hydrate 循环当场断掉、后面的条目全渲染不出来（用户报的"有一部分内容看不到 + 拉不到底"）。
+  // 这条用真 render 钉住：能渲染出 diff、且 edit 的 diff 默认展开。
+  test('an Edit card renders its diff without throwing, default-open (229 regression)', () => {
+    const { NS } = loadClient();
+    const node = NS.toolCallView.render(toolWith({
+      kind: 'edit',
+      command: null,
+      items: [{ type: 'diff', path: 'a.ts', oldText: 'a\n', newText: 'b\n' }],
+    }), 'e-diff');
+    assert.ok(node.querySelector('.diff'), 'the diff renders (was: tool is not defined)');
+    assert.strictEqual(node.querySelector('.diff-body').hidden, false, 'edit diff default-open (223)');
+  });
+
+  // [CUSTOM-20261009-218] Bash 卡片的 OUT 里明明是 markdown 表格却按字面显示：不是"没渲染
+  // markdown"，而是 Claude Code 把 stdout 包在一条围栏里发过来、而 066 的规则把围栏渲染成代码块。
+  // 判据（与用户商定）窄到只有"整段就是一个围栏 **且** 内容里有 GFM 表格分隔行"才拆。
+  test('a fenced output that IS a markdown table is handed to markdown without its fence (218)', () => {
+    const { NS } = loadClient();
+    NS.toolCallView.render(toolWithText(
+      '```console\n=== 14.1 表 ===\n| 锚点 | 量级 |\n|---|---|\n| 一元（大劫） | 约十二万九千六百年 |\n```'), 'u1');
+    const asked = NS.toolCallView.pendingMarkdownItems() as Array<{ text: string }>;
+    assert.strictEqual(asked.length, 1);
+    assert.ok(!asked[0].text.includes('```'), 'the fence is gone, so marked sees a real table');
+    assert.ok(asked[0].text.includes('| 锚点 | 量级 |'), 'the table itself is what gets rendered');
+  });
+
+  test('a fenced output that is NOT a table keeps its fence (218)', () => {
+    const { NS } = loadClient();
+    // `ls -la` 与代码片段是这条规则**故意**不碰的：拆了它们会被 md 语法吃掉
+    // （缩进变代码块、'#' 开头的注释变标题、'-' 开头的行变列表）。
+    NS.toolCallView.render(toolWithText('```console\ntotal 18\ndrwxr-xr-x 1 zouwei 0 Oct 9 .\n```'), 'u2');
+    const asked = NS.toolCallView.pendingMarkdownItems() as Array<{ text: string }>;
+    assert.ok(asked[0].text.includes('```console'), 'a plain console output stays a code block');
+  });
+
+  // [CUSTOM-20261009-219] 用户问"主 agent 输出与子 agent 输出能区分吗"。数据上的答案是：
+  // 子 agent 的报告以**委派调用结果**的形态回来，身份就在那条结果里 —— 面板要把它画出来，
+  // 否则报告正文与主 agent 自己写的话一模一样。
+  test('a delegating card is marked as a sub-agent and labels its report (219)', () => {
+    const { NS } = loadClient();
+    const node = NS.toolCallView.render(toolWith({
+      command: null, kind: 'think', toolName: 'Agent',
+      items: [{ type: 'content', block: { type: 'text', text: '报告正文' } }],
+      subagent: { type: 'story_editor', model: 'claude-opus-5.5', tokens: 152136, durationMs: 924103, agentId: 'a3bd09f1' },
+    }), 's1');
+    const chip = node.querySelector('.tool-subagent');
+    assert.ok(chip, 'the head carries the sub-agent marker');
+    assert.strictEqual(chip.textContent, 'subagent · story_editor');
+    assert.ok(chip.title.includes('152136 tokens'), 'the tooltip carries what the same payload reported');
+    assert.strictEqual(node.querySelector('.tool-seg-label').textContent, 'Sub-agent report',
+      'the report is not left looking like the main agent\'s own words');
+  });
+
+  test('the sub-agent marker appears when the result carrying it arrives (219)', () => {
+    const { NS } = loadClient();
+    const node = NS.toolCallView.render(toolWith({ command: null }), 's2');
+    assert.strictEqual(node.querySelector('.tool-subagent'), null, 'nothing reported yet');
+    NS.toolCallView.update(node, toolWith({ command: null, subagent: { type: 'story_editor' } }), 's2');
+    assert.strictEqual(node.querySelector('.tool-subagent').textContent, 'subagent · story_editor',
+      'the update path must be able to add the chip');
+  });
+
+  test('a card that delegated to nobody carries no marker (219)', () => {
+    const { NS } = loadClient();
+    const node = NS.toolCallView.render(toolWith({ command: null, kind: 'read' }), 's3');
+    assert.strictEqual(node.querySelector('.tool-subagent'), null);
+  });
+
   test('a command-line call is sectioned IN / OUT, and stays collapsed', () => {
     const { NS } = loadClient();
     const node = NS.toolCallView.render(toolWith({ command: 'ls -la', description: '列目录' }), 'e4');
@@ -4471,7 +4541,7 @@ suite('build fingerprint: 宿主 / 标记 / 客户端三处自报身份 (CUSTOM-
 // scroll 事件。用户 2026-10-03 报的"消息面板没到底（Jump 还在）、滚动条却已触底、鼠标滚不动"
 // 就是这一族：贴底的人被长高的浮层挤到后面，视口判定却停在旧值。修法是写入方喊一声 reflowNow()。
 suite('scroll: 几何（内容 / 留白）变化后视口判定要重算 (CUSTOM-20261003-176)', () => {
-  function mountScroll(paddingBottom = '0px'): { NS: any; el: any; jump: any } {
+  function mountScroll(paddingBottom = '0px', composerVar?: string): { NS: any; el: any; jump: any } {
     const NS: Record<string, any> = {};
     const listeners: Record<string, Array<() => void>> = {};
     const el: Record<string, any> = {
@@ -4490,7 +4560,12 @@ suite('scroll: 几何（内容 / 留白）变化后视口判定要重算 (CUSTOM
       setTimeout: () => 0,
       addEventListener: () => {},
     };
-    new Function('window', 'document', scrollClient)(win, {});
+    // [CUSTOM-20261010-228] 给 scroll.ts 的 bodyVar('--acpc-composer-h') 喂一个可配置的值 ——
+    // 自愈的「变量是否失真」门槛要拿它当参照；不给时 bodyVar 返回 '-'（parseFloat→0），保持旧行为。
+    const doc: Record<string, any> = composerVar === undefined
+      ? {}
+      : { body: { style: { getPropertyValue: () => composerVar } } };
+    new Function('window', 'document', scrollClient)(win, doc);
     NS.scroll.init(el, jump);
     return { NS, el, jump };
   }
@@ -4575,8 +4650,9 @@ suite('scroll: 几何（内容 / 留白）变化后视口判定要重算 (CUSTOM
   // 照旧归真 Chromium 的预览档。
   function mountHeal(opts: {
     pad: string; scrollTop: number; lastBottom: number; composerTop: number; composerH: number;
+    composerVar?: string;
   }): { healed: () => number } {
-    const { NS, el } = mountScroll(opts.pad);
+    const { NS, el } = mountScroll(opts.pad, opts.composerVar);
     let healed = 0;
     NS.composer = { refreshHeight: () => { healed++; } };
     NS.dom = { qs: () => ({ getBoundingClientRect: () => ({ top: opts.composerTop, height: opts.composerH }) }) };
@@ -4622,6 +4698,14 @@ suite('scroll: 几何（内容 / 留白）变化后视口判定要重算 (CUSTOM
   test('卡片没显示（相位断开，rect 全 0）⇒ 此刻没有可压的内容，不关它的事', () => {
     const m = mountHeal({ pad: '24px', scrollTop: 600, lastBottom: 990, composerTop: 0, composerH: 0 });
     assert.strictEqual(m.healed(), 0);
+  });
+
+  test('变量已是正确值（矮视口、非变量失真）⇒ 绝不重测 —— 2026-10-10 死循环回归', () => {
+    // composer 实高 100 == --acpc-composer-h 100：尾巴被盖是因为视口矮（composer 占满），不是
+    // 变量失真。旧实现在这里照样调 refreshHeight → 重测 → 写回 → 派发 scroll → 再自愈，循环不停
+    // （真机日志 104 次 tail-covered-heal）。门槛要求「实高比变量高出 ≥2px」才出手。
+    const m = mountHeal({ pad: '24px', scrollTop: 600, lastBottom: 990, composerTop: 900, composerH: 100, composerVar: '100px' });
+    assert.strictEqual(m.healed(), 0, '变量没失真，被盖是视口矮，不是该自愈的病灶');
   });
 });
 

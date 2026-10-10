@@ -1188,3 +1188,17 @@ history picker 4 条（每行一对动作且不嵌套 / 点 Archive 只发消息
 applyAction 摘行换标签且不重置过滤）；真 Chromium 的 `#historyrowprobe`（默认 opacity=0、
 动作落在行内且纵向居中、图标画出来、点击发出 `archiveSession`、回执后行数 -1；
 截图档 `history-row-actions.png` 第一行是"悬停后"的摆法 —— 无头里触发不了真 :hover）。
+
+### 5.51 会话 tab 的目录标识（CUSTOM-20261009-225，修订 226/227）
+
+状态圆点（7px 圆点）改造成 16px **方形**圆角块，里面写目录缩写（最多 4 个字母，按非字母数字 + 驼峰边界拆词取首字母，大写）。
+
+**取最底层目录名（227 修订，用户报"DGAD 不对"）**：首版 `cwd.split(/[\\/]/)` 在模板串里求值后客户端拿到 `/[\/]/`（只匹配正斜杠），Windows 路径（`D:\Git\…`）整条不拆 ⇒ 整条路径进拆词 ⇒ DGAD。修法：模板串里写**四个**反斜杠（`/[\\\\/]/`），客户端拿到 `/[\\/]/`（同时匹配两种分隔符）⇒ 取到最后一段目录名再拆词。
+
+**2x2 布局（227）**：`NS.dom.el(tag, cls, text)` 把缩写当一个文本节点，一行排不下才换行 ⇒ 4 个字母挤一行。修法：每个字母一个 `<span class="dir-letter">`（宽度 50%），4 字母自然排成 2x2 两行；1-3 个字母时不硬拆（宽度 auto，自然居中）。
+
+**颜色分工（226 修订，用户报"完成态看不见"）**：首版把状态色写在 `color:` 上，而 `background: currentColor` 会把 color 当背景用 —— 完成态（无状态类）时 color 是 `descriptionForeground`（灰）、背景灰、文字近黑 ⇒ 看不见。现在**状态色只给 background-color，文字色固定在 color 上**（不再吃状态类）；外圈单独读 `--tab-dot-state` 自定义属性（background-color 不能给 currentColor 用）。
+
+缩写规则：'story-myriad-pavilion' → 'SMP'，'AbcDeFg' → 'ADF'，'abc-de-fg' → 'ADF'。
+
+**踩坑**：拆词不用正则 lookbehind（本文件要走 check-webview-client.mjs 的 new Function 解析，lookbehind 在它的目标解析里会报 Unexpected token）—— 用两轮拆分（先按非字母数字切，再按驼峰边界切）。预览主题里原先没有 `--vscode-charts-orange/yellow/blue` 三个 token，waiting/loading/attention 三态的 background-color 算出来是透明 —— 补齐后探针才验得出对比色。

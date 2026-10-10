@@ -16,6 +16,8 @@
 import { Marked, type RendererObject, type Tokens } from 'marked';
 // [CUSTOM-20261004-184] The one place that decides "is this href a local file".
 import { localPathOf } from './content/contentBlocks';
+// [CUSTOM-20261009-216] 也借用它的视图模型（mention 解析的产物与 ContentBlock 转出来的同形）。
+import type { ContentBlockView } from './content/contentBlocks';
 
 const HTML_ESCAPES: Record<string, string> = {
   '&': '&amp;',
@@ -84,6 +86,63 @@ export function fileLinkTarget(href: string): { path: string; line?: number } | 
   const path = localPathOf(rest);
   if (!path) { return undefined; }
   return { path, line };
+}
+
+// [CUSTOM-BEGIN] CUSTOM-20261009-216 - 回放里的「文件引用」不是内容块，是一段文本。
+//
+// 现象（用户报）：引用了文件的消息发送时气泡里有 chip，**会话 reload 后**变成原样显示的一串
+// `[@GrapplingHookPointComponent.cs](file:///f%3A/P4/…#L437-440)`。
+//
+// 根因：面板把引用按 ACP `resource_link` 块发出去，而 Claude Code 把它**序列化成一段文本**存进
+// 自己的转录（`[{text: 正文}, {text: '[@名](file:///…)'}]`），`session/load` 回放时又把这两块各发
+// 一条 `user_message_chunk`（共用同一个 messageId，实测见 acp-client-custom.log）。宿主原先只认
+// **块**，于是那段文本被当正文又建一条用户气泡 —— 而用户气泡正文是**纯文本节点**（不跑 markdown，
+// 见 transcriptView.buildUserBubble），所以 markdown 原样露出来。
+//
+// 这里只做一件事：认出「整段就是若干条本地文件引用」，产出与 `toContentView` 同形的
+// `resource_link` 视图，好让回放分支把它和图片一样**并进同一个气泡**。判据刻意窄，两条都要满足：
+//   ①整段（trim 后）的每一段都是这种链接（用户随手在正文里写一个 `[@a](b.ts)` 不会中招）；
+//   ②标签以 `@` 开头 —— 那是这个约定的形态，抓到的数据里没有例外。
+// 行区间语法直接复用上面的 `fileLinkTarget`（184 已经把 `#L12-L20` / `path:12` 收在一处，不写第二份）。
+// [CUSTOM-END] CUSTOM-20261009-216
+const MENTION_LINK = /^\[@([^\]\n]*)\]\(([^()\s]+)\)$/;
+/** 标签尾部的行区间（`Foo.cs#L437-440` / `Foo.cs#L437`），归一成 live chip 的 `:437-440`。 */
+const MENTION_RANGE = /#L(\d+)(?:-L?(\d+))?$/;
+
+/**
+ * [CUSTOM-20261009-216] Views for a message that is nothing but file references
+ * (Claude Code's serialisation of `resource_link` blocks), or null when the text
+ * is ordinary prose that merely happens to contain a link.
+ */
+export function fileMentionViews(text: string): ContentBlockView[] | null {
+  const value = String(text ?? '').trim();
+  // 便宜的守卫：这类文本的第一段必然是链接（`^\[@`），长度不限 —— 于是普通正文
+  // （每一段都要 split + 跑正则）在第一步就出去了。
+  if (!value.startsWith('[@')) { return null; }
+  const segments = value.split(/\s+/).filter(Boolean);
+  if (segments.length === 0) { return null; }
+  const views: ContentBlockView[] = [];
+  for (const segment of segments) {
+    const match = MENTION_LINK.exec(segment);
+    if (!match) { return null; }
+    const uri = match[2];
+    const target = fileLinkTarget(uri);
+    if (!target) { return null; }
+    views.push({ type: 'resource_link', uri, name: mentionName(match[1]), path: target.path });
+  }
+  return views;
+}
+
+/**
+ * The chip's label. The agent writes `Name.cs#L437-440`; the live path shows
+ * `Name.cs:437-440` (`composer.ts` `refLabel`). Same file, same range, two spellings
+ * — normalised so a reopened conversation looks like the one that was just sent.
+ */
+function mentionName(label: string): string {
+  const range = MENTION_RANGE.exec(label);
+  if (!range) { return label; }
+  const end = range[2];
+  return `${label.slice(0, range.index)}:${range[1]}${end && end !== range[1] ? `-${end}` : ''}`;
 }
 
 const renderer: RendererObject = {

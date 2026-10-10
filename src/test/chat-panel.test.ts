@@ -48,6 +48,8 @@ import { directoryKey, directoryOptions } from '../ui/chat/historyDirs';
 import { panelIdForAgent } from '../ui/chat/panelContract';
 import { readDiskSessions, readTranscriptTimes } from '../ui/chat/diskSessions';
 import { ToolInvocationStore } from '../ui/chat/transcript/ToolInvocationStore';
+// [CUSTOM-20261009-219] 子 agent 身份要一路走到视图模型（卡片头那个 chip 的来源）。
+import { toToolCallView } from '../ui/chat/content/toolCalls';
 import type { ChatSurface, SurfaceKey } from '../ui/chat/ChatSurface';
 // [CUSTOM-20260930-124/125] `resolveAutoConnect` / `PanelPrefsIO` are exported so this
 // file can drive the settings seam with a stub instead of the developer's settings.json.
@@ -2460,6 +2462,111 @@ suite('chat panel: replay fidelity (CUSTOM-20260928-100)', () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  // [CUSTOM-20261009-216] 文件引用在转录里**不是块，是一段文本**（agent 把 `resource_link`
+  // 序列化成 `[@名](file:///…)`），回放时作为**单独一条** user chunk 发回来。原先它被当正文，
+  // 于是重开后多出一条蓝色气泡、把 markdown 原样显示出来（用户报的就是这个）。
+  test('a replayed user message carries its file references in the bubble, and the mention chunk is dropped', async () => {
+    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!cwd) { return; }   // no workspace folder ⇒ no transcript bucket to read
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'acpc-ref-replay-'));
+    const previous = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = root;
+    try {
+      const bucket = path.join(root, 'projects', cwd.replace(/[^A-Za-z0-9]/g, '-'));
+      fs.mkdirSync(bucket, { recursive: true });
+      const target = 'f%3A/P4/AKI/aki_dev_zouwei/Source/Client/GrapplingHookPointComponent.cs';
+      fs.writeFileSync(path.join(bucket, 's-ref.jsonl'), [
+        JSON.stringify({
+          type: 'user', uuid: 'u-ref', timestamp: '2026-10-09T10:00:00.000Z',
+          message: { role: 'user', content: [
+            { type: 'text', text: '还是很多波浪线' },
+            { type: 'text', text: `[@GrapplingHookPointComponent.cs#L437-440](file:///${target}#L437-440)` },
+          ] },
+        }),
+      ].join('\n'));
+
+      const harness = makeHarness('s-ref', 'Claude Code');
+      harness.surface.sent.length = 0;
+      await (harness.host as any).preloadTranscriptTimes('Claude Code', 's-ref');
+
+      harness.handler.handleUpdate({
+        sessionId: 's-ref',
+        update: { sessionUpdate: 'user_message_chunk', messageId: 'u-ref', content: { type: 'text', text: '还是很多波浪线' } },
+      } as any);
+      harness.handler.handleUpdate({
+        sessionId: 's-ref',
+        update: {
+          sessionUpdate: 'user_message_chunk', messageId: 'u-ref',
+          content: { type: 'text', text: `[@GrapplingHookPointComponent.cs#L437-440](file:///${target}#L437-440)` },
+        },
+      } as any);
+
+      const state = settle(harness, 'Claude Code', 's-ref');
+      const users = state.entries.filter(e => e.kind === 'user');
+      const contents = state.entries.filter(e => e.kind === 'content');
+      assert.strictEqual(users.length, 1, 'the mention does not become a second user bubble');
+      assert.strictEqual(contents.length, 0, 'and not a content row either');
+      const user = users[0] as { text: string; attachments?: Array<{ type: string; name: string; path?: string; uri: string }> };
+      assert.strictEqual(user.text, '还是很多波浪线', 'the prose stays the bubble text');
+      assert.ok(user.attachments, 'the bubble carries the file reference');
+      assert.strictEqual(user.attachments!.length, 1);
+      assert.strictEqual(user.attachments![0].type, 'resource_link');
+      // `path` 存在 ⇒ chip 点击走 openFile（039/205 的既有约定），与发送时那条同形。
+      assert.strictEqual(user.attachments![0].path, 'f:\\P4\\AKI\\aki_dev_zouwei\\Source\\Client\\GrapplingHookPointComponent.cs');
+      // 名字归一成 live chip 的写法（composer.ts refLabel 的 `<name>:<start>-<end>`）。
+      assert.strictEqual(user.attachments![0].name, 'GrapplingHookPointComponent.cs:437-440');
+    } finally {
+      if (previous === undefined) { delete process.env.CLAUDE_CONFIG_DIR; }
+      else { process.env.CLAUDE_CONFIG_DIR = previous; }
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // 只有引用、没有正文的消息（发送路径支持：215）回放时**只有**那条引用 chunk —— 丢弃的判据
+  // 必须是"这条记录有没有正文"，否则它连记录一起消失（比显示成原文更糟）。
+  test('a message that is only a file reference still renders after the replay', async () => {
+    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!cwd) { return; }
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'acpc-refonly-replay-'));
+    const previous = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = root;
+    try {
+      const bucket = path.join(root, 'projects', cwd.replace(/[^A-Za-z0-9]/g, '-'));
+      fs.mkdirSync(bucket, { recursive: true });
+      const mention = '[@a.cs](file:///f%3A/tmp/a.cs)';
+      fs.writeFileSync(path.join(bucket, 's-refonly.jsonl'), [
+        JSON.stringify({
+          type: 'user', uuid: 'u-refonly', timestamp: '2026-10-09T10:00:00.000Z',
+          message: { role: 'user', content: [{ type: 'text', text: mention }] },
+        }),
+      ].join('\n'));
+
+      const harness = makeHarness('s-refonly', 'Claude Code');
+      harness.surface.sent.length = 0;
+      await (harness.host as any).preloadTranscriptTimes('Claude Code', 's-refonly');
+
+      harness.handler.handleUpdate({
+        sessionId: 's-refonly',
+        update: { sessionUpdate: 'user_message_chunk', messageId: 'u-refonly', content: { type: 'text', text: mention } },
+      } as any);
+
+      const state = settle(harness, 'Claude Code', 's-refonly');
+      assert.strictEqual(state.entries.filter(e => e.kind === 'user').length, 0, 'no prose ⇒ no bubble');
+      const contents = state.entries.filter(e => e.kind === 'content');
+      assert.strictEqual(contents.length, 1, 'the reference itself is the record (same shape as sending)');
+      const blocks = (contents[0] as { blocks: Array<{ type: string; path?: string }> }).blocks;
+      assert.strictEqual(blocks.length, 1);
+      assert.strictEqual(blocks[0].type, 'resource_link');
+      assert.strictEqual(blocks[0].path, 'f:\\tmp\\a.cs');
+      // 原文那串 markdown 绝不能出现在任何记录里。
+      assert.ok(!visibleText(state).includes('](file:///'), 'the raw markdown is never shown');
+    } finally {
+      if (previous === undefined) { delete process.env.CLAUDE_CONFIG_DIR; }
+      else { process.env.CLAUDE_CONFIG_DIR = previous; }
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 // [CUSTOM-20260929-117] 工具卡标题（agent 写的 description）——对齐官方插件的
@@ -2537,6 +2644,67 @@ suite('chat panel: tool card description (CUSTOM-20260929-117)', () => {
     const read = views.filter(v => (v.command ?? null) === null && v.title.startsWith('Read')).pop();
     assert.ok(read, 'the Read card must have reached the webview too');
     assert.strictEqual(read!.description, undefined, 'no invented description');
+  });
+});
+
+// [CUSTOM-20261009-219] 子 agent 的身份：用户问"主 agent 输出与子 agent 输出能区分吗"。
+// ACP 没有答案（没有 subagent 概念）。判据是厂商专属键：`rawInput.subagent_type`（首帧就有）
+// 与更早一次载荷的 `_meta.claudeCode.toolResponse.agentType` —— 两者都认，都没有就当不是委派。
+// 锁存而不是按需读（`_meta` 整体替换、`rawInput` 只在首帧给全：117 的教训）。
+suite('chat panel: sub-agent identity (CUSTOM-20261009-219)', () => {
+  test('rawInput.subagent_type marks a delegation from the first frame', () => {
+    const store = new ToolInvocationStore();
+    store.upsertCall('s1', {
+      toolCallId: 'a1', title: 'World doc C-tier review', kind: 'think', status: 'pending',
+      content: [], locations: [],
+      rawInput: { description: 'World doc C-tier review', prompt: '…', subagent_type: 'story_editor' },
+      _meta: { claudeCode: { toolName: 'Agent' } },
+    } as never);
+    const inv = store.get('s1', 'a1')!;
+    assert.strictEqual(inv.subagent?.type, 'story_editor');
+    assert.strictEqual(toToolCallView(inv).subagent?.type, 'story_editor');
+  });
+
+  test('the older toolResponse.agentType shape is also honoured and latched', () => {
+    const store = new ToolInvocationStore();
+    const meta = (response?: Record<string, unknown>) =>
+      ({ claudeCode: response ? { toolName: 'Agent', toolResponse: response } : { toolName: 'Agent' } });
+    store.upsertCall('s1', {
+      toolCallId: 'a1', title: 'Task', kind: 'think', status: 'in_progress',
+      content: [], locations: [], rawInput: {}, _meta: meta(),
+    } as never);
+    assert.strictEqual(store.get('s1', 'a1')!.subagent, undefined, 'nothing reported yet');
+
+    store.upsertUpdate('s1', {
+      toolCallId: 'a1', status: 'completed',
+      _meta: meta({
+        agentType: 'story_editor', agentId: 'a3bd09f1ce4d3cc7d',
+        resolvedModel: 'claude-opus-5.5', totalTokens: 152136, totalDurationMs: 924103,
+      }),
+    } as never);
+    // The shape the real stream ends on: the next update replaces `_meta` wholesale,
+    // with no toolResponse at all.
+    store.upsertUpdate('s1', { toolCallId: 'a1', _meta: meta() } as never);
+
+    const inv = store.get('s1', 'a1')!;
+    assert.ok(inv.subagent, 'the identity survives the update that drops _meta');
+    assert.strictEqual(inv.subagent!.type, 'story_editor');
+    assert.strictEqual(inv.subagent!.agentId, 'a3bd09f1ce4d3cc7d');
+    assert.strictEqual(inv.subagent!.model, 'claude-opus-5.5');
+    assert.strictEqual(inv.subagent!.tokens, 152136);
+    assert.strictEqual(inv.subagent!.durationMs, 924103);
+  });
+
+  test('a payload without either known key reports no sub-agent', () => {
+    const store = new ToolInvocationStore();
+    // `_meta.toolResponse` without `agentType`（实测 Bash 就是 {stdout,stderr,…}）+ 输入里也没有
+    // `subagent_type` ⇒ 不是一次可识别的委派，整条都不猜（与 extractToolName 同规矩）。
+    store.upsertCall('s1', {
+      toolCallId: 'a2', title: 'Read', kind: 'read', status: 'completed', content: [], locations: [],
+      rawInput: { file_path: 'a.ts' },
+      _meta: { claudeCode: { toolName: 'Read', toolResponse: { status: 'completed' } } },
+    } as never);
+    assert.strictEqual(store.get('s1', 'a2')!.subagent, undefined);
   });
 });
 
@@ -3672,6 +3840,8 @@ suite('chat panel: the context ring only trusts usage_update', () => {
     const reported = {
       used: 55642, size: 1000000,
       costAmount: 2.6394680000000004, costCurrency: 'USD',
+      // [CUSTOM-20261009-224] 思考 token：当前适配器没发过来，所以是 undefined。
+      thoughtTokens: undefined,
     };
     assert.deepStrictEqual(usageOf(harness), reported,
       'the agent-reported context usage is what the ring shows');

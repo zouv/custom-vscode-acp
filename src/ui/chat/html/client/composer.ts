@@ -652,6 +652,11 @@ export const composerClient = `
     if (lastUsage.costAmount !== undefined && lastUsage.costAmount !== null && isFinite(cost)) {
       label += '  ' + cost.toFixed(2) + ' ' + (lastUsage.costCurrency || '');
     }
+    // [CUSTOM-20261009-224] 思考 token：有就显示（官方插件的 thinking 卡片会动态显示它），
+    // 没有就不显示 —— 不猜、不编一个数。
+    if (typeof lastUsage.thoughtTokens === 'number' && lastUsage.thoughtTokens > 0) {
+      label += '  ·  ' + Math.round(lastUsage.thoughtTokens / 1000) + 'k thinking';
+    }
     contextMeter.hidden = false;
     contextMeter.title = percent + '%  ·  ' + label;
     contextMeter.className = 'context-meter'

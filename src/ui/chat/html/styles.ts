@@ -157,25 +157,53 @@ export function styles(): string {
      两者必须独立——卡在权限提示上的轮次两件事同时为真。颜色走 color 而不是直接写
      background，外圈才能用同一个 currentColor 画出来（颜色只有一个来源）。
      **它只是提示**：不弹窗、不抢焦点——与"不做后台权限卡"的决定不冲突。 */
+  /* [CUSTOM-20261009-225/226] 目录标识：dot 放大成方形并写目录缩写，两色设计。
+     ⚠️ 226 修订（用户报"完成状态就看不到图标了"）：**状态色只给 background，文字色固定**。
+     首版把状态色写在 color 上 —— 而 background: currentColor 会把 color 当背景用，
+     于是完成态（无状态类）时 color 是 descriptionForeground（灰）、背景灰、文字近黑 ⇒ 看不见。
+     现在的分工：状态色 → background（外圈跟它走），文字色 → color（固定在 editor-background）。
+     方形不是矩形：宽高都 16px（226 从 18 缩到 16，用户报"可以稍微小一些"）。
+     2x2 布局（227）：4 个字母排两行两列 —— flex-wrap + 字号压到半格，行高 1 让两行正好占满。 */
   .tab-dot {
     position: relative;
-    width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto;
-    color: var(--vscode-descriptionForeground);
-    background: currentColor;
+    width: 16px; height: 16px; border-radius: 4px; flex: 0 0 auto;
+    display: inline-flex; align-items: center; justify-content: center;
+    flex-wrap: wrap; align-content: center;
+    font-size: 0.42em; font-weight: 700; line-height: 1; letter-spacing: 0;
+    /* 文字色：固定、不随状态变（否则完成态背景灰+文字深灰就看不清了）。 */
+    color: var(--vscode-editor-background);
+    /* 背景色：默认空闲态的灰；下面的状态类**只覆盖这一个属性**。 */
+    background-color: var(--vscode-descriptionForeground);
+    padding: 0;
+    overflow: hidden;
   }
-  /* 优先级：等人回答 > 轮次在跑 > 载入历史 > 后台有新输出 > 平常。 */
-  .tab-dot.waiting { color: var(--vscode-charts-orange, var(--vscode-charts-yellow)); }
-  .tab-dot.running { color: var(--vscode-progressBar-background); }
-  .tab-dot.loading { color: var(--vscode-charts-yellow); }
+  /* [CUSTOM-20261009-227] 每个字母一个 span，227 的 2x2 布局靠它换行。
+     宽度 50% 让两个字母占一行；1-2 个字母时（T / AV）不硬拆，让它们自然居中。 */
+  .tab-dot .dir-letter { width: 50%; text-align: center; }
+  .tab-dot .dir-letter:nth-child(-n+2):nth-last-child(-n+2),
+  .tab-dot .dir-letter:only-child { width: auto; }
+  /* 优先级：等人回答 > 轮次在跑 > 载入历史 > 后台有新输出 > 平常。
+     每条只改 background-color —— color 不动，文字永远保持对比色。 */
+  .tab-dot.waiting { background-color: var(--vscode-charts-orange, var(--vscode-charts-yellow)); }
+  .tab-dot.running { background-color: var(--vscode-progressBar-background); }
+  .tab-dot.loading { background-color: var(--vscode-charts-yellow); }
   /* [CUSTOM-20260925-063] 后台会话在你离开后有了新输出 —— 由宿主侧的 unread 集合驱动。 */
-  .tab-dot.attention { color: var(--vscode-charts-blue); }
+  .tab-dot.attention { background-color: var(--vscode-charts-blue); }
   /* 外圈：一圈向外扩散的涟漪，只在"正在做事"（轮次在跑 / 正在载入）时出现。
-     早先把 running 做成圆点自身的脉动，那样两个信号就挤在同一个像素上了。 */
+     早先把 running 做成圆点自身的脉动，那样两个信号就挤在同一个像素上了。
+     [CUSTOM-20261009-226] 外圈要跟随**背景色**（状态色），而 background-color 不能给
+     currentColor 用 —— 所以外圈单独读 background-color。 */
   .tab-dot.busy::after {
     content: ''; position: absolute; inset: -1px; border-radius: 50%;
-    border: 1px solid currentColor;
+    /* 226：外圈跟随背景色（状态色），不是文字色 —— 文字色现在是固定的对比色。 */
+    border: 1px solid var(--tab-dot-state, var(--vscode-descriptionForeground));
     animation: tab-ring 1.4s ease-out infinite;
   }
+  /* 226：每条状态类把状态色同时写进自定义属性，外圈读它。 */
+  .tab-dot.busy.waiting { --tab-dot-state: var(--vscode-charts-orange, var(--vscode-charts-yellow)); }
+  .tab-dot.busy.running { --tab-dot-state: var(--vscode-progressBar-background); }
+  .tab-dot.busy.loading { --tab-dot-state: var(--vscode-charts-yellow); }
+  .tab-dot.busy.attention { --tab-dot-state: var(--vscode-charts-blue); }
   @keyframes tab-ring {
     0% { transform: scale(0.7); opacity: 0.9; }
     100% { transform: scale(1.9); opacity: 0; }
@@ -1181,6 +1209,13 @@ export function styles(): string {
   .table-wrap { overflow-x: auto; max-width: 100%; }
   .table-wrap > table { margin: 6px 0; }
   .bubble th, .bubble td, .md th, .md td { border: 1px solid var(--vscode-panel-border); padding: 2px 6px; }
+  /* [CUSTOM-20261009-220] 工具输出的 md 表格不要再被 pre-wrap 拖下水：
+     .tool-text 是 white-space: pre-wrap（工具正文一直是字面文本），而 218 起其中会拿
+     markdown（元素化），marked 输出的块间换行会被 pre-wrap 再渲染一遍 ⇒ 每行下多一行空白、
+     单元格内按原文折行，"约**十二万九千六百年**"被折成两行两截。
+     修两边：宿主上的 '.md' 复位空白（与 .thought-body.md 同一条），表格自己则要求单元格
+     能自然折行但不靠换行符撑开 —— '十二万九千六百年' 是一个词，别在中途断它。 */
+  .md th, .md td { white-space: normal; word-break: keep-all; overflow-wrap: anywhere; }
   .bubble a, .md a { color: var(--vscode-textLink-foreground); text-decoration: none; cursor: pointer; }
   .bubble a:hover, .md a:hover { text-decoration: underline; }
   /* GFM 任务列表的勾选态（CUSTOM-20260926-072）：由宿主侧 markdown.ts 的 checkbox
@@ -1290,7 +1325,9 @@ export function styles(): string {
   }
   .thought[open] > summary { color: var(--vscode-foreground); }
   .thought-body {
-    max-height: 300px; overflow-y: auto;
+    /* [CUSTOM-20261009-217] 300px → 600px：用户 2026-10-09 报"Thought 展开后内容高度有点低，
+       加大一倍"。它是**滚动视口**的高度（超出才滚动），一倍之后长推理一次能看到更多。 */
+    max-height: 600px; overflow-y: auto;
     white-space: pre-wrap; word-break: break-word;
     margin-top: 3px; padding-left: 14px;
     font-style: italic; opacity: 0.85;
@@ -1341,6 +1378,15 @@ export function styles(): string {
     flex: 0 0 auto; font-size: 0.82em; padding: 0 4px; border-radius: 3px;
     color: var(--vscode-descriptionForeground);
     background: var(--vscode-textCodeBlock-background);
+  }
+  /* [CUSTOM-20261009-219] 委派给**子 agent** 的卡。与 .tool-name 同样是一个 chip，但配色不同：
+     它表达的不是"哪个工具"，而是"这段产出不是你正在对话的那个 agent 写的" —— 折叠态也看得见，
+     而"这话是谁说的"正是在折叠态被问出来的。其余细节（id / 模型 / token / 耗时）在 tooltip 里。 */
+  .tool-subagent {
+    flex: 0 0 auto; font-size: 0.82em; padding: 0 4px; border-radius: 3px;
+    color: var(--vscode-badge-foreground, var(--vscode-foreground));
+    background: var(--vscode-badge-background, var(--vscode-textCodeBlock-background));
+    cursor: help;
   }
   .tool-inferred {
     flex: 0 0 auto; font-size: 0.8em; color: var(--vscode-descriptionForeground);
@@ -1420,7 +1466,10 @@ export function styles(): string {
     font-family: var(--vscode-editor-font-family); font-size: 0.9em;
     white-space: pre-wrap; word-break: break-all; margin: 0;
   }
-  .tool-body .tool-seg-out { max-height: 340px; overflow: auto; }
+  /* [CUSTOM-20261009-221] 340px → 510px：用户 2026-10-09 报"子 agent 卡展开后高度再放大 1/2"。
+     报告是长文（story_editor 那份就有近千 token），340px 时一次只能看到开头，
+     而要"读子 agent 的话"必须先把 OUT 展开 —— 高度翻倍能让一次可见内容多一半。 */
+  .tool-body .tool-seg-out { max-height: 510px; overflow: auto; }
   .tool-command {
     font-family: var(--vscode-editor-font-family); font-size: 0.92em;
     background: var(--vscode-textCodeBlock-background);

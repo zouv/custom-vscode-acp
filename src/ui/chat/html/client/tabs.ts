@@ -209,11 +209,53 @@ export const tabsClient = `
     return 'session';
   }
 
+  /**
+   * [CUSTOM-20261009-225] 目录标识：取目录名单词的头几个字母（最多 4 个，2x2 布局）。
+   *
+   * 规则（用户指定）：按非字母数字切分取每段首字母，大写。如：
+   *   'story-myriad-pavilion' → 'SMP'（3 段）
+   *   'AbcDeFg' → 'ADF'（按驼峰拆：Abc / De / Fg）
+   *   'abc-de-fg' → 'ADF'
+   *   'a' → 'A'，'ab' → 'AB'
+   *
+   * 与"取前 4 个字符"不同：按单词边界取首字母，用户一眼能认出是哪个目录。
+   * 拆词不用正则 lookbehind（本文件要走 check-webview-client.mjs 的 new Function 解析，
+   * lookbehind 在它的目标解析里会报 Unexpected token）—— 用两轮拆分。
+   */
+  function directoryAbbrev(cwd) {
+    if (!cwd || typeof cwd !== 'string') { return ''; }
+    // [CUSTOM-20261009-226] 模板串里的反斜杠要双写：这里写四个，客户端拿到两个，
+    // 正则才是 /[\\/]/（同时匹配反斜杠与正斜杠）。只写两个的话客户端收到 /[\/]/ ——
+    // 只匹配正斜杠，Windows 路径整条不拆（实测：D 盘路径不拆分，缩写成 DGZX 而不是 Y）。
+    var parts = cwd.split(/[\\\\/]/).filter(Boolean);
+    if (parts.length === 0) { return ''; }
+    var name = parts[parts.length - 1];
+    // 第一轮：按非字母数字切；第二轮：按驼峰边界再切。
+    var words = [];
+    var rough = name.split(/[^a-zA-Z0-9]+/);
+    for (var r = 0; r < rough.length; r++) {
+      var seg = rough[r];
+      if (!seg) { continue; }
+      var cur = '';
+      for (var c = 0; c < seg.length; c++) {
+        var ch = seg[c];
+        if (cur && ch >= 'A' && ch <= 'Z' && seg[c - 1] >= 'a' && seg[c - 1] <= 'z') {
+          words.push(cur); cur = '';
+        }
+        cur += ch;
+      }
+      if (cur) { words.push(cur); }
+    }
+    var letters = [];
+    for (var i = 0; i < words.length && letters.length < 4; i++) {
+      var w = words[i];
+      if (w.length === 0) { continue; }
+      letters.push(w[0].toUpperCase());
+    }
+    return letters.join('');
+  }
+
   function dotClass(summary) {
-    // [CUSTOM-20260930-130] 两个**互相独立**的信号，按分工使用（用户指定）：
-    //   · 圆点的**颜色**说"这个会话处在什么状态"；
-    //   · 圆点外的**圈**说"它正在做事"。
-    // 它们必须独立：一个卡在权限提示上的轮次两件事同时为真（在跑 + 在等人），
     // 而早先把 running 映射成"颜色 + 整体脉动"时，两件事被挤进了同一个信号里。
     var cls = 'tab-dot';
     // 优先级：等人回答 > 轮次在跑 > 载入历史 > 后台有新输出 > 平常。
@@ -460,8 +502,17 @@ export const tabsClient = `
             ? label + '\\n' + model.id + '\\n(not loaded yet \\u2014 click to open)'
             : label + '\\n' + model.id);
 
-        tab.appendChild(NS.dom.el('span', isDraft ? 'tab-dot draft'
-          : (isRestore ? 'tab-dot restore' : dotClass(model.summary))));
+        // [CUSTOM-20261009-225/227] 目录标识：dot 里写目录缩写，一个字母一个 span
+        // （227 的 2x2 布局靠它换行），背景色保留状态色。
+        var dot = NS.dom.el('span', isDraft ? 'tab-dot draft'
+          : (isRestore ? 'tab-dot restore' : dotClass(model.summary)));
+        if (!isDraft && !isRestore) {
+          var abbrev = directoryAbbrev(model.summary.cwd);
+          for (var li = 0; li < abbrev.length; li++) {
+            dot.appendChild(NS.dom.el('span', 'dir-letter', abbrev[li]));
+          }
+        }
+        tab.appendChild(dot);
         tab.appendChild(NS.dom.el('span', 'tab-label', label));
 
         var close = NS.dom.el('button', 'tab-close', '\\u00d7');

@@ -27,8 +27,10 @@ export interface UserEntry extends EntryBase {
    * [CUSTOM-20260928-108] 发送时带的图片附件（chip 视图模型）。
    * 不进 ACP 协议——它是宿主从 `handleSendPrompt` 传下来的渲染视图；
    * `attachments` 与 `imageData` 在发送后清空，气泡里的图片因此只存在 transcript 里。
-   * Replay 路径不重建（`user_message_chunk` 的文本与非文本块分成两条 chunk 到达，
-   * 而条目模型没有 messageId 可以把它关联回去；重建需要第二来源的关联，见 §5.25）。
+   * [CUSTOM-20261009-216] Replay 路径**会**重建它们（这段注释此前说"不重建"，111 起就过期了）：
+   * 回放把同一条消息的正文与各附件分成多条 chunk 到达，宿主按 `messageId` 从 agent 的转录里
+   * 取回附件（`diskSessions.readTranscriptUserAttachments`）并挂到正文那条气泡上。
+   * 于是图片、文件引用、IDE 上下文 chip 在重开会话后与刚发送时同形。
    */
   attachments?: ContentBlockView[];
 }
@@ -188,6 +190,31 @@ export interface EntryPatch {
 }
 
 /**
+ * [CUSTOM-20261009-219] 子 agent 的身份，如其**汇报**在委派调用的输入/结果里
+ * （Claude Code：输入是 `rawInput.subagent_type`，更早的载荷是
+ * `_meta.claudeCode.toolResponse`）。
+ *
+ * 为什么只能从厂商专属键读：ACP **没有**子 agent 概念（239 个 schema 定义里
+ * `parent|subagent|delegate|spawn` 零命中），也就没有"这段是谁说的"字段。
+ *
+ * 只读已知形状，别的键一律不猜（与 `extractToolName` 同一条规矩）。
+ */
+export interface SubagentInfo {
+  /** 子 agent 的名字（`rawInput.subagent_type` / `toolResponse.agentType`：如 `story_editor`）。 */
+  type: string;
+  agentId?: string;
+  model?: string;
+  tokens?: number;
+  durationMs?: number;
+  /**
+   * [CUSTOM-20261009-222] 主 agent 派给它的那条指令（`rawInput.prompt`），只取前 ~200 字。
+   * 完整版在卡片的正文里（Agent 调用的第一个内容块就是 prompt 本身），这里只是让 tooltip
+   * 能回答"我让它去干什么"。
+   */
+  prompt?: string;
+}
+
+/**
  * View model for a single ACP tool call. Mirrors `ToolCall` / `ToolCallUpdate`
  * with the spec's replace-collection semantics applied (see
  * ToolInvocationStore.upsert).
@@ -216,11 +243,26 @@ export interface ToolInvocation {
    */
   description?: string;
   /**
+   * [CUSTOM-20261009-219] 这条调用是**委派给子 agent** 的时候，子 agent 的身份信息。
+   *
+   * 判据是 `rawInput.subagent_type`（在**首帧** `tool_call` 的输入里就有，不晚到），并额外认
+   * `_meta.claudeCode.toolResponse.agentType`（更早一次载荷的形状）。**锁存**而不是按需读：
+   * `_meta` 整体替换（117 的教训），输入字段只在 `tool_call` 上才给全。
+   */
+  subagent?: SubagentInfo;
+  /**
    * ACP `_meta` for this tool call. Vendor-specific and typed `unknown`, but
    * it is one of the few places an agent could put an explicit parent link —
    * so the nesting strategy searches it.
    */
   meta?: unknown;
+  /**
+   * [CUSTOM-20261009-221] The tool's OWN reported duration (`_meta.claudeCode.toolResponse.elapsedTimeSeconds`),
+   * in seconds. More accurate than `endedAt - startedAt` (which includes transport
+   * and rendering overhead). Latched like `description`: it arrives on the completion
+   * update only, and `_meta` is replaced wholesale afterwards.
+   */
+  toolElapsedSeconds?: number;
   startedAt: number;
   endedAt?: number;
   /** Nesting parent, set by a NestingStrategy (Phase 4). */

@@ -207,6 +207,17 @@ const THEME = `:root {
   --vscode-button-hoverBackground: #1177bb;
   --vscode-button-secondaryForeground: #ffffff;
   --vscode-textCodeBlock-background: #2b2b2b;
+  /* [CUSTOM-20261009-219] 真主题里这两个 token 一定有（Dark+ 就是下面这组），而这份预览主题
+     原先没写 —— 子 agent 的 chip（.tool-subagent）用的正是它们，缺了就会与 .tool-name 撞成同色，
+     于是"看截图"这条验收根本验不出东西。补上，让预览与真机一致。 */
+  --vscode-badge-background: #4d4d4d;
+  --vscode-badge-foreground: #ffffff;
+  /* [CUSTOM-20261009-226] 状态色 token：226 的探针发现 waiting/loading/attention 三态的
+     background-color 算出来是透明 —— 预览主题里根本没有这些 token，真机里有。
+     补齐后预览才验得出"背景与文字是否对比色"。 */
+  --vscode-charts-orange: #e78a4e;
+  --vscode-charts-yellow: #e5c07b;
+  --vscode-charts-blue: #4daafc;
   --vscode-textLink-foreground: #4daafc;
   --vscode-progressBar-background: #0e70c0;
   --vscode-list-hoverBackground: #2a2d2e;
@@ -286,6 +297,7 @@ function driver() {
   }
   // [CUSTOM-20260930-130] #tabs：标签栏上的状态点。颜色说"处在什么状态"，外圈说"正在做事"，
   // 五个标签把全部组合各摆一个（空闲 / 轮次在跑 / 等权限 / 载入历史 / 后台有新输出）。
+  // [CUSTOM-20261009-225] 目录标识：dot 里写目录缩写，背景色保留状态色。
   if (location.hash.indexOf('tabs') >= 0) {
     NS.tabs.init();
     var row = function (id, title, over) {
@@ -300,7 +312,42 @@ function driver() {
       row('s3', '等你回答', { running: true, waiting: true }),
       row('s4', '载入历史', { loading: true }),
       row('s5', '后台有新输出', { unread: true }),
+      row('s6', '多词目录', { cwd: 'd:/Git/zgame/zgame-ai-design/story-myriad-pavilion' }),
+      row('s7', '驼峰目录', { cwd: 'd:/Git/zgame/zgame-ai-design/AbcDeFg' }),
+      row('s8', '短横线目录', { cwd: 'd:/Git/zgame/zgame-ai-design/abc-de-fg' }),
+      row('s9', '四词目录', { cwd: 'd:/Git/zgame/zgame-ai-design/alpha-beta-gamma-delta' }),
     ]);
+    // [CUSTOM-20261009-226/227] 探针：完成态（s1，无状态类）下背景与文字必须是**对比色**，
+    // 不能同色撞车 —— 226 修的就是这个（背景被 currentColor 吃成灰、文字近黑 ⇒ 看不见）。
+    // 227 追加：缩写要取**最底层目录名**（不是整条路径），且 4 个字母要排成 2x2 两行
+    // （每个字母一个 span，宽度 50% 换行）。
+    if (location.hash.indexOf('probe') >= 0) {
+      var dotEls = document.querySelectorAll('.tab-dot');
+      var dots = [];
+      for (var d = 0; d < dotEls.length; d++) {
+        var cs = getComputedStyle(dotEls[d]);
+        var letterEls = dotEls[d].querySelectorAll('.dir-letter');
+        var letterTops = [];
+        for (var le = 0; le < letterEls.length; le++) {
+          letterTops.push(Math.round(letterEls[le].getBoundingClientRect().top));
+        }
+        dots.push({
+          text: dotEls[d].textContent,
+          bg: cs.backgroundColor,
+          fg: cs.color,
+          w: Math.round(dotEls[d].getBoundingClientRect().width),
+          h: Math.round(dotEls[d].getBoundingClientRect().height),
+          // 227：4 个字母（如 SMP→SM P? 不，SMP 是 3 个）的 top 值集合 —— 相同 top 数=行数。
+          // SMP: 3 个字母，前两一行、第三个第二行（或都一行）—— 看实际渲染。
+          // 227 的目标是 4 字母（如 ABCD）排 2x2。这里的夹具有 SMP(3)/ADF(3)。
+          letterRows: letterTops.length > 0 ? (new Set(letterTops)).size : 0,
+        });
+      }
+      var tabPre = document.getElementById('probe') || (function () {
+        var el = document.createElement('pre'); el.id = 'probe'; document.body.appendChild(el); return el;
+      })();
+      tabPre.textContent = JSON.stringify({ kind: 'tabdots', dots: dots });
+    }
   }
   // [CUSTOM-20260930-129] #times：打开每条记录的时刻（真面板里由 header 的 Times 开关切，
   // 这里只是给 #messages 加那个类）。
@@ -463,6 +510,50 @@ function driver() {
         dataUri: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8AAAwAB/AGtQ9RvAAAAAElFTkSuQmCC',
       }] },
     ] });
+  }
+  // [CUSTOM-20261009-217/219] #subagent：两件事一起看 ——
+  //   · 委派给**子 agent** 的卡：卡头的 subagent chip + 正文那段 'Sub-agent report' 标签（219），
+  //     读数取 chip 文本 / tooltip / 计算背景色 与那段标签；
+  //   · 一条**长** Thought：217 把正文滚动上限从 300px 提到 600px，读数直接取 max-height
+  //     （"看起来变高了"不是判据，数字才是）。
+  if (hash.indexOf('subagent') >= 0) {
+    NS.transcriptView.init(messages);
+    NS.transcriptView.reset();
+    NS.transcriptView.hydrate({ sessionId: 'subagent', entries: [
+      { id: 'sq-t', kind: 'thought', at: 1000, streaming: false, elapsedMs: 52400,
+        text: '长推理',
+        html: '<p>第一段推理。</p><p>第二段推理。</p><p>第三段推理。</p><p>第四段推理。</p>'
+          + '<p>第五段推理。</p><p>第六段推理。</p><p>第七段推理。</p><p>第八段推理。</p>'
+          + '<p>第九段推理。</p><p>第十段推理。</p><p>第十一段推理。</p><p>第十二段推理。</p>' },
+      { id: 'sq-tool', kind: 'tool', at: 2000,
+        toolView: {
+          toolCallId: 'call_agent_1', title: 'Task', kind: 'think', status: 'completed',
+          toolName: 'Agent', description: '复核共享世界文档',
+          command: null, locations: [], elapsedMs: 924103,
+          subagent: {
+            type: 'story_editor', agentId: 'a3bd09f1ce4d3cc7d',
+            model: 'claude-opus-5.5', tokens: 152136, durationMs: 924103,
+          },
+          items: [{ type: 'content', block: {
+            type: 'text', text: '啊唯，C-1 到 C-10 已逐条复核完毕，结论是 verdict=revise。' } }],
+        } },
+    ] });
+    if (hash.indexOf('probe') >= 0) {
+      var sqPre = document.getElementById('probe') || (function () {
+        var el = document.createElement('pre'); el.id = 'probe'; document.body.appendChild(el); return el;
+      })();
+      var sqChip = document.querySelector('.tool-subagent');
+      var sqLabel = document.querySelector('.tool-seg-label');
+      var sqBody = document.querySelector('.thought-body');
+      sqPre.textContent = JSON.stringify({
+        kind: 'subagent',
+        chip: sqChip ? sqChip.textContent : null,
+        chipTitle: sqChip ? sqChip.title : null,
+        chipBg: sqChip ? getComputedStyle(sqChip).backgroundColor : null,
+        sectionLabel: sqLabel ? sqLabel.textContent : null,
+        thoughtMaxHeight: sqBody ? getComputedStyle(sqBody).maxHeight : null,
+      });
+    }
   }
   // [CUSTOM-20261008-206] #refchip：输入框引用栏里的「编辑器当前文件」格（'+' 还没引用）。
   // 走真路径：composer.init + setFocus（有会话）+ setActiveFile（宿主推来的那个文件）。
@@ -2215,6 +2306,8 @@ const SHOTS = [
   ['#refchip', 'ref-chip'],
   // [CUSTOM-20261008-206] 用户气泡里的文件 chip（与 caret 同栏 + 加高 + </> 图标）。
   ['#filechip', 'file-chip'],
+  // [CUSTOM-20261009-217/219] 子 agent 卡的标识 + 长 Thought 的滚动上限（带 probe：读数字）。
+  ['#subagentprobe', 'subagent', '1440,900'],
   // [CUSTOM-20261008-199] 空态 header（已连接、还没有会话）：地址栏该有内容、Times 该贴右缘。
   // 带 probe：判据是数字（Times 右缘与 header 右缘之差），不是肉眼看截图。
   ['#nosessionheaderprobe', 'no-session-header', '1440,900'],
@@ -2226,6 +2319,8 @@ const SHOTS = [
   ['#gaugehotbig', 'gauge-hot-big'],
   // [CUSTOM-20260930-130] 标签栏状态点：颜色 = 状态，外圈 = 正在做事。
   ['#tabs', 'tabs'],
+  // [CUSTOM-20261009-226] 标签栏目录标识：完成态下背景与文字必须是对比色（probe 读计算样式）。
+  ['#tabsprobe', 'tabs-probe', '1440,900'],
   ['#tabsbig', 'tabs-big'],
   // [CUSTOM-20260930-136] 底部栏（输入卡 + 预留功能区）。窄档走默认的 500（退化档：卡片随
   // 主列收缩、圆角与内边距不变，证明没有 media query 也能正常退化）；其余宽档必须显式给
