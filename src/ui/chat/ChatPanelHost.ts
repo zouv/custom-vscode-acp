@@ -37,6 +37,8 @@ import type {
   TranscriptSnapshotWire,
   UiPrefs,
 } from './protocol';
+// [CUSTOM-20261011-235] 自定义模型读取迁到 config 层（SessionManager 也要读同一份）。
+import { readCustomModels, type CustomModel } from '../../config/CustomModels';
 import type { IChatPanel, PanelContext } from './panelContract';
 import { isModernAgent, MODERN_AGENTS } from './panelContract';
 import { viewSurface, type ChatSurface, type SurfaceKey } from './ChatSurface';
@@ -2662,6 +2664,8 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       // 是同一条记录 —— 不是两份真相（pitfall #19）。
       configOptions: withRememberedMode(snapshot?.configOptions ?? [], agent ? this.lastMode.get(agent) : undefined),
       availableCommands: snapshot?.availableCommands ?? [],
+      // [CUSTOM-20261010-233] 自定义模型别名——草稿页的模型下拉也显示这份，随草稿选项下发。
+      customModels: this.customModels(),
     }, to);
   }
   // [CUSTOM-END] CUSTOM-20260930-151
@@ -2807,7 +2811,7 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       void this.handleSendPrompt(session.sessionId, text)
         .catch(e => this.reportError(session.sessionId, e));
     } catch (e: any) {
-      this.post({ type: 'draftFailed', draftId, message: e?.message ?? String(e) }, to);
+      this.post({ type: 'draftFailed', draftId, message: errorDetail(e) }, to);
     }
   }
 
@@ -2831,6 +2835,9 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
     // （没有桶就返回 null）—— 正好复现它要避免的那个坑（这条是测试发现的）。
     this.transcripts.ensureSession(session.sessionId, session.agentName);
     const options = session.configOptions ?? [];
+    // [CUSTOM-20261010-233] 自定义模型（`acpc.customModels`）不在 agent 的候选列表里，但用户
+    // 在草稿页显式选过它 —— 放行并照常转发给 agent（agent 最终裁决），否则会被当成坏值跳过。
+    const customModelIds = new Set(this.customModels().map(m => m.modelId));
     let applied = 0;
     for (const { configId, value } of selections) {
       const option = options.find(o => o.id === configId);
@@ -2841,7 +2848,8 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       if (String((option as { currentValue?: unknown }).currentValue) === value) { continue; }
       const valid = option.type === 'boolean'
         ? value === 'true' || value === 'false'
-        : selectValues(option).includes(value);
+        : selectValues(option).includes(value)
+          || ((option as { category?: string }).category === 'model' && customModelIds.has(value));
       if (!valid) {
         log(`${LOG_PREFIX}: draft selection ${configId}=${value} is no longer a valid value; skipped`);
         continue;
@@ -2855,11 +2863,11 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
           this.rememberUserMode(session.sessionId);
         }
       } catch (e: any) {
-        const message = e?.message ?? String(e);
+        const message = errorDetail(e);
         log(`${LOG_PREFIX}: draft selection ${configId}=${value} failed: ${message}`);
         const entry = this.transcripts.appendNotice(
           session.sessionId, 'info',
-          `Could not apply the ${option.name || configId} chosen on the new-session page.`,
+          `Could not apply the ${option.name || configId} chosen on the new-session page. ${message}`,
         );
         if (entry) { this.post({ type: 'append', sessionId: session.sessionId, entries: [entry] }); }
       }
@@ -3188,6 +3196,14 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
     };
   }
 
+  /**
+   * [CUSTOM-20261011-235] 用户自定义模型别名（`acpc.customModels`），随 meta / 草稿选项下发。
+   * 全局共享，读自 config 层（`readCustomModels`）。
+   */
+  private customModels(): CustomModel[] {
+    return readCustomModels();
+  }
+
   private metaOf(sessionId: string): SessionMeta {
     const session = sessionOf(this.sessionManager, sessionId);
     return {
@@ -3204,6 +3220,8 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
       attachments: this.attachments.get(sessionId) ?? [],
       // [CUSTOM-20261010-232] 额外根目录（多根工作区）——只读展示，随 focus/boot 下发。
       additionalDirectories: session?.additionalDirectories ?? [],
+      // [CUSTOM-20261010-233] 自定义模型别名——全局共享，随 meta 下发。
+      customModels: this.customModels(),
     };
   }
 
@@ -3217,7 +3235,7 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
    * attach to.
    */
   private reportError(sessionId: string | null, e: unknown): void {
-    const message = (e as any)?.message ?? String(e);
+    const message = errorDetail(e);
     log(`${LOG_PREFIX}: error ${message}`);
     if (!sessionId) {
       this.post({ type: 'error', message });
@@ -3342,6 +3360,22 @@ export function turnOutcome(stopReason: string | undefined): TurnOutcome {
   if (stopReason === 'cancelled') { return { silent: true }; }
   const detail = stopReasonText(stopReason);
   return detail ? { failed: true, detail } : {};
+}
+
+/**
+ * [CUSTOM-20261011-234] 把 agent 报的错翻译成人话：ACP 的 `RequestError` 常把真实原因藏在
+ * `data.details`（`message` 只是个笼统的 "Internal error"，见 2026-10-10 用户报「切自定义模型
+ * 报 Internal error」，agent 实际说的是 `Invalid value for config option model: grok-4.6`）。
+ * 优先取 details，否则回落 message，再否则 String(e)。
+ */
+export function errorDetail(e: unknown): string {
+  const err = e as { message?: unknown; data?: unknown } | null | undefined;
+  const data = err?.data;
+  if (data && typeof data === 'object') {
+    const details = (data as { details?: unknown }).details;
+    if (typeof details === 'string' && details.trim()) { return details; }
+  }
+  return typeof err?.message === 'string' && err.message ? err.message : String(e);
 }
 
 /**

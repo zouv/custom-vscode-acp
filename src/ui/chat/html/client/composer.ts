@@ -48,6 +48,10 @@ export const composerClient = `
     loading: false,
     commands: [],
     configOptions: [],
+    // [CUSTOM-20261011-235] 自定义模型别名（acpc.customModels，来自 meta / draftOptions）。
+    // 模型本身经 agent 的 '_meta.extraModels' 注入进入 model 配置项（见 SessionManager），
+    // 这里只拿它做**显示名映射**：agent 把自定义模型列为裸 id，optionLabel 据此显示成 name。
+    customModels: [],
     attachments: [],
     slashIndex: 0,
     slashMatches: [],
@@ -670,6 +674,12 @@ export const composerClient = `
   function optionLabel(option) {
     var value = option.currentValue;
     if (option.type === 'boolean') { return value ? 'On' : 'Off'; }
+    // [CUSTOM-20261011-235] 自定义模型：agent 经 '_meta.extraModels' 注入后把模型列为**裸 id**，
+    // currentValue 命中自定义 modelId 时显示配置的 name，否则落到 agent 候选（找不到再回退裸值）。
+    if (option.category === 'model') {
+      var customName = customModelName(value);
+      if (customName !== null) { return customName; }
+    }
     var options = option.options || [];
     for (var i = 0; i < options.length; i++) {
       var entry = options[i];
@@ -682,6 +692,17 @@ export const composerClient = `
       }
     }
     return String(value);
+  }
+
+  // [CUSTOM-20261011-235] 自定义模型的显示名（按 modelId 查）；没命中返回 null。
+  function customModelName(modelId) {
+    var custom = state.customModels || [];
+    for (var i = 0; i < custom.length; i++) {
+      if (String(custom[i].modelId) === String(modelId)) {
+        return custom[i].name || custom[i].modelId;
+      }
+    }
+    return null;
   }
 
   function iconFor(category) {
@@ -746,6 +767,8 @@ export const composerClient = `
         menu.appendChild(menuItem(menu, option, entry.value, entry.name));
       }
     }
+    // [CUSTOM-20261011-235] 自定义模型现在由 agent 经 '_meta.extraModels' 注入后进入 model 配置项
+    // （见 SessionManager），这里不再硬塞一个「自定义」分组 —— 再塞会与 agent 候选重复。
   }
 
   function menuItem(menu, option, value, label) {
@@ -1139,6 +1162,8 @@ export const composerClient = `
     if (!state.draft || state.draft.draftId !== payload.draftId) { return; }
     state.configOptions = payload.configOptions || [];
     state.commands = payload.availableCommands || [];
+    // [CUSTOM-20261010-233] 自定义模型随草稿选项一起到。
+    state.customModels = payload.customModels || [];
     // The user's own picks outrank the snapshot's values: this draft may have been focused
     // before, and the answer always arrives with the snapshot's (agent-side) current values.
     applyDraftSelections();
@@ -1180,6 +1205,9 @@ export const composerClient = `
         return true;
       }
     }
+    // [CUSTOM-20261010-233] 自定义模型也在候选里 —— 否则 setDraftOptions 回包时
+    // applyDraftSelections 会把用户选的自定义模型回滚掉（它不在 agent 的 options 里）。
+    if (option.category === 'model' && customModelName(value) !== null) { return true; }
     return false;
   }
 
@@ -1279,10 +1307,13 @@ export const composerClient = `
       if (typeof meta.steering === 'boolean') { state.steering = meta.steering; }
       // [CUSTOM-20261010-232] 会话的额外根目录（只读展示，来自宿主 meta）。
       state.additionalDirectories = meta.additionalDirectories || [];
+      // [CUSTOM-20261010-233] 自定义模型别名（来自宿主 meta）。
+      state.customModels = meta.customModels || [];
     } else {
       state.commands = [];
       state.configOptions = [];
       state.additionalDirectories = [];
+      state.customModels = [];
     }
     // [CUSTOM-20261010-232] 已有会话：额外根目录只读（创建后锁死不可改）。
     state.addDirectoriesReadonly = true;
@@ -1307,6 +1338,8 @@ export const composerClient = `
   function setMeta(meta) {
     state.commands = meta.availableCommands || [];
     state.configOptions = meta.configOptions || [];
+    // [CUSTOM-20261010-233] 自定义模型别名（来自宿主 meta）。
+    state.customModels = meta.customModels || [];
     // [CUSTOM-20261004-187] 能力位（见 setFocus 的同名处理）。
     if (typeof meta.steering === 'boolean') { state.steering = meta.steering; }
     renderPickers();

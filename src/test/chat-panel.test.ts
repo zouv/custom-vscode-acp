@@ -58,8 +58,10 @@ import { ChatPanelHost, resolveAutoConnect, type PanelPrefsIO } from '../ui/chat
 import type { NoticeChannel } from '../ui/chat/SessionNotifier';
 import {
   stopReasonText, turnOutcome, readActiveFileFrom,
-  resolveRestoreChoice,
+  resolveRestoreChoice, errorDetail,
 } from '../ui/chat/ChatPanelHost';
+// [CUSTOM-20261011-235] 归一化迁到 config 层。
+import { normalizeCustomModels } from '../config/CustomModels';
 import type { RestoreChoice } from '../ui/chat/protocol';
 import type { ActiveEditorLike } from '../ui/chat/ChatPanelHost';
 import type { ExtToChatMessage, TranscriptSnapshotWire } from '../ui/chat/protocol';
@@ -3467,6 +3469,53 @@ suite('chat panel: turn outcome wording (CUSTOM-20261001-157)', () => {
     assert.strictEqual(stopReasonText(undefined), null);
     assert.ok(stopReasonText('max_turn_requests')!.includes('agent-request limit'));
     assert.ok(stopReasonText('something-new')!.includes('something-new'), 'unknown reasons are still reported verbatim');
+  });
+});
+
+// [CUSTOM-20261010-233] 自定义模型别名（`acpc.customModels`）的归一化：只钉住纯函数，
+// 不碰 vscode 配置读取（`readCustomModels` 读真实设置，测试不该去改它）。
+suite('chat panel: custom model aliases (CUSTOM-20261010-233)', () => {
+  test('non-array or empty input normalises to nothing', () => {
+    assert.deepStrictEqual(normalizeCustomModels(undefined), []);
+    assert.deepStrictEqual(normalizeCustomModels(null), []);
+    assert.deepStrictEqual(normalizeCustomModels('nope'), []);
+    assert.deepStrictEqual(normalizeCustomModels([]), []);
+  });
+
+  test('entries without a modelId are dropped, the rest keep their id', () => {
+    assert.deepStrictEqual(normalizeCustomModels([
+      { modelId: 'a' }, { name: 'no id' }, { modelId: '  ' }, {},
+    ]), [{ modelId: 'a', name: 'a', description: undefined }]);
+  });
+
+  test('a missing or blank name falls back to the modelId', () => {
+    assert.strictEqual(normalizeCustomModels([{ modelId: 'deepseek-v4-pro[1M]' }])[0].name, 'deepseek-v4-pro[1M]');
+    assert.strictEqual(normalizeCustomModels([{ modelId: 'x', name: '   ' }])[0].name, 'x');
+  });
+
+  test('name and description are kept verbatim when present', () => {
+    const [m] = normalizeCustomModels([{ modelId: 'x', name: '我的模型', description: 'hover' }]);
+    assert.strictEqual(m.name, '我的模型');
+    assert.strictEqual(m.description, 'hover');
+    assert.strictEqual(normalizeCustomModels([{ modelId: 'x', description: 42 }])[0].description, undefined);
+  });
+});
+
+// [CUSTOM-20261011-234] 把 agent 报的错翻译成人话：优先 `data.details`，否则回落 message。
+suite('chat panel: errorDetail surfaces the real reason (CUSTOM-20261011-234)', () => {
+  test('an ACP RequestError hides its reason in data.details', () => {
+    const err = Object.assign(new Error('Internal error'), {
+      code: -32603,
+      data: { details: 'Invalid value for config option model: grok-4.6' },
+    });
+    assert.strictEqual(errorDetail(err), 'Invalid value for config option model: grok-4.6');
+  });
+
+  test('without details it falls back to message, then to String()', () => {
+    assert.strictEqual(errorDetail(new Error('boom')), 'boom');
+    assert.strictEqual(errorDetail({ data: { details: 42 }, message: 'm' }), 'm', 'a non-string details is ignored');
+    assert.strictEqual(errorDetail({ data: { details: '  ' }, message: 'm' }), 'm', 'a blank details is ignored');
+    assert.strictEqual(errorDetail('plain'), 'plain');
   });
 });
 

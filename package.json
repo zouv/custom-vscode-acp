@@ -422,6 +422,31 @@
           "type": "boolean",
           "default": true,
           "description": "Log all ACP protocol traffic to the output channel."
+        },
+        "acpc.customModels": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "modelId": {
+                "type": "string",
+                "description": "The model id injected into the agent via ACP '_meta.extraModels' and sent on selection."
+              },
+              "name": {
+                "type": "string",
+                "description": "Display name shown in the model dropdown; falls back to modelId when empty."
+              },
+              "description": {
+                "type": "string",
+                "description": "Optional hover text."
+              }
+            },
+            "required": [
+              "modelId"
+            ]
+          },
+          "default": [],
+          "description": "User-defined models injected into the agent's model list via the ACP '_meta.extraModels' field at session creation, so they appear in the model dropdown. Picking one still sends its modelId to the agent; whether it takes effect is up to the agent."
         }
       }
     }
