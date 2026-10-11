@@ -17,6 +17,30 @@
 
 ---
 
+### 2026-10-11 - CUSTOM-20261011-235
+- **功能**：自定义模型机制重做——改为「会话创建时经 ACP `_meta.extraModels` 注入 agent」，并提供一个支持该字段的本地 fork 桥
+- **改动文件**：`src/config/CustomModels.ts`（新增）、`src/core/SessionManager.ts`、`src/ui/chat/protocol.ts`、`src/ui/chat/ChatPanelHost.ts`、`src/ui/chat/html/client/composer.ts`、`src/ui/chat/html/styles.ts`、`src/test/chat-panel.test.ts`、`package.json`；**仓库外**：`https://github.com/zouv/claude-agent-acp`（fork 自 `@agentclientprotocol/claude-agent-acp@0.89.1`；补丁 commit `63ecd66`，含 `prepare` 脚本供 `npx -y github:zouv/claude-agent-acp` 从 git 安装时自动构建）
+- **来源**：用户 2026-10-11 提供 Universe Editor 模型层分析（r2），要求「走 fork 桥、不改 Claude 原有的 5 个档位映射、要能加新的自定义模型」，并选定「本地目录引用」
+- **详细说明**：233 版把自定义模型塞进客户端「自定义」分组、选中走 `setModel` 转发，但 agent 只认自己 model 配置项里的值，必然被拒（234 把真实原因 `Invalid value for config option model: …` 翻了出来）。**关键排查结论**：`_meta.extraModels` 是 Universe Editor **自己 fork 的桥**加的字段，stock `claude-agent-acp@0.89.1` 里 0 处；而 stock 的 `availableModels` 白名单虽然能合成任意模型，但它只从 **settings 文件**读（`SettingsManager.getSettings()`），`_meta` 传的 settings 走不到那条合成逻辑（已实测：`_meta` 路径下 grok/qwen 出不来）。因此要么写用户 settings 文件、要么 fork 桥——用户选了 fork。本改动：①`CustomModel` 类型 + `normalizeCustomModels`/`readCustomModels` 迁到新增的 `src/config/CustomModels.ts`（SessionManager 也要读，UI 层不该被 core 反向依赖）；②`SessionManager` 新增 `extraModelIds()`，`createAcpSession`/`loadSession`/`resumeSession` 三处把 modelId 经 `_meta.extraModels` 注入（列表为空时不带 `_meta`）；③撤掉 composer 的「自定义」分组硬塞与 styles 的 `picker-*-custom`；④保留 `optionLabel` 显示名映射（fork 桥让 agent 把自定义模型列为裸 id → 客户端据此显示配置的 name）与 `applyDraftSelections`/`offersValue` 的自定义 modelId 放行（对 stock 桥是兜底）。**fork 桥补丁**（改 `src/session-model.ts` + `src/acp-agent.ts`，镜像 UE 的 `XR()`/`h5()`；已 push 到 zouv/claude-agent-acp）：新增 `extraModelIdsFromMeta()`（trim/去重/封顶 64）与 `applyExtraModels()`（把 id 追加进模型列表），在 `createSession` 的 allowlist 之后调用，并把 extraModels 计入 `computeSessionFingerprint` 以便 load/resume 也重算。
+- **验证方式**：扩展侧 `npm run compile` / `lint` / `npm test`（455 passing）/ `check-registry` 全绿。**fork 桥侧有实测**（非推断）：①用桩 SDK 跑 patch 后的 `createSession`/`loadSession`/`resumeSession`，三条路径的 model 列表都带出 `grok-4.6[1m]`/`qwen3.8-max[1m]`；②**真实 CLI 端到端**：`session/new` 的 model 选项为 `default, opus, fable, sonnet, haiku, grok-4.6[1m], qwen3.8-max[1m]`；③**切换实测**：`qwen3.8-max[1m]`/`deepseek-v4-pro` 均 `set_config_option` 成功。**已知非本功能问题**：`grok-4.6[1m]` 切换时网关返回 `Couldn't confirm model … with the API`——是网关/账号不认该 id，与注入无关。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-11 - CUSTOM-20261011-234
+- **功能**：把 agent 报的错翻译成人话——错误展示优先取 `data.details` 而非笼统的 `message`
+- **改动文件**：`src/ui/chat/ChatPanelHost.ts`、`src/test/chat-panel.test.ts`
+- **来源**：用户 2026-10-11「我已经配置了自定义模型，输入框的模型下拉列表里也能看到，但是切换失败，报 Internal error」
+- **详细说明**：用户把 `grok-4.6` 配成自定义模型，切换时 agent 回 `error: { code: -32603, message: "Internal error", data: { details: "Invalid value for config option model: grok-4.6" } }`——agent 的 `model` 配置项只认它自己的别名（`default`/`opus`/`fable`/`sonnet`/`haiku`），不认任意 modelId，这是 agent 权威边界（233 已写明）。但客户端只显示 `e.message`（"Internal error"），把真实原因吞了。新增纯函数 `errorDetail(e)`：优先取 `data.details`（非空字符串），否则回落 `message`，再否则 `String(e)`；`reportError` / `applyDraftSelections` 的 catch / `handleCreateDraftAndSend` 的 `draftFailed` 三处统一改走它。**注意**：这只是让"为什么失败"看得见，不改变 agent 拒绝的事实——要用 agent 没暴露的模型，得在 agent 侧配置。
+- **验证方式**：`npm run compile` / `npm run lint` / `node CUSTOMIZATIONS/scripts/check-registry.mjs` 全绿；`npm test` 455 passing（新增 `errorDetail` 2 条单测）
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-10-10 - CUSTOM-20261010-233
+- **功能**：模型下拉支持用户自定义模型（`acpc.customModels`）
+- **改动文件**：`package.json`、`src/ui/chat/protocol.ts`、`src/ui/chat/ChatPanelHost.ts`、`src/ui/chat/html/client/composer.ts`、`src/ui/chat/html/styles.ts`、`src/test/chat-panel.test.ts`
+- **来源**：用户 2026-10-10「输入框下面的模型选择列表，里面的模型是从哪里获取的？该列表支持自定义吗」「需要能支持自定义，怎么跟 agent 传过来的大模型区分」
+- **详细说明**：模型下拉由 agent 的 `configOptions[category='model']` 驱动，客户端纯转发。本次在客户端侧加一层「自定义模型别名」，与 agent 模型在数据源上分离：settings.json 新增 `acpc.customModels`（`array`，每项 {modelId, name?, description?}，默认 `[]`）。宿主 `readCustomModels()` 归一化（过滤缺 modelId 的项、name 缺省回填 modelId）后随 `SessionMeta.customModels` / `draftOptions.customModels` 下发；composer 把它追加进 model 下拉的「自定义」分组（✦ 图标 + 分组头，与 agent 候选物理分隔，`picker-group-custom`/`picker-item-custom` 用强调色），选中走现成 `setModel`（已有会话）或 `selections`（草稿页）；`optionLabel`/`offersValue` 认自定义 modelId 做按钮回显与草稿回放；宿主 `applyDraftSelections` 对 model 项放行自定义 modelId（不在 agent 候选列表里）。**边界**：客户端仍只把 modelId 转发给 agent（`setSessionConfigOption`），是否生效由 agent 裁决，不接受会回弹；「当前模型」唯一权威仍是 agent 的 `currentValue`，自定义列表只作候选、不造第二份事实（避开 mode/model「同一事实两份副本」的既有坑）。归一化抽成纯函数 `normalizeCustomModels` 导出（与 `pickDefaultCwd`/`resolveDefaultCwd` 同一类拆分），配 4 条单测。
+- **验证方式**：`npm run compile`（含 `check-webview-client.mjs`）/ `npm run lint` / `node CUSTOMIZATIONS/scripts/check-registry.mjs` 全绿；`npm test` 453 passing（新增 `normalizeCustomModels` 4 条单测）
+- **基于上游版本**：0.2.0（commit e7371659）
+
 ### 2026-10-10 - CUSTOM-20261010-232
 - **功能**：多根工作区 additionalDirectories 改显式 UI——输入栏 `+` 按钮选择额外根目录（回退 231 的自动全量）
 - **改动文件**：`src/ui/chat/protocol.ts`、`src/core/SessionManager.ts`、`src/ui/chat/ChatPanelHost.ts`、`src/ui/chat/html/client/boot.ts`、`src/ui/chat/html/client/composer.ts`、`src/ui/chat/html/client/icons.ts`、`src/ui/chat/html/body.ts`、`src/test/chat-client.test.ts`

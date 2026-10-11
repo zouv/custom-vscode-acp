@@ -5,6 +5,8 @@
 import type { SessionConfigOption, SessionModeState } from '@agentclientprotocol/sdk';
 // [CUSTOM-20261003-175] ACP SDK 1.x 删掉了 models API（说明见 core/SessionManager.ts 的同名注释）。
 import type { LegacySessionModelState } from '../../core/SessionManager';
+// [CUSTOM-20261011-235] 自定义模型类型从共享的 config 模块引入（SessionManager 也要读同一份）。
+import type { CustomModel } from '../../config/CustomModels';
 
 import type { EntryPatch, TranscriptEntry, TranscriptSnapshot } from './transcript/types';
 import type { ToolCallView } from './content/toolCalls';
@@ -79,6 +81,11 @@ export interface SessionMeta {
    * 展示 —— additionalDirectories 创建后锁死不可改。缺省 = 没有额外根。
    */
   additionalDirectories?: string[];
+  /**
+   * [CUSTOM-20261010-233] 全局共享的自定义模型别名（`acpc.customModels`）。随 meta/focus/boot 下发，
+   * 客户端只在 model 下拉里追加一个「自定义」分组展示，不与 agent 的 configOptions 合并。
+   */
+  customModels?: CustomModel[];
 }
 
 /** Incremental patch for an existing transcript entry (streaming text, status). */
@@ -232,7 +239,7 @@ export type ExtToChat =
   // 校验后才下发，陈旧无害。
   // 定向发给发起请求的那个面（同 058 那四条——这是"某个文档正在编辑的草稿"）；
   // `draftId` 同样不能省：应答回来时用户可能已经换了草稿，客户端据它丢弃过期结果。
-  | { type: 'draftOptions'; draftId: string; agentName: string | null; configOptions: SessionConfigOption[]; availableCommands: SessionMeta['availableCommands'] }
+  | { type: 'draftOptions'; draftId: string; agentName: string | null; configOptions: SessionConfigOption[]; availableCommands: SessionMeta['availableCommands']; customModels: CustomModel[] }
   // [CUSTOM-END] CUSTOM-20260930-151
   | { type: 'sessionClosed'; sessionId: string; reason: CloseReason }
   | { type: 'append'; sessionId: string; entries: WireEntry[] }

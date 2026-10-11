@@ -49,6 +49,8 @@ import type { PermissionBridge } from '../handlers/PermissionBridge';
 import type { ElicitationBridge } from '../handlers/ElicitationBridge';
 // [CUSTOM-END] CUSTOM-20260924-020
 import { getAgentConfigs } from '../config/AgentConfig';
+// [CUSTOM-20261011-235] 自定义模型：会话创建/加载/恢复时经 `_meta.extraModels` 注入 agent。
+import { readCustomModels } from '../config/CustomModels';
 import { log, logError } from '../utils/Logger';
 import { sendEvent, sendError } from '../utils/TelemetryManager';
 
@@ -682,6 +684,16 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
+   * [CUSTOM-20261011-235] 自定义模型的 modelId 列表，会话创建/加载/恢复时经 ACP `_meta.extraModels`
+   * 下发给 agent，由 fork 桥把它们追加进 model 配置项（见 changelog 235）。这张表**不需要**带上
+   * Claude Code 的档位别名：fork 桥是把这些 id 追加到 agent 已有的模型列表之后（不是替换），
+   * 档位别名由 agent 自己保留。跑 stock 桥时该字段被忽略（无害）。
+   */
+  private extraModelIds(): string[] {
+    return readCustomModels().map(m => m.modelId);
+  }
+
+  /**
    * Internal: create the ACP session with auth handling.
    */
   private async createAcpSession(
@@ -699,12 +711,15 @@ export class SessionManager extends EventEmitter {
         .filter(p => typeof p === 'string' && p.trim().length > 0 && isAbsolute(p.trim()))
         .map(p => p.trim())
       : [];
+    // [CUSTOM-20261011-235] 自定义模型注入（fork 桥经 _meta.extraModels 读取；stock 桥忽略）。
+    const extraModels = this.extraModelIds();
     let sessionResponse: NewSessionResponse;
     try {
       sessionResponse = await connInfo.connection.newSession({
         cwd,
         mcpServers: [],
         ...(extra.length ? { additionalDirectories: extra } : {}),
+        ...(extraModels.length ? { _meta: { extraModels } } : {}),
       });
     } catch (e: any) {
       if (!this.isAuthRequiredError(e)) {
@@ -719,6 +734,7 @@ export class SessionManager extends EventEmitter {
           cwd,
           mcpServers: [],
           ...(extra.length ? { additionalDirectories: extra } : {}),
+          ...(extraModels.length ? { _meta: { extraModels } } : {}),
         });
       } catch (retryErr) {
         logError('Failed to create session after authentication', retryErr);
@@ -1422,12 +1438,15 @@ export class SessionManager extends EventEmitter {
     this.emit('session-load-start', sessionId, agentName);
 
     try {
+      // [CUSTOM-20261011-235] 自定义模型注入（见 createAcpSession 的同名处理）。
+      const extraModels = this.extraModelIds();
       const response = await this.enqueueControl(
         agentId,
         () => conn.connection.loadSession({
           sessionId,
           cwd,
           mcpServers: [],
+          ...(extraModels.length ? { _meta: { extraModels } } : {}),
         }),
       );
       // The response carries the latest mode/model/configOptions snapshot.
@@ -1488,12 +1507,15 @@ export class SessionManager extends EventEmitter {
 
     let response: any;
     try {
+      // [CUSTOM-20261011-235] 自定义模型注入（见 createAcpSession 的同名处理）。
+      const extraModels = this.extraModelIds();
       response = await this.enqueueControl(
         agentId,
         () => conn.connection.resumeSession({
           sessionId,
           cwd,
           mcpServers: [],
+          ...(extraModels.length ? { _meta: { extraModels } } : {}),
         }),
       );
     } catch (e: any) {
