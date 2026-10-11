@@ -1708,3 +1708,26 @@ zod 的 object 默认**丢弃未声明的键**，于是 adapter 明明发了说�
   必须分开问一遍（与 #36「空数组 ≡ 没有？」、#54「把一次请求的结果当终身真相」同族：
   判据比它看起来的更弱）。**写"丢弃 / 跳过"类判据前，先列出"哪些合法输入会落进这个判据"**
   —— 这正是 #62 教训 2 那条反噬的通用形态。
+
+## 64. `CUSTOMIZATIONS/` 下的文档**换行符约定是混合的** —— 一把梭改成 CRLF 会造出整文件伪差异
+
+**现象**：给 `changelog.md` 追加一条变更日志后，`git diff --stat` 报该文件 **6178 行变更**（整文件重写），而内容只多了 24 行。
+
+**根因**：本仓库 `CUSTOMIZATIONS/` 下的文档**不统一**：
+- `docs/changelog.md` → **CRLF**（由早期工具写入）；
+- `registry.md` / `architecture.md` / `README.md` / `release-notes/*.md` / `docs/pitfalls.md` → **LF**。
+
+`.gitattributes` 用了 `-text`（关闭 git 的 EOL 转换、按字节存取），所以换行符一改就是**真实的逐行差异**，不是可被忽略的 whitespace。用 python 的 `open(f,'w')`（默认 translate）或某些编辑器保存时，会把 CRLF 文件写成 LF（反之亦然），于是整文件重写。
+
+**解法**：改 `CUSTOMIZATIONS/` 文档前，先确认该文件在 HEAD 里的实际换行符：
+```bash
+python -c "import subprocess;b=subprocess.run(['git','show','HEAD:路径'],capture_output=True).stdout;print('CRLF',b.count(b'
+'),'LF',b.count(b'
+')-b.count(b'
+'))"
+```
+写入时**对齐原样**：`io.open(f,'w',encoding='utf-8',newline='')` 会原样保留读进来的换行符；只用 `newline=''` 读 + `newline=''` 写，不要在中间做 `splitlines()`/`join()`。
+
+**注意 `normalize-eol.mjs` 不覆盖这里**：它按「上游共有文件 vs 纯自定义文件」分类，`CUSTOMIZATIONS/` 全算自定义、**不强制 CRLF**，所以它不会报错、也不会替你修——这正是本次伪差异能溜过闸门的原因（`check-registry.mjs` 同样是全绿）。
+
+**教训**：`-text` 仓库里，"换个换行符"和"改内容"在 git 眼里没有区别；动文档前先量一下它的 EOL，事后再用 `git diff --stat` 复核（数字远大于改动量 = 中招了）。
