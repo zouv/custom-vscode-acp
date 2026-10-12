@@ -13,15 +13,23 @@
 > **2026-09-25 做过一次同题合并**（CUSTOM-20260925-060）：把"同一个问题分多次修"的条目合并成一条
 > （14 项面板审计 → 2 条、白条问题 → 1 条、每会话 cwd 两步 → 1 条），59 条 → 46 条。
 > **所有 change-id 都保留在合并后的标题里**，所以「代码标记 → 账本 → 日志」的追溯链没有断。
-> 这是本文件唯一一次改写历史——**之后仍然 append-only**。
+> 20261012-236 又对 235 条目里的具名指称做了同类订正（范围仅限该名称）。除此之外**仍然 append-only**。
 
 ---
+
+### 2026-10-12 - CUSTOM-20261012-236
+- **改动**：去掉代码注释与自定义文档中对外部参考实现的具名指称，统一改指向本仓库配套的 fork 桥（`zouv/claude-agent-acp`）
+- **改动文件**：`src/config/CustomModels.ts`（注释措辞，复用 235 标记块）、`CUSTOMIZATIONS/release-notes/v0.2.0-custom.14.md`、`CUSTOMIZATIONS/docs/changelog.md`（235 条目内两处 + 文件头注记）
+- **来源**：用户 2026-10-12 要求去掉注释与文档中对外部参考实现的具名指称
+- **详细说明**：三处替换——①`CustomModels.ts` 头部注释「某外部客户端的做法」→「配套 fork 桥的做法」；②`release-notes/v0.2.0-custom.14.md` 的 `_meta.extraModels` 说明改指向配套 fork 桥；③`changelog.md` 235 条目内两处（来源行、详细说明中「自己 fork 的桥」与该处括号里的对照实现）。**本次再次改写了 changelog 历史**——继 060 同题合并之后的第二次，范围**仅限该名称**：谁做的、怎么做的、验证结论一字未动；文件头那条「唯一一次改写历史」的注记已同步订正。
+- **验证方式**：全仓 `grep -ri` 确认无残留（`dist/`、`out/`、`.vscode-test/` 等构建/测试产物除外，重新编译即消失）；`check-registry.mjs` 与 `npm run lint` 全绿
+- **基于上游版本**：0.2.0（commit e7371659）
 
 ### 2026-10-11 - CUSTOM-20261011-235
 - **功能**：自定义模型机制重做——改为「会话创建时经 ACP `_meta.extraModels` 注入 agent」，并提供一个支持该字段的本地 fork 桥
 - **改动文件**：`src/config/CustomModels.ts`（新增）、`src/core/SessionManager.ts`、`src/ui/chat/protocol.ts`、`src/ui/chat/ChatPanelHost.ts`、`src/ui/chat/html/client/composer.ts`、`src/ui/chat/html/styles.ts`、`src/test/chat-panel.test.ts`、`package.json`；**仓库外**：`https://github.com/zouv/claude-agent-acp`（fork 自 `@agentclientprotocol/claude-agent-acp@0.89.1`；补丁 commit `63ecd66`，含 `prepare` 脚本供 `npx -y github:zouv/claude-agent-acp` 从 git 安装时自动构建）
-- **来源**：用户 2026-10-11 提供 Universe Editor 模型层分析（r2），要求「走 fork 桥、不改 Claude 原有的 5 个档位映射、要能加新的自定义模型」，并选定「本地目录引用」
-- **详细说明**：233 版把自定义模型塞进客户端「自定义」分组、选中走 `setModel` 转发，但 agent 只认自己 model 配置项里的值，必然被拒（234 把真实原因 `Invalid value for config option model: …` 翻了出来）。**关键排查结论**：`_meta.extraModels` 是 Universe Editor **自己 fork 的桥**加的字段，stock `claude-agent-acp@0.89.1` 里 0 处；而 stock 的 `availableModels` 白名单虽然能合成任意模型，但它只从 **settings 文件**读（`SettingsManager.getSettings()`），`_meta` 传的 settings 走不到那条合成逻辑（已实测：`_meta` 路径下 grok/qwen 出不来）。因此要么写用户 settings 文件、要么 fork 桥——用户选了 fork。本改动：①`CustomModel` 类型 + `normalizeCustomModels`/`readCustomModels` 迁到新增的 `src/config/CustomModels.ts`（SessionManager 也要读，UI 层不该被 core 反向依赖）；②`SessionManager` 新增 `extraModelIds()`，`createAcpSession`/`loadSession`/`resumeSession` 三处把 modelId 经 `_meta.extraModels` 注入（列表为空时不带 `_meta`）；③撤掉 composer 的「自定义」分组硬塞与 styles 的 `picker-*-custom`；④保留 `optionLabel` 显示名映射（fork 桥让 agent 把自定义模型列为裸 id → 客户端据此显示配置的 name）与 `applyDraftSelections`/`offersValue` 的自定义 modelId 放行（对 stock 桥是兜底）。**fork 桥补丁**（改 `src/session-model.ts` + `src/acp-agent.ts`，镜像 UE 的 `XR()`/`h5()`；已 push 到 zouv/claude-agent-acp）：新增 `extraModelIdsFromMeta()`（trim/去重/封顶 64）与 `applyExtraModels()`（把 id 追加进模型列表），在 `createSession` 的 allowlist 之后调用，并把 extraModels 计入 `computeSessionFingerprint` 以便 load/resume 也重算。
+- **来源**：用户 2026-10-11 提供一份同类 ACP 客户端的模型层分析（r2），要求「走 fork 桥、不改 Claude 原有的 5 个档位映射、要能加新的自定义模型」，并选定「本地目录引用」
+- **详细说明**：233 版把自定义模型塞进客户端「自定义」分组、选中走 `setModel` 转发，但 agent 只认自己 model 配置项里的值，必然被拒（234 把真实原因 `Invalid value for config option model: …` 翻了出来）。**关键排查结论**：`_meta.extraModels` 是配套 fork 桥（`zouv/claude-agent-acp`）自己加的扩展字段，stock `claude-agent-acp@0.89.1` 里 0 处；而 stock 的 `availableModels` 白名单虽然能合成任意模型，但它只从 **settings 文件**读（`SettingsManager.getSettings()`），`_meta` 传的 settings 走不到那条合成逻辑（已实测：`_meta` 路径下 grok/qwen 出不来）。因此要么写用户 settings 文件、要么 fork 桥——用户选了 fork。本改动：①`CustomModel` 类型 + `normalizeCustomModels`/`readCustomModels` 迁到新增的 `src/config/CustomModels.ts`（SessionManager 也要读，UI 层不该被 core 反向依赖）；②`SessionManager` 新增 `extraModelIds()`，`createAcpSession`/`loadSession`/`resumeSession` 三处把 modelId 经 `_meta.extraModels` 注入（列表为空时不带 `_meta`）；③撤掉 composer 的「自定义」分组硬塞与 styles 的 `picker-*-custom`；④保留 `optionLabel` 显示名映射（fork 桥让 agent 把自定义模型列为裸 id → 客户端据此显示配置的 name）与 `applyDraftSelections`/`offersValue` 的自定义 modelId 放行（对 stock 桥是兜底）。**fork 桥补丁**（改 `src/session-model.ts` + `src/acp-agent.ts`，照同类客户端桥的同名实现；已 push 到 zouv/claude-agent-acp）：新增 `extraModelIdsFromMeta()`（trim/去重/封顶 64）与 `applyExtraModels()`（把 id 追加进模型列表），在 `createSession` 的 allowlist 之后调用，并把 extraModels 计入 `computeSessionFingerprint` 以便 load/resume 也重算。
 - **验证方式**：扩展侧 `npm run compile` / `lint` / `npm test`（455 passing）/ `check-registry` 全绿。**fork 桥侧有实测**（非推断）：①用桩 SDK 跑 patch 后的 `createSession`/`loadSession`/`resumeSession`，三条路径的 model 列表都带出 `grok-4.6[1m]`/`qwen3.8-max[1m]`；②**真实 CLI 端到端**：`session/new` 的 model 选项为 `default, opus, fable, sonnet, haiku, grok-4.6[1m], qwen3.8-max[1m]`；③**切换实测**：`qwen3.8-max[1m]`/`deepseek-v4-pro` 均 `set_config_option` 成功。**已知非本功能问题**：`grok-4.6[1m]` 切换时网关返回 `Couldn't confirm model … with the API`——是网关/账号不认该 id，与注入无关。
 - **基于上游版本**：0.2.0（commit e7371659）
 
