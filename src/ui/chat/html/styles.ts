@@ -290,7 +290,18 @@ export function styles(): string {
      只写在 #history 上、不动 .outline 的通用规则 —— #outline / #cwdMenu 里没有这种嵌套菜单。
      head 的 background: inherit 与 sticky 都保留（后者仍是菜单的定位锚）。 */
   #history { display: flex; flex-direction: column; overflow: visible; }
-  #history .outline-head { flex: none; }
+  /* [CUSTOM-BEGIN] CUSTOM-20261013-237 - head 必须有正的 z-index，否则历史行会把目录过滤菜单盖住
+     （用户 2026-10-13 报，图为"菜单与列表项互相透底"）。
+     因果链：212 给每行套了 .session-row 并给它 position: relative（悬停图标要一个定位祖先）
+     ⇒ 每一行都成了"定位元素、z-index: auto"，与同样 z-index: auto 的 .outline-head 落在**同一个
+     绘制步**里；同一步内按 DOM 顺序画，而列表排在 head 之后 ⇒ 行画在 head 之上。
+     菜单自己的 z-index: 20 **救不了**：position: sticky 让 .outline-head 自成层叠上下文，菜单被封在
+     里面 —— 实测把它抬到 999 也照样被盖，能动的只有 head 这一层。
+     抬 head 之后整棵子树（chip + 菜单）进入"z-index > 0"那一步、画在所有 z-index: auto 的行之上；
+     顺带把 sticky head 本来该有的"盖住滚过去的行"也一并补对了。
+     只写 #history（沿用 141 的口径）：#outline / #cwdMenu 里没有 .session-row，没有这个竞争。 */
+  #history .outline-head { flex: none; z-index: 2; }
+  /* [CUSTOM-END] CUSTOM-20261013-237 */
   #history .outline-list { flex: 1; min-height: 0; overflow-y: auto; }
   /* --- 时间显示（CUSTOM-20260925-065）------------------------------------
      每条记录的时刻。元素**始终在 DOM 里**，可见性由 #messages 上的一个类决定

@@ -1731,3 +1731,22 @@ python -c "import subprocess;b=subprocess.run(['git','show','HEAD:路径'],captu
 **注意 `normalize-eol.mjs` 不覆盖这里**：它按「上游共有文件 vs 纯自定义文件」分类，`CUSTOMIZATIONS/` 全算自定义、**不强制 CRLF**，所以它不会报错、也不会替你修——这正是本次伪差异能溜过闸门的原因（`check-registry.mjs` 同样是全绿）。
 
 **教训**：`-text` 仓库里，"换个换行符"和"改内容"在 git 眼里没有区别；动文档前先量一下它的 EOL，事后再用 `git diff --stat` 复核（数字远大于改动量 = 中招了）。
+
+## 65. 「谁盖住谁」是**绘制顺序**，不是 z-index 大小 —— 而预览的 fixture 与主题都能让它在图上消失
+
+**现象**：用户报「点会话历史的 ↺，目录筛选的下拉列表会被会话历史的列表项内容给盖住」—— 菜单自己的行（`alpha` / `3 sessions`）与列表行的标题在同一块区域**互相透底**。菜单明明带着 `z-index: 20`，看着"没道理被盖"。
+
+**根因（两层）**：
+
+1. **层叠**。四天前（212）给历史行外套 `.session-row` 时加了 `position: relative`（悬停的 Archive/Rename 图标要一个定位祖先），于是**每一行都成了定位元素、`z-index: auto`**。`z-index: auto` 的定位元素与 `.outline-head`（`position: sticky`）落在**同一个绘制步**里，同一步内按 **DOM 顺序**画 —— 列表排在 head 之后 ⇒ 行画在 head 整棵子树（含菜单）之上。菜单的 `z-index: 20` 救不了它：`position: sticky` 让 `.outline-head` **自成层叠上下文**，菜单被封在里面，那个 20 只在 head 内部参与比较。**实测**：把它抬到 999 照样被盖（这条推不出来，只能量）。
+2. **预览为什么没拦住**（三处叠加）。①`#historyfilter` 档的 fixture 是**手搭**的（往 `.outline-list` 里塞光秃秃的 `.outline-item`），而真行外面套着 `.session-row` ⇒ **触发条件在预览里根本不存在**；②预览主题里没有 `--vscode-dropdown-*` / `--vscode-editorWidget-background`，浮层背景于是算成**透明** ⇒ 两层叠起来的像素几乎一样（实测只差 119 个），图上分不出谁在上；③那一档的量测写在**解析期**同步跑，量的时候菜单还没打开，读出来是一组零。
+
+**解法**：能动的只有 head 这一层 —— `#history .outline-head { z-index: 2 }`，整棵子树进入"z-index > 0"那一步、画在所有 `auto` 的行之上（顺带补对了 sticky head 本该盖住滚过去的行）。同轮把 fixture 改走**真路径**（点 ↺ + 喂 `setHistory` + 点 chip 真开菜单）、补上预览主题的浮层 token、探针搬进 load 回调并新增 `menuOnTop` / `headOnTop`（`elementFromPoint` 取菜单矩形中心与 head 那一点各一次）。
+
+**教训**：
+1. 带 `z-index` 的东西被盖住时，先问「**它在谁的层叠上下文里**」—— `sticky` / `fixed` **总是**自成层叠上下文，写在那里的 `z-index` 与祖先的 `z-index` 不是同一个擂台。
+2. 同一个绘制步内，胜负由 **DOM 顺序**决定。**给列表里任意一行加 `position` 就能把"列表 vs 头部"的胜负翻过来** —— 212 当时只想给图标一个定位祖先，埋的却是这颗雷；动行内定位时要顺手想一下它上面有没有 sticky 头。
+3. fixture 与真渲染器"**长得差不多但不一样**"，那一档就等于没验（#19 的老账）。渲染路径能复用生产代码就复用，别手搭。
+4. 预览主题**缺 token** 会让"看图验收"静默失效（219 的 badge、226 的状态色是同一族）—— 浮层类尤其：背景一透明，叠放关系在截图里就消失了。
+
+**验证**：`node CUSTOMIZATIONS/scripts/preview-records.mjs` 的 `#historyfilter` 档 —— 探针 `menuOnTop` 由 false 变 true、`headOnTop` 同步 true；改动前后的两张 PNG 做像素对比，差异落在「菜单底下那条行文字」带上（改前行文字压在菜单上，改后在菜单左缘被截断）。最小复现页（headless Chrome + `elementFromPoint`）另行确认了触发条件、以及"抬菜单自己的 z-index 无效"。
