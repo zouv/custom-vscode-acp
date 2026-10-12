@@ -1,7 +1,7 @@
 // [CUSTOM-BEGIN] CUSTOM-20261011-235 - 自定义模型（acpc.customModels）：类型、归一化与读取。
 // 从 ChatPanelHost 迁来（原 CUSTOM-20261010-233 的 normalizeCustomModels）：SessionManager（core）
 // 也要读同一份配置，在会话创建时经 ACP `_meta.extraModels` 注入 agent，让 agent 把自定义模型
-// 列入其 `model` 配置项（Universe Editor 的做法，见 CUSTOMIZATIONS/docs/changelog.md 235）。
+// 列入其 `model` 配置项（配套 fork 桥的做法，见 CUSTOMIZATIONS/docs/changelog.md 235）。
 // name/description 供客户端显示名映射用（composer.optionLabel），不在 _meta.extraModels 里。
 // [CUSTOM-END] CUSTOM-20261011-235
 import * as vscode from 'vscode';
