@@ -226,6 +226,16 @@ const THEME = `:root {
   --vscode-widget-shadow: rgba(0, 0, 0, 0.36);
   --vscode-input-background: #313131;
   --vscode-editor-font-family: Consolas, monospace;
+  /* [CUSTOM-20261013-237] 浮层那几个 token（取 Dark+ 的值）。这份预览主题一直没有它们，
+     于是 .outline（历史浮层）与 .picker-menu（目录过滤菜单、composer 的选择器）的 background
+     全算成**透明** —— 浮层看着像"印在内容上"，而这正是 237 要验的那件事（菜单与历史行谁在上）：
+     菜单不透明，行文字被盖住才是像素上看得见的结果；透明的话两层叠起来的图几乎一模一样
+     （实测只差 119 个像素），"看图验收"等于没验。同类缺口见 219（badge）与 226（状态色）——
+     都是"预览主题缺 token ⇒ 验的东西不显形"。 */
+  --vscode-dropdown-background: #313131;
+  --vscode-dropdown-foreground: #cccccc;
+  --vscode-dropdown-border: #3c3c3c;
+  --vscode-editorWidget-background: #252526;
 }`;
 
 /** The driver: render the fixtures, then honour '#collapsed' by closing every fold. */
@@ -942,25 +952,93 @@ function driver() {
   }
   // [CUSTOM-20260930-141] 目录过滤菜单：它挂在历史浮层内部的 .outline-head 里，而浮层原先
   // 是个 overflow: auto 的滚动容器 ⇒ 绝对定位的菜单会被裁成几行（历史列表越短越矮）。
-  // 这一档手动搭出那个嵌套结构（渲染逻辑由桩 DOM 测试覆盖，这里只看**布局**：溢出有没有被裁）。
-  if (location.hash.indexOf('historyfilter') >= 0) {
-    var drawerEl2 = document.getElementById('history');
-    var listEl2 = drawerEl2 ? drawerEl2.querySelector('.outline-list') : null;
-    var chipEl = document.getElementById('historyFilter');
-    var filterMenuEl2 = document.getElementById('historyFilterMenu');
-    if (drawerEl2 && listEl2 && filterMenuEl2) {
-      drawerEl2.hidden = false;
-      if (chipEl) { chipEl.hidden = false; chipEl.textContent = 'ai-gateway-viewer'; }
-      // 历史列表只放 4 行：修好之前，菜单的可见高度 = head 底边到浮层底边，短得只剩两三行。
-      for (var si = 0; si < 4; si++) {
-        listEl2.appendChild(NS.dom.el('div', 'outline-item', '会话记录 ' + (si + 1)));
-      }
-      // 菜单 20 行：内容高度远超它自己的 max-height（260px），所以"显示不完整"只可能是被裁。
-      for (var di = 0; di < 20; di++) {
-        filterMenuEl2.appendChild(NS.dom.el('div', 'picker-item filter-item', 'folder-' + (di + 1)));
-      }
-      filterMenuEl2.className = 'picker-menu down filter-menu open';
+  // [CUSTOM-20261013-237] 这一档**改走真路径**：以前它手搭结构（往 .outline-list 里塞几个
+  // 光秃秃的 .outline-item），而真行外面还套着 .session-row（212 为悬停图标加的，带
+  // position: relative）—— 于是 237 那次"行盖住菜单"的层叠退化，在这一档里**量不出来**
+  // （光秃秃的 .outline-item 不参与定位绘制）。fixture 与真渲染器长得不一样，就是 pitfalls #19
+  // 说的"知识的第二份拷贝"。现在点 ↺ + 喂一条 setHistory 回复，行由 sessionMenu 自己建；
+  // 再接一次 chip 的真点击把菜单打开（连"点了 chip 菜单会开"这条接线一起验）。
+  // 只看**布局**：菜单有没有被裁（menuH / menuScrollH）、有没有被行盖住（menuOnTop）。
+  // 列表刻意留短（当前目录 3 条）：浮层高度是内容撑的，菜单只有比列表长才谈得上"溢出"与
+  // "重叠"，141 与 237 两件事才都显形。
+  function historyFilterMode() {
+    var hfFocus = { sessionId: 's1', agentName: 'Claude Code', title: 'here', cwd: 'D:/Git/alpha',
+      createdAt: '2026-09-20T00:00:00Z', loading: false, running: false, unread: false };
+    NS.tabs.setSessions([hfFocus]);
+    NS.tabs.setFocus(hfFocus);
+    document.getElementById('historyBtn').click();
+    var hfSession = function (id, title, dir) {
+      return { sessionId: id, title: title, cwd: dir, dirKey: dir.toLowerCase(),
+        updatedAt: '2026-09-20T00:00:00Z' };
+    };
+    NS.sessionMenu.setHistory({
+      type: 'history', agentName: 'Claude Code', source: 'agent',
+      // 标题刻意长（照用户报障那张图里的真实标题）：行文字要一直伸到菜单底下，这一档才既
+      // 量得到"谁盖住谁"（探针）、也**看得见**（截图里行文字压在菜单上）。短标题时两层
+      // 谁是上层在像素上完全一样 —— 只差命中测试，图会骗人。
+      sessions: [
+        hfSession('a1', '根因：网关 PID 放错每次插一个随机占位符 ---- 排查下这个问题是新出现的吗', 'D:/Git/alpha'),
+        hfSession('a2', '使用 story_editor 检查下 06-纪元专题-近古纪元.md 的纪元设定，看看有没有短板/缺陷，有哪些可以改进', 'D:/Git/alpha'),
+        hfSession('a3', '展示出来的目录筛选默认要按当前目录过滤，但用户手动选过一次就不要改', 'D:/Git/alpha'),
+        hfSession('b1', 'beta one', 'D:/Git/beta'),
+        hfSession('b2', 'beta two', 'D:/Git/beta'),
+        hfSession('c1', 'gamma one', 'D:/Git/gamma'),
+        hfSession('d1', 'delta one', 'D:/Git/delta'),
+        hfSession('e1', 'epsilon one', 'D:/Git/epsilon')
+      ],
+      directories: [
+        { key: 'd:/git/alpha', cwd: 'D:/Git/alpha', name: 'alpha', label: 'alpha', count: 3, current: true },
+        { key: 'd:/git/beta', cwd: 'D:/Git/beta', name: 'beta', label: 'beta', count: 2, current: false },
+        { key: 'd:/git/gamma', cwd: 'D:/Git/gamma', name: 'gamma', label: 'gamma', count: 1, current: false },
+        { key: 'd:/git/delta', cwd: 'D:/Git/delta', name: 'delta', label: 'delta', count: 1, current: false },
+        { key: 'd:/git/epsilon', cwd: 'D:/Git/epsilon', name: 'epsilon', label: 'epsilon', count: 1, current: false }
+      ]
+    });
+    var hfChip = document.getElementById('historyFilter');
+    // 真点击：菜单由 chip 自己的处理函数打开（这里不设 .open，设了就绕过了接线）。
+    if (hfChip) { hfChip.click(); }
+    // 量测紧跟搭建（这一段**必须**在 load 之后跑，所以不能放进解析期那段通用探针里）。
+    // 菜单被历史行盖住这件事**只能量不能推**（pitfall #31）：两者的矩形本就是重叠的、CSS 文本
+    // 也读不出"谁在上"，唯一的事实是**那一点上最上层的元素是谁**。
+    //   · menuOnTop —— 菜单矩形中心（必然压着几行历史行）取 elementFromPoint，必须落在菜单内；
+    //   · headOnTop —— 同一条竖线的 head 那一带：head 是 sticky 且带背景，滚过去的行本该被它
+    //     盖住，这一项把那个不变量也一起钉住。
+    var hfDrawer = document.getElementById('history');
+    var hfMenu = document.getElementById('historyFilterMenu');
+    var hfLine = null;
+    if (hfDrawer && hfMenu) {
+      var hfRect = hfMenu.getBoundingClientRect();
+      var hfX = Math.round(hfRect.left + hfRect.width / 2);
+      var hfHit = document.elementFromPoint(hfX, Math.round(hfRect.top + hfRect.height / 2));
+      var hfHead = hfDrawer.querySelector('.outline-head');
+      var hfHeadRect = hfHead ? hfHead.getBoundingClientRect() : null;
+      var hfHitHead = hfHeadRect ? document.elementFromPoint(hfX, Math.round(hfHeadRect.top + 2)) : null;
+      hfLine = JSON.stringify({
+        kind: 'history-filter',
+        drawerH: Math.round(hfDrawer.getBoundingClientRect().height),
+        drawerOverflowY: getComputedStyle(hfDrawer).overflowY,
+        menuOpen: hfMenu.className.indexOf('open') >= 0,
+        menuH: Math.round(hfRect.height),
+        menuScrollH: hfMenu.scrollHeight,
+        menuBorderColor: getComputedStyle(hfMenu).borderTopColor,
+        menuOverhang: Math.round(hfRect.bottom - hfDrawer.getBoundingClientRect().bottom),
+        menuOnTop: !!(hfHit && hfMenu.contains(hfHit)),
+        menuHitClass: hfHit ? String(hfHit.className || hfHit.tagName) : null,
+        headOnTop: !!(hfHitHead && hfHead && hfHead.contains(hfHitHead)),
+        headHitClass: hfHitHead ? String(hfHitHead.className || hfHitHead.tagName) : null,
+        rowCount: hfDrawer.querySelectorAll('.outline-list .session-row').length,
+      });
     }
+    var hfPre = document.createElement('pre');
+    hfPre.id = 'history-probe';
+    hfPre.textContent = hfLine || JSON.stringify({ kind: 'history-filter', error: 'no drawer/menu node' });
+    document.body.appendChild(hfPre);
+  }
+  if (location.hash.indexOf('historyfilter') >= 0) {
+    // 同 historyDefaultMode：本档也手动派发过一次 DOMContentLoaded 来提前跑 boot，真的那个
+    // 随后还会到 —— 等 load，避开"第二次 init 末尾的 close()"把抽屉关掉。
+    if (document.readyState === 'complete') { historyFilterMode(); }
+    else { window.addEventListener('load', historyFilterMode); }
   }
   // [CUSTOM-20261001-155] 历史会话的**默认筛选**：走真路径（真 boot → 真 ↺ → 宿主形状的
   // history 回复 → 真标记 #history/#historyFilter），桩 DOM 测试测的是逻辑、这里测的是
@@ -1930,19 +2008,11 @@ function driver() {
         }));
       }
     }
-    var drawerEl3 = document.getElementById('history');
-    var filterMenuEl3 = document.getElementById('historyFilterMenu');    if (drawerEl3 && filterMenuEl3) {
-      out.push(JSON.stringify({
-        kind: 'history-filter',
-        drawerH: Math.round(drawerEl3.getBoundingClientRect().height),
-        drawerOverflowY: getComputedStyle(drawerEl3).overflowY,
-        menuH: Math.round(filterMenuEl3.getBoundingClientRect().height),
-        menuScrollH: filterMenuEl3.scrollHeight,
-        menuBorderColor: getComputedStyle(filterMenuEl3).borderTopColor,
-        menuOverhang: Math.round(filterMenuEl3.getBoundingClientRect().bottom
-          - drawerEl3.getBoundingClientRect().bottom),
-      }));
-    }
+    // [CUSTOM-20261013-237] 这里**原先**有一段 history-filter 的量测（drawerH / menuH /
+    // menuOverhang…）。它随 #historyfilter 档一起搬去了 historyFilterMode() —— 因为那一档改成
+    // 走真路径、必须等 load 才能驱动，而这一段是**解析期**同步跑的：等它量的时候菜单还没打开，
+    // 读出来是一组零（#historydefaultprobe 的图上就能看到那条全零的 history-filter 行）。
+    // 量测跟着 fixture 走，别把"什么时候量"和"什么时候搭"分成两处。
     // [CUSTOM-20261003-176] 复现用户 2026-10-03 报的"消息面板没到底（Jump 还在），可滚动条已经触底、
     // 鼠标再也滚不动"。**只能量不能推**（pitfall #31）：把滚动状态与"内容 / 表单抽屉 / 输入卡"三者的
     // 几何一起读出来。elic 档只 hydrate 了表单本身（滚不动），这里把标准夹具一并具上，才有得滚。
@@ -2390,7 +2460,12 @@ const SHOTS = [
   // [CUSTOM-20260930-149] markdown 往返：走真机路径（boot → reset → append → revise），
   // 探针读 asked / hasMdClass / droppedNoSession —— 这三项一起看才能判定整条链路。
   ['#bootroundprobe', 'markdown-round', '1440,900'],
-  ['#historyfilter', 'history-filter', '1440,900'],
+  // [CUSTOM-20261013-237] 这一档除图之外还有一组数字（写在 <pre id="history-probe"> 里）：
+  // menuOnTop / headOnTop 是"谁盖住谁"的唯一硬判据（图为辅），rowCount 证明列表走的是真渲染器。
+  // 宽度取用户报障那张图的窗口宽（955）而不是脚本惯用的 1440：菜单贴浮层右缘、行文字也够长，
+  // 两者在**像素上**才重叠得起来。1440 下行文字根本伸不到菜单底下，两层谁在上在截图里一模一样
+  // （实测 373 个差异像素全落在底部那行探针文字上）—— 这正是这个 bug 藏了四天的原因。
+  ['#historyfilter', 'history-filter', '955,900'],
   // [CUSTOM-20261001-155] 默认筛选（地址栏有目录 ⇒ 列表只出该目录）：截图看列表本身，
   // 探针（同 hash 带 probe）读 askedCwd / rows / chip —— 数字比肉眼可靠。
   ['#historydefaultprobe', 'history-default', '1440,900'],

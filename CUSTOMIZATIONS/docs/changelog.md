@@ -17,6 +17,15 @@
 
 ---
 
+### 2026-10-13 - CUSTOM-20261013-237
+- **功能**：修「历史会话的目录筛选菜单被会话列表行盖住」（层叠退化）；同一轮把预览截图档改成走真渲染路径，并补上预览主题里缺失的浮层 token
+- **改动文件**：`src/ui/chat/html/styles.ts`（一条规则 + 因果链注释）、`CUSTOMIZATIONS/scripts/preview-records.mjs`（`#historyfilter` 档重做 + 主题 token + 探针）
+- **来源**：用户 2026-10-13 报：点「会话历史」的 ↺ 之后，目录筛选的下拉列表「会被会话历史的列表项内容给盖住」
+- **详细说明**：**根因是一条层叠链**（用户报的是现象，现象背后是绘制顺序）：212 给历史行外套 `.session-row` 并给了它 `position: relative`（悬停的 Archive/Rename 图标要一个定位祖先）—— 于是每一行都成了**定位元素、`z-index: auto`**，与同样 `z-index: auto` 的 `.outline-head` 落在**同一个绘制步**里；同一步内按 DOM 顺序画，而 `.outline-list` 排在 head 之后 ⇒ 行画在 head 之上。菜单自己的 `z-index: 20` **救不了**，因为 `position: sticky` 让 `.outline-head` 自成层叠上下文，菜单被封在里面 —— 实测把它抬到 999 也照样被盖（这条用最小复现页量出来的，不是推的）。能动的只有 head 这一层：`#history .outline-head { flex: none; z-index: 2 }` ⇒ 整棵子树（chip + 菜单）进入「z-index > 0」那一步、画在所有 auto 的行之上；顺带把 sticky head 本来该有的「盖住滚过去的行」也一并补对了。只写 `#history`（沿用 141 的口径）：`#outline` / `#cwdMenu` 里没有 `.session-row`，没有这个竞争。
+  **同一轮修掉的是「这个 bug 为什么在预览里看不见」**（三个阶段都记下来，因为下次还会遇到）：①**fixture 与真渲染器不同形** —— `#historyfilter` 档原先手搭光秃秃的 `.outline-item`，而 212 之后真行外面套着 `.session-row`，于是层叠退化在这一档里量不出来（pitfall #19 的「知识第二份拷贝」）；现改为**走真路径**：点 ↺ → 喂一条 setHistory 回复 → 点 chip 真开菜单（连「点 chip 会开菜单」这条接线一起验）。②**预览主题缺 token** —— `--vscode-dropdown-*` 与 `--vscode-editorWidget-background` 一直没写，`.outline` / `.picker-menu` 的背景于是算成**透明**，两层叠起来的图几乎一模一样（实测只差 119 个像素），「看图验收」等于没验；补上后取 Dark+ 的值（同族缺口：219 的 badge、226 的状态色）。③**量测时机** —— 原来的量测在**解析期**同步跑（那时菜单还没打开，读出来是一组零），现搬进 load 回调、与 fixture 同处；新增 `menuOnTop` / `headOnTop`（`elementFromPoint` 取菜单矩形中心与 head 那一点各一次）——「谁盖住谁」只有这一条硬判据。另外该档窗口宽改 955（用户报障那张图的宽度）：1440 下行文字根本伸不到菜单底下，两层谁在上在像素上无差别。
+- **验证方式**：①**真 Chromium 截图**（本仓库的布局验收工具）：`node CUSTOMIZATIONS/scripts/preview-records.mjs` —— 改动前 `menuOnTop: false`（`menuHitClass` 是 `outline-item`），改动后 `menuOnTop: true`（`picker-item`），`headOnTop` 同步为 true；两张图做像素对比，差异落在「菜单底下那条行文字」带上（改前行文字压在菜单上，改后行文字在菜单左缘被截断）。②**最小复现页**（headless Chrome + `elementFromPoint`）单独证明机制：`.session-row{position:relative}` 是触发条件、把菜单 `z-index` 抬到 999 无效、给 head 加 `z-index` 才有效。③闸门：`check-registry.mjs` exit 0、`npm run lint` 全绿、`npm test` 455 passing。
+- **基于上游版本**：0.2.0（commit e7371659）
+
 ### 2026-10-12 - CUSTOM-20261012-236
 - **改动**：去掉代码注释与自定义文档中对外部参考实现的具名指称，统一改指向本仓库配套的 fork 桥（`zouv/claude-agent-acp`）
 - **改动文件**：`src/config/CustomModels.ts`（注释措辞，复用 235 标记块）、`CUSTOMIZATIONS/release-notes/v0.2.0-custom.14.md`、`CUSTOMIZATIONS/docs/changelog.md`（235 条目内两处 + 文件头注记）
