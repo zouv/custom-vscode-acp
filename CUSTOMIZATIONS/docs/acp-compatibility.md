@@ -100,4 +100,4 @@ acpc.customModels 经 _meta.extraModels 传给本仓库配套 Claude fork；这�
 - CI 配置已补 Node 22、Windows minimum、macOS compile/lint 和分发闸门；未跑远程 CI，macOS 历史 Electron live-test 限制保留。
 - 普通关闭尽力保存快照；宿主强杀/系统断电不承诺 Memento 写必完成。已退出父进程的孤儿后代不保证全面回收；日志溢出/I/O 错误可能丢记录。
 - 三份 replay fixture 路径已匿名化，另补两份夹具 ls owner/group 的 user/1000 占位替换，预览与测试中的机器相关样例也替换为占位值，并加入路径/目录身份闸门（10个合成自检）；历史 changelog 的两处私人路径和 Git 历史仍未清理：append-only/历史重写规则需要用户明确授权。不是全面 secret/二进制审计。
-- 未 commit、push、升版本或发布。
+- 上述修复审查阶段未 commit、push、升版本或发布；后续打包与发布记录见 ../release-notes/v0.2.0-custom.16.md。

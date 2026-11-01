@@ -17,6 +17,13 @@
 
 ---
 
+### 2026-11-01 - CUSTOM-20261101-016
+- **功能**：打包0.2.0-custom.16并同步发布账本与版本说明。
+- **改动文件**：package.json、package-lock.json、CUSTOMIZATIONS/registry.md、release-notes/v0.2.0-custom.16.md、docs/acp-compatibility.md、docs/changelog.md。
+- **详细说明**：干净工作区执行release-vsix.sh；版本及lock根版本同步到.16，锁依赖无额外升级；registry当前/最近发布元数据更新至2026-11-01；归档修复摘要、ACP缺口与验证边界。compatibility尾句明确审查与后续发布阶段，历史流水不改写。
+- **验证方式**：release脚本lint/compile/test/production/vsce全通过；Windows1.144.0与1.85.0各503 passing；VSIX9个文件，runtime仅extension.js；隔离安装激活成功、22命令注册。runtime audit0，全量17 moderate无high/critical；GitHub发布按tag及SHA256回下载核验。
+- **基于上游版本**：0.2.0（commit e7371659）
+
 ### 2026-11-01 - CUSTOM-20261101-015
 - **功能**：补齐 ACP replay 夹具目录列表的身份脱敏与发布前隐私门禁。
 - **改动文件**：src/test/fixtures/claude-code-bash-tools.json、claude-code-session-load.json、chat-client.test.ts、chat-panel.test.ts；CUSTOMIZATIONS/scripts/preview-records.mjs、check-fixtures.mjs、registry.md、docs/pitfalls.md、docs/acp-compatibility.md。
