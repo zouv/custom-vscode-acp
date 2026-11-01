@@ -47,7 +47,9 @@ const extensionConfig = {
       {
         test: /\.ts$/,
         exclude: /node_modules/,
-        use: [{ loader: 'ts-loader' }],
+        // [CUSTOM-BEGIN] CUSTOM-20261101-006 - The published bundle must not generate declarations.
+        use: [{ loader: 'ts-loader', options: { compilerOptions: { declaration: false } } }],
+        // [CUSTOM-END] CUSTOM-20261101-006
       },
     ],
   },

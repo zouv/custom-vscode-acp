@@ -27,6 +27,12 @@
 
 ## 5. 新 Chat 面板子系统（`src/ui/chat/`，CUSTOM-20260923-011）
 
+**当前策略（CUSTOM-20261101-007）**：全部非空 Agent 名与空态走现代 session-keyed 面板；`MODERN_AGENTS` 是 Claude Code/Codex CLI 默认候选，不是 UI 白名单；legacy 只供上游同步保留。Claude 专属磁盘解析/子 Agent 启发式仍按 Agent 类型选择，不因通用 UI 而泛化。
+
+**恢复/历史修复（004/010）**：`saveOpenSessions` 调度时捕获 pendingSnapshot；`flushOpenSessions` 在 debounce 与 dispose 前写入，dispose 幂等；extension 先 dispose chatRouter，再 SessionManager。写 Memento 是 best-effort，不承诺宿主强杀时必完成。历史 picker 调 `listAllSessions(...,{reconcile:false})` 获取全部页，然后与本地/磁盘联合，不能提前对账删除 cache-only；树仍保留逐页 Load More。
+
+**安全/能力（001/007/009）**：sanitize 对未知包装先递归子树再 unwrap；send/steer 验 promptCapabilities；terminal auth 单独交互命令，不混同普通工具终端。详细兼容边界见 [ACP 兼容性审查](../acp-compatibility.md)。
+
 > 上游**没有**这一整棵树，所以它不参与任何上游合并冲突。入口是 `index.ts`，
 > 外部只依赖 `ChatRouterProvider`。
 
@@ -92,7 +98,7 @@
 
 - 新面板的 transcript 存在**扩展宿主**（`TranscriptStore`），切走再切回不丢内容，也不需要重新 `session/load`。
 - 面板未 attach 时记录照常累积（后台会话继续跑），只是 `postMessage` 被守卫丢弃。
-- 旧面板的 DOM 记录在重新赋 `webview.html` 时**会丢**——这是明确接受的代价（非目标）。
+- legacy DOM 记录在重新赋 HTML 时会丢；当前正常路由只走现代面板，保留 legacy 仅供上游同步。
 - `acpc-chat.focus` 的 5 个调用点（`extension.ts` ×4 + `SessionTreeProvider` 的树项命令）**都不需要改**：
   视图 id 没变，路由层决定内容。
 
@@ -166,22 +172,19 @@
 | `focus` / `meta` / `sessionsChanged` / `append` / `revise` | 广播 |
 | `renderMarkdown` 往返 | 请求照旧；`markdownRendered` 广播（两个文档都需要 html，`TranscriptStore.patch` 幂等）。**186 加了一条铁律：一份 html 只对"它照之渲染的那段文本"有效**。请求带的是发起那一刻的文本，而正文还在流（适配器 `includePartialMessages: true`，一条消息拆成很多 chunk），所以回填往往对不上当前文本。两边都要判：宿主 `handleRenderMarkdown` 比对 `item.text` 与 store 当前 `entry.text`，不符就**不落盘、不回填**；客户端 `patch` 则用 `asked[entryId]`（这次问的是哪段文本）判定，不符就丢掉手里的 html。**不判的后果**：正文冻在"第一段"上，后面收到的内容一个字都不显示（用户报的"消息显示不全"），而且换会话/重开都还是那一版 |
 | 关掉再打开 | `onDidDispose` → `detachSurface('editor')`；store 不动；重开 → 新文档 → `ready` → 定向 boot → 全量快照 |
-| 窗口重载后恢复 | **非目标**（需 `registerWebviewPanelSerializer`） |
+| 窗口重载后恢复 | 自动重建面板仍非目标（需 serializer）；会话快照由独立 restore 流程处理 |
 
 **三条不变量**（踩了不会有自动检查报错）：
 
-1. **编辑区面存在 ⟹ 聚焦 agent（若有）∈ `MODERN_AGENTS`**。
-   焦点跨到一个 **legacy** agent 时 `syncActivePanel()` 必须 `close('focus-changed')`。
-   **注意是蕴含不是等价**（031 放宽）：**没有聚焦会话是合法状态**，不该关面板、也不该拒绝打开——
-   窗口重载后 `activeSessionId` 就是 null，而状态栏仍会显示"第一个已连接的 agent"
-   （`activeSession?.agentDisplayName || connectedAgents[0]`），所以"状态栏写着 Claude Code"
-   并不代表它被聚焦。这条曾经让「打开编辑区面板」的按钮在重载后必被拒。
+1. **所有 Agent 与空焦点均可打开现代编辑区面板**（20261101-007）。`MODERN_AGENTS` 不是白名单；
+   空焦点优先取默认候选，再取其他 connected Agent 的最近 live 会话；不为打开面板自动 spawn。
+   状态栏的已连接 Agent 不等于聚焦会话，仍不能拿状态栏名称代替 focus。
 2. **`attachSurface` 之前必须先注册 `onDidReceiveMessage` / `onDidDispose`**。`attachSurface` 会写 HTML，
    文档的 `ready` 紧随其后；注册晚了会漏掉第一条 `ready`，面板永久空白。
 3. **`detach()` 只断侧边栏面**（`detachSurface('view')`）。写成清空全部 = 侧边栏切到 legacy 时编辑区一起变空白。
 
 **打开面板时的目标会话（031）**：`ChatEditorPanel.open()` 的顺序是
-「有聚焦 agent 且是 legacy → 拒绝」→「没有聚焦会话 → `focusMostRecentModernSession()`
+「没有聚焦会话 → `focusMostRecentModernSession()`
 （复用面板 agent 选择器那套：取该 agent 最近一个 live 会话并 `focusSession`）」→「创建面板并
 **重新读一次 context** 作为 boot 快照」。
 **刻意不自动建会话**：`open()` 不该 spawn 进程；空面板是合法结果，面板里的 `+` 一键开新会话。

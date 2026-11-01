@@ -27,6 +27,9 @@ export interface ConnectionInfo {
   initResponse: InitializeResponse;
   /** Terminal handler for this connection — lets the chat panel read terminal output. */
   terminals: TerminalHandler;
+  // [CUSTOM-BEGIN] CUSTOM-20261101-003 - Idempotent transport and owned-resource disposal.
+  dispose?: () => void;
+  // [CUSTOM-END] CUSTOM-20261101-003
   // [CUSTOM-BEGIN] CUSTOM-20261004-187 - 轮次进行中的补充消息（steering）能力。
   /**
    * The agent advertised ACP **steering** (`InitializeResponse._meta.steering.supported`):
@@ -75,7 +78,8 @@ export class ConnectionManager {
     const stream = ndJsonStream(writable, readable);
 
     // Wrap the stream to intercept and log all ACP traffic
-    const tappedStream = this.tapStream(stream);
+    const abort = new AbortController();
+    const tappedStream = this.tapStream(stream, abort.signal);
 
     // Create handlers
     const fsHandler = new FileSystemHandler();
@@ -106,29 +110,48 @@ export class ConnectionManager {
 
     // Initialize the connection
     log(`ConnectionManager: initializing connection to agent ${agentId}`);
-    const initResponse = await connection.initialize({
-      protocolVersion: PROTOCOL_VERSION,
-      clientInfo: {
-        name: 'vscode-acp-client',
-        version: extensionVersion,
-      },
-      clientCapabilities: {
-        fs: {
-          readTextFile: true,
-          writeTextFile: true,
+    // [CUSTOM-BEGIN] CUSTOM-20261101-003 - Handshake failure must release resources, too.
+    let disposed = false;
+    const dispose = () => {
+      if (disposed) { return; }
+      disposed = true;
+      abort.abort(); terminalHandler.dispose();
+      process.stdin?.destroy(); process.stdout?.destroy();
+    };
+    let initResponse: InitializeResponse;
+    try {
+      initResponse = await connection.initialize({
+        protocolVersion: PROTOCOL_VERSION,
+        clientInfo: {
+          name: 'vscode-acp-client',
+          version: extensionVersion,
         },
-        terminal: true,
-        // [CUSTOM-20260929-119] Form elicitation. This is what makes AskUserQuestion
-        // reachable AT ALL: the Claude Code adapter renders it as an ACP form only for
-        // clients that declare this, and **disables the tool outright** for clients
-        // that do not (`disallowedTools = ["AskUserQuestion"]`). Declaring it also
-        // means MCP-server elicitations and the refusal-fallback consent prompt arrive
-        // here — all three are the same form, so one implementation covers them.
-        // `url` mode is deliberately NOT declared: we never render a URL prompt,
-        // and agents fail closed on undeclared modes.
-        elicitation: { form: {} },
-      },
-    });
+        clientCapabilities: {
+          fs: {
+            readTextFile: true,
+            writeTextFile: true,
+          },
+          terminal: true,
+          // [CUSTOM-BEGIN] CUSTOM-20261101-009 - Reproduce configured agent invocation in an interactive terminal.
+          auth: { terminal: true },
+          // [CUSTOM-END] CUSTOM-20261101-009
+          // [CUSTOM-20260929-119] Form elicitation. This is what makes AskUserQuestion
+          // reachable AT ALL: the Claude Code adapter renders it as an ACP form only for
+          // clients that declare this, and **disables the tool outright** for clients
+          // that do not (`disallowedTools = ["AskUserQuestion"]`). Declaring it also
+          // means MCP-server elicitations and the refusal-fallback consent prompt arrive
+          // here — all three are the same form, so one implementation covers them.
+          // `url` mode is deliberately NOT declared: we never render a URL prompt,
+          // and agents fail closed on undeclared modes.
+          elicitation: { form: {} },
+        },
+      });
+
+    } catch (error) { dispose(); throw error; }
+    if (initResponse.protocolVersion !== PROTOCOL_VERSION) {
+      dispose(); throw new Error('Unsupported ACP protocol version: ' + initResponse.protocolVersion);
+    }
+    // [CUSTOM-END] CUSTOM-20261101-003
 
     log(`ConnectionManager: initialized. Agent: ${initResponse.agentInfo?.name || 'unknown'} v${initResponse.agentInfo?.version || '?'}`);
 
@@ -139,9 +162,13 @@ export class ConnectionManager {
     const supportsSteering = meta?.steering?.supported === true;
     log(`ConnectionManager: steering ${supportsSteering ? 'supported' : 'not supported'} by ${agentId}`);
 
-    const info: ConnectionInfo = { connection, client, initResponse, terminals: terminalHandler, supportsSteering };
+    const info: ConnectionInfo = { connection, client, initResponse, terminals: terminalHandler, supportsSteering, dispose };
     // [CUSTOM-END] CUSTOM-20261004-187
+    this.removeConnection(agentId);
     this.connections.set(agentId, info);
+    void connection.closed.finally(() => {
+      if (this.connections.get(agentId) === info) { this.removeConnection(agentId); }
+    }).catch(() => undefined);
 
     return info;
   }
@@ -151,17 +178,21 @@ export class ConnectionManager {
   }
 
   removeConnection(agentId: string): void {
+    // [CUSTOM-BEGIN] CUSTOM-20261101-003 - Dead processes still own terminals and stream pumps.
+    const info = this.connections.get(agentId);
     this.connections.delete(agentId);
+    if (info?.dispose) { info.dispose(); } else { info?.terminals.dispose(); }
+    // [CUSTOM-END] CUSTOM-20261101-003
   }
 
   dispose(): void {
-    this.connections.clear();
+    for (const id of this.connections.keys()) { this.removeConnection(id); }
   }
 
   /**
    * Wrap a Stream to intercept and log all messages in both directions.
    */
-  private tapStream(stream: Stream): Stream {
+  private tapStream(stream: Stream, signal: AbortSignal): Stream {
     // Tap outgoing messages (client → agent)
     const sendTap = new TransformStream({
       transform(chunk: unknown, controller: TransformStreamDefaultController) {
@@ -180,8 +211,8 @@ export class ConnectionManager {
 
     // Pipe: sendTap.readable → original writable, original readable → recvTap.writable
     // These run in the background — no need to await
-    void sendTap.readable.pipeTo(stream.writable).catch(e => logError('Traffic tap send pipe error', e));
-    void stream.readable.pipeTo(recvTap.writable).catch(e => logError('Traffic tap recv pipe error', e));
+    void sendTap.readable.pipeTo(stream.writable, { signal }).catch(e => { if (!signal.aborted) { logError('Traffic tap send pipe error', e); } });
+    void stream.readable.pipeTo(recvTap.writable, { signal }).catch(e => { if (!signal.aborted) { logError('Traffic tap recv pipe error', e); } });
 
     return {
       writable: sendTap.writable,

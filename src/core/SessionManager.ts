@@ -29,6 +29,9 @@ import type {
   AgentCapabilities,
 } from '@agentclientprotocol/sdk';
 import { RequestError } from '@agentclientprotocol/sdk';
+// [CUSTOM-BEGIN] CUSTOM-20261101-009 - Terminal authentication is a separate interactive invocation.
+import { TerminalAuthHandler } from '../handlers/TerminalAuthHandler';
+// [CUSTOM-END] CUSTOM-20261101-009
 
 // [CUSTOM-20261003-175] ACP SDK 1.x **删掉了整个 session models API**（`SessionModelState` /
 // `unstable_setSessionModel`）：模型改由 Session Config Options（`category: 'model'`）表达 ——
@@ -270,6 +273,9 @@ export class SessionManager extends EventEmitter {
     private readonly agentManager: AgentManager,
     private readonly connectionManager: ConnectionManager,
     private readonly sessionUpdateHandler: SessionUpdateHandler,
+    // [CUSTOM-BEGIN] CUSTOM-20261101-009 - Injectable for contract tests without real credentials.
+    private readonly terminalAuth: Pick<TerminalAuthHandler, 'authenticate' | 'dispose'> = new TerminalAuthHandler(),
+    // [CUSTOM-END] CUSTOM-20261101-009
   ) {
     super();
 
@@ -453,8 +459,8 @@ export class SessionManager extends EventEmitter {
 
     this.dropSessionsForAgent(agentName, 'agent-disconnected');
 
-    if (!alreadyDead && agentId) {
-      this.agentManager.killAgent(agentId);
+    if (agentId) {
+      if (!alreadyDead) { this.agentManager.killAgent(agentId); }
       this.connectionManager.removeConnection(agentId);
     }
     this.connectionQueues.delete(agentId ?? '');
@@ -724,11 +730,10 @@ export class SessionManager extends EventEmitter {
     } catch (e: any) {
       if (!this.isAuthRequiredError(e)) {
         logError('Failed to create session', e);
-        this.agentManager.killAgent(agentId);
         throw e;
       }
       // Auth required — interactively authenticate, then retry.
-      await this.runAuthFlow(agentName, agentId, connInfo);
+      await this.runAuthFlow(agentName, agentId, connInfo, cwd);
       try {
         sessionResponse = await connInfo.connection.newSession({
           cwd,
@@ -738,7 +743,6 @@ export class SessionManager extends EventEmitter {
         });
       } catch (retryErr) {
         logError('Failed to create session after authentication', retryErr);
-        this.agentManager.killAgent(agentId);
         throw retryErr;
       }
     }
@@ -784,17 +788,16 @@ export class SessionManager extends EventEmitter {
 
   /**
    * Run the interactive auth flow against an already-initialized connection.
-   * Throws if the user cancels or auth fails — caller is expected to clean
-   * up the agent process.
+   * Throws if the user cancels or auth fails; existing shared sessions stay alive.
    */
   private async runAuthFlow(
     agentName: string,
     agentId: string,
     connInfo: ConnectionInfo,
+    cwd?: string,
   ): Promise<void> {
     const authMethods = connInfo.initResponse.authMethods;
     if (!authMethods || authMethods.length === 0) {
-      this.agentManager.killAgent(agentId);
       throw new Error(
         `Agent "${agentName}" requires authentication but did not advertise any auth methods.`,
       );
@@ -817,7 +820,6 @@ export class SessionManager extends EventEmitter {
         },
       );
       if (!picked) {
-        this.agentManager.killAgent(agentId);
         throw new Error('Authentication cancelled by user.');
       }
       selectedMethod = picked.method;
@@ -828,18 +830,24 @@ export class SessionManager extends EventEmitter {
         'Authenticate',
       );
       if (confirm !== 'Authenticate') {
-        this.agentManager.killAgent(agentId);
         throw new Error('Authentication cancelled by user.');
       }
     }
 
     try {
       log(`Authenticating with method: ${selectedMethod.name} (${selectedMethod.id})`);
-      await connInfo.connection.authenticate({ methodId: selectedMethod.id });
+      // [CUSTOM-BEGIN] CUSTOM-20261101-009 - A terminal method MUST NOT be sent to authenticate.
+      if ('type' in selectedMethod && selectedMethod.type === 'terminal') {
+        const instance = this.agentManager.getAgent(agentId);
+        if (!instance) { throw new Error('Agent launch configuration is no longer available.'); }
+        await this.terminalAuth.authenticate(instance.config, selectedMethod, cwd ?? this.resolveDefaultCwd());
+      } else {
+        await connInfo.connection.authenticate({ methodId: selectedMethod.id });
+      }
+      // [CUSTOM-END] CUSTOM-20261101-009
       log('Authentication successful');
     } catch (authErr: any) {
       logError('Authentication failed', authErr);
-      this.agentManager.killAgent(agentId);
       throw new Error(`Authentication failed: ${authErr.message}`);
     }
   }
@@ -893,6 +901,7 @@ export class SessionManager extends EventEmitter {
       ? [{ type: 'text', text: prompt }]
       : prompt;
 
+    this.validatePromptBlocks(session, blocks);
     log(`sendPrompt: session=${sessionId}, blocks=${blocks.length}`);
 
     this.inFlightTurns.add(sessionId);
@@ -907,6 +916,19 @@ export class SessionManager extends EventEmitter {
       this.inFlightTurns.delete(sessionId);
     }
   }
+
+  // [CUSTOM-BEGIN] CUSTOM-20261101-007 - Prompt modalities must follow the initialized agent capability flags.
+  private validatePromptBlocks(session: SessionInfo, blocks: ContentBlock[]): void {
+    const caps = session.initResponse.agentCapabilities?.promptCapabilities;
+    for (const block of blocks) {
+      if (block.type === 'image' && caps?.image !== true
+        || block.type === 'audio' && caps?.audio !== true
+        || block.type === 'resource' && caps?.embeddedContext !== true) {
+        throw new Error('The agent does not support prompt content type: ' + block.type);
+      }
+    }
+  }
+  // [CUSTOM-END] CUSTOM-20261101-007
 
   // [CUSTOM-BEGIN] CUSTOM-20261004-187 - 轮次进行中的补充消息（steering）。
   /**
@@ -949,6 +971,7 @@ export class SessionManager extends EventEmitter {
       ? [{ type: 'text', text: prompt }]
       : prompt;
 
+    this.validatePromptBlocks(session, blocks);
     log(`steerPrompt: session=${sessionId}, blocks=${blocks.length}`);
     const result = await connInfo.connection.extMethod('_session/steering', {
       sessionId,
@@ -998,12 +1021,13 @@ export class SessionManager extends EventEmitter {
 
     // Prefer configOptions if available (spec: clients that support
     // configOptions MUST use it exclusively when both are present)
-    if (session.configOptions && session.configOptions.length > 0) {
+    if (session.configOptions !== null) {
       const modeOpt = session.configOptions.find(o => o.category === 'mode');
       if (modeOpt) {
         await this.setConfigOption(sessionId, modeOpt.id, modeId);
         return;
       }
+      throw new Error('The agent did not expose a mode config option.');
     }
 
     const connInfo = this.connectionManager.getConnection(session.agentId);
@@ -1029,12 +1053,13 @@ export class SessionManager extends EventEmitter {
     const session = this.sessions.get(sessionId);
     if (!session) { return; }
 
-    if (session.configOptions && session.configOptions.length > 0) {
+    if (session.configOptions !== null) {
       const modelOpt = session.configOptions.find(o => o.category === 'model');
       if (modelOpt) {
         await this.setConfigOption(sessionId, modelOpt.id, modelId);
         return;
       }
+      throw new Error('The agent did not expose a model config option.');
     }
 
 
@@ -1049,7 +1074,9 @@ export class SessionManager extends EventEmitter {
     if (typeof legacySetModel !== 'function') {
       log(`SessionManager: agent "${session.agentId}" has no model config option and the legacy `
         + `setSessionModel API is gone (ACP SDK 1.x) — cannot switch model to ${modelId}`);
-      return;
+      // [CUSTOM-BEGIN] CUSTOM-20261101-007 - Unsupported legacy switching must not be reported as success.
+      throw new Error('This agent does not expose a model config option; legacy model switching is unavailable.');
+      // [CUSTOM-END] CUSTOM-20261101-007
     }
     await legacySetModel.call(connInfo.connection, { sessionId, modelId });
 
@@ -1269,7 +1296,7 @@ export class SessionManager extends EventEmitter {
    * List sessions known to an agent (ACP `session/list`).
    * Throws if the agent doesn't advertise the capability.
    */
-  async listSessions(agentName: string, opts: { cwd?: string; cursor?: string } = {}): Promise<{ sessions: ProtocolSessionInfo[]; nextCursor?: string }> {
+  async listSessions(agentName: string, opts: { cwd?: string; cursor?: string; reconcile?: boolean } = {}): Promise<{ sessions: ProtocolSessionInfo[]; nextCursor?: string }> {
     const conn = await this.ensureConnected(agentName);
     const caps = this.capabilities.get(agentName);
     if (!caps?.list) {
@@ -1288,7 +1315,7 @@ export class SessionManager extends EventEmitter {
         // Auth then retry.
         const agentInfo = this.findAgentIdForConnection(conn);
         if (agentInfo) {
-          await this.runAuthFlow(agentName, agentInfo, conn);
+          await this.runAuthFlow(agentName, agentInfo, conn, opts.cwd);
           response = await conn.connection.listSessions(params);
         } else {
           throw e;
@@ -1302,15 +1329,40 @@ export class SessionManager extends EventEmitter {
     // Reconcile the history store — drop any locally-cached entries that
     // the agent no longer knows about. Live sessions are never pruned
     // (see SessionHistoryStore.reconcileFromAgent).
-    if (this.historyStore && !opts.cursor) {
+    // [CUSTOM-BEGIN] CUSTOM-20261101-010 - Reconciliation is opt-out for non-authoritative merged pickers.
+    if (this.historyStore && opts.reconcile !== false && !opts.cursor && !opts.cwd && !response?.nextCursor) {
       this.historyStore.reconcileFromAgent(
         agentName,
         new Set(sessions.map(s => s.sessionId)),
         this.getSessionIdsForAgent(agentName),
       );
     }
+    // [CUSTOM-END] CUSTOM-20261101-010
     return { sessions, nextCursor: response?.nextCursor ?? undefined };
   }
+
+  // [CUSTOM-BEGIN] CUSTOM-20261101-010 - The chat history picker must not silently stop at page one.
+  async listAllSessions(agentName: string, opts: { reconcile?: boolean } = {}): Promise<ProtocolSessionInfo[]> {
+    const sessions = new Map<string, ProtocolSessionInfo>();
+    const seen = new Set<string>();
+    let cursor: string | undefined;
+    for (let page = 0; page < 100; page++) {
+      const response = await this.listSessions(agentName, { cursor, reconcile: false });
+      for (const session of response.sessions) { sessions.set(session.sessionId, session); }
+      cursor = response.nextCursor;
+      if (!cursor) {
+        // Reconcile only after all pages succeeded. No page/subset can erase unrelated history.
+        if (opts.reconcile !== false) {
+          this.historyStore?.reconcileFromAgent(agentName, new Set(sessions.keys()), this.getSessionIdsForAgent(agentName));
+        }
+        return Array.from(sessions.values());
+      }
+      if (seen.has(cursor)) { throw new Error('Agent returned a repeated session/list cursor.'); }
+      seen.add(cursor);
+    }
+    throw new Error('Session list exceeded the 100-page safety limit.');
+  }
+  // [CUSTOM-END] CUSTOM-20261101-010
 
   /**
    * Load an existing session, replaying the entire conversation history via
@@ -1649,6 +1701,9 @@ export class SessionManager extends EventEmitter {
   // --- Cleanup ---
 
   dispose(): void {
+    // [CUSTOM-BEGIN] CUSTOM-20261101-009 - Stop pending interactive logins on shutdown.
+    this.terminalAuth.dispose();
+    // [CUSTOM-END] CUSTOM-20261101-009
     this.agentManager.killAll();
     this.connectionManager.dispose();
     this.sessions.clear();

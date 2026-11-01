@@ -1,54 +1,56 @@
+// [CUSTOM-BEGIN] CUSTOM-20261101-008 - Validate the distribution-based ACP registry; timeout and coalesce fetches.
 import { log, logError } from '../utils/Logger';
 
-interface RegistryAgent {
-  name: string;
-  description?: string;
-  command: string;
-  args?: string[];
-  homepage?: string;
+export interface RegistryAgent {
+  id: string; name: string; description?: string; version?: string; website?: string;
+  distribution?: Record<string, unknown>;
 }
 
-interface Registry {
-  agents: RegistryAgent[];
+export function parseRegistry(data: unknown): RegistryAgent[] {
+  if (!data || typeof data !== 'object' || !Array.isArray((data as { agents?: unknown }).agents)) {
+    throw new Error('Invalid ACP registry: expected agents array');
+  }
+  const seen = new Set<string>();
+  return (data as { agents: unknown[] }).agents.flatMap(value => {
+    if (!value || typeof value !== 'object') { return []; }
+    const agent = value as Record<string, unknown>;
+    if (typeof agent.id !== 'string' || typeof agent.name !== 'string' || seen.has(agent.id)) { return []; }
+    seen.add(agent.id);
+    return [{ id: agent.id, name: agent.name,
+      ...(typeof agent.description === 'string' ? { description: agent.description } : {}),
+      ...(typeof agent.website === 'string' ? { website: agent.website } : {}),
+      ...(typeof agent.version === 'string' ? { version: agent.version } : {}),
+      ...(agent.distribution && typeof agent.distribution === 'object' ? { distribution: agent.distribution as Record<string, unknown> } : {}),
+    }];
+  });
 }
 
 const REGISTRY_URL = 'https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json';
-
-let cachedRegistry: Registry | null = null;
+let cache: RegistryAgent[] | null = null;
 let cacheTime = 0;
-const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+let inFlight: Promise<RegistryAgent[]> | null = null;
+let generation = 0;
 
-/**
- * Fetches the ACP agent registry from the CDN.
- * Results are cached for 5 minutes.
- */
 export async function fetchRegistry(): Promise<RegistryAgent[]> {
-  const now = Date.now();
-  if (cachedRegistry && (now - cacheTime) < CACHE_TTL) {
-    return cachedRegistry.agents;
-  }
-
-  try {
-    log('Fetching ACP agent registry...');
-    const response = await fetch(REGISTRY_URL);
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
-    const data = (await response.json()) as Registry;
-    cachedRegistry = data;
-    cacheTime = now;
-    log(`Registry fetched: ${data.agents?.length || 0} agents`);
-    return data.agents || [];
-  } catch (e) {
-    logError('Failed to fetch registry', e);
-    return cachedRegistry?.agents || [];
-  }
+  if (cache && Date.now() - cacheTime < 5 * 60 * 1000) { return cache; }
+  if (inFlight) { return inFlight; }
+  const epoch = generation;
+  const request = (async () => {
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), 10000);
+    try {
+      log('Fetching ACP agent registry...');
+      const response = await fetch(REGISTRY_URL, { signal: abort.signal });
+      if (!response.ok) { throw new Error('HTTP ' + response.status); }
+      const agents = parseRegistry(await response.json());
+      if (epoch === generation) { cache = agents; cacheTime = Date.now(); }
+      return agents;
+    } catch (error) { logError('Failed to fetch registry', error); return cache ?? []; }
+    finally { clearTimeout(timer); if (epoch === generation) { inFlight = null; } }
+  })();
+  inFlight = request;
+  return request;
 }
 
-/**
- * Clear the registry cache.
- */
-export function clearRegistryCache(): void {
-  cachedRegistry = null;
-  cacheTime = 0;
-}
+export function clearRegistryCache(): void { cache = null; cacheTime = 0; inFlight = null; generation++; }
+// [CUSTOM-END] CUSTOM-20261101-008

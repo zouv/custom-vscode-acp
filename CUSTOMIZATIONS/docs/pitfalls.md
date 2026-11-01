@@ -1750,3 +1750,38 @@ python -c "import subprocess;b=subprocess.run(['git','show','HEAD:路径'],captu
 4. 预览主题**缺 token** 会让"看图验收"静默失效（219 的 badge、226 的状态色是同一族）—— 浮层类尤其：背景一透明，叠放关系在截图里就消失了。
 
 **验证**：`node CUSTOMIZATIONS/scripts/preview-records.mjs` 的 `#historyfilter` 档 —— 探针 `menuOnTop` 由 false 变 true、`headOnTop` 同步 true；改动前后的两张 PNG 做像素对比，差异落在「菜单底下那条行文字」带上（改前行文字压在菜单上，改后在菜单左缘被截断）。最小复现页（headless Chrome + `elementFromPoint`）另行确认了触发条件、以及"抬菜单自己的 z-index 无效"。
+
+
+## 66. 分页或联合历史不能当完整的权威列表
+
+首次请求无 cursor 不代表响应完整：nextCursor 仍可能存在；cwd 筛选只覆盖一部分。更隐蔽的是全页 Agent 结果与本地 cache/Claude disk 是联合来源，提前 reconcile 会先删掉 cache-only 行。修复：单页只在无 cursor/cwd/nextCursor 时对账；listAllSessions 每页禁 reconcile，全部成功再处理，联合 picker 明确 reconcile:false。测试覆盖两页、循环 cursor、过滤、失败与联合缓存。
+
+## 67. 测试 bundling 修好 ESM，却可能把预览工具的 out 模块弄丢
+
+最低 1.85 宿主不能 CommonJS require ESM SDK；webpack 独立打包测试解决，但只写 out/test 会留下过期 out/ui/handlers（机器上已有旧产物时难发现）。修复：compile-tests 先 tsc 输出真实模块，再 webpack 覆盖测试；clean 仅 out/test。preview-records/probe-elicitation 仍用真实产物，运行前刷新编译。Windows shell/交互终端回归用 npm NODE，不把旧 Code.exe 当通用命令行 Node。
+
+## 68. terminal auth 不是 authenticate RPC；Windows exe 和 .cmd 的转义不能混用
+
+标准 terminal 方法应运行已配置 Agent command+base args+auth args，覆盖合并 auth env，等待交互终端退出；exit0 以外是失败/取消。cmd /d /s /c 的 shellArgs 必须为完整字符串，native exe 带空格要引号包裹；.cmd/.bin shim 采用 cross-spawn 风格 meta/double escape。生命周期假桩不够，必须实际 spawn 含空格/ampersand/quote/trailing-backslash/percent 参数并跑 no-op VS Code terminal。
+
+## 69. debounce 在 teardown 后才读取状态，会把有效恢复快照写空
+
+只清定时器又会丢掉刚开的标签。修复：调度时捕获有效 pendingSnapshot；dispose 前 flush，disposed guard 阻止晚到调度，extension 先拆 chatRouter 再 SessionManager。Memento update 异步 best-effort，不宣称进程强杀仍可靠。
+
+## 70. auth schema 兼容不代表新认证元数据也保留下来
+
+SDK 1.7.0 v1 agent/terminal union 的 agent 分支 strip 未知字段；Codex 0.16.0 EnvVar auth 能退化成 id/name，但 type/env 丢失。不能拿“RPC 没报方法不存在”当 API Key 完整支持。当前只支持预先启动环境；新增安全输入需升级/适配 schema、SecretStorage 和不破坏共享 Agent 的重连方案。本轮已定位并记录，未伪造完整实现。
+
+## 71. 文件/队列限额必须运行期持续执行，而不是首次打开检查一次
+
+日志首用 stat 后不更新大小，会在长任务里无限增长；多窗口共用文件又可能轮转竞争。修复为 context.logUri 的 opt-in writer，串行队列、单条/队列字节预算、持续 5MiB+.1 轮转、UTF-8 边界截断；I/O 和超额静默丢日志仍是诊断限制。分享前脱敏，原始协议与持久化必须分别 opt-in。
+
+
+## 72. 用 URI 字符串比较本地文件会让大小写/符号链接别名绕过 dirty 保护
+
+真实 Windows Extension Host 复现：Agent 将路径改成大写，read 返回旧磁盘内容，write 未拒绝并改了磁盘，随后用户 save 出现 File Modified Since。修复：先匹配原 URI，再用 realpath 对文件身份；不在 Unix 上盲目 toLowerCase，clean 文档编辑用已有 doc.uri。补大小写读/dirty 写/clean 写、目录 junction 与缺失父目录回归；workspace.fs 本身支持创建缺失父目录，无需重复修。真实 cmd/native 进程测试设置有界 10s 超时，避免旧宿主启动抖动触发默认 2s 超时。
+
+
+## 73. 夹具只脱敏路径，仍可能在 ls owner/group 中泄露身份
+
+发布前扫描补查发现两份 replay 的目录权限行仍保留机器所有者及组标识。JSON 长文本不容易肉眼复核；只查 Users/home 路径不会覆盖这类身份。修复：owner/group 统一示例 user/1000；check-fixtures 识别权限行并校验占位名单，十个合成自检覆盖 Windows 反斜线与目录身份。失败只输出字段位置，不输出原值。此闸门不是完整秘密审计，也不能替代对历史/截图/二进制的检查。

@@ -3219,7 +3219,7 @@
           "_meta": {
             "claudeCode": {
               "toolResponse": {
-                "stdout": "total 36099\ndrwxr-xr-x 1 zouwei 1049089  0 Sep 25 18:31 .\ndrwxr-xr-x 1 zouwei 1049089  0 Sep 25 18:31 ..\n-rw-r--r-- 1 zouwei 1049089 17 Sep 25 18:31 a.txt\n-rw-r--r-- 1 zouwei 1049089 34 Sep 25 18:31 b.md\n-rw-r--r-- 1 zouwei 1049089 28 Sep 25 18:31 c.csv",
+                "stdout": "total 36099\ndrwxr-xr-x 1 user 1000  0 Sep 25 18:31 .\ndrwxr-xr-x 1 user 1000  0 Sep 25 18:31 ..\n-rw-r--r-- 1 user 1000 17 Sep 25 18:31 a.txt\n-rw-r--r-- 1 user 1000 34 Sep 25 18:31 b.md\n-rw-r--r-- 1 user 1000 28 Sep 25 18:31 c.csv",
                 "stderr": "",
                 "interrupted": false,
                 "isImage": false,
@@ -3248,13 +3248,13 @@
           "content": [
             {
               "content": {
-                "text": "```console\ntotal 36099\ndrwxr-xr-x 1 zouwei 1049089  0 Sep 25 18:31 .\ndrwxr-xr-x 1 zouwei 1049089  0 Sep 25 18:31 ..\n-rw-r--r-- 1 zouwei 1049089 17 Sep 25 18:31 a.txt\n-rw-r--r-- 1 zouwei 1049089 34 Sep 25 18:31 b.md\n-rw-r--r-- 1 zouwei 1049089 28 Sep 25 18:31 c.csv\n```",
+                "text": "```console\ntotal 36099\ndrwxr-xr-x 1 user 1000  0 Sep 25 18:31 .\ndrwxr-xr-x 1 user 1000  0 Sep 25 18:31 ..\n-rw-r--r-- 1 user 1000 17 Sep 25 18:31 a.txt\n-rw-r--r-- 1 user 1000 34 Sep 25 18:31 b.md\n-rw-r--r-- 1 user 1000 28 Sep 25 18:31 c.csv\n```",
                 "type": "text"
               },
               "type": "content"
             }
           ],
-          "rawOutput": "total 36099\ndrwxr-xr-x 1 zouwei 1049089  0 Sep 25 18:31 .\ndrwxr-xr-x 1 zouwei 1049089  0 Sep 25 18:31 ..\n-rw-r--r-- 1 zouwei 1049089 17 Sep 25 18:31 a.txt\n-rw-r--r-- 1 zouwei 1049089 34 Sep 25 18:31 b.md\n-rw-r--r-- 1 zouwei 1049089 28 Sep 25 18:31 c.csv",
+          "rawOutput": "total 36099\ndrwxr-xr-x 1 user 1000  0 Sep 25 18:31 .\ndrwxr-xr-x 1 user 1000  0 Sep 25 18:31 ..\n-rw-r--r-- 1 user 1000 17 Sep 25 18:31 a.txt\n-rw-r--r-- 1 user 1000 34 Sep 25 18:31 b.md\n-rw-r--r-- 1 user 1000 28 Sep 25 18:31 c.csv",
           "status": "completed",
           "toolCallId": "call_00_lFqoDcV9rwdiW4ywShmg7465",
           "sessionUpdate": "tool_call_update"
@@ -5238,11 +5238,11 @@
           "locations": [
             {
               "line": 1,
-              "path": "C:\\Users\\zouwei\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\a.txt"
+              "path": "C:\\Users\\user\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\a.txt"
             }
           ],
           "rawInput": {
-            "file_path": "C:\\Users\\zouwei\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\a.txt"
+            "file_path": "C:\\Users\\user\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\a.txt"
           },
           "title": "Read a.txt",
           "toolCallId": "call_00_RQljyN0d5vyIwKyRAWXd9210",
@@ -5285,7 +5285,7 @@
               "toolResponse": {
                 "type": "text",
                 "file": {
-                  "filePath": "C:\\Users\\zouwei\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\a.txt",
+                  "filePath": "C:\\Users\\user\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\a.txt",
                   "content": "alpha\nbeta\ngamma\n",
                   "numLines": 4,
                   "startLine": 1,
@@ -5345,11 +5345,11 @@
           "locations": [
             {
               "line": 1,
-              "path": "C:\\Users\\zouwei\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\b.md"
+              "path": "C:\\Users\\user\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\b.md"
             }
           ],
           "rawInput": {
-            "file_path": "C:\\Users\\zouwei\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\b.md"
+            "file_path": "C:\\Users\\user\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\b.md"
           },
           "title": "Read b.md",
           "toolCallId": "call_01_hrfKp9GUHgT9vgUBMbeS4021",
@@ -5392,7 +5392,7 @@
               "toolResponse": {
                 "type": "text",
                 "file": {
-                  "filePath": "C:\\Users\\zouwei\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\b.md",
+                  "filePath": "C:\\Users\\user\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\b.md",
                   "content": "# Title\n\n- one\n- two\n\nSome prose.\n",
                   "numLines": 7,
                   "startLine": 1,
@@ -5452,11 +5452,11 @@
           "locations": [
             {
               "line": 1,
-              "path": "C:\\Users\\zouwei\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\c.csv"
+              "path": "C:\\Users\\user\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\c.csv"
             }
           ],
           "rawInput": {
-            "file_path": "C:\\Users\\zouwei\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\c.csv"
+            "file_path": "C:\\Users\\user\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\c.csv"
           },
           "title": "Read c.csv",
           "toolCallId": "call_02_ij2ej9s2mczcCRqfge5T4589",
@@ -5492,7 +5492,7 @@
               "toolResponse": {
                 "type": "text",
                 "file": {
-                  "filePath": "C:\\Users\\zouwei\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\c.csv",
+                  "filePath": "C:\\Users\\user\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\c.csv",
                   "content": "id,name\n1,one\n2,two\n3,three\n",
                   "numLines": 5,
                   "startLine": 1,
@@ -16108,13 +16108,13 @@
           "content": [
             {
               "content": {
-                "text": "```console\ntotal 36099\ndrwxr-xr-x 1 zouwei 1049089  0 Sep 25 18:31 .\ndrwxr-xr-x 1 zouwei 1049089  0 Sep 25 18:31 ..\n-rw-r--r-- 1 zouwei 1049089 17 Sep 25 18:31 a.txt\n-rw-r--r-- 1 zouwei 1049089 34 Sep 25 18:31 b.md\n-rw-r--r-- 1 zouwei 1049089 28 Sep 25 18:31 c.csv\n```",
+                "text": "```console\ntotal 36099\ndrwxr-xr-x 1 user 1000  0 Sep 25 18:31 .\ndrwxr-xr-x 1 user 1000  0 Sep 25 18:31 ..\n-rw-r--r-- 1 user 1000 17 Sep 25 18:31 a.txt\n-rw-r--r-- 1 user 1000 34 Sep 25 18:31 b.md\n-rw-r--r-- 1 user 1000 28 Sep 25 18:31 c.csv\n```",
                 "type": "text"
               },
               "type": "content"
             }
           ],
-          "rawOutput": "total 36099\ndrwxr-xr-x 1 zouwei 1049089  0 Sep 25 18:31 .\ndrwxr-xr-x 1 zouwei 1049089  0 Sep 25 18:31 ..\n-rw-r--r-- 1 zouwei 1049089 17 Sep 25 18:31 a.txt\n-rw-r--r-- 1 zouwei 1049089 34 Sep 25 18:31 b.md\n-rw-r--r-- 1 zouwei 1049089 28 Sep 25 18:31 c.csv",
+          "rawOutput": "total 36099\ndrwxr-xr-x 1 user 1000  0 Sep 25 18:31 .\ndrwxr-xr-x 1 user 1000  0 Sep 25 18:31 ..\n-rw-r--r-- 1 user 1000 17 Sep 25 18:31 a.txt\n-rw-r--r-- 1 user 1000 34 Sep 25 18:31 b.md\n-rw-r--r-- 1 user 1000 28 Sep 25 18:31 c.csv",
           "status": "completed",
           "toolCallId": "call_00_lFqoDcV9rwdiW4ywShmg7465",
           "sessionUpdate": "tool_call_update"
@@ -16232,11 +16232,11 @@
           "locations": [
             {
               "line": 1,
-              "path": "C:\\Users\\zouwei\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\a.txt"
+              "path": "C:\\Users\\user\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\a.txt"
             }
           ],
           "rawInput": {
-            "file_path": "C:\\Users\\zouwei\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\a.txt"
+            "file_path": "C:\\Users\\user\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\a.txt"
           },
           "status": "pending",
           "title": "Read a.txt",
@@ -16290,11 +16290,11 @@
           "locations": [
             {
               "line": 1,
-              "path": "C:\\Users\\zouwei\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\b.md"
+              "path": "C:\\Users\\user\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\b.md"
             }
           ],
           "rawInput": {
-            "file_path": "C:\\Users\\zouwei\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\b.md"
+            "file_path": "C:\\Users\\user\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\b.md"
           },
           "status": "pending",
           "title": "Read b.md",
@@ -16348,11 +16348,11 @@
           "locations": [
             {
               "line": 1,
-              "path": "C:\\Users\\zouwei\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\c.csv"
+              "path": "C:\\Users\\user\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\c.csv"
             }
           ],
           "rawInput": {
-            "file_path": "C:\\Users\\zouwei\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\c.csv"
+            "file_path": "C:\\Users\\user\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp\\c.csv"
           },
           "status": "pending",
           "title": "Read c.csv",
@@ -16413,7 +16413,7 @@
         "sessionId": "07e14531-f30a-4f8d-8057-6dc2b6a974b3",
         "update": {
           "content": {
-            "text": "Three files in `C:\\Users\\zouwei\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp`:\n\n| File | Lines |\n| --- | --- |\n| `a.txt` | 3 |\n| `b.md` | 6 |\n| `c.csv` | 4 |\n| **Total** | **13** |\n\nA `.csv` file is the right choice when the content is genuinely tabular — rows of records that all share the same fields — and the primary consumer is a program rather than a person. Spreadsheets, pandas/R data frames, SQL `COPY`, and BI tools all read CSV natively, and its strict comma-and-newline structure means parsing needs no custom rules. Its weaknesses are real but bounded: there is no standard way to express types, nesting, formulas, or formatting, so anything richer than a flat rectangle has to be flattened or encoded by convention, and the format is unforgiving of unescaped commas and quotes.\n\nA `.md` file is the right choice when the content is meant to be read by humans and happens to live in a plain-text toolchain. Prose, headings, lists, tables, and links all survive as readable plain text even unrendered, and diffs are line-oriented, which makes Markdown a good fit for docs, READMEs, notes, and long-lived text under version control. Reach for it when structure is narrative or mixed rather than uniform — a Markdown table is fine for a handful of rows in a doc, but once the data grows or needs to be queried, joined, or validated, it should move to CSV and be referenced from the `.md` instead.",
+            "text": "Three files in `C:\\Users\\user\\AppData\\Local\\Temp\\acp-replay-capture-be1Qcp`:\n\n| File | Lines |\n| --- | --- |\n| `a.txt` | 3 |\n| `b.md` | 6 |\n| `c.csv` | 4 |\n| **Total** | **13** |\n\nA `.csv` file is the right choice when the content is genuinely tabular — rows of records that all share the same fields — and the primary consumer is a program rather than a person. Spreadsheets, pandas/R data frames, SQL `COPY`, and BI tools all read CSV natively, and its strict comma-and-newline structure means parsing needs no custom rules. Its weaknesses are real but bounded: there is no standard way to express types, nesting, formulas, or formatting, so anything richer than a flat rectangle has to be flattened or encoded by convention, and the format is unforgiving of unescaped commas and quotes.\n\nA `.md` file is the right choice when the content is meant to be read by humans and happens to live in a plain-text toolchain. Prose, headings, lists, tables, and links all survive as readable plain text even unrendered, and diffs are line-oriented, which makes Markdown a good fit for docs, READMEs, notes, and long-lived text under version control. Reach for it when structure is narrative or mixed rather than uniform — a Markdown table is fine for a handful of rows in a doc, but once the data grows or needs to be queried, joined, or validated, it should move to CSV and be referenced from the `.md` instead.",
             "type": "text"
           },
           "messageId": "0d9d91e1-920d-4b04-af21-5e632a3febd6",

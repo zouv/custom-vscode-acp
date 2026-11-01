@@ -32,7 +32,7 @@ VS Code 侧边栏容器 acp-client-custom            VS Code 编辑区（编辑�
                           ┌───────────────┴───────────────┐
                           ▼                               ▼
                    ChatPanelHost                   LegacyPanelAdapter
-                   （新面板，Claude Code）          （facade 包装，旧面板零改动）
+                   （所有 Agent 的现代面板）          （仅保留作上游同步）
                    surfaces: view + editor           仅侧边栏，无编辑区面
                           ▲ postMessage                  ▲ postMessage
                                           │
@@ -56,8 +56,8 @@ VS Code 侧边栏容器 acp-client-custom            VS Code 编辑区（编辑�
 
 > **两个 surface 的关系（CUSTOM-20260924-019）**：编辑区面板与侧边栏视图**并存**，共享同一个
 > `ChatPanelHost` 实例（状态原本就在扩展宿主）。`post()` 默认广播、`boot` 只回发起者。
-> 不变量：**编辑区面存在 ⟺ 聚焦 agent 属于 `MODERN_AGENTS`**——非 Claude Code 走 legacy，
-> 而 legacy 的内容在 webview DOM 里，换面渲染等于丢历史，故直接拒绝。
+> 当前策略：**所有 Agent 与空态均使用现代 session-keyed 面板**；`MODERN_AGENTS` 只列默认候选，不是白名单。
+> legacy facade 留作上游同步，不再按 Agent 名路由；侧边栏与编辑区共享同一个宿主。
 > 详见 [`docs/arch/chat-panel.md`](./docs/arch/chat-panel.md) §5.7。
 
 **技术栈 / 关键约束**：npm（**禁 pnpm/yarn**，否则生成本仓库不认的锁文件）；
@@ -72,12 +72,13 @@ webpack + ts-loader（不是 esbuild）；ESLint flat config；`@vscode/test-cli
 | 任务类型 | 该读（仅限） | 可忽略 | 入口 |
 |---|---|---|---|
 | 连接/拉起 agent 失败（ENOENT、退出码、stderr） | `AgentManager.ts` + `AgentConfig.ts` | UI、webview | §2.1 |
+| Claude/Codex ACP 能力差异与遗漏 | `docs/acp-compatibility.md` + `ConnectionManager.ts` + `SessionManager.ts` + `TerminalAuthHandler.ts` | UI 记录区 | §2.7 |
 | ACP 握手 / 协议 traffic 日志 / **日志里的构建指纹** | `ConnectionManager.ts` + `StreamAdapter.ts` + `AcpClientImpl.ts` + `Logger.ts(logTraffic)` + `utils/BuildInfo.ts` | tree、webview | §2.2 |
 | 会话生命周期（新建/加载/恢复/切换、认证 -32000） | `SessionManager.ts` + `SessionHistoryStore.ts` | handlers | §2.3 |
 | 发消息 / 取消 / 流式更新 | `SessionManager.ts(sendPrompt/cancelTurn)` + `SessionUpdateHandler.ts` + `ChatWebviewProvider.ts(handleMessage)` | tree | §2.4 |
 | 聊天 UI（新面板 / 路由 / 标签页 / 工具调用渲染） | `src/ui/chat/`（入口 `index.ts`；先看 [`docs/arch/chat-panel.md`](./docs/arch/chat-panel.md) §5.1 的文件表再定位） | 旧面板、core | arch/chat-panel.md §5.1 |
 | 编辑区面板（第二个 surface / 双面同步 / 显隐与前置） | `src/ui/chat/ChatSurface.ts` + `ChatEditorPanel.ts` + `ChatPanelHost.attachSurface/post` | 旧面板 | arch/chat-panel.md §5.7 |
-| 聊天 UI（旧面板，仅非 Claude Code agent 走这条） | `ChatWebviewProvider.ts`（**只读 `getHtmlContent()` 对应片段，勿整读 87KB**） | 新面板 | §2.5 |
+| 聊天 UI（旧面板，仅供上游同步，正常路由不走） | `ChatWebviewProvider.ts`（**只读 `getHtmlContent()` 对应片段，勿整读 87KB**） | 新面板 | §2.5 |
 | 侧边栏树 / 未连接态 / 会话列表分页 | `SessionTreeProvider.ts` | webview | §2.6 |
 | 文件读写 / 终端 / 权限弹窗 / **表单请求（AskUserQuestion）** | `handlers/`（表单：`Elicitation*.ts` + 客户端 `elicitationView.ts`） | core | §2.7 |
 | agent 默认列表 / 设置项 schema | `package.json(contributes.configuration)` + `AgentConfig.ts` | 全部业务代码 | §2.8 |
@@ -93,13 +94,13 @@ webpack + ts-loader（不是 esbuild）；ESLint flat config；`@vscode/test-cli
 | 文件/目录 | 职责 | 何时改它 |
 |---|---|---|
 | `src/extension.ts` | 激活入口：装配全部服务与 UI、注册 22 个命令、把 SessionManager 事件接到视图刷新、dispose 编排 | 新增命令 / 新增事件转发 / 改装配顺序 |
-| `src/core/AgentManager.ts` | agent 子进程生命周期：`spawnAgent`/`killAgent`/`killAll`；Windows 走 `cmd.exe`+`shell:true`，macOS/Linux 走 login shell（修 `spawn npx ENOENT`）；emit `agent-stderr`/`agent-error`/`agent-closed` | agent 起不来 / 平台差异 / 进程泄漏 |
+| `src/core/AgentManager.ts` | agent 子进程生命周期：`spawnAgent`/`killAgent`/`killAll`；Windows 走 cross-spawn `shell:false`/`windowsHide`（按需安全解析 cmd shim），macOS/Linux 走 login shell（修 `spawn npx ENOENT`）；emit `agent-stderr`/`agent-error`/`agent-closed` | agent 起不来 / 平台差异 / 进程泄漏 |
 | `src/core/ConnectionManager.ts` | 把子进程 stdio 转 Web Streams + `ndJsonStream`，建 `ClientSideConnection`，做 `initialize` 握手；`tapStream` 双向拦截供 traffic 日志 | 协议握手 / 抓包 / ACP SDK 升级 |
 | `src/core/SessionManager.ts` | **本仓库最复杂的编排器**（1300+ 行，属"用 grep 定位、勿整读"一类）：`connectToAgent`/`newConversation`/`sendPrompt`/`cancelTurn`/`setMode`/`setModel`/`setConfigOption`/`listSessions`/`loadSession`/`resumeSession`；`-32000` 认证重试；早到通知缓冲（`pendingAvailableCommands`/`pendingConfigOptions`/`pendingTitles`）；emit 13 种事件。**187 起还有轮次中补发**：`supportsSteering`/`hasRunningTurn`/`steerPrompt`（走 `extMethod('_session/steering')`）。**235 起** `createAcpSession`/`loadSession`/`resumeSession` 三处把 `acpc.customModels` 的 modelId 经 `_meta.extraModels` 注入 agent | 会话状态机 / 新事件 / 能力协商 |
 | `src/core/SessionHistoryStore.ts` | `workspaceState` 持久化的会话缓存（tier-2 树数据源），按 agent+cwd 分桶、有容量上限、`reconcileFromAgent` 与 agent 侧对账 | 会话列表丢失 / 缓存策略 |
 | `src/core/AcpClientImpl.ts` | ACP SDK `Client` 接口的门面，把方法转发给各 handler | 新增 ACP 客户端能力 |
-| `src/handlers/FileSystemHandler.ts` | `fs/read_text_file`（**优先返回未保存的编辑器缓冲区**，支持 `line`/`limit`）、`fs/write_text_file`（建父目录 + 打开预览） | 文件读写异常 |
-| `src/handlers/TerminalHandler.ts` | `terminal/*`：托管终端 Map、1MB 输出上限（UTF-8 安全截断）、100ms 缓冲刷写、SIGTERM 终止 | 终端输出卡住 / 乱码 / 泄漏 |
+| `src/handlers/FileSystemHandler.ts` | `fs/read_text_file`（**优先返回未保存的编辑器缓冲区**，支持 `line`/`limit`）、`fs/write_text_file`（`findOpenDocument` 用 realpath 匹配大小写/符号链接别名，拒绝覆盖 dirty buffer；clean open 使用现有文档 URI WorkspaceEdit+save；其他走 workspace.fs（含创建缺失父目录）） | 文件读写异常 |
+| `src/handlers/TerminalHandler.ts` | `terminal/*`：托管终端 Map、1MB 输出上限（UTF-8 安全截断）、输出收到即更新、独立 StringDecoder、session ownership gate、ProcessLifecycle 终止进程树 | 终端输出卡住 / 乱码 / 泄漏 |
 | `src/handlers/PermissionHandler.ts` | `session/request_permission` → 读 `acpc.autoApprovePermissions` 自动批准；否则交给 `PermissionBridge`（面板卡片 / 退回 `quickPick`） | 权限弹窗行为 |
 | `src/handlers/ElicitationBridge.ts` | **表单请求（ACP elicitation / AskUserQuestion）的唯一出口**（119 新增）：与 `PermissionBridge` 同构（FIFO / 幂等 / 降级），三态 accept/decline/cancel；`fieldsOf()` 把 JSON Schema 扁平化成五种字段 | 表单行为 / schema 形状 / 生命周期 |
 | `src/handlers/ElicitationHandler.ts` | 表单的策略层 + **弹框兜底**（逐字段 QuickPick/InputBox）；只认 form + sessionId 作用域 | 弹框兜底行为 |
@@ -111,8 +112,11 @@ webpack + ts-loader（不是 esbuild）；ESLint flat config；`@vscode/test-cli
 | `src/ui/StatusBarManager.ts` | 状态栏 `$(hubot) ACP: <status>`，订阅 5 个 SessionManager 事件；点击触发 `acpc.connectAgent` | 状态显示 |
 | `src/config/AgentConfig.ts` | 读 `acpc.agents` 设置，导出 `getAgentConfigs`/`getAgentNames`/`getAgentConfig` | agent 列表读取逻辑 |
 | `src/config/CustomModels.ts` | 自定义模型（`acpc.customModels`）：`CustomModel` 类型 + `normalizeCustomModels()`（纯函数）+ `readCustomModels()`（读 vscode 配置）。SessionManager 与 ChatPanelHost 共用同一份读取 | 自定义模型配置 |
-| `src/config/RegistryClient.ts` | 拉 `cdn.agentclientprotocol.com` 的 agent registry，5 分钟 TTL，失败回退缓存 | 换 registry 源 / 缓存策略 |
-| `src/utils/Logger.ts` | 双输出通道（`ACP Client (Custom)` / `ACP Traffic (Custom)`）；`logTraffic` 按 JSON-RPC 分类 REQUEST/NOTIFICATION/RESPONSE，受 `acpc.logTraffic` 开关控制 | 日志格式 / 新增通道 |
+| `src/config/RegistryClient.ts` | 拉 `cdn.agentclientprotocol.com` 的 agent registry，Registry v1 schema 校验、5 分钟 TTL、10 秒 timeout、inFlight 合并和 clear generation 防旧响应覆盖；仅浏览无安装 | 换 registry 源 / 缓存策略 |
+| `src/utils/Logger.ts` | 双输出通道（`ACP Client (Custom)` / `ACP Traffic (Custom)`）；`logTraffic` 按 JSON-RPC 分类 REQUEST/NOTIFICATION/RESPONSE，受默认关闭的 `acpc.logTraffic` 开关控制；`acpc.persistLogs` 默认关闭，落盘用 context.logUri/acpc.log + BoundedLogWriter 限额/持续轮转 | 日志格式 / 新增通道 |
+| `src/handlers/TerminalAuthHandler.ts` | terminal auth：配置 invocation + auth args/env 独立交互终端，exit0 才成功、dispose 取消；不发 authenticate RPC | 认证窗口 / Windows argv |
+| `src/utils/ProcessLifecycle.ts` | Windows taskkill /T、Unix process group；失败 fallback | 子进程树清理 |
+| `src/utils/BoundedLogWriter.ts` | 串行异步落盘，entry/queue/file 限额、UTF-8 安全截断、5MiB+.1 | 日志内存与磁盘约束 |
 | `src/utils/StreamAdapter.ts` | `childProcessToWebStreams`：ChildProcess → `AcpStream{readable,writable}` | 流适配 |
 | `src/utils/BuildInfo.ts` | 构建指纹（版本 + git 短 sha + 打包时间 + bundle 哈希）：`buildStamp()`。宿主 activate 写一行、`html/body.ts` 写进 `<body data-acpc-build>`、客户端 boot 第一条日志报出来 —— 用于判定"这个窗口跑的是哪份代码" | 改日志身份标识 / 排查"改动没生效"（先确认跑的是哪份代码） |
 | `src/utils/TelemetryManager.ts` | **本仓库已改为 no-op**（见 registry `CUSTOM-20260923-002`），保留同名 API | 重新启用遥测 |
@@ -125,7 +129,7 @@ webpack + ts-loader（不是 esbuild）；ESLint flat config；`@vscode/test-cli
 
 ### 2.1 连接/拉起 agent
 `SessionManager.connectToAgent` → `AgentConfig.getAgentConfig` → `AgentManager.spawnAgent`
-（平台分支：Windows `cmd.exe`/`shell:true`；macOS/Linux login shell 解析）→ 失败看
+（平台分支：Windows cross-spawn `shell:false`；macOS/Linux login shell 解析）→ 失败看
 `AgentManager` 的 `agent-stderr`/`agent-error` 事件与 `Logger`。
 
 ### 2.2 ACP 握手与抓包
@@ -133,6 +137,8 @@ webpack + ts-loader（不是 esbuild）；ESLint flat config；`@vscode/test-cli
 `initialize`）→ 想看原始报文开 `acpc.logTraffic`，读 `Logger.logTraffic` + `ConnectionManager.tapStream`。
 
 ### 2.3 会话生命周期
+
+当前修复（2026-11-01）：新建/认证取消或失败不销毁共享 Agent 的其他会话；`listAllSessions` 全页成功才 reconcile，联合历史用 `reconcile:false`。configOptions 包括空数组都独占 legacy modes/models；prompt/steer 先验 image/audio/embeddedContext 能力。
 `SessionManager`：`newConversation` / `loadSession` / `resumeSession` / `listSessions`；
 认证失败是 `-32000` → 走 `showQuickPick` 选 auth method 后重试 `newSession`；
 持久化缓存读写看 `SessionHistoryStore`。
@@ -152,9 +158,9 @@ webpack + ts-loader（不是 esbuild）；ESLint flat config；`@vscode/test-cli
 
 ### 2.5 聊天 UI
 **路由层**：`ChatRouterProvider`（`src/ui/chat/`）按「聚焦会话所属 agent」在
-`ChatPanelHost`（新，仅 Claude Code）与 `LegacyPanelAdapter`（旧）之间切换；
+`ChatPanelHost`（所有 Agent 的现代面板）；`LegacyPanelAdapter`（仅留上游同步，不按 Agent 名切换）；
 `ChatWebviewProvider` 本身零改动，靠 facade 接入。**视图 id 仍是唯一的 `acpc-chat`**。
-019 起它同时管理**编辑区面板**（`ChatEditorPanel`，视图类型 `acpc-chat-editor`，仅 Claude Code），
+019 起它同时管理**编辑区面板**（`ChatEditorPanel`，视图类型 `acpc-chat-editor`，所有 Agent），
 两个 surface 共享同一个 `ChatPanelHost`：见 [`docs/arch/chat-panel.md`](./docs/arch/chat-panel.md) §5.7。
 
 **新面板**：`ChatPanelHost.onMessage`（webview→扩展）→ `SessionManager`；
@@ -210,6 +216,8 @@ webview→扩展消息类型（**按"要不要带 sessionId"分组——这正�
 分页 `loadMore`；能力探测 `probeCapabilities`。
 
 ### 2.7 客户端能力实现
+
+握手声明 fs/terminal/form/terminal auth。standard terminal auth 必须执行交互命令而非 authenticate RPC；URL elicitation 未实现且不声明。固定适配器版本的接口矩阵、EnvVar/MCP/provider/fork/delete 缺口见 [ACP 兼容性审查](./docs/acp-compatibility.md)。
 `handlers/FileSystemHandler`（读写文件）、`handlers/TerminalHandler`（终端）、
 `handlers/PermissionHandler`（权限）；都由 `AcpClientImpl` 统一暴露给 ACP SDK。
 
@@ -223,12 +231,12 @@ webview→扩展消息类型（**按"要不要带 sessionId"分组——这正�
 ### 2.8 agent 默认列表与设置项
 agent 定义是**纯数据**：`package.json` 的
 `contributes.configuration.properties["acpc.agents"].default`（11 条）+ `AgentConfig.ts` 读取。
-加/改 agent 不需要动代码。其余设置项：`acpc.autoApprovePermissions` / `acpc.defaultWorkingDirectory` / `acpc.logTraffic` / `acpc.autoConnectOnOpen`（面板打开 1s 后自动连接，面板初始界面上有同一个开关，见 [`docs/arch/chat-panel.md`](./docs/arch/chat-panel.md) §5.28）。
+加/改 agent 不需要动代码。其余设置项：`acpc.autoApprovePermissions` / `acpc.defaultWorkingDirectory` / `acpc.logTraffic` / `acpc.autoConnectOnOpen`（面板打开 0.5s 后自动连接，面板初始界面上有同一个开关，见 [`docs/arch/chat-panel.md`](./docs/arch/chat-panel.md) §5.28）。
 
 ### 2.9 打包 / 发布
 `package.json` 的 `scripts`（`compile`/`watch`/`package`/`lint`/`test`）、
 `.vscodeignore`（**新增顶层目录必须同步加排除，否则会打进 .vsix**）、
-`CUSTOMIZATIONS/scripts/release-vsix.sh`。
+`CUSTOMIZATIONS/scripts/release-vsix.sh`；`check-fixtures.mjs` 校验 replay JSON 的占位路径/目录身份（10个合成自检），`check-package.mjs` 校验有效分发白名单。
 
 ---
 

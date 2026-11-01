@@ -3,6 +3,10 @@
 // 纯新增字段，现有消费者按需解构，无破坏性。
 // [CUSTOM-END] CUSTOM-20260923-010
 import { spawn, ChildProcess } from 'node:child_process';
+// [CUSTOM-BEGIN] CUSTOM-20261101-002 - Resolve executable vs batch commands without losing argv boundaries.
+import crossSpawn from 'cross-spawn';
+import { terminateProcess } from '../utils/ProcessLifecycle';
+// [CUSTOM-END] CUSTOM-20261101-002
 import { existsSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { log, logError } from '../utils/Logger';
@@ -84,21 +88,23 @@ export class AgentManager extends EventEmitter {
     log(`Spawning agent "${name}" (${id}): ${config.command} ${(config.args || []).join(' ')}`);
 
     const child = (() => {
+      // [CUSTOM-BEGIN] CUSTOM-20261101-002 - Preserve argv and own the Unix process group.
       if (process.platform === 'win32') {
         // On Windows, commands like npx are batch scripts (.cmd) that require
         // shell resolution via cmd.exe.
-        return spawn(config.command, config.args || [], {
+        return crossSpawn(config.command, config.args || [], {
           stdio: ['pipe', 'pipe', 'pipe'],
           env: { ...process.env, ...(config.env || {}) },
           cwd: cwd || undefined,
-          shell: true,
+          shell: false,
+          windowsHide: true,
         });
       }
 
       // On macOS/Linux, use the user's login shell so that PATH includes
       // nvm, Homebrew, and other user-installed tool directories.
       const { shell, useLoginFlag } = resolveUnixShell();
-      const commandStr = [config.command, ...(config.args || [])].map(shellEscape).join(' ');
+      const commandStr = 'exec ' + [config.command, ...(config.args || [])].map(shellEscape).join(' ');
       const shellArgs = useLoginFlag ? ['-l', '-c', commandStr] : ['-c', commandStr];
 
       log(`Using shell: ${shell} ${shellArgs.join(' ')}`);
@@ -108,7 +114,9 @@ export class AgentManager extends EventEmitter {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env, ...(config.env || {}) },
         cwd: cwd || undefined,
+        detached: true,
       });
+      // [CUSTOM-END] CUSTOM-20261101-002
     })();
 
     const instance: AgentInstance = { id, name, process: child, config };
@@ -150,13 +158,12 @@ export class AgentManager extends EventEmitter {
     log(`Killing agent "${instance.name}" (${agentId})`);
 
     try {
-      instance.process.kill('SIGTERM');
-      // Force kill after 5s if still running
-      setTimeout(() => {
-        if (instance.process.exitCode === null) {
-          instance.process.kill('SIGKILL');
-        }
-      }, 5000);
+      // [CUSTOM-BEGIN] CUSTOM-20261101-002 - Kill descendants too; do not retain the extension host for the fallback timer.
+      terminateProcess(instance.process);
+      const timer = setTimeout(() => terminateProcess(instance.process, true), 5000);
+      timer.unref();
+      instance.process.once('close', () => clearTimeout(timer));
+      // [CUSTOM-END] CUSTOM-20261101-002
     } catch (e) {
       logError(`Failed to kill agent ${agentId}`, e);
     }

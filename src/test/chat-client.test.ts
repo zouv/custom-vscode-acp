@@ -1591,7 +1591,7 @@ suite('chat client logic: tool-card markdown round trip (stub DOM)', () => {
     const { NS } = loadClient();
     // `ls -la` 与代码片段是这条规则**故意**不碰的：拆了它们会被 md 语法吃掉
     // （缩进变代码块、'#' 开头的注释变标题、'-' 开头的行变列表）。
-    NS.toolCallView.render(toolWithText('```console\ntotal 18\ndrwxr-xr-x 1 zouwei 0 Oct 9 .\n```'), 'u2');
+    NS.toolCallView.render(toolWithText('```console\ntotal 18\ndrwxr-xr-x 1 user 0 Oct 9 .\n```'), 'u2');
     const asked = NS.toolCallView.pendingMarkdownItems() as Array<{ text: string }>;
     assert.ok(asked[0].text.includes('```console'), 'a plain console output stays a code block');
   });
@@ -1673,12 +1673,12 @@ suite('chat client logic: tool-card markdown round trip (stub DOM)', () => {
     const { NS } = loadClient({}, { syncFrames: true });
     const node = NS.toolCallView.render(toolWith({
       items: [{ type: 'content', block: { type: 'text', text: '   ' } }],
-      output: 'total 4\ndrwxr-xr-x 1 zouwei',
+      output: 'total 4\ndrwxr-xr-x 1 user',
     }), 'e6');
     assert.strictEqual(node.querySelector('.tool-text'), null, 'the blank item contributes nothing');
     const raw = node.querySelector('.tool-raw') as StubNode;
     assert.ok(raw, 'the raw output is rendered instead of an empty box');
-    assert.strictEqual(raw.textContent, 'total 4\ndrwxr-xr-x 1 zouwei');
+    assert.strictEqual(raw.textContent, 'total 4\ndrwxr-xr-x 1 user');
   });
 
   test('a visible item wins over the raw output', () => {

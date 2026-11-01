@@ -17,6 +17,112 @@
 
 ---
 
+### 2026-11-01 - CUSTOM-20261101-015
+- **功能**：补齐 ACP replay 夹具目录列表的身份脱敏与发布前隐私门禁。
+- **改动文件**：src/test/fixtures/claude-code-bash-tools.json、claude-code-session-load.json、chat-client.test.ts、chat-panel.test.ts；CUSTOMIZATIONS/scripts/preview-records.mjs、check-fixtures.mjs、registry.md、docs/pitfalls.md、docs/acp-compatibility.md。
+- **详细说明**：路径匿名化不足以清理 ls 输出中的 owner/group；替换为 user/1000，保留协议及工具输出形状；预览和测试里的目录身份与机器相关文件引用同样使用示例值。通用权限行检查不硬编码真实身份，失败只输出 JSON 字段位置；加入10个合成样例，覆盖 Windows/home 占位路径与目录身份。
+- **验证方式**：补修前新闸门捕获两份夹具11个字段；匿名化后闸门及10个自检通过。既有503项宿主回归未减少；发布打包再跑完整验收。历史 changelog 与 Git 历史不改写。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-11-01 - CUSTOM-20261101-014
+- **功能**：封住 Windows 大小写/符号链接文件别名对编辑器保护的绕过。
+- **改动文件**：src/handlers/FileSystemHandler.ts、src/test/acp-regression.test.ts；registry/architecture/pitfalls/dev-workflow/acp-compatibility 同步。
+- **详细说明**：真实宿主先复现大小写路径读到旧磁盘内容及写绕过 dirty 拒绝；使用 realpath 识别文件别名，不对 Unix 盲目折叠大小写，clean edit 使用已有文档 URI。新增五项回归；缺失父目录已由 workspace.fs 创建，未重复修。Windows 真实进程测试设置有界10s超时，修正最低宿主的一次默认2s超时。
+- **验证方式**：最终 Windows VS Code 1.144.0 与1.85.0均503 passing；与前13条的498次验证属于不同阶段。六节registry、lint、fixtures、production与package清单检查；未登录真实Agent。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-11-01 - CUSTOM-20261101-001
+- **功能**：编辑器文件写入数据保护
+- **改动文件**：src/handlers/FileSystemHandler.ts、src/test/acp-regression.test.ts；registry/architecture/chat-panel/dev-workflow/pitfalls/acp-compatibility 文档同步。
+- **详细说明**：dirty buffer 拒绝覆盖；clean open 文档 WorkspaceEdit+save；limit0返回空；真实编辑器回归。
+- **验证方式**：Windows VS Code stable 1.144.0 与最低 1.85.0 各 498 passing；lint/fixture、六节 registry 闸门与 production/package 清单验收，真实 Agent 登录未测。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-11-01 - CUSTOM-20261101-002
+- **功能**：安全进程与工具终端生命周期
+- **改动文件**：src/core/AgentManager.ts、src/handlers/TerminalHandler.ts、src/utils/ProcessLifecycle.ts、package.json/package-lock.json、回归测试；registry/architecture/chat-panel/dev-workflow/pitfalls/acp-compatibility 文档同步。
+- **详细说明**：cross-spawn安全 argv/windowsHide；Unix process group、Windows taskkill tree；即时输出/StringDecoder/UTF-8字节限制、session ownership、close/error settle wait、release/dispose清理。
+- **验证方式**：Windows VS Code stable 1.144.0 与最低 1.85.0 各 498 passing；lint/fixture、六节 registry 闸门与 production/package 清单验收，真实 Agent 登录未测。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-11-01 - CUSTOM-20261101-003
+- **功能**：共享会话错误隔离与连接清理
+- **改动文件**：src/core/SessionManager.ts、src/core/ConnectionManager.ts、回归测试；registry/architecture/chat-panel/dev-workflow/pitfalls/acp-compatibility 文档同步。
+- **详细说明**：新建/认证取消与失败不杀共享Agent；握手失败/协议版本不兼容/closed/dispose清理流/终端，已退出进程仍清connection。
+- **验证方式**：Windows VS Code stable 1.144.0 与最低 1.85.0 各 498 passing；lint/fixture、六节 registry 闸门与 production/package 清单验收，真实 Agent 登录未测。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-11-01 - CUSTOM-20261101-004
+- **功能**：退出前持久化有效恢复快照
+- **改动文件**：src/ui/chat/ChatPanelHost.ts、src/extension.ts、回归测试；registry/architecture/chat-panel/dev-workflow/pitfalls/acp-compatibility 文档同步。
+- **详细说明**：调度时捕获pendingSnapshot，dispose前flush、幂等guard；先chatRouter后SessionManager，异步Memento仅best-effort。
+- **验证方式**：Windows VS Code stable 1.144.0 与最低 1.85.0 各 498 passing；lint/fixture、六节 registry 闸门与 production/package 清单验收，真实 Agent 登录未测。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-11-01 - CUSTOM-20261101-005
+- **功能**：隐私 opt-in 与有界窗口日志
+- **改动文件**：src/utils/Logger.ts、src/utils/BoundedLogWriter.ts、src/extension.ts、package.json；registry/architecture/chat-panel/dev-workflow/pitfalls/acp-compatibility 文档同步。
+- **详细说明**：persistLogs/logTraffic默认false；context.logUri隔离；串行限额、64KiB entry/1MiB queue/5MiB+.1持续轮转；错误可落盘但IO/队列超额仍可能丢记录。
+- **验证方式**：Windows VS Code stable 1.144.0 与最低 1.85.0 各 498 passing；lint/fixture、六节 registry 闸门与 production/package 清单验收，真实 Agent 登录未测。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-11-01 - CUSTOM-20261101-006
+- **功能**：最低版本测试与最小分发白名单
+- **改动文件**：webpack.tests.config.js、webpack.config.js、.vscode-test.mjs、.vscodeignore、package.json/package-lock.json、CUSTOMIZATIONS/scripts/check-package.mjs；registry/architecture/chat-panel/dev-workflow/pitfalls/acp-compatibility 文档同步。
+- **详细说明**：SDK ESM独立test bundles；compile-tests保留tsc out模块供preview/probe；类型锁1.85.0；不产/分发声明和map；有效vsce清单断言。
+- **验证方式**：Windows VS Code stable 1.144.0 与最低 1.85.0 各 498 passing；lint/fixture、六节 registry 闸门与 production/package 清单验收，真实 Agent 登录未测。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-11-01 - CUSTOM-20261101-007
+- **功能**：全部 Agent 现代 UI 与 prompt 能力门控
+- **改动文件**：src/ui/chat/panelContract.ts、ChatEditorPanel.ts、ChatRouterProvider.ts、diskSessions.ts、html/client/dom.ts、src/config/AgentConfig.ts、src/core/SessionManager.ts、测试；registry/architecture/chat-panel/dev-workflow/pitfalls/acp-compatibility 文档同步。
+- **详细说明**：现代session-keyed界面覆盖Claude/Codex/自定义Agent和空态；sanitize递归unknown包装；configOptions包括[]都独占；无legacy model API显式失败；send/steer验证image/audio/resource，resource_link独立。
+- **验证方式**：Windows VS Code stable 1.144.0 与最低 1.85.0 各 498 passing；lint/fixture、六节 registry 闸门与 production/package 清单验收，真实 Agent 登录未测。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-11-01 - CUSTOM-20261101-008
+- **功能**：Registry v1 schema 与并发缓存
+- **改动文件**：src/config/RegistryClient.ts、src/extension.ts、回归测试；registry/architecture/chat-panel/dev-workflow/pitfalls/acp-compatibility 文档同步。
+- **详细说明**：id/name/distribution校验去重；10s timeout、5minTTL、inFlight合并和generation防clear后旧响应覆盖；仅浏览不安装。
+- **验证方式**：Windows VS Code stable 1.144.0 与最低 1.85.0 各 498 passing；lint/fixture、六节 registry 闸门与 production/package 清单验收，真实 Agent 登录未测。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-11-01 - CUSTOM-20261101-009
+- **功能**：接通标准 terminal auth
+- **改动文件**：src/handlers/TerminalAuthHandler.ts、src/core/ConnectionManager.ts、src/core/SessionManager.ts、回归测试；registry/architecture/chat-panel/dev-workflow/pitfalls/acp-compatibility 文档同步。
+- **详细说明**：声明terminal auth；运行配置command+base/auth args/env而非authenticate RPC，cwd传递，exit0才成功、dispose取消；Windows exe/cmd shim转义真实测试。
+- **验证方式**：Windows VS Code stable 1.144.0 与最低 1.85.0 各 498 passing；lint/fixture、六节 registry 闸门与 production/package 清单验收，真实 Agent 登录未测。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-11-01 - CUSTOM-20261101-010
+- **功能**：全分页历史与非权威联合缓存
+- **改动文件**：src/core/SessionManager.ts、src/ui/chat/ChatPanelHost.ts、src/test/chat-panel.test.ts、回归测试；registry/architecture/chat-panel/dev-workflow/pitfalls/acp-compatibility 文档同步。
+- **详细说明**：listAllSessions逐页去重/循环cursor/100页保护，完整成功才reconcile；联合picker reconcile:false保护cache-only，树保留Load More。
+- **验证方式**：Windows VS Code stable 1.144.0 与最低 1.85.0 各 498 passing；lint/fixture、六节 registry 闸门与 production/package 清单验收，真实 Agent 登录未测。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-11-01 - CUSTOM-20261101-011
+- **功能**：Replay fixture 路径匿名化与隐私闸门
+- **改动文件**：src/test/fixtures/三份JSON、CUSTOMIZATIONS/scripts/check-fixtures.mjs、package.json；registry/architecture/chat-panel/dev-workflow/pitfalls/acp-compatibility 文档同步。
+- **详细说明**：占位路径替换保留replay形状，pretest执行fixture私人路径闸门（非全面秘密扫描）。历史changelog两处路径与Git历史因append-only/授权规则未修改。
+- **验证方式**：Windows VS Code stable 1.144.0 与最低 1.85.0 各 498 passing；lint/fixture、六节 registry 闸门与 production/package 清单验收，真实 Agent 登录未测。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-11-01 - CUSTOM-20261101-012
+- **功能**：CI 最低宿主与构建/分发闸门
+- **改动文件**： .github/workflows/ci.yml、.github/workflows/publish.yml；registry/architecture/chat-panel/dev-workflow/pitfalls/acp-compatibility 文档同步。
+- **详细说明**：Node锁22，Windows增加minimum1.85，macOS历史live Electron跳过但补编译/lint；全平台fixture/package清单闸门，手动打包一致。未运行远程workflow。
+- **验证方式**：Windows VS Code stable 1.144.0 与最低 1.85.0 各 498 passing；lint/fixture、六节 registry 闸门与 production/package 清单验收，真实 Agent 登录未测。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+### 2026-11-01 - CUSTOM-20261101-013
+- **功能**：兼容修复开发依赖安全风险
+- **改动文件**：package.json/package-lock.json、兼容性报告；registry/architecture/chat-panel/dev-workflow/pitfalls/acp-compatibility 文档同步。
+- **详细说明**：npm audit fix（无force）和Mocha scoped serialize-javascript7.1.3 override；runtime audit0，全量仍17moderate/0high/0critical。不盲目跨major升级。
+- **验证方式**：Windows VS Code stable 1.144.0 与最低 1.85.0 各 498 passing；lint/fixture、六节 registry 闸门与 production/package 清单验收，真实 Agent 登录未测。
+- **基于上游版本**：0.2.0（commit e7371659）
+
+
 ### 2026-10-13 - CUSTOM-20261013-237
 - **功能**：修「历史会话的目录筛选菜单被会话列表行盖住」（层叠退化）；同一轮把预览截图档改成走真渲染路径，并补上预览主题里缺失的浮层 token
 - **改动文件**：`src/ui/chat/html/styles.ts`（一条规则 + 因果链注释）、`CUSTOMIZATIONS/scripts/preview-records.mjs`（`#historyfilter` 档重做 + 主题 token + 探针）

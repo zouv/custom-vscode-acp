@@ -7,7 +7,11 @@ node_modules/**
 .gitattributes
 *.map
 *.ts
-!dist/**
+# [CUSTOM-BEGIN] CUSTOM-20261101-006 - Only the runtime bundle belongs in the published extension.
+dist/**
+!dist/extension.js
+webpack.tests.config.js
+# [CUSTOM-END] CUSTOM-20261101-006
 tsconfig.json
 webpack.config.js
 eslint.config.mjs

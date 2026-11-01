@@ -23,7 +23,9 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: lts/*
+          # [CUSTOM-BEGIN] CUSTOM-20261101-012 - Pin the validated major instead of a moving LTS alias.
+          node-version: '22'
+          # [CUSTOM-END] CUSTOM-20261101-012
           cache: npm
 
       - run: npm ci
@@ -54,6 +56,19 @@ jobs:
       - run: npm test
         if: runner.os == 'Windows'
       # [CUSTOM-END] CUSTOM-20260923-009
+
+      # [CUSTOM-BEGIN] CUSTOM-20261101-012 - Compile macOS, test Windows minimum, and inspect package contents everywhere.
+      - name: Compile and lint without launching Electron (macOS)
+        if: runner.os == 'macOS'
+        run: npm run compile-tests && npm run lint
+      - name: Test declared minimum VS Code (Windows)
+        if: runner.os == 'Windows'
+        env:
+          ACPC_TEST_VSCODE_VERSION: '1.85.0'
+        run: npm test
+      - run: npm run check:fixtures
+      - run: npm run package && npm run check:package
+      # [CUSTOM-END] CUSTOM-20261101-012
 
       - name: Package VSIX
         run: npx @vscode/vsce package

@@ -21,13 +21,18 @@ import { ElicitationBridge } from './handlers/ElicitationBridge';
 // [CUSTOM-END] CUSTOM-20260924-020
 import { getAgentNames } from './config/AgentConfig';
 import { fetchRegistry } from './config/RegistryClient';
-import { log, logError, disposeChannels, getOutputChannel, getTrafficChannel } from './utils/Logger';
+// [CUSTOM-BEGIN] CUSTOM-20261101-005 - Initialize window-scoped logging.
+import { initLogger, log, logError, disposeChannels, getOutputChannel, getTrafficChannel } from './utils/Logger';
+// [CUSTOM-END] CUSTOM-20261101-005
 import { initTelemetry, sendEvent } from './utils/TelemetryManager';
 // [CUSTOM-BEGIN] CUSTOM-20261002-173 - 激活日志上报构建指纹（排查"当前窗口跑的是哪份代码"）。
 import { buildStamp } from './utils/BuildInfo';
 // [CUSTOM-END] CUSTOM-20261002-173
 
 export function activate(context: vscode.ExtensionContext): void {
+  // [CUSTOM-BEGIN] CUSTOM-20261101-005 - Use isolated VS Code log storage; persistence is explicitly opt-in.
+  initLogger(context.logUri);
+  // [CUSTOM-END] CUSTOM-20261101-005
   // [CUSTOM-BEGIN] CUSTOM-20261002-173 - 这一行的指纹是对照基准：webview 客户端会在 boot 时
   // 报出它拿到的 `<body data-acpc-build>`，两者一致才说明"窗口跑的就是当前构建"。
   log(`ACP Client extension activating... [build ${buildStamp()}]`);
@@ -547,7 +552,9 @@ export function activate(context: vscode.ExtensionContext): void {
       const agents = await fetchRegistry();
       const items = agents.map(a => ({
         label: a.name,
-        description: a.command,
+        // [CUSTOM-BEGIN] CUSTOM-20261101-008 - Registry v1 exposes distribution metadata, not a command.
+        description: a.id + (a.version ? ' · ' + a.version : ''),
+        // [CUSTOM-END] CUSTOM-20261101-008
         detail: a.description || '',
       }));
       if (items.length === 0) {
@@ -592,13 +599,15 @@ export function activate(context: vscode.ExtensionContext): void {
     browseRegistryCmd,
     {
       dispose: () => {
+        // [CUSTOM-BEGIN] CUSTOM-20261101-004 - Flush UI snapshots before clearing live sessions.
+        chatRouter.dispose();
+        // [CUSTOM-END] CUSTOM-20261101-004
         sessionManager.dispose();
         sessionUpdateHandler.dispose();
         // [CUSTOM-20260924-020] 先回答掉所有待决权限请求，再拆面板。
         permissionBridge.cancelAll();
         // [CUSTOM-20260929-119] 表单请求同样不能挂着：先回答掉再拆面板。
         elicitationBridge.cancelAll();
-        chatRouter.dispose();
         permissionBridge.dispose();
         elicitationBridge.dispose();
         sessionTreeProvider.dispose();

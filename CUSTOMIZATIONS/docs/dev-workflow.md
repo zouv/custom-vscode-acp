@@ -74,27 +74,25 @@ npm run compile && code --new-window --extensionDevelopmentPath="D:/Git/zgithub/
 
 ---
 
-## 排查入口：日志已经落盘（先读文件，别让用户手工拷）
+## 排查入口：日志默认不落盘（先明确开启诊断）
 
-宿主 `src/utils/Logger.ts` 的 `log()` / `logTraffic()` 除了写输出通道，还会**异步追加**到：
+- `acpc.persistLogs` 与 `acpc.logTraffic` **均默认 false**。普通诊断仍写 `ACP Client (Custom)` 输出通道；原始协议输出须开启 logTraffic；原始协议落盘须同时开启两者。
+- 文件位于当前 VS Code 窗口的 `ExtensionContext.logUri/acpc.log`（不是旧的 `~/.claude` 共用路径）。可用 VS Code 的“Developer: Open Logs Folder”定位当前窗口的扩展日志目录；不要读取其他项目日志。
+- BoundedLogWriter 串行异步追加、单条 64KiB、pending queue 1MiB、文件 5MiB，持续轮转为 `acpc.log.1`，只保留一份备份。UTF-8 安全截断；队列超额或 I/O 失败可能静默丢记录，因此日志缺失不能直接证明事件未发生。
+- 开启持久化后 error/stack、文件名和会话元数据也可能含私人路径；logTraffic 可能含完整 prompt、附件、文件内容。诊断后关闭，分享前匿名化；不要提交日志。
+- webview clientLog 经宿主写诊断通道，仍有每 10 秒 30 条限额。buildStamp 是“运行哪份构建”的判断依据；落盘关闭时在输出通道查激活/boot 指纹。
 
-```
-~/.claude/acp-client-custom.log        # Windows: %USERPROFILE%\.claude\acp-client-custom.log
-```
+## 构建、测试与分发闸门（2026-11-01）
 
-- **webview 客户端的 `console.warn` / `console.error` 也在里面**（经 `clientLog` 消息转发给宿主的 `log()`），前缀是 `chat-panel: client(warn):`。所以面板里的运行时问题（markdown 不渲染、布局改动没生效、消息被丢弃……）**都能在这里找到证据**。
-- 排查姿势：`grep -n "acpc\]" <file> | tail -40`，或按会话 id / 关键词过滤。文件超过 5MB 会**轮转**（旧文件改名成 `<file>.1`，只留一份备份，新日志从空文件开始）——排查"刚刚那次"的现场时，若当前文件是刚轮转过的空壳，**上一段会话在 `.1` 里**（pitfall #61：这里原先是"截断清零"，恰好会毁掉要查的那一段）。
-- 需要新证据时，在 `src/ui/chat/html/client/*.ts` 里加一行 `console.warn('[acpc] …')` 就会自动进文件（⚠️ 模板体内禁用反引号，见 pitfalls #11）。
-- **先确认"这个窗口跑的是哪份代码"**（CUSTOM-20261002-173）：日志首行是
-  `ACP Client extension activating... [build v0.2.0-custom.6·2819d85·2026-10-02T13:45:07.598Z·9f3e1a2b4c5d(2110432B)]`，
-  客户端每次加载还会报一条 `chat-panel: client(info): build …`。
-  · 两行都有且**等于当前 `dist` 的指纹** ⇒ 这个窗口跑的就是当前代码；
-  · 客户端报的是**旧值**（或只有宿主那行、客户端那行是旧的）⇒ webview 是旧的，重开面板/重载窗口；
-  · **两行都没有** ⇒ 这个窗口压根没重载过（改了代码要先 `npm run compile` 再 `Ctrl+R`）。
-  这条是"我改了但没生效"类问题的第一道判据，别再靠"应该重载了吧"来猜。
-- **客户端日志有配额**：转发是**滚动窗口**（每 10 秒最多 30 条，超出丢弃），
-  所以"日志里没有某条诊断"要先确认配额没被别的噪声吃满（markdown 那条诊断已限流，见 pitfalls #42）。
-- **不要请用户从输出面板手工拷贝日志** —— 这个文件存在的唯一目的就是省掉那一步（见 pitfalls #35）。
+使用 npm、webpack+ts-loader，CI/开发构建 Node 22。
+
+`npm run compile-tests` 先 `tsc -p . --outDir out` 生成预览/探针所需的真实模块，再 webpack 把每个测试和 ESM ACP SDK 独立打成 CommonJS（external vscode，clean 仅 out/test）。不能只打测试 bundle 而遗留旧 out/ui 产物。`watch-tests` 只 watch 测试 bundle；使用预览/探针前重新 compile-tests。
+
+`npm test` 覆盖 stable；PowerShell 下 `$env:ACPC_TEST_VSCODE_VERSION='1.85.0'; npm test` 覆盖最低支持宿主，结束后 `Remove-Item Env:ACPC_TEST_VSCODE_VERSION`。类型锁 1.85.0 防止编译时无意使用更高版本 API。Windows 回归 shell/交互终端使用 npm 提供的真实 Node（NODE），不是把旧 Electron Code.exe 当通用 Node。
+
+`npm run check:fixtures` 是 pretest 第一步（非全面秘密扫描）。`npm run package && npm run check:package` 检查有效 VSIX 文件清单：只允许 dist/extension.js，不允许 map/d.ts/src/out/tests/node_modules/CUSTOMIZATIONS。生产 webpack 禁 declaration；隐藏 source map 仅本地生成，不分发。六节 registry 检查与 lint 必须全绿。
+
+本轮本机 Windows：VS Code stable 1.144.0 与 1.85.0 均 503 tests。真实编辑器、SDK stdio、cmd shim/native argv、进程树、no-op 认证终端已测；未登录真实 Claude/Codex，不启动有费用的 prompt；Linux/macOS workflow 只更新配置，未真机验证。运行依赖 audit 0；开发依赖仍 17 moderate，需要后续跟踪而非强制跨 major 升级。
 
 ## 记录区布局：自己截图看（`preview-records.mjs`）
 
@@ -170,7 +168,7 @@ node CUSTOMIZATIONS/scripts/capture-acp-replay.mjs --out src/test/fixtures/claud
 |---|---|
 | **`Developer: Open Webview Developer Tools`** | **webview 客户端 JS 的唯一报错出口**。`src/ui/chat/html/client/*.ts` 是内联脚本，tsc/lint 看不到运行时问题。命令面板里搜 `webview` 即可找到 |
 | 输出通道 **`ACP Client (Custom)`** | 扩展侧日志。聊天面板相关搜前缀 `chat-router:`（面板路由决策）与 `chat-panel:`（面板收到的消息与错误）。**性能相关搜 `chat-panel: outbox`**——每轮结束时打一行 `sent=N merged=M queued=K`，`merged` 高说明流式合帧在工作 |
-| 输出通道 **`ACP Traffic (Custom)`** | ACP 协议**原始报文**（受 `acpc.logTraffic` 控制，默认开）。很多时候是 agent 没发某条通知，而不是面板没渲染 |
+| 输出通道 **`ACP Traffic (Custom)`** | ACP 协议**原始报文**（受 `acpc.logTraffic` 控制，默认关闭）。很多时候是 agent 没发某条通知，而不是面板没渲染 |
 | 命令面板搜 `ACP (Custom)` | 应该列出 22 个命令。少于 22 个说明扩展没完整激活 |
 
 **判断当前是哪块面板**（Chat 面板重写后有两套实现）：
@@ -579,14 +577,14 @@ node CUSTOMIZATIONS/scripts/check-webview-client.mjs --fix
 
 > **210 的真机验证是这一轮唯一必须人工做的一次操作**：拖拽没法在自动覆盖里复现（预览是
 > `--dump-dom` 一次性模式，合成 DragEvent 只跑得到我们自己的处理器，而 198 的现场是浏览器那一侧）。
-> 若仍弹回，**先读日志**：`~/.claude/acp-client-custom.log` 搜 `tabdrag` —— 有 `start=` 没 `drop`
+> 若仍弹回，**先读日志**：当前窗口的 `context.logUri/acpc.log`（先开启 persistLogs） 搜 `tabdrag` —— 有 `start=` 没 `drop`
 > 说明落点没接住；两行都有说明落了但顺序被别的东西覆盖（那行后面那条 `uiPrefs` 是嫌疑）。
 
 **2026-10-08（202）：loading 期间点 tab 没反应 —— 回填分帧 + 长任务看门狗**
 
 | # | 操作 | 期望 | 反例（说明哪里坏了） |
 |---|---|---|---|
-| 211 | 从草稿页打开一条**很大**的历史会话（几百条记录），趁还在 loading 时点别的会话 tab | 切换**立刻生效**（loading 期间也一样）；记录填进来的过程可以慢，但面板一直能点 | 点了像没反应、要等十几秒到几十秒才切过去。**先读日志**：`~/.claude/acp-client-custom.log` 搜 `longtask` —— 会看到 `[acpc] longtask NNNNms during=markdown-apply`（数字就是卡了多久）；如果**连一行都没有**却仍然卡，说明卡在别的阶段（把 `perf.phase` 的标签换到可疑的那一段再复现一次） |
+| 211 | 从草稿页打开一条**很大**的历史会话（几百条记录），趁还在 loading 时点别的会话 tab | 切换**立刻生效**（loading 期间也一样）；记录填进来的过程可以慢，但面板一直能点 | 点了像没反应、要等十几秒到几十秒才切过去。**先读日志**：当前窗口的 `context.logUri/acpc.log`（先开启 persistLogs） 搜 `longtask` —— 会看到 `[acpc] longtask NNNNms during=markdown-apply`（数字就是卡了多久）；如果**连一行都没有**却仍然卡，说明卡在别的阶段（把 `perf.phase` 的标签换到可疑的那一段再复现一次） |
 | 212 | 同一会话正常打开（不点别的 tab），盯着记录区 | 记录是一批批填进来的（每帧一片），不是"一次性全出来" | 一整批瞬间全出（`queueMarkdown` 没走分帧）；或只出来一部分就停了（分帧断了 —— 看有没有 `applyMarkdown failed` 那一行，坏的那一条会被跳过并记一行） |
 | 213 | `+` 新建会话 → 点标题栏那一格打开目录抽屉 → **Browse…** 选一个新目录 → 发一条消息；然后**再打开**那个抽屉 | 新目录出现在「Recently used」里（打开抽屉时会回头问一次宿主，回复到了就地刷新） | 列表里只有老目录（候选被终身缓存了，见 pitfalls #54）；或每次打开都闪一下 `Loading…`（`pending` 被当成"每次都在加载"） |
 | 214 | 打开右侧大纲栏（☰ → ⇥ 固定），再用 ☰ 或 Escape 把它**关掉**；然后点一下地址栏的 **Times**、拖一下 tab、拖一下大纲栏宽度 | 侧栏**保持关着**（那三个动作都会各自写一次偏好，宿主会把 `uiPrefs` 广播回来 —— 回话只该让两端收敛） | 点一下 Times 就把它弹回来（`applyPrefs` 又把 `isOpen` 算成 `mode === 'sidebar'`，见 pitfalls #55） |

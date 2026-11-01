@@ -1699,7 +1699,7 @@ suite('chat panel: audit round — routing, close, empty state', () => {
     assert.strictEqual(panelIdForAgent(undefined), 'modern');
     assert.strictEqual(panelIdForAgent(''), 'modern');
     assert.strictEqual(panelIdForAgent('Claude Code'), 'modern');
-    assert.strictEqual(panelIdForAgent('GitHub Copilot'), 'legacy', 'a known non-modern agent still uses the upstream panel');
+    assert.strictEqual(panelIdForAgent('GitHub Copilot'), 'modern', 'all agents use session-keyed transcripts');
   });
 
   /** Records the cancel; the in-flight state is ours to decide. */
@@ -2477,13 +2477,13 @@ suite('chat panel: replay fidelity (CUSTOM-20260928-100)', () => {
     try {
       const bucket = path.join(root, 'projects', cwd.replace(/[^A-Za-z0-9]/g, '-'));
       fs.mkdirSync(bucket, { recursive: true });
-      const target = 'f%3A/P4/AKI/aki_dev_zouwei/Source/Client/GrapplingHookPointComponent.cs';
+      const target = 'f%3A/Workspace/sample/src/ExampleComponent.cs';
       fs.writeFileSync(path.join(bucket, 's-ref.jsonl'), [
         JSON.stringify({
           type: 'user', uuid: 'u-ref', timestamp: '2026-10-09T10:00:00.000Z',
           message: { role: 'user', content: [
             { type: 'text', text: '还是很多波浪线' },
-            { type: 'text', text: `[@GrapplingHookPointComponent.cs#L437-440](file:///${target}#L437-440)` },
+            { type: 'text', text: `[@ExampleComponent.cs#L437-440](file:///${target}#L437-440)` },
           ] },
         }),
       ].join('\n'));
@@ -2500,7 +2500,7 @@ suite('chat panel: replay fidelity (CUSTOM-20260928-100)', () => {
         sessionId: 's-ref',
         update: {
           sessionUpdate: 'user_message_chunk', messageId: 'u-ref',
-          content: { type: 'text', text: `[@GrapplingHookPointComponent.cs#L437-440](file:///${target}#L437-440)` },
+          content: { type: 'text', text: `[@ExampleComponent.cs#L437-440](file:///${target}#L437-440)` },
         },
       } as any);
 
@@ -2515,9 +2515,9 @@ suite('chat panel: replay fidelity (CUSTOM-20260928-100)', () => {
       assert.strictEqual(user.attachments!.length, 1);
       assert.strictEqual(user.attachments![0].type, 'resource_link');
       // `path` 存在 ⇒ chip 点击走 openFile（039/205 的既有约定），与发送时那条同形。
-      assert.strictEqual(user.attachments![0].path, 'f:\\P4\\AKI\\aki_dev_zouwei\\Source\\Client\\GrapplingHookPointComponent.cs');
+      assert.strictEqual(user.attachments![0].path, 'f:\\Workspace\\sample\\src\\ExampleComponent.cs');
       // 名字归一成 live chip 的写法（composer.ts refLabel 的 `<name>:<start>-<end>`）。
-      assert.strictEqual(user.attachments![0].name, 'GrapplingHookPointComponent.cs:437-440');
+      assert.strictEqual(user.attachments![0].name, 'ExampleComponent.cs:437-440');
     } finally {
       if (previous === undefined) { delete process.env.CLAUDE_CONFIG_DIR; }
       else { process.env.CLAUDE_CONFIG_DIR = previous; }
@@ -3340,14 +3340,14 @@ suite('chat panel: background prompts notify instead of interrupting (CUSTOM-202
     assert.strictEqual(harness.notices.shown.length, 1, 'and no second notification appeared');
   });
 
-  test('a legacy agent still gets the dialog — the panel can never render it', () => {
+  test('a non-Claude agent can render session-scoped permission cards', async () => {
     const permission = new PermissionBridge();
     const harness = makeHarness('s-1', 'Claude Code', undefined, new StubPrefs(), { permission });
-    registerFakeSession(harness.sessionManager, 'legacy-1', 'Gemini CLI');
-
-    const dialogCalls = requestPermission(permission, 'legacy-1');
-    assert.deepStrictEqual(dialogCalls, ['dialog'], 'no modern panel exists for that agent, so the dialog is the only way to answer');
-    assert.strictEqual(permissionRecord(harness, 'legacy-1'), null, 'and nothing was appended to a transcript it does not have');
+    registerFakeSession(harness.sessionManager, 'codex-1', 'Codex CLI');
+    const dialogCalls = requestPermission(permission, 'codex-1');
+    assert.deepStrictEqual(dialogCalls, [], 'generic agents also use the panel presenter');
+    await waitFor(() => !!permissionRecord(harness, 'codex-1'), 'the Codex permission card to be recorded');
+    harness.host.dispose();
   });
 
   test('with no surface at all the dialog stays the exit that cannot hang the agent', () => {
@@ -4262,6 +4262,17 @@ suite('chat panel: session restore (CUSTOM-20261009-209)', () => {
     assert.strictEqual(resolveRestoreChoice('ask'), 'ask');
     assert.strictEqual(resolveRestoreChoice('sometimes'), 'ask');
     assert.strictEqual(resolveRestoreChoice(undefined), 'ask');
+  });
+
+  test('dispose flushes a pending snapshot before the manager can clear its sessions', async () => {
+    const memento = new FakeMemento();
+    const h = makeHarness('snapshot-race', 'Codex CLI', undefined, new StubPrefs(), {}, memento);
+    h.sessionManager.focusSession('snapshot-race', { force: true });
+    h.host.dispose();
+    h.sessionManager.dispose();
+    assert.deepStrictEqual(snapshotOf(memento)?.sessions.map(s => s.sessionId), ['snapshot-race']);
+    await new Promise(resolve => setTimeout(resolve, 350));
+    assert.deepStrictEqual(snapshotOf(memento)?.sessions.map(s => s.sessionId), ['snapshot-race']);
   });
 
   test('the open sessions are snapshotted, and offered to the next window', async () => {

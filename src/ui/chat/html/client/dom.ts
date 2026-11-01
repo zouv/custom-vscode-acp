@@ -44,6 +44,7 @@ export const domClient = `
         if (child.nodeType !== 1) { continue; }
         if (!ALLOWED_TAGS[child.tagName]) {
           // Unwrap unknown elements rather than dropping their text content.
+          walk(child);
           while (child.firstChild) { node.insertBefore(child.firstChild, child); }
           node.removeChild(child);
           continue;

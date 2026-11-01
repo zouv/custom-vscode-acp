@@ -11,15 +11,12 @@ import * as vscode from 'vscode';
 /** Which implementation is currently owning the single chat view. */
 export type PanelId = 'modern' | 'legacy';
 
-/**
- * Agents whose chat panel is the rewritten one. Matched against the
- * `acpc.agents` configuration KEY (e.g. "Claude Code"), not against the
- * display name the agent reports in `initialize`.
- */
-export const MODERN_AGENTS: ReadonlySet<string> = new Set(['Claude Code']);
+/** Default startup candidates only; panel selection supports every configured ACP agent. */
+// [CUSTOM-BEGIN] CUSTOM-20261101-007 - Every configured ACP agent uses the session-keyed modern host.
+export const MODERN_AGENTS: ReadonlySet<string> = new Set(['Claude Code', 'Codex CLI']);
 
 export function isModernAgent(agentName: string | null | undefined): boolean {
-  return !!agentName && MODERN_AGENTS.has(agentName);
+  return !!agentName;
 }
 
 /**
@@ -29,13 +26,15 @@ export function isModernAgent(agentName: string | null | undefined): boolean {
  * upstream panel, and attaching it REPLACES the sidebar document (`webview.html`), which
  * throws away everything client-local — a draft page and its typed text (058) — and makes
  * the modern empty state ("No session yet" + Connect) unreachable: it exists precisely for
- * the sessionless panel, which used to route to legacy instead. Only a KNOWN non-modern
- * agent goes to legacy.
+ * the sessionless panel, which used to route to legacy instead. All configured agents now
+ * use the modern session-keyed host; the legacy implementation remains for upstream sync.
  */
 export function panelIdForAgent(agentName: string | null | undefined): 'modern' | 'legacy' {
   if (!agentName) { return 'modern'; }
   return isModernAgent(agentName) ? 'modern' : 'legacy';
 }
+
+// [CUSTOM-END] CUSTOM-20261101-007
 
 /** Focused agent + session, as understood by the router. */
 export interface PanelContext {

@@ -3395,7 +3395,7 @@
           "_meta": {
             "claudeCode": {
               "toolResponse": {
-                "stdout": "total 38147\ndrwxr-xr-x 1 zouwei 1049089  0 Sep 29 22:21 .\ndrwxr-xr-x 1 zouwei 1049089  0 Sep 29 22:21 ..\n-rw-r--r-- 1 zouwei 1049089 17 Sep 29 22:21 a.txt\n-rw-r--r-- 1 zouwei 1049089 34 Sep 29 22:21 b.md\n-rw-r--r-- 1 zouwei 1049089 28 Sep 29 22:21 c.csv",
+                "stdout": "total 38147\ndrwxr-xr-x 1 user 1000  0 Sep 29 22:21 .\ndrwxr-xr-x 1 user 1000  0 Sep 29 22:21 ..\n-rw-r--r-- 1 user 1000 17 Sep 29 22:21 a.txt\n-rw-r--r-- 1 user 1000 34 Sep 29 22:21 b.md\n-rw-r--r-- 1 user 1000 28 Sep 29 22:21 c.csv",
                 "stderr": "",
                 "interrupted": false,
                 "isImage": false,
@@ -3424,13 +3424,13 @@
           "content": [
             {
               "content": {
-                "text": "```console\ntotal 38147\ndrwxr-xr-x 1 zouwei 1049089  0 Sep 29 22:21 .\ndrwxr-xr-x 1 zouwei 1049089  0 Sep 29 22:21 ..\n-rw-r--r-- 1 zouwei 1049089 17 Sep 29 22:21 a.txt\n-rw-r--r-- 1 zouwei 1049089 34 Sep 29 22:21 b.md\n-rw-r--r-- 1 zouwei 1049089 28 Sep 29 22:21 c.csv\n```",
+                "text": "```console\ntotal 38147\ndrwxr-xr-x 1 user 1000  0 Sep 29 22:21 .\ndrwxr-xr-x 1 user 1000  0 Sep 29 22:21 ..\n-rw-r--r-- 1 user 1000 17 Sep 29 22:21 a.txt\n-rw-r--r-- 1 user 1000 34 Sep 29 22:21 b.md\n-rw-r--r-- 1 user 1000 28 Sep 29 22:21 c.csv\n```",
                 "type": "text"
               },
               "type": "content"
             }
           ],
-          "rawOutput": "total 38147\ndrwxr-xr-x 1 zouwei 1049089  0 Sep 29 22:21 .\ndrwxr-xr-x 1 zouwei 1049089  0 Sep 29 22:21 ..\n-rw-r--r-- 1 zouwei 1049089 17 Sep 29 22:21 a.txt\n-rw-r--r-- 1 zouwei 1049089 34 Sep 29 22:21 b.md\n-rw-r--r-- 1 zouwei 1049089 28 Sep 29 22:21 c.csv",
+          "rawOutput": "total 38147\ndrwxr-xr-x 1 user 1000  0 Sep 29 22:21 .\ndrwxr-xr-x 1 user 1000  0 Sep 29 22:21 ..\n-rw-r--r-- 1 user 1000 17 Sep 29 22:21 a.txt\n-rw-r--r-- 1 user 1000 34 Sep 29 22:21 b.md\n-rw-r--r-- 1 user 1000 28 Sep 29 22:21 c.csv",
           "status": "completed",
           "toolCallId": "call_00_sXecYKQAm4Lxbj0X3Omp8505",
           "sessionUpdate": "tool_call_update"
@@ -7574,13 +7574,13 @@
           "content": [
             {
               "content": {
-                "text": "```console\ntotal 38147\ndrwxr-xr-x 1 zouwei 1049089  0 Sep 29 22:21 .\ndrwxr-xr-x 1 zouwei 1049089  0 Sep 29 22:21 ..\n-rw-r--r-- 1 zouwei 1049089 17 Sep 29 22:21 a.txt\n-rw-r--r-- 1 zouwei 1049089 34 Sep 29 22:21 b.md\n-rw-r--r-- 1 zouwei 1049089 28 Sep 29 22:21 c.csv\n```",
+                "text": "```console\ntotal 38147\ndrwxr-xr-x 1 user 1000  0 Sep 29 22:21 .\ndrwxr-xr-x 1 user 1000  0 Sep 29 22:21 ..\n-rw-r--r-- 1 user 1000 17 Sep 29 22:21 a.txt\n-rw-r--r-- 1 user 1000 34 Sep 29 22:21 b.md\n-rw-r--r-- 1 user 1000 28 Sep 29 22:21 c.csv\n```",
                 "type": "text"
               },
               "type": "content"
             }
           ],
-          "rawOutput": "total 38147\ndrwxr-xr-x 1 zouwei 1049089  0 Sep 29 22:21 .\ndrwxr-xr-x 1 zouwei 1049089  0 Sep 29 22:21 ..\n-rw-r--r-- 1 zouwei 1049089 17 Sep 29 22:21 a.txt\n-rw-r--r-- 1 zouwei 1049089 34 Sep 29 22:21 b.md\n-rw-r--r-- 1 zouwei 1049089 28 Sep 29 22:21 c.csv",
+          "rawOutput": "total 38147\ndrwxr-xr-x 1 user 1000  0 Sep 29 22:21 .\ndrwxr-xr-x 1 user 1000  0 Sep 29 22:21 ..\n-rw-r--r-- 1 user 1000 17 Sep 29 22:21 a.txt\n-rw-r--r-- 1 user 1000 34 Sep 29 22:21 b.md\n-rw-r--r-- 1 user 1000 28 Sep 29 22:21 c.csv",
           "status": "completed",
           "toolCallId": "call_00_sXecYKQAm4Lxbj0X3Omp8505",
           "sessionUpdate": "tool_call_update"
@@ -7672,7 +7672,7 @@
         "sessionId": "ccfeb155-ec3a-4691-bfc1-1237afcea1f4",
         "update": {
           "content": {
-            "text": "两条命令的原始输出：\n\n**1. `ls -la`**（退出码 0）\n```\ntotal 38147\ndrwxr-xr-x 1 zouwei 1049089  0 Sep 29 22:21 .\ndrwxr-xr-x 1 zouwei 1049089  0 Sep 29 22:21 ..\n-rw-r--r-- 1 zouwei 1049089 17 Sep 29 22:21 a.txt\n-rw-r--r-- 1 zouwei 1049089 34 Sep 29 22:21 b.md\n-rw-r--r-- 1 zouwei 1049089 28 Sep 29 22:21 c.csv\n```\n\n**2. `git status --short`**（退出码 128）\n```\nfatal: not a git repository (or any of the parent directories): .git\n```\n\n第二条失败是因为当前目录 `C:\\Users\\zouwei\\AppData\\Local\\Temp\\acp-replay-capture-7S6ZGg` 不是 git 仓库。按要求停在这里。",
+            "text": "两条命令的原始输出：\n\n**1. `ls -la`**（退出码 0）\n```\ntotal 38147\ndrwxr-xr-x 1 user 1000  0 Sep 29 22:21 .\ndrwxr-xr-x 1 user 1000  0 Sep 29 22:21 ..\n-rw-r--r-- 1 user 1000 17 Sep 29 22:21 a.txt\n-rw-r--r-- 1 user 1000 34 Sep 29 22:21 b.md\n-rw-r--r-- 1 user 1000 28 Sep 29 22:21 c.csv\n```\n\n**2. `git status --short`**（退出码 128）\n```\nfatal: not a git repository (or any of the parent directories): .git\n```\n\n第二条失败是因为当前目录 `C:\\Users\\user\\AppData\\Local\\Temp\\acp-replay-capture-7S6ZGg` 不是 git 仓库。按要求停在这里。",
             "type": "text"
           },
           "messageId": "614fe65d-c84e-4c76-9487-a483eff22cdb",

@@ -240,6 +240,10 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
   private openSessions: OpenSessionsSnapshot | null = null;
   private restoreDismissed = false;
   private snapshotTimer: ReturnType<typeof setTimeout> | null = null;
+  // [CUSTOM-BEGIN] CUSTOM-20261101-004 - Flush the last live snapshot before lifecycle teardown.
+  private pendingSnapshot: OpenSessionsSnapshot | null = null;
+  private disposed = false;
+  // [CUSTOM-END] CUSTOM-20261101-004
   /** 本生命周期里出现过会话吗 —— 只有出现过，才允许把快照写成空表（启动时的空态会把它抹掉）。 */
   private sawLiveSession = false;
 
@@ -1024,6 +1028,11 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
   }
 
   dispose(): void {
+    // [CUSTOM-BEGIN] CUSTOM-20261101-004 - Idempotent disposal must persist before sessions disappear.
+    if (this.disposed) { return; }
+    this.flushOpenSessions();
+    this.disposed = true;
+    // [CUSTOM-END] CUSTOM-20261101-004
     // [CUSTOM-20260925-041] Unregister first: an update arriving while the
     // rest of this method runs would otherwise index into state that is being
     // torn down.
@@ -2252,8 +2261,10 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
 
     try {
       if (connected && caps?.list) {
-        const response = await this.sessionManager.listSessions(agent);
-        const fromAgent = response.sessions
+        // [CUSTOM-BEGIN] CUSTOM-20261101-010 - Fetch every history page; the tree keeps its explicit Load More behavior.
+        const listed = await this.sessionManager.listAllSessions(agent, { reconcile: false });
+        // [CUSTOM-END] CUSTOM-20261101-010
+        const fromAgent = listed
           .map(s => {
             const info = s as { sessionId?: unknown; title?: unknown; cwd?: unknown; updatedAt?: unknown };
             const sessionId = String(info.sessionId ?? '');
@@ -2965,18 +2976,26 @@ export class ChatPanelHost implements IChatPanel, PermissionPresenter, Elicitati
    *   那一瞬间就会把上一次的快照抹掉（而那正是要读它的时刻）。
    * - **防抖**：它挂在 created / closed / focus 三个事件上，而 focus 会因为"切标签"频繁发生。
    */
+  // [CUSTOM-BEGIN] CUSTOM-20261101-004 - Capture at scheduling time, never after SessionManager teardown.
   private saveOpenSessions(): void {
+    if (this.disposed) { return; }
     if (this.snapshotTimer) { clearTimeout(this.snapshotTimer); }
-    this.snapshotTimer = setTimeout(() => {
-      this.snapshotTimer = null;
-      const live = this.liveSessionsInTabOrder();
-      if (live.length === 0 && !this.sawLiveSession) { return; }
-      const snapshot: OpenSessionsSnapshot = { sessions: live, focused: this.focused.sessionId };
-      this.openSessions = snapshot;
-      const write = this.globalState?.update(OPEN_SESSIONS_KEY, snapshot);
-      if (write) { void Promise.resolve(write).catch(() => undefined); }
-    }, SNAPSHOT_DEBOUNCE_MS);
+    const live = this.liveSessionsInTabOrder();
+    if (live.length === 0 && !this.sawLiveSession) { return; }
+    this.pendingSnapshot = { sessions: live, focused: this.focused.sessionId };
+    this.snapshotTimer = setTimeout(() => this.flushOpenSessions(), SNAPSHOT_DEBOUNCE_MS);
   }
+
+  private flushOpenSessions(): void {
+    if (this.snapshotTimer) { clearTimeout(this.snapshotTimer); this.snapshotTimer = null; }
+    if (!this.pendingSnapshot) { return; }
+    const snapshot = this.pendingSnapshot;
+    this.pendingSnapshot = null;
+    this.openSessions = snapshot;
+    const write = this.globalState?.update(OPEN_SESSIONS_KEY, snapshot);
+    if (write) { void Promise.resolve(write).catch(() => undefined); }
+  }
+  // [CUSTOM-END] CUSTOM-20261101-004
 
   /**
    * [CUSTOM-20261009-209] 恢复时把一条快照会话真正加载回来。

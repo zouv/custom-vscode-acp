@@ -14,10 +14,18 @@ import type {
   ReleaseTerminalResponse,
 } from '@agentclientprotocol/sdk';
 
-import { spawn, ChildProcess } from 'node:child_process';
+// [CUSTOM-BEGIN] CUSTOM-20261101-002 - Safe argv spawning, synchronous UTF-8 output, session-scoped resources.
+import type { ChildProcess } from 'node:child_process';
+import crossSpawn from 'cross-spawn';
+import { StringDecoder } from 'node:string_decoder';
+import { terminateProcess } from '../utils/ProcessLifecycle';
+// [CUSTOM-END] CUSTOM-20261101-002
 
+// [CUSTOM-BEGIN] CUSTOM-20261101-002 - Terminal identity includes the owning session and display emitter.
 interface ManagedTerminal {
   id: string;
+  sessionId: string;
+  writeEmitter: vscode.EventEmitter<string>;
   process: ChildProcess;
   output: string;
   truncated: boolean;
@@ -28,6 +36,7 @@ interface ManagedTerminal {
   exitPromise: Promise<void>;
   vsTerminal?: vscode.Terminal;
 }
+// [CUSTOM-END] CUSTOM-20261101-002
 
 /**
  * Manages terminals that ACP agents request (terminal/create, terminal/output, etc.).
@@ -50,104 +59,49 @@ export class TerminalHandler {
       }
     }
 
-    const child = spawn(params.command, params.args || [], {
-      cwd: params.cwd || undefined,
-      env,
-      shell: true,
-      stdio: ['pipe', 'pipe', 'pipe'],
+    // [CUSTOM-BEGIN] CUSTOM-20261101-002 - Update the managed state in the data callback, not on a polling timer.
+    if (!Number.isSafeInteger(outputByteLimit) || outputByteLimit < 0) {
+      throw new Error('outputByteLimit must be a non-negative integer');
+    }
+    const child = crossSpawn(params.command, params.args || [], {
+      cwd: params.cwd || undefined, env, shell: false, windowsHide: true,
+      detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'],
     });
-
-    let output = '';
-    let truncated = false;
-
-    const appendOutput = (data: Buffer) => {
-      const text = data.toString();
-      output += text;
-      // Truncate from beginning if over limit
-      const byteLength = Buffer.byteLength(output, 'utf-8');
-      if (byteLength > outputByteLimit) {
-        const excess = byteLength - outputByteLimit;
-        // Find a safe character boundary to truncate at
-        let cutPoint = 0;
-        let bytes = 0;
-        for (let i = 0; i < output.length; i++) {
-          bytes += Buffer.byteLength(output[i], 'utf-8');
-          if (bytes >= excess) {
-            cutPoint = i + 1;
-            break;
-          }
-        }
-        output = output.substring(cutPoint);
-        truncated = true;
-      }
-    };
-
-    child.stdout?.on('data', appendOutput);
-    child.stderr?.on('data', appendOutput);
-
-    const exitPromise = new Promise<void>((resolve) => {
-      child.on('close', (code, signal) => {
-        const managed = this.terminals.get(terminalId);
-        if (managed) {
-          managed.exitCode = code;
-          managed.exitSignal = signal;
-          managed.exited = true;
-        }
-        resolve();
-      });
-      child.on('error', () => {
-        resolve();
-      });
-    });
-
-    // Also create a VS Code terminal for visual output
     const writeEmitter = new vscode.EventEmitter<string>();
-    const pty: vscode.Pseudoterminal = {
-      onDidWrite: writeEmitter.event,
-      open() {
-        writeEmitter.fire(`$ ${params.command} ${(params.args || []).join(' ')}\r\n`);
-      },
-      close() { /* no-op */ },
-    };
     const vsTerminal = vscode.window.createTerminal({
-      name: `ACP: ${params.command}`,
-      pty,
+      name: 'ACP: ' + params.command,
+      pty: { onDidWrite: writeEmitter.event, open() { writeEmitter.fire('$ ' + params.command + '\r\n'); }, close() { terminateProcess(child, true); } },
     });
-
-    // Stream output to VS Code terminal
-    child.stdout?.on('data', (data: Buffer) => {
-      writeEmitter.fire(data.toString().replace(/\n/g, '\r\n'));
-    });
-    child.stderr?.on('data', (data: Buffer) => {
-      writeEmitter.fire(data.toString().replace(/\n/g, '\r\n'));
-    });
-
+    let resolveExit!: () => void;
     const managed: ManagedTerminal = {
-      id: terminalId,
-      process: child,
-      output: '',
-      truncated: false,
-      outputByteLimit,
-      exitCode: null,
-      exitSignal: null,
-      exited: false,
-      exitPromise,
-      vsTerminal,
+      id: terminalId, sessionId: params.sessionId, process: child, output: '', truncated: false,
+      outputByteLimit, exitCode: null, exitSignal: null, exited: false,
+      exitPromise: new Promise<void>(resolve => { resolveExit = resolve; }), vsTerminal, writeEmitter,
     };
-
-    // Keep output reference updated
-    const timer = setInterval(() => {
-      managed.output = output;
-      managed.truncated = truncated;
-    }, 100);
-
-    child.on('close', () => {
-      managed.output = output;
-      managed.truncated = truncated;
-      clearInterval(timer);
-    });
-
     this.terminals.set(terminalId, managed);
+    const append = (text: string) => {
+      if (!text) { return; }
+      writeEmitter.fire(text.replace(/\r?\n/g, '\r\n'));
+      const bytes = Buffer.from(managed.output + text, 'utf8');
+      if (bytes.length <= outputByteLimit) { managed.output += text; return; }
+      let start = bytes.length - outputByteLimit;
+      while (start < bytes.length && (bytes[start] & 0xc0) === 0x80) { start++; }
+      managed.output = bytes.subarray(start).toString('utf8');
+      managed.truncated = true;
+    };
+    const stdout = new StringDecoder('utf8');
+    const stderr = new StringDecoder('utf8');
+    child.stdout?.on('data', (data: Buffer) => append(stdout.write(data)));
+    child.stderr?.on('data', (data: Buffer) => append(stderr.write(data)));
+    const finish = (code: number | null, signal: string | null) => {
+      if (managed.exited) { return; }
+      append(stdout.end()); append(stderr.end());
+      managed.exitCode = code; managed.exitSignal = signal; managed.exited = true;
+      resolveExit();
+    };
+    child.once('close', finish);
+    child.once('error', (error) => { logError('Terminal process failed', error); finish(1, null); });
+    // [CUSTOM-END] CUSTOM-20261101-002
 
     return { terminalId };
   }
@@ -178,8 +132,10 @@ export class TerminalHandler {
     };
   }
 
+  // [CUSTOM-BEGIN] CUSTOM-20261101-002 - Enforce session ownership and clean up process trees/emitters.
   async terminalOutput(params: TerminalOutputRequest): Promise<TerminalOutputResponse> {
     const managed = this.terminals.get(params.terminalId);
+    if (managed && managed.sessionId !== params.sessionId) { throw new Error('Terminal belongs to another session'); }
     if (!managed) {
       throw new Error(`Terminal not found: ${params.terminalId}`);
     }
@@ -201,6 +157,7 @@ export class TerminalHandler {
 
   async waitForTerminalExit(params: WaitForTerminalExitRequest): Promise<WaitForTerminalExitResponse> {
     const managed = this.terminals.get(params.terminalId);
+    if (managed && managed.sessionId !== params.sessionId) { throw new Error('Terminal belongs to another session'); }
     if (!managed) {
       throw new Error(`Terminal not found: ${params.terminalId}`);
     }
@@ -215,12 +172,13 @@ export class TerminalHandler {
 
   async killTerminal(params: KillTerminalRequest): Promise<KillTerminalResponse> {
     const managed = this.terminals.get(params.terminalId);
+    if (managed && managed.sessionId !== params.sessionId) { throw new Error('Terminal belongs to another session'); }
     if (!managed) {
       throw new Error(`Terminal not found: ${params.terminalId}`);
     }
 
     try {
-      managed.process.kill('SIGTERM');
+      terminateProcess(managed.process, true);
     } catch (e) {
       logError(`Failed to kill terminal ${params.terminalId}`, e);
     }
@@ -230,6 +188,7 @@ export class TerminalHandler {
 
   async releaseTerminal(params: ReleaseTerminalRequest): Promise<ReleaseTerminalResponse> {
     const managed = this.terminals.get(params.terminalId);
+    if (managed && managed.sessionId !== params.sessionId) { throw new Error('Terminal belongs to another session'); }
     if (!managed) {
       throw new Error(`Terminal not found: ${params.terminalId}`);
     }
@@ -239,13 +198,14 @@ export class TerminalHandler {
     // Kill if still running
     if (!managed.exited) {
       try {
-        managed.process.kill('SIGTERM');
+        terminateProcess(managed.process, true);
       } catch {
         // ignore
       }
     }
 
     // Don't dispose VS Code terminal — keep output visible per ACP spec
+    managed.writeEmitter.dispose();
     this.terminals.delete(params.terminalId);
 
     return {};
@@ -255,13 +215,15 @@ export class TerminalHandler {
     for (const [, managed] of this.terminals) {
       try {
         if (!managed.exited) {
-          managed.process.kill('SIGKILL');
+          terminateProcess(managed.process, true);
         }
         managed.vsTerminal?.dispose();
+        managed.writeEmitter.dispose();
       } catch {
         // ignore
       }
     }
     this.terminals.clear();
   }
+  // [CUSTOM-END] CUSTOM-20261101-002
 }

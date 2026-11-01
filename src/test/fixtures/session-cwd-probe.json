@@ -2,8 +2,8 @@
   "_comment": "CUSTOM-20260925-056 - 由 CUSTOMIZATIONS/scripts/probe-session-cwd.mjs 生成。回答一个问题：agent 适配器是否遵守会话级 cwd。",
   "capturedAt": "2026-09-25T11:32:25.361Z",
   "agentCommand": "npx @agentclientprotocol/claude-agent-acp@latest",
-  "processCwd": "C:\\Users\\zouwei\\AppData\\Local\\Temp\\acp-cwd-probe-1790335927104-proc-hv8rPL",
-  "sessionCwd": "C:\\Users\\zouwei\\AppData\\Local\\Temp\\acp-cwd-probe-1790335927104-sess-YERxv3",
+  "processCwd": "C:\\Users\\user\\AppData\\Local\\Temp\\acp-cwd-probe-1790335927104-proc-hv8rPL",
+  "sessionCwd": "C:\\Users\\user\\AppData\\Local\\Temp\\acp-cwd-probe-1790335927104-sess-YERxv3",
   "dirsKept": false,
   "prompt": "Do exactly these three things and report their RAW output, no commentary:\n1. Run the shell command `pwd` and print its exact output after \"PWD:\".\n2. Run the shell command `ls -1` and print its exact output after \"LS:\".\n3. Read the file at the RELATIVE path `which-dir.txt` and print its exact contents after \"READ:\".",
   "agentInfo": {

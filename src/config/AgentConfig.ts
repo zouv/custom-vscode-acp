@@ -34,8 +34,8 @@ export function getAgentConfigs(): Record<string, AgentConfigEntry> {
 // 顺序来自 `acpc.agents` 的键序，而用户自建的配置很容易把 Claude Code 排到后面；
 // 这里做一次**稳定**调整：只把主用 agent 提到最前，其余保持原顺序（不做全排序，
 // 否则会打乱用户刻意安排的次序）。
-// 与 `panelContract.MODERN_AGENTS` 是两件事：那个管「哪些 agent 用新面板」，
-// 这个只管「谁排第一」。两者目前取值相同，但改动理由不同，不合并。
+// 与 `panelContract.MODERN_AGENTS` 是两件事：那个只管缺省启动候选，
+// 这个只管「谁排第一」；所有配置的 ACP agent 都使用新面板。
 const PRIMARY_AGENT = 'Claude Code';
 
 export function getAgentNames(): string[] {

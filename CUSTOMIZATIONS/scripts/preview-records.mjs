@@ -152,7 +152,7 @@ const FIXTURES = [
       status: 'completed', toolName: 'Bash', description: '查看博客目录及父目录现有内容',
       command: 'ls -la "D:/Git/zgame/zgame_blog_astro" 2>/dev/null && echo "---" && ls "D:/Git/zgame" 2>/dev/null',
       locations: [], elapsedMs: 420,
-      items: [{ type: 'content', block: { type: 'text', text: 'total 4\ndrwxr-xr-x 1 zouwei 1049089 0 Sep 29 16:06 .\ndrwxr-xr-x 1 zouwei 1049089 0 Sep 29 16:06 ..\n---\nzgame_blog\nzgame_blog_astro' } }],
+      items: [{ type: 'content', block: { type: 'text', text: 'total 4\ndrwxr-xr-x 1 user 1000 0 Sep 29 16:06 .\ndrwxr-xr-x 1 user 1000 0 Sep 29 16:06 ..\n---\nzgame_blog\nzgame_blog_astro' } }],
     },
   },
   {

@@ -3,9 +3,8 @@
 // `ChatPanelHost`——记录本来就存在扩展宿主，所以两个面天然同源，关掉再打开也不丢内容
 // （重开只是新文档 → `ready` → 定向 boot → 全量快照，**不会**触发 session/load）。
 //
-// 不变量（由本类与 ChatRouterProvider 双向保证）：**编辑区面存在 ⟺ 聚焦 agent 属于 MODERN_AGENTS**。
-// 非 Claude Code 的 agent 走 legacy 面板，而 legacy 的对话内容存在 webview DOM 里，
-// 换一个面渲染等于丢历史——所以这里直接拒绝，而不是给出一个空面板。
+// 所有配置的 ACP agent 都使用现代的 session-keyed host；编辑区和侧边栏同源。
+// MODERN_AGENTS 仅是空焦点时的缺省候选，不是 Claude/Codex 白名单。
 // [CUSTOM-END] CUSTOM-20260924-019
 import * as vscode from 'vscode';
 
@@ -44,10 +43,10 @@ export class ChatEditorPanel implements vscode.Disposable {
     // 「窗口重载后 / 没点过任何会话」正好是这种状态（`activeSessionId` 为 null）。
     // 更误导的是状态栏：它显示的是 `activeSession?.agentDisplayName || connectedAgents[0]`，
     // 没有活跃会话时退化成「第一个已连接的 agent」，所以看起来像"明明就是 Claude Code"。
-    // 现在只在**真的聚焦到了别的（legacy）agent** 时才拒绝——那才是这条门禁要防的情况。
+    // 现在所有非空 agent 名都通过现代面板门禁；保留分支供未来路由策略扩展。
     if (ctx.agentName && !isModernAgent(ctx.agentName)) {
       void vscode.window.showInformationMessage(
-        'The editor-area chat panel supports Claude Code only. Use the sidebar chat for this agent.',
+        'This agent does not support the editor-area chat panel.',
       );
       log(`${LOG_PREFIX}: editor panel refused (agent "${ctx.agentName}" uses the legacy panel)`);
       return;
@@ -106,7 +105,10 @@ export class ChatEditorPanel implements vscode.Disposable {
    * a session in one click.
    */
   private focusMostRecentModernSession(): void {
-    for (const agentName of MODERN_AGENTS) {
+    // [CUSTOM-BEGIN] CUSTOM-20261101-007 - Default candidates first, then every other connected agent.
+    const candidates = new Set([...MODERN_AGENTS, ...this.sessionManager.getConnectedAgentNames()]);
+    // [CUSTOM-END] CUSTOM-20261101-007
+    for (const agentName of candidates) {
       const ids = this.sessionManager.getSessionIdsForAgent(agentName);
       const mostRecent = ids[ids.length - 1];
       if (mostRecent) {

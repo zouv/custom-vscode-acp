@@ -33,7 +33,7 @@ export class ChatRouterProvider implements vscode.WebviewViewProvider {
 
   private readonly modern: ChatPanelHost;
   private readonly legacy: LegacyPanelAdapter;
-  // [CUSTOM-BEGIN] CUSTOM-20260924-019 - 编辑区面板（第二个 surface，仅 Claude Code）。
+  // [CUSTOM-BEGIN] CUSTOM-20260924-019 - 编辑区面板（第二个 surface，所有配置的 ACP agent）。
   private readonly editor: ChatEditorPanel;
   // [CUSTOM-END] CUSTOM-20260924-019
 
@@ -164,9 +164,8 @@ export class ChatRouterProvider implements vscode.WebviewViewProvider {
     const ctx = this.context();
 
     // [CUSTOM-BEGIN] CUSTOM-20260924-019 / CUSTOM-20260925-031 - 不变量：编辑区面存在 ⟹
-    // 聚焦 agent（**若有**）属于 MODERN_AGENTS。
-    // 焦点跨到别的 agent 时先关掉编辑区面板：legacy 面板的对话内容存在 webview DOM 里，
-    // 留着它只会显示上一个 agent 的陈旧内容。
+    // 聚焦 agent（**若有**）使用 modern host（现覆盖所有配置的 ACP agent）。
+    // 仅为未来可能引入的 legacy 路由保留关闭门禁；MODERN_AGENTS 不是 agent 白名单。
     // **没有聚焦会话（agentName 为 null）不再算违规**——那是个合法状态（窗口重载后就是这样），
     // 031 之前它会让"打开编辑区面板"的按钮必被拒（见 ChatEditorPanel.open 的说明）。
     if (ctx.agentName && id !== 'modern' && this.editor.isOpen) {

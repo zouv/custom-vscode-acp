@@ -26,9 +26,9 @@ import { fileMentionViews } from './markdown';
 
 /**
  * The agent whose transcripts these are. A SEPARATE constant from
- * `panelContract.MODERN_AGENTS` on purpose: that one decides which panel to render, this
- * one decides whose private storage we are willing to read — they happen to hold the same
- * name today, and neither should inherit the other's changes (pitfalls #19).
+ * `panelContract.MODERN_AGENTS` on purpose: that one holds default startup candidates,
+ * this one decides whose private storage we can read. Every configured agent now uses
+ * the modern panel; Claude-only disk access must not inherit that broader policy.
  */
 export const CLAUDE_CODE_AGENT = 'Claude Code';
 
